@@ -1,0 +1,6 @@
+# Software AES+GHASH dominates CPU on router-class ARM; always build with
+# hardware AES. Enforced at compile time in src/main.rs on aarch64/x86_64.
+# Note: an RUSTFLAGS environment variable overrides this file and must also
+# include the feature.
+[build]
+rustflags = ["-C", "target-feature=+aes"]

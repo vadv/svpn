@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.99.0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: Rust formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install rustfmt
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo "+$RUST_TOOLCHAIN" fmt --all -- --check
+
+  clippy:
+    name: Rust Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check native compiler
+        run: cc --version
+      - name: Install Clippy
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+      - name: Check all Rust targets
+        run: cargo "+$RUST_TOOLCHAIN" clippy --locked --workspace --all-targets -- -D warnings
+
+  native:
+    name: Native tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        rust: ["1.89.0", "1.99.0"]
+    env:
+      RUST_VERSION: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check native compiler
+        run: cc --version
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Test Rust without TUN privileges
+        run: cargo "+$RUST_VERSION" test --locked --workspace --all-targets
+      - name: Test harness cleanup and log retention without Docker
+        run: |
+          bash -n tests/run.sh
+          python3 tests/test_artifacts.py
+          python3 tests/test_groups.py
+          python3 tests/test_package.py
+
+  network:
+    name: Network ${{ matrix.suite }} / ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: integration
+            group: bootstrap
+          - suite: integration
+            group: lifecycle-pool
+          - suite: integration
+            group: udp
+          - suite: integration
+            group: tcp-auto
+          - suite: matrix
+            group: udp
+          - suite: matrix
+            group: tcp-auto
+    env:
+      TEST_SUITE: ${{ matrix.suite }}
+      TEST_GROUP: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Docker and TUN availability
+        run: |
+          docker version
+          docker compose version
+          test -c /dev/net/tun
+      - name: Run isolated network group
+        run: |
+          if [[ "$TEST_SUITE" == matrix ]]; then
+            tests/run.sh --matrix "$TEST_GROUP"
+          else
+            tests/run.sh "$TEST_GROUP"
+          fi
+      - name: Retain only this job's test logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: network-${{ matrix.suite }}-${{ matrix.group }}-${{ github.run_attempt }}
+          path: |
+            tests/.work/artifacts/run.*/*.log
+            tests/.work/artifacts/run.*/sessions/*.log
+          # Explicit log paths only; .work itself is hidden and may contain keys.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Package ${{ matrix.target }} (native container)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64-gnu
+            os: ubuntu-24.04
+            arch: x86_64
+            platform: linux/amd64
+            recipe: build/x86_64.Dockerfile
+            binary: svpn-x86_64-gnu
+          - target: openwrt-aarch64
+            os: ubuntu-24.04-arm
+            arch: aarch64
+            platform: linux/arm64
+            recipe: build/openwrt.Dockerfile
+            binary: svpn-openwrt-aarch64
+    env:
+      TARGET: ${{ matrix.target }}
+      HOST_ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+      RECIPE: ${{ matrix.recipe }}
+      BINARY: ${{ matrix.binary }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check native architecture and Docker builder
+        run: |
+          test "$(uname -m)" = "$HOST_ARCH"
+          docker buildx version
+      - name: Install Cargo for offline package metadata
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Build and check binary in pinned container
+        run: docker buildx build --platform "$PLATFORM" -f "$RECIPE" --output type=local,dest=dist/raw .
+      - name: Package binary and checksum
+        run: RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/package.py "$TARGET" "dist/raw/$BINARY"
+      - name: Retain release archives
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/archives/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    name: Package macOS arm64 (native)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check native architecture
+        run: test "$(uname -m)" = arm64
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Build and smoke-test native binary
+        run: |
+          cargo "+$RUST_TOOLCHAIN" build --locked --release
+          ./target/release/svpn --version
+          ./target/release/svpn --help
+      - name: Package binary and checksum
+        run: RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/package.py macos-arm64 target/release/svpn
+      - name: Retain release archives
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-macos-arm64
+          path: dist/archives/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish verified release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'vadv/svpn'
+    needs: [fmt, clippy, native, network, build-linux, build-macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Cargo for version validation
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Download and verify this run's archives
+        run: |
+          gh run download "$GITHUB_RUN_ID" --pattern 'package-*' --dir dist/release
+          RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/release.py \
+            dist/release "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID" > dist/release-files.txt
+      - name: Upload, verify downloads, then publish
+        run: |
+          mapfile -t files < dist/release-files.txt
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag \
+            --draft --prerelease --title "SVPN $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
+          gh release download "$GITHUB_REF_NAME" --dir dist/downloaded
+          RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/release.py \
+            dist/downloaded "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease

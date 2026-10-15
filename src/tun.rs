@@ -1,0 +1,82 @@
+//! TUN device creation and the busy-name diagnostics of the serve side.
+
+use std::net::Ipv4Addr;
+
+use anyhow::{Context, Result, ensure};
+use tun_rs::{AsyncDevice, DeviceBuilder};
+
+pub fn validate_tun_name(name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= 15,
+        "TUN name must be 1..=15 bytes"
+    );
+    ensure!(
+        bytes.iter().all(|b| b.is_ascii_graphic() && *b != b'/'),
+        "TUN name must not contain spaces, control characters, or '/'"
+    );
+    Ok(())
+}
+
+pub fn create_tun(
+    local: Ipv4Addr,
+    peer: Ipv4Addr,
+    mtu: u16,
+    name: Option<&str>,
+    announce: bool,
+) -> Result<AsyncDevice> {
+    let mut builder = DeviceBuilder::new().ipv4(local, 32u8, Some(peer)).mtu(mtu);
+    if let Some(name) = name {
+        builder = builder.name(name);
+    }
+    #[cfg(target_os = "macos")]
+    let builder = builder.associate_route(false);
+    let tun = builder
+        .build_async()
+        .context("create/configure TUN (requires network privileges)")?;
+    crate::debug!(
+        "TUN ready: {} local={local} peer={peer} mtu={mtu}",
+        tun.name()?
+    );
+    if announce {
+        crate::info!("tun: {} ready — {}, MTU {}", tun.name()?, local, mtu);
+    }
+    Ok(tun)
+}
+
+/// TUNSETIFF fails with EBUSY while another process holds the name (the
+/// previous serve inside its heartbeat-shutdown window).
+pub fn is_busy_tun(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.raw_os_error() == Some(16))
+}
+
+/// Pids (besides us) holding /dev/net/tun, for the final EBUSY report.
+pub fn stale_tun_holders() -> String {
+    let me = std::process::id();
+    let holders: Vec<String> = std::fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| *pid != me)
+        .filter(|pid| {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .map(|fds| {
+                    fds.filter_map(Result::ok).any(|fd| {
+                        std::fs::read_link(fd.path())
+                            .is_ok_and(|target| target == std::path::Path::new("/dev/net/tun"))
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .map(|pid| pid.to_string())
+        .collect();
+    match holders.is_empty() {
+        true => String::new(),
+        false => format!(" (pid {})", holders.join(", pid ")),
+    }
+}

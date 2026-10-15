@@ -1,0 +1,13 @@
+*
+!.cargo/
+!.cargo/**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!README.en.md
+!src/
+!src/**
+!tests/
+!tests/**
+tests/.work/
+tests/__pycache__/

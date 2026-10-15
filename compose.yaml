@@ -1,0 +1,93 @@
+name: svpn-test
+
+services:
+  keys:
+    image: svpn-test:local
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    command: [python3, /tests/keys.py]
+    volumes:
+      - keys:/keys
+    network_mode: none
+
+  server:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /tests/server.py]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    devices: [/dev/net/tun:/dev/net/tun]
+    volumes:
+      - keys:/keys:ro
+    networks:
+      test:
+        ipv4_address: 172.30.77.2
+    depends_on:
+      keys:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; socket.create_connection(('127.0.0.1', 22), 1).close()"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+
+  server2:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /tests/server.py]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    devices: [/dev/net/tun:/dev/net/tun]
+    volumes:
+      - keys:/keys:ro
+    networks:
+      test:
+        ipv4_address: 172.30.77.5
+    depends_on:
+      keys:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; socket.create_connection(('127.0.0.1', 22), 1).close()"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+
+  client:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /tests/integration.py]
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    environment:
+      SVPN_TEST_LOG_DIR: /testlogs
+      SVPN_TEST_GROUP: ${SVPN_TEST_GROUP:-all}
+    volumes:
+      - keys:/keys:ro
+      - ${SVPN_TEST_ARTIFACTS:-./tests/.work/artifacts/manual}/sessions:/testlogs
+    networks:
+      test:
+        ipv4_address: 172.30.77.3
+    depends_on:
+      server:
+        condition: service_healthy
+
+  target:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /tests/target.py]
+    networks:
+      test:
+        ipv4_address: 172.30.77.4
+
+volumes:
+  keys:
+
+networks:
+  test:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24
