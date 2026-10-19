@@ -1,6 +1,10 @@
+//! Logging: record formatting and level filtering.
+
 use std::sync::atomic::Ordering;
 
 use svpn::logging::*;
+
+// ── record formatting ──
 
 #[test]
 fn every_record_ends_with_one_newline() {
@@ -23,6 +27,8 @@ fn every_record_ends_with_one_newline() {
         "t+    1.000s first\nt+    2.000s second\n"
     );
 }
+
+// ── level filtering ──
 
 #[test]
 fn level_order_filters_output() {

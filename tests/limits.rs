@@ -1,3 +1,5 @@
+//! Resource limits: raising RLIMIT_NOFILE never lowers the soft limit.
+
 use rlimit::Resource;
 use svpn::limits::*;
 

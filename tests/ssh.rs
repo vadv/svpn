@@ -1,3 +1,5 @@
+//! SSH transport: connection lifecycle, host-key checks, identity loading, stderr relay.
+
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,6 +9,11 @@ use russh::keys::ssh_key::Fingerprint;
 use russh::keys::{HashAlg, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use svpn::ssh::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+const ED25519_PUBLIC: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETpwGaBiFyUdKRNtIrPlYpMvnfZW3YbXd+kV4GZYy2n test";
+
+// ── connection lifecycle ──
 
 #[tokio::test]
 async fn dropping_tail_stops_idle_pump_and_closes_connection() {
@@ -134,6 +141,47 @@ async fn dropping_tail_stops_idle_pump_and_closes_connection() {
     drop((stdin, stdout));
 }
 
+// Real time: russh keepalive timers make paused-clock auto-advance loop
+// forever in Linux containers (the cost is one ~10s CONNECT_TIMEOUT).
+#[tokio::test]
+async fn hung_key_exchange_is_closed_after_the_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        sock.write_all(b"SSH-2.0-SVPNTest\r\n").await.unwrap();
+        // The client's banner and KEXINIT arrive first; EOF is what must
+        // eventually follow once the abandoned transport is torn down.
+        let mut buf = [0u8; 64];
+        loop {
+            if sock.read(&mut buf).await.unwrap() == 0 {
+                return;
+            }
+        }
+    });
+    let target = SshTarget {
+        user: "nobody".into(),
+        identity: None,
+        host_key: None,
+        host_label: "hung-peer".into(),
+    };
+    let err = match connect(&target, addr, "true", "").await {
+        Ok(_) => panic!("hung peer must not complete the connection"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("SSH connection timeout"),
+        "{err:#}"
+    );
+    // russh's internal task must not outlive its inactivity bound.
+    tokio::time::timeout(Duration::from_secs(120), peer)
+        .await
+        .expect("peer socket leaked past the inactivity bound")
+        .unwrap();
+}
+
+// ── host-key checks ──
+
 #[tokio::test]
 async fn unreadable_known_hosts_rejects_without_overwriting_records() {
     let path = std::env::temp_dir().join(format!(
@@ -239,103 +287,6 @@ async fn parallel_first_connects_remember_both_host_keys() {
     let _ = std::fs::remove_file(&path);
 }
 
-// Real time: russh keepalive timers make paused-clock auto-advance loop
-// forever in Linux containers (the cost is one ~10s CONNECT_TIMEOUT).
-#[tokio::test]
-async fn hung_key_exchange_is_closed_after_the_timeout() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        sock.write_all(b"SSH-2.0-SVPNTest\r\n").await.unwrap();
-        // The client's banner and KEXINIT arrive first; EOF is what must
-        // eventually follow once the abandoned transport is torn down.
-        let mut buf = [0u8; 64];
-        loop {
-            if sock.read(&mut buf).await.unwrap() == 0 {
-                return;
-            }
-        }
-    });
-    let target = SshTarget {
-        user: "nobody".into(),
-        identity: None,
-        host_key: None,
-        host_label: "hung-peer".into(),
-    };
-    let err = match connect(&target, addr, "true", "").await {
-        Ok(_) => panic!("hung peer must not complete the connection"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("SSH connection timeout"),
-        "{err:#}"
-    );
-    // russh's internal task must not outlive its inactivity bound.
-    tokio::time::timeout(Duration::from_secs(120), peer)
-        .await
-        .expect("peer socket leaked past the inactivity bound")
-        .unwrap();
-}
-
-#[test]
-fn relay_strips_server_timestamp_and_marks_role() {
-    // Output goes to the shared log — here we only check the line transformation.
-    // The full record goes through logging; here — a pure function on the t+ prefix.
-    fn strip(line: &str) -> &str {
-        if line.starts_with("t+")
-            && let Some((_, rest)) = line.split_once('s')
-            && rest.starts_with(' ')
-        {
-            return rest.trim_start();
-        }
-        line
-    }
-    assert_eq!(strip("t+    0.174s TUN ready: tun4"), "TUN ready: tun4");
-    assert_eq!(strip("t+1s"), "t+1s"); // no space after s — not a timestamp
-    assert_eq!(strip("plain line"), "plain line");
-    assert_eq!(strip("t+ 12.5s tx"), "tx");
-}
-
-#[test]
-fn server_stderr_line_marks_the_pool_link_and_keeps_single_server_output() {
-    assert_eq!(
-        server_stderr_line("", "TUN ready: tun4"),
-        "[server] TUN ready: tun4"
-    );
-    assert_eq!(
-        server_stderr_line("[h1]", "TUN ready: tun4"),
-        "[server h1] TUN ready: tun4"
-    );
-}
-
-const ED25519_PUBLIC: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIETpwGaBiFyUdKRNtIrPlYpMvnfZW3YbXd+kV4GZYy2n test";
-
-#[test]
-fn identity_from_private_key_file() {
-    let dir = std::env::temp_dir().join("svpn_ssh_tests");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("id_ed25519");
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).unwrap();
-    let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
-    let key = PrivateKey::new(pair.into(), "test").unwrap();
-    let encoded = key.to_openssh(Default::default()).unwrap();
-    std::fs::write(&path, encoded.as_bytes()).unwrap();
-    assert!(matches!(load_identity(&path), Ok(Identity::Key(_))));
-    std::fs::remove_file(&path).unwrap();
-}
-
-#[test]
-fn identity_from_public_key_file_loads_agent_identity() {
-    let dir = std::env::temp_dir().join("svpn_ssh_tests");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("id_ed25519.pub");
-    std::fs::write(&path, ED25519_PUBLIC).unwrap();
-    assert!(matches!(load_identity(&path), Ok(Identity::Agent(_))));
-}
-
 #[test]
 fn known_hosts_decide_is_tofu() {
     use HostKeyDecision::*;
@@ -369,6 +320,44 @@ fn known_hosts_decide_is_tofu() {
 }
 
 #[test]
+fn fingerprint_parses_openssh_format() {
+    let fp: Fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        .parse()
+        .expect("valid fingerprint");
+    assert_eq!(
+        fp.to_string(),
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
+    assert!("md5:xx".parse::<Fingerprint>().is_err());
+}
+
+// ── identity loading ──
+
+#[test]
+fn identity_from_private_key_file() {
+    let dir = std::env::temp_dir().join("svpn_ssh_tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("id_ed25519");
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).unwrap();
+    let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
+    let key = PrivateKey::new(pair.into(), "test").unwrap();
+    let encoded = key.to_openssh(Default::default()).unwrap();
+    std::fs::write(&path, encoded.as_bytes()).unwrap();
+    assert!(matches!(load_identity(&path), Ok(Identity::Key(_))));
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn identity_from_public_key_file_loads_agent_identity() {
+    let dir = std::env::temp_dir().join("svpn_ssh_tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("id_ed25519.pub");
+    std::fs::write(&path, ED25519_PUBLIC).unwrap();
+    assert!(matches!(load_identity(&path), Ok(Identity::Agent(_))));
+}
+
+#[test]
 fn identity_from_garbage_fails() {
     let dir = std::env::temp_dir().join("svpn_ssh_tests");
     std::fs::create_dir_all(&dir).unwrap();
@@ -381,14 +370,35 @@ fn identity_from_garbage_fails() {
     assert!(err.contains("agent"), "unexpected: {err}");
 }
 
+// ── server stderr relay ──
+
 #[test]
-fn fingerprint_parses_openssh_format() {
-    let fp: Fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        .parse()
-        .expect("valid fingerprint");
+fn relay_strips_server_timestamp_and_marks_role() {
+    // Output goes to the shared log — here we only check the line transformation.
+    // The full record goes through logging; here — a pure function on the t+ prefix.
+    fn strip(line: &str) -> &str {
+        if line.starts_with("t+")
+            && let Some((_, rest)) = line.split_once('s')
+            && rest.starts_with(' ')
+        {
+            return rest.trim_start();
+        }
+        line
+    }
+    assert_eq!(strip("t+    0.174s TUN ready: tun4"), "TUN ready: tun4");
+    assert_eq!(strip("t+1s"), "t+1s"); // no space after s — not a timestamp
+    assert_eq!(strip("plain line"), "plain line");
+    assert_eq!(strip("t+ 12.5s tx"), "tx");
+}
+
+#[test]
+fn server_stderr_line_marks_the_pool_link_and_keeps_single_server_output() {
     assert_eq!(
-        fp.to_string(),
-        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        server_stderr_line("", "TUN ready: tun4"),
+        "[server] TUN ready: tun4"
     );
-    assert!("md5:xx".parse::<Fingerprint>().is_err());
+    assert_eq!(
+        server_stderr_line("[h1]", "TUN ready: tun4"),
+        "[server h1] TUN ready: tun4"
+    );
 }

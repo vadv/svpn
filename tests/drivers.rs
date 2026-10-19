@@ -1,4 +1,7 @@
+//! Transport drivers: rebind budgets, datagram sockets, QUIC relay, WebRTC channels.
+
 use std::time::Duration;
+
 use svpn::drivers::*;
 use svpn::profile::Profile;
 use svpn::{quic, webrtc};
@@ -45,6 +48,8 @@ where
         }
     }
 }
+
+// ── rebind ──
 
 #[tokio::test]
 async fn rebind_rejects_held_sockets_expired_budgets_and_other_errors() {
@@ -95,6 +100,8 @@ async fn rebind_rejects_success_observed_after_deadline() {
     assert!(socket.is_none(), "the bind attempt must have completed");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
 }
+
+// ── datagram ──
 
 #[tokio::test]
 async fn datagram_round_trips_plain_and_learn_peer() {
@@ -290,6 +297,8 @@ async fn datagram_event_queue_is_bounded_and_survives_backlog() {
     }
 }
 
+// ── quic ──
+
 #[tokio::test]
 async fn quic_server_drop_aborts_pending_relay_and_releases_sockets() {
     let cert = rcgen::generate_simple_self_signed(vec!["cdn.example".to_string()]).unwrap();
@@ -367,6 +376,8 @@ async fn quic_drivers_carry_records_through_relay() {
         Event::Wire(b"quic-record-2-0123456789abcdef".to_vec())
     );
 }
+
+// ── webrtc ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webrtc_outbound_burst_does_not_wait_for_receive_ticks() {

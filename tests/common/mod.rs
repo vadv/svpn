@@ -1,7 +1,11 @@
 //! Shared packet fixtures for integration tests.
 
+pub mod selector;
+pub mod session;
+
 use svpn::packet::internet_checksum;
 
+#[allow(dead_code)] // unused by some of the including test targets
 pub fn udp_packet(reverse: bool) -> Vec<u8> {
     let mut bytes = vec![0u8; 28];
     bytes[0] = 0x45;
@@ -12,6 +16,17 @@ pub fn udp_packet(reverse: bool) -> Vec<u8> {
     bytes[20..22].copy_from_slice(&(if reverse { 9000u16 } else { 40000 }).to_be_bytes());
     bytes[22..24].copy_from_slice(&(if reverse { 40000u16 } else { 9000 }).to_be_bytes());
     bytes[24..26].copy_from_slice(&8u16.to_be_bytes());
+    bytes
+}
+
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn tcp_packet(reverse: bool) -> Vec<u8> {
+    let mut bytes = udp_packet(reverse);
+    bytes.resize(40, 0);
+    bytes[2..4].copy_from_slice(&40u16.to_be_bytes());
+    bytes[9] = 6;
+    bytes[32] = 0x50;
+    bytes[33] = 0x02;
     bytes
 }
 

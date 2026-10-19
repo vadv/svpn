@@ -1,11 +1,14 @@
-use clap::Parser;
-use nix::errno::Errno;
-use nix::sys::signal::Signal;
-use nix::unistd::Pid;
+//! Up/down hooks: CLI validation, script resolution, process behavior, lifecycle.
+
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use clap::Parser;
+use nix::errno::Errno;
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use svpn::hooks::*;
 use tokio::time::Instant;
 
@@ -22,6 +25,20 @@ fn context() -> TunContext {
         peer: Ipv4Addr::new(10, 77, 0, 1),
     }
 }
+
+fn temporary_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "svpn hook {} {}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+// ── parsing and resolution ──
 
 #[test]
 fn parser_rejects_conflicts_repetition_and_invalid_values() {
@@ -44,30 +61,6 @@ fn parser_rejects_conflicts_repetition_and_invalid_values() {
             Err(_) => true,
         });
     }
-}
-
-fn temporary_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "svpn hook {} {}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&path).unwrap();
-    path
-}
-
-async fn write_script(path: &std::path::Path) {
-    // A child-owned writer cannot be inherited by other tests' concurrent spawns.
-    let mut context = context();
-    context.name = path.to_str().unwrap().into();
-    let hook = Hook::Command("printf '#!/bin/sh\\nexit 0\\n' > \"$SVPN_TUN_NAME\"".into());
-    Running::spawn(&hook, "up", &context)
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -104,6 +97,46 @@ async fn script_validation_uses_callers_execute_permissions() {
     assert_eq!(resolved.is_ok(), executable, "spawn error: {spawn_error:?}");
 }
 
+// ── running process ──
+
+#[tokio::test]
+async fn environment_is_literal_and_stdin_is_closed() {
+    let hook = Hook::Command("test \"$SVPN_EVENT\" = up && test \"$SVPN_TUN_NAME\" = 'utun$(false); literal' && test \"$SVPN_TUN_ADDR\" = 10.77.0.2 && test \"$SVPN_PEER_ADDR\" = 10.77.0.1 && ! read -r line".into());
+    Running::spawn(&hook, "up", &context())
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn exit_signal_spawn_and_timeout_are_errors() {
+    for text in ["exit 7", "kill -TERM $$"] {
+        assert!(
+            Running::spawn(&Hook::Command(text.into()), "up", &context())
+                .unwrap()
+                .wait()
+                .await
+                .is_err()
+        );
+    }
+    assert!(Running::spawn(&Hook::Script("/no/such/hook".into()), "up", &context()).is_err());
+    let mut running =
+        Running::spawn(&Hook::Command("sleep 60 & wait".into()), "up", &context()).unwrap();
+    let pid = running.group;
+    running.deadline = Instant::now() + Duration::from_millis(100);
+    assert!(
+        running
+            .wait()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timed out")
+    );
+    assert!(running.finished);
+    assert_eq!(nix::sys::signal::kill(pid, None), Err(Errno::ESRCH));
+}
+
 #[tokio::test]
 async fn completed_hook_stops_remaining_group() {
     for ending in ["exit 0", "exit 7", "kill -TERM $$"] {
@@ -135,6 +168,8 @@ async fn completed_hook_stops_remaining_group() {
         assert!(gone, "hook descendant survived {ending}");
     }
 }
+
+// ── up/down lifecycle ──
 
 #[tokio::test]
 async fn failed_up_runs_compensation_once_with_same_context() {
@@ -183,44 +218,6 @@ async fn failed_down_is_not_retried_and_never_runs_before_tun() {
 }
 
 #[tokio::test]
-async fn environment_is_literal_and_stdin_is_closed() {
-    let hook = Hook::Command("test \"$SVPN_EVENT\" = up && test \"$SVPN_TUN_NAME\" = 'utun$(false); literal' && test \"$SVPN_TUN_ADDR\" = 10.77.0.2 && test \"$SVPN_PEER_ADDR\" = 10.77.0.1 && ! read -r line".into());
-    Running::spawn(&hook, "up", &context())
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn exit_signal_spawn_and_timeout_are_errors() {
-    for text in ["exit 7", "kill -TERM $$"] {
-        assert!(
-            Running::spawn(&Hook::Command(text.into()), "up", &context())
-                .unwrap()
-                .wait()
-                .await
-                .is_err()
-        );
-    }
-    assert!(Running::spawn(&Hook::Script("/no/such/hook".into()), "up", &context()).is_err());
-    let mut running =
-        Running::spawn(&Hook::Command("sleep 60 & wait".into()), "up", &context()).unwrap();
-    let pid = running.group;
-    running.deadline = Instant::now() + Duration::from_millis(100);
-    assert!(
-        running
-            .wait()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("timed out")
-    );
-    assert!(running.finished);
-    assert_eq!(nix::sys::signal::kill(pid, None), Err(Errno::ESRCH));
-}
-
-#[tokio::test]
 async fn cancellation_finishes_up_before_single_down() {
     let mut hooks = Args {
         up_command: Some("sleep 60".into()),
@@ -239,4 +236,16 @@ async fn cancellation_finishes_up_before_single_down() {
     assert!(hooks.context.is_none());
     assert_eq!(nix::sys::signal::kill(pid, None), Err(Errno::ESRCH));
     hooks.finish().await.unwrap();
+}
+
+async fn write_script(path: &std::path::Path) {
+    // A child-owned writer cannot be inherited by other tests' concurrent spawns.
+    let mut context = context();
+    context.name = path.to_str().unwrap().into();
+    let hook = Hook::Command("printf '#!/bin/sh\\nexit 0\\n' > \"$SVPN_TUN_NAME\"".into());
+    Running::spawn(&hook, "up", &context)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
 }

@@ -1,3 +1,5 @@
+//! Server specs: parsing, resolution for single/pool/perf modes, and local TUN names.
+
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
@@ -6,6 +8,24 @@ use svpn::logging;
 use svpn::server_spec::*;
 
 const PIN: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn globals() -> Globals {
+    let cli = svpn::Cli::try_parse_from([
+        "svpn",
+        "multi",
+        "--server",
+        "203.0.113.10",
+        "--peer-tun-name",
+        "svpn0",
+    ])
+    .unwrap();
+    let svpn::Mode::Client(svpn::cli::ClientArgs { globals, .. }) = cli.command else {
+        unreachable!()
+    };
+    globals
+}
+
+// ── local TUN names ──
 
 #[test]
 fn local_tun_names_follow_the_client_platform() {
@@ -27,21 +47,7 @@ fn local_tun_names_follow_the_client_platform() {
     }
 }
 
-fn globals() -> Globals {
-    let cli = svpn::Cli::try_parse_from([
-        "svpn",
-        "multi",
-        "--server",
-        "203.0.113.10",
-        "--peer-tun-name",
-        "svpn0",
-    ])
-    .unwrap();
-    let svpn::Mode::Client(svpn::cli::ClientArgs { globals, .. }) = cli.command else {
-        unreachable!()
-    };
-    globals
-}
+// ── parsing ──
 
 #[test]
 fn parses_hosts_ports_and_numeric_boundaries() {
@@ -142,14 +148,6 @@ fn hostnames_are_validated_and_normalized_without_dns() {
     );
 }
 
-#[tokio::test]
-async fn ipv4_literals_do_not_require_dns() {
-    assert_eq!(
-        resolve_ipv4("203.0.113.10").await.unwrap(),
-        Ipv4Addr::new(203, 0, 113, 10)
-    );
-}
-
 #[test]
 fn rejects_invalid_keys_values_and_separators() {
     for suffix in [
@@ -219,6 +217,18 @@ fn rejects_invalid_keys_values_and_separators() {
         );
     }
 }
+
+// ── DNS ──
+
+#[tokio::test]
+async fn ipv4_literals_do_not_require_dns() {
+    assert_eq!(
+        resolve_ipv4("203.0.113.10").await.unwrap(),
+        Ipv4Addr::new(203, 0, 113, 10)
+    );
+}
+
+// ── single-server resolution ──
 
 #[test]
 fn resolves_defaults_and_keeps_owned_retry_configuration() {
@@ -320,6 +330,8 @@ fn validates_merged_configuration_before_bootstrap() {
     assert!(spec.resolve(&globals).is_err());
 }
 
+// ── pool resolution ──
+
 #[test]
 fn resolves_whole_pool_and_reports_server_index() {
     let mut globals = globals();
@@ -355,6 +367,8 @@ fn resolves_whole_pool_and_reports_server_index() {
     globals.ssh_host_key = None;
     assert!(resolve_servers(&pinned, &globals).is_ok());
 }
+
+// ── perf constraints ──
 
 #[test]
 fn perf_requires_one_effective_mimic_and_rejects_weight() {
