@@ -132,9 +132,19 @@ def matrix_groups():
 
 
 def matrix_diagnostics():
+    def make_wait(stalled, progress, calls):
+        def wait_side_effect(_):
+            if not stalled:
+                progress[0] += 1
+            return calls.pop(0)
+
+        return wait_side_effect
+
     for stalled, failure in [(False, False), (True, False), (True, True)]:
+        progress = [0]
+        calls = [False, False, True]
         stop = Mock()
-        stop.wait.side_effect = [False, True] if stalled else [True]
+        stop.wait.side_effect = make_wait(stalled, progress, calls)
         output = io.StringIO()
         results = [
             subprocess.TimeoutExpired("ss", 5) if failure else SimpleNamespace(stdout="client sockets"),
@@ -144,7 +154,7 @@ def matrix_diagnostics():
             patch.object(matrix, "command", side_effect=results) as command,
             contextlib.redirect_stdout(output),
         ):
-            matrix.tcp_diagnostics(stop)
+            matrix.tcp_diagnostics(stop, progress)
         assert command.call_count == (2 if stalled else 0)
         if stalled:
             assert "TCP-DIAGNOSTICS client" in output.getvalue()

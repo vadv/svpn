@@ -1,6 +1,7 @@
 """Lifecycle-pool group: up/down hooks on real Linux TUNs, pool failover, control loss, Checking."""
 
 import concurrent.futures
+import contextlib
 import os
 import pathlib
 import re
@@ -49,6 +50,7 @@ def verify_events(directory, events, name="svpn0"):
     return actual
 
 
+@contextlib.contextmanager
 def client(name, flags):
     # Unlike session(), failure cases may finish before an observer sees the TUN.
     path = LOG_DIR / ("hooks-" + name + ".log")

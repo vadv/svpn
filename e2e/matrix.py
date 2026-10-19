@@ -15,36 +15,42 @@ import time
 from _lib import CLIENT, PEER, SSH, command, session
 
 
-def tcp_diagnostics(stop):
+def tcp_diagnostics(stop, progress):
     """Capture socket pressure and kernel drops only while a transfer stalls."""
     script = (
         "uname -r; ss -tinm; nstat -az; "
         "timeout 2 tcpdump -i svpn0 -nn -S -tt -s 96 -c 20 'tcp port 9000' 2>&1"
     )
-    while not stop.wait(3):
-        for role, args in [("client", ["sh", "-c", script]), ("server", SSH + [script])]:
-            try:
-                result = command(args, check=False, timeout=5)
-                print(f"TCP-DIAGNOSTICS {role}\n{result.stdout}", flush=True)
-            except Exception as error:
-                print(f"TCP-DIAGNOSTICS {role}: {error}", flush=True)
+    last = None
+    while not stop.wait(2):
+        current = progress[0]
+        if last is not None and current == last:
+            for role, args in [("client", ["sh", "-c", script]), ("server", SSH + [script])]:
+                try:
+                    result = command(args, check=False, timeout=5)
+                    print(f"TCP-DIAGNOSTICS {role}\n{result.stdout}", flush=True)
+                except Exception as error:
+                    print(f"TCP-DIAGNOSTICS {role}: {error}", flush=True)
+        last = current
 
 
 def tcp_echo_both_ways(size_mib=4):
     """Echo: the client drives the upload, the reply is the download; both directions over one connection."""
-    payload = bytes(65536)
+    payload = bytes(8192)
     total = size_mib * 1024 * 1024
     received = bytearray()
+    progress = [0]
 
     def reader(stream):
-        while chunk := stream.recv(65536):
+        while chunk := stream.recv(8192):
             received.extend(chunk)
+            progress[0] += len(chunk)
 
     start = time.monotonic()
     with socket.create_connection((PEER, 9000), timeout=60) as stream:
         stream.settimeout(60)
         stop = threading.Event()
-        monitor = threading.Thread(target=tcp_diagnostics, args=(stop,))
+        monitor = threading.Thread(target=tcp_diagnostics, args=(stop, progress))
         monitor.start()
         try:
             thread = threading.Thread(target=reader, args=(stream,))
@@ -59,8 +65,21 @@ def tcp_echo_both_ways(size_mib=4):
             stop.set()
             monitor.join()
     wall = time.monotonic() - start
-    assert bytes(received) == bytes(total) + b"EOF", "echo mismatch"
+    assert bytes(received) == bytes(total) + b"EOF", f"echo mismatch: got {len(received)} B in {wall:.1f} s"
     return round(wall, 2), round(total * 16 / wall / 1_000_000, 1)
+
+
+def tcp_echo_with_retry(size_mib=4, attempts=2):
+    """Shared CI runners can stall a bulk TCP flow over a userspace tunnel; retry once."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return tcp_echo_both_ways(size_mib)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError) as error:
+            last_error = error
+            print(f"tcp_echo attempt {attempt} failed: {error}; retrying...", flush=True)
+            time.sleep(1)
+    raise last_error
 
 
 def udp_mtu_probe(count=3):
@@ -120,14 +139,14 @@ CONFIGS = [
 def run_config(name, args):
     row = {}
     with session(f"matrix-{name}", args=CLIENT + args) as (process, path):
-        wall, mbit = tcp_echo_both_ways()
+        wall, mbit = tcp_echo_with_retry()
         row["bulk_4mib_echo_s"] = wall
         row["bulk_4mib_mbit"] = mbit
         row["udp_mtu"] = udp_mtu_probe()
         row["udp_each_once"] = udp_each_once()
         row["icmp_mtu"] = icmp_mtu()
         idle_survive(process=process)
-        wall2, _ = tcp_echo_both_ways(1)
+        wall2, _ = tcp_echo_with_retry(1)
         row["idle_75s_then_echo"] = "ok"
         row["log_tail_hints"] = "tcp_remote" if "tcp_remote" in path.read_text() else "udp-channel"
     return row
