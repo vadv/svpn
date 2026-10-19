@@ -309,6 +309,7 @@ pub(crate) async fn open_link(
             pin,
             // Without TCP camouflage the server will not send a tcp candidate.
             tcp: if plan.tcp.is_some() { server_tcp } else { None },
+            tcp_camouflage: plan.tcp.as_ref().map(|(_, camouflage)| *camouflage),
         },
     };
     Ok((control, tail, config, server_ip))
@@ -379,6 +380,45 @@ async fn serve(
             pin: quic.as_ref().map(|(_, pin)| *pin),
         })
         .await?;
+    let strategy_names: Vec<String> = strategies
+        .iter()
+        .map(|s| format!("{:?}", s).to_lowercase())
+        .collect();
+    match (&tcp, &tcp_candidate) {
+        (Some((mode, _)), _) => {
+            crate::info!(
+                "serve: tcp_mode={:?} port={} bind={}",
+                mode.camouflage,
+                mode.port,
+                bind
+            );
+        }
+        (None, Some((_, port))) => {
+            crate::info!(
+                "serve: strategies={} udp_ports={} tcp_fallback={} bind={}",
+                strategy_names.join("+"),
+                ports
+                    .iter()
+                    .map(|e| e.port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                port,
+                bind
+            );
+        }
+        (None, None) => {
+            crate::info!(
+                "serve: strategies={} udp_ports={} bind={}",
+                strategy_names.join("+"),
+                ports
+                    .iter()
+                    .map(|e| e.port.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                bind
+            );
+        }
+    }
     let name = match tun_name {
         None | Some("") => None,
         Some(name) => {

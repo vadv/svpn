@@ -170,6 +170,18 @@ impl Selector {
         self.configured.clone()
     }
 
+    pub fn preparation_candidate(&self) -> Option<Candidate> {
+        self.preparation.map(|p| p.candidate)
+    }
+
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    pub fn pre_active_count(&self) -> usize {
+        self.flows.values().filter(|f| !f.stage.is_active()).count()
+    }
+
     pub fn ready_channel(&self, candidate: Candidate) -> Option<u64> {
         self.channels
             .get(&candidate)

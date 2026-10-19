@@ -251,6 +251,14 @@ impl Session {
                     // The flow's first packet is already queued in selector.request().
                 } else if let Some(selector) = plane.selector.as_mut() {
                     if selector.enqueue(flow_id, bytes).is_err() {
+                        crate::debug!(
+                            "{} selector backlog: flow={} pre_active={} queued_bytes={} preparing={:?}",
+                            self.drop_prefix,
+                            flow_id,
+                            selector.pre_active_count(),
+                            selector.queued_bytes(),
+                            selector.preparation_candidate()
+                        );
                         self.stats.count_drop(
                             &self.drop_prefix,
                             &format!("flow {flow_id} selector queue full"),

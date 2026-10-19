@@ -28,6 +28,8 @@ struct Slot {
     delay: Duration,
     weight: u32,
     current: i128,
+    attempt: u32,
+    last_reason: String,
 }
 
 pub struct Pool {
@@ -51,6 +53,8 @@ impl Pool {
                     delay: Duration::from_secs(1),
                     weight,
                     current: 0,
+                    attempt: 0,
+                    last_reason: String::new(),
                 })
                 .collect(),
             started: false,
@@ -142,7 +146,7 @@ impl Pool {
         Ok(true)
     }
 
-    pub fn failed(&mut self, epoch: Epoch, now: Instant) -> Result<bool> {
+    pub fn failed(&mut self, epoch: Epoch, now: Instant, reason: &str) -> Result<bool> {
         let Some(slot) = self.slots.get_mut(epoch.link).filter(|s| {
             s.epoch == epoch
                 && matches!(s.state, State::Connecting | State::Ready | State::Checking)
@@ -152,6 +156,8 @@ impl Pool {
         slot.state = State::Failed;
         slot.round = false;
         slot.current = 0;
+        slot.attempt += 1;
+        slot.last_reason = reason.to_string();
         if self.started {
             slot.backoff(now);
         }
@@ -164,6 +170,14 @@ impl Pool {
             State::Backoff(at) => Some(at),
             _ => None,
         }
+    }
+
+    pub fn retry_attempt(&self, link: usize) -> u32 {
+        self.slots[link].attempt
+    }
+
+    pub fn last_reason(&self, link: usize) -> &str {
+        &self.slots[link].last_reason
     }
 
     pub fn next_retry(&self) -> Option<Instant> {

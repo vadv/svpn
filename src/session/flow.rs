@@ -229,7 +229,14 @@ impl Session {
         plane.flows.insert(flow_id, registered);
         if !is_probe_flow(flow_id) {
             self.stats.opened_flows += 1;
-            crate::debug!("flow_open role=server id={flow_id} channel={channel_id}");
+            let transport = plane
+                .channels
+                .get(&channel_id)
+                .map(|h| h.candidate.to_string())
+                .unwrap_or_else(|| "tcp".to_string());
+            crate::debug!(
+                "flow_open role=server id={flow_id} channel={channel_id} transport={transport}"
+            );
         }
         // N3: the preflight flow must be reachable from the TUN side too —
         // the kernel's echo reply routes back through `by_key`.

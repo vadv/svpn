@@ -57,6 +57,22 @@ pub enum Camouflage {
     Ssh,
 }
 
+impl Camouflage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Camouflage::None => "none",
+            Camouflage::Banner => "banner",
+            Camouflage::Ssh => "ssh",
+        }
+    }
+}
+
+impl std::fmt::Display for Camouflage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// L2 decoder step: a constant hello block of the other side, a binding frame, or data.
 enum Step {
     Const(Vec<u8>),

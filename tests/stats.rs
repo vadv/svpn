@@ -16,6 +16,7 @@ fn counters(value: u64, active: usize) -> Stats {
         open_failed_flows: value,
         closed_flows: value,
         active_flows: active,
+        active_candidate: None,
     }
 }
 
@@ -82,9 +83,11 @@ fn report_labels_rates_interval_counters_and_totals() {
         open_failed_flows: 1,
         closed_flows: 2,
         active_flows: 3,
+        active_candidate: None,
     };
     let total = Stats {
         inner_rx_bytes: 64 * 1_048_576,
+        active_candidate: None,
         ..delta.clone()
     };
     assert_eq!(

@@ -13,11 +13,11 @@ pub const FLOW_BUDGET: Duration = Duration::from_secs(30);
 /// Hold-down for a failed candidate and a total failure.
 pub const HOLD_DOWN: Duration = Duration::from_secs(30);
 /// Pre-active queue: packets of a flow waiting for transport readiness.
-pub const PREACTIVE_PACKETS: usize = 4;
+pub const PREACTIVE_PACKETS: usize = 8;
 /// Pre-active queue: concurrently waiting flows.
 pub const PENDING_FLOWS: usize = 64;
 /// Pre-active queue: total size of waiting packets.
-pub const PREACTIVE_BYTES: usize = 1024 * 1024;
+pub const PREACTIVE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Auto candidates in cold order (EPIC-005 §7).
 pub const COLD_ORDER: [Candidate; 5] = [
