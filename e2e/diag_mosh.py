@@ -3,10 +3,8 @@ bring up a session like matrix.py, capture ss on both sides, try a connect."""
 import os
 import socket
 import subprocess
-import sys
 import time
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from _lib import CLIENT, PEER, session, ssh
 
 STRATEGY = os.environ.get('DIAG_STRATEGY', 'mosh')

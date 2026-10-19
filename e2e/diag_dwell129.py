@@ -2,10 +2,8 @@
 through the 15-second dwell, not close instantly."""
 import re
 import socket
-import sys
 import time
 
-sys.path.insert(0, '/tests-ro')
 from integration import PEER, session, ssh
 
 

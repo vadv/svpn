@@ -2,9 +2,7 @@
 Test bodies live in the suite_* modules; rig helpers live in _lib.py (shared with matrix.py/load.py)."""
 import argparse
 import os
-import sys
 
-sys.path.insert(0, __file__.rsplit('/', 1)[0])
 import suite_bootstrap
 import suite_pool
 import suite_tcp_auto
