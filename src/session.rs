@@ -118,6 +118,25 @@ impl Session {
         }
     }
 
+    pub fn active_candidate(&self) -> Option<String> {
+        match &self.plane {
+            Plane::Channels(plane) => plane
+                .selector
+                .as_ref()
+                .and_then(|selector| selector.last_good)
+                .map(|candidate| match candidate {
+                    Candidate::Tcp => plane
+                        .tcp_camouflage
+                        .map(|c| format!("tcp-{c}"))
+                        .unwrap_or_else(|| candidate.to_string()),
+                    _ => candidate.to_string(),
+                }),
+            Plane::Tcp(plane) => plane
+                .server_ip
+                .map(|_| format!("tcp-{}", plane.mode.camouflage)),
+        }
+    }
+
     pub(crate) fn accepts_packets(&self) -> bool {
         self.readiness.is_none_or(|state| state == Readiness::Ready)
     }
@@ -211,6 +230,7 @@ impl Session {
                         let now = tokio::time::Instant::now();
                         self.expire_flows(now).await?;
                         self.stats.active_flows = self.flow_count();
+                        self.stats.active_candidate = self.active_candidate();
                         if let PacketIo::Link(io) = &self.io {
                             io.delivery.apply(&mut self.stats);
                         }
@@ -352,6 +372,7 @@ async fn run_io(
             endpoints,
             pin,
             tcp,
+            tcp_camouflage,
         } => {
             let mut allowed = Allowed::default();
             let offer: Vec<Strategy> = endpoints.iter().map(|e| e.strategy).collect();
@@ -392,6 +413,7 @@ async fn run_io(
                 server_ip: server,
                 quic_pin: pin,
                 tcp_port: tcp,
+                tcp_camouflage,
                 token_index: HashMap::new(),
                 ports: HashMap::new(),
                 bind: Ipv4Addr::UNSPECIFIED,
@@ -418,6 +440,7 @@ async fn run_io(
                 server_ip: None,
                 quic_pin: None,
                 tcp_port,
+                tcp_camouflage: None,
                 token_index: HashMap::new(),
                 ports: ports.iter().map(|e| (e.strategy, e.port)).collect(),
                 bind,

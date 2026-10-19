@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
 use crate::control::{Endpoint, Strategy};
+use crate::framing::Camouflage;
 use crate::link_io::LinkIo;
 use crate::packet::{self, FlowKey};
 use crate::selector::{Action, Candidate, Reason, Selector};
@@ -119,6 +120,8 @@ pub enum TransportConfig {
         pin: Option<[u8; 32]>,
         /// TCP-candidate port from endpoints, if fallback is allowed.
         tcp: Option<u16>,
+        /// TCP fallback camouflage agreed with the server; None when TCP is off.
+        tcp_camouflage: Option<Camouflage>,
     },
     /// UDP-channel server: public port of each strategy, bind address
     /// and the shared QUIC endpoint with certificate pin.
@@ -209,6 +212,8 @@ pub struct ChannelsPlane {
     pub quic_pin: Option<[u8; 32]>,
     /// Server: TCP-candidate port (SSH camouflage), if enabled.
     pub tcp_port: Option<u16>,
+    /// Client: TCP fallback camouflage, for stats labeling.
+    pub tcp_camouflage: Option<Camouflage>,
     /// Server: binding-frame token → flow.
     pub token_index: HashMap<[u8; 16], u64>,
     /// Server: public ports, bind address, and QUIC endpoint.

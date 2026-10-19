@@ -309,6 +309,7 @@ pub(crate) async fn open_link(
             pin,
             // Without TCP camouflage the server will not send a tcp candidate.
             tcp: if plan.tcp.is_some() { server_tcp } else { None },
+            tcp_camouflage: plan.tcp.as_ref().map(|(_, camouflage)| *camouflage),
         },
     };
     Ok((control, tail, config, server_ip))

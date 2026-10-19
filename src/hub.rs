@@ -118,12 +118,15 @@ impl Hub {
             stats::add(&mut delta, &change);
             stats::add(&mut total, &sum);
             let state = link_state(&self.pool, link, index);
-            per_link.push(stats::format(
-                &format!("[{}] {state}", link.params.server),
-                &change,
-                &sum,
-                elapsed,
-            ));
+            let active = link
+                .latest
+                .as_ref()
+                .and_then(|rx| rx.borrow().active_candidate.clone());
+            let label = match active {
+                Some(candidate) => format!("[{} ({candidate})] {state}", link.params.server),
+                None => format!("[{}] {state}", link.params.server),
+            };
+            per_link.push(stats::format(&label, &change, &sum, elapsed));
         }
         let mut report = format!(
             "stats: last {:.1} s | servers ready {}/{} | RX download / TX upload (inner IP)",

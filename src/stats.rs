@@ -44,6 +44,7 @@ pub fn difference(now: &Stats, before: &Stats) -> Stats {
             .saturating_sub(before.open_failed_flows),
         closed_flows: now.closed_flows.saturating_sub(before.closed_flows),
         active_flows: now.active_flows,
+        active_candidate: None,
     }
 }
 

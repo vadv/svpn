@@ -1,6 +1,10 @@
 //! Session small units: formatting, strategy maps, heartbeat deadline guard.
 
+mod common;
+
 use svpn::control::Strategy;
+use svpn::framing::Camouflage;
+use svpn::selector::Candidate;
 use svpn::session::*;
 
 #[test]
@@ -77,4 +81,27 @@ async fn ready_work_cannot_revive_an_expired_heartbeat() {
         .is_err()
     );
     assert!(last_heartbeat > expired);
+}
+
+#[tokio::test]
+async fn active_candidate_reflects_last_good_strategy_and_tcp_camouflage() {
+    let (mut session, _) = common::session::link_session(false);
+    assert_eq!(session.active_candidate(), None);
+    if let Plane::Channels(plane) = &mut session.plane
+        && let Some(selector) = plane.selector.as_mut()
+    {
+        selector.last_good = Some(Candidate::Mosh);
+    }
+    assert_eq!(session.active_candidate(), Some("mosh".to_string()));
+
+    if let Plane::Channels(plane) = &mut session.plane {
+        plane.tcp_camouflage = Some(Camouflage::Ssh);
+        if let Some(selector) = plane.selector.as_mut() {
+            selector.last_good = Some(Candidate::Tcp);
+        }
+    }
+    assert_eq!(session.active_candidate(), Some("tcp-ssh".to_string()));
+
+    let (session, _) = common::session::link_session(true);
+    assert_eq!(session.active_candidate(), Some("tcp-none".to_string()));
 }
