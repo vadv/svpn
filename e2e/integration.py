@@ -87,7 +87,7 @@ def test_idle_tcp_teardown():
             command(['iptables', '-w', '-I'] + rule)
         try:
             with session('idle-tcp-' + name, args=CLIENT + options + ['--stats-interval', '1']) as (process, path):
-                remote = subprocess.Popen(SSH + [f'python3 -u /tests/idle_tcp.py {PEER}'],
+                remote = subprocess.Popen(SSH + [f'python3 -u /e2e/idle_tcp.py {PEER}'],
                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=subprocess.STDOUT, text=True)
                 try:
@@ -162,7 +162,7 @@ def test_data():
         with socket.create_connection((PEER, 9000), timeout=5) as stream:
             stream.sendall(b'before')
             assert stream.recv(6, socket.MSG_WAITALL) == b'before'
-            ssh(f'python3 /tests/forged_rst.py {stream.getsockname()[1]}')
+            ssh(f'python3 /e2e/forged_rst.py {stream.getsockname()[1]}')
             time.sleep(2.2)
             stream.sendall(b'after')
             assert stream.recv(5, socket.MSG_WAITALL) == b'after'
@@ -304,7 +304,7 @@ def test_blocked_stderr():
 
 
 def test_server_blocked_stderr():
-    ssh('python3 /tests/blocked_stderr.py', timeout=20)
+    ssh('python3 /e2e/blocked_stderr.py', timeout=20)
     assert command(SSH + ['pgrep -x svpn'], check=False).returncode == 1
     print('PASS server stderr full: live stdin, heartbeat timeout exits and removes TUN')
 

@@ -140,16 +140,16 @@ def shell_groups():
     for group in ('all', *integration.GROUPS):
         calls = check('success', 0, (group,))
         assert all(line.endswith('group=' + group) for line in calls.splitlines())
-        assert '/tests/matrix.py' not in calls
+        assert '/e2e/matrix.py' not in calls
     for group in ('all', *matrix.GROUPS):
         calls = check('success', 0, ('--matrix', group))
-        assert 'python3 -u /tests/matrix.py --group ' + group in calls
+        assert 'python3 -u /e2e/matrix.py --group ' + group in calls
         assert all(line.endswith('group=' + group) for line in calls.splitlines())
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
-        (root / 'tests').mkdir()
+        (root / 'e2e').mkdir()
         (root / 'bin').mkdir()
-        script = root / 'tests/run.sh'
+        script = root / 'e2e/run.sh'
         shutil.copy2(pathlib.Path(__file__).with_name('run.sh'), script)
         docker = root / 'bin/docker'
         docker.write_text('#!/bin/sh\necho unexpected Docker invocation >&2\nexit 99\n')
@@ -160,7 +160,7 @@ def shell_groups():
             result = subprocess.run(['bash', str(script), *args], env=env,
                                     capture_output=True, text=True, timeout=5)
             assert result.returncode == status, (args, result.stdout, result.stderr)
-            assert not (root / 'tests/.work').exists(), 'selector must fail before side effects'
+            assert not (root / 'e2e/.work').exists(), 'selector must fail before side effects'
     print('PASS shell selection, matrix routing and fail-fast validation')
 
 

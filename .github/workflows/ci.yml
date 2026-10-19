@@ -76,10 +76,10 @@ jobs:
         run: cargo "+$RUST_VERSION" test --locked --workspace --all-targets
       - name: Test harness cleanup and log retention without Docker
         run: |
-          bash -n tests/run.sh
-          python3 tests/test_artifacts.py
-          python3 tests/test_groups.py
-          python3 tests/test_package.py
+          bash -n e2e/run.sh
+          python3 e2e/test_artifacts.py
+          python3 e2e/test_groups.py
+          python3 e2e/test_package.py
 
   network:
     name: Network ${{ matrix.suite }} / ${{ matrix.group }}
@@ -116,9 +116,9 @@ jobs:
       - name: Run isolated network group
         run: |
           if [[ "$TEST_SUITE" == matrix ]]; then
-            tests/run.sh --matrix "$TEST_GROUP"
+            e2e/run.sh --matrix "$TEST_GROUP"
           else
-            tests/run.sh "$TEST_GROUP"
+            e2e/run.sh "$TEST_GROUP"
           fi
       - name: Retain only this job's test logs
         if: ${{ always() }}
@@ -126,8 +126,8 @@ jobs:
         with:
           name: network-${{ matrix.suite }}-${{ matrix.group }}-${{ github.run_attempt }}
           path: |
-            tests/.work/artifacts/run.*/*.log
-            tests/.work/artifacts/run.*/sessions/*.log
+            e2e/.work/artifacts/run.*/*.log
+            e2e/.work/artifacts/run.*/sessions/*.log
           # Explicit log paths only; .work itself is hidden and may contain keys.
           include-hidden-files: true
           if-no-files-found: error

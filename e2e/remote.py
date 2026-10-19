@@ -395,7 +395,7 @@ if __name__ == '__main__':
     p.add_argument('--agent-socket', default='/run/host-services/ssh-auth.sock')
     p.add_argument('--seconds', type=int, default=900)
     p.add_argument('--image', default='svpn-test:local')
-    p.add_argument('--work', default='tests/.work/remote')
+    p.add_argument('--work', default='e2e/.work/remote')
     args = parser.parse_args()
     if args.mode == 'selftest':
         selftest()

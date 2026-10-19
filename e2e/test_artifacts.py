@@ -34,7 +34,7 @@ if command == 'up':
 if command == 'run':
     logs = pathlib.Path(os.environ['SVPN_TEST_ARTIFACTS']) / 'sessions'
     (logs / 'flow.log').write_text('flow diagnostic\\n')
-    (root / 'tests/.work/credential.key').write_text('PRIVATE TEST MATERIAL')
+    (root / 'e2e/.work/credential.key').write_text('PRIVATE TEST MATERIAL')
     if case == 'test-fails':
         sys.exit(17)
 if command == 'run' and case.endswith('-running'):
@@ -57,9 +57,9 @@ if command == 'down':
 def check(case, status, args=()):
     with tempfile.TemporaryDirectory(prefix='svpn artifacts ') as temporary:
         root = pathlib.Path(temporary)
-        (root / 'tests').mkdir()
+        (root / 'e2e').mkdir()
         (root / 'bin').mkdir()
-        shutil.copy2(pathlib.Path(__file__).with_name('run.sh'), root / 'tests/run.sh')
+        shutil.copy2(pathlib.Path(__file__).with_name('run.sh'), root / 'e2e/run.sh')
         docker = root / 'bin/docker'
         docker.write_text(DOCKER)
         docker.chmod(0o755)
@@ -70,7 +70,7 @@ def check(case, status, args=()):
         if case == 'stale-state':
             (root / 'resources').touch()
         for attempt in range(2 if case == 'success' else 1):
-            process = subprocess.Popen(['bash', str(root / 'tests/run.sh'), *args], env=env,
+            process = subprocess.Popen(['bash', str(root / 'e2e/run.sh'), *args], env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, start_new_session=True)
             try:
@@ -95,7 +95,7 @@ def check(case, status, args=()):
                             pass
                     process.communicate(timeout=3)
             assert process.returncode == status, (case, stdout, stderr)
-            outputs = list((root / 'tests/.work/artifacts').iterdir())
+            outputs = list((root / 'e2e/.work/artifacts').iterdir())
             assert len(outputs) == attempt + 1, 'each run needs a separate artifact directory'
             for output in outputs:
                 assert (output / 'preflight.log').exists()

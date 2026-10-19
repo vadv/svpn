@@ -23,7 +23,7 @@ def forged_then_close():
         with socket.create_connection((PEER, 9000), timeout=5) as stream:
             stream.sendall(b'before')
             assert stream.recv(6, socket.MSG_WAITALL) == b'before'
-            ssh(f'python3 /tests/forged_rst.py {stream.getsockname()[1]}')
+            ssh(f'python3 /e2e/forged_rst.py {stream.getsockname()[1]}')
             time.sleep(2.2)
             stream.sendall(b'after')
             assert stream.recv(5, socket.MSG_WAITALL) == b'after'

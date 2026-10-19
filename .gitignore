@@ -1,6 +1,7 @@
 /target/
 /dist/
 /dist_mine
+/e2e/.work/
 /tests/.work/
 /docs/
 AGENTS.md

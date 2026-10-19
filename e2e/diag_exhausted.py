@@ -1,5 +1,5 @@
 """Diagnose all-transports-blocked shutdown without expecting a ready TUN.
-Run: docker compose run --rm --no-deps client python3 /tests/diag_exhausted.py
+Run: docker compose run --rm --no-deps client python3 /e2e/diag_exhausted.py
 """
 import glob
 import os
