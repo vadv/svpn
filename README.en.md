@@ -28,42 +28,24 @@ real traffic.
 
 ## 1. Install a prebuilt binary
 
-Download an archive for each machine from [Releases](https://github.com/vadv/svpn/releases/tag/v0.2.0).
-Running SVPN does not require Rust or Cargo.
+Download the archive for your system and its `.sha256` from
+[Releases](https://github.com/vadv/svpn/releases):
 
-| System | Archive |
-| --- | --- |
-| Linux x86-64, glibc 2.36+ (Debian 12 / Ubuntu 24.04 or newer) | [linux-x86_64-gnu](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-linux-x86_64-gnu.tar.gz) |
-| OpenWrt ARM64 with ARMv8 crypto | [openwrt-aarch64](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-openwrt-aarch64.tar.gz) |
-| macOS, Apple Silicon | [macos-arm64](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-macos-arm64.tar.gz) |
+- `linux-x86_64-gnu` — Linux server and client (glibc 2.36+: Debian 12,
+  Ubuntu 24.04 or newer)
+- `openwrt-aarch64` — OpenWrt ARM64 router client
+- `macos-arm64` — macOS client on Apple Silicon
 
-Also download the matching `.sha256` file. On Linux x86-64:
+Verify the checksum and install (on macOS use `shasum -a 256 -c`):
 
 ```sh
-sha256sum -c svpn-0.2.0-linux-x86_64-gnu.tar.gz.sha256
-tar -xzf svpn-0.2.0-linux-x86_64-gnu.tar.gz
+sha256sum -c svpn-*.tar.gz.sha256
+tar -xzf svpn-*.tar.gz
 sudo install -m 755 svpn /usr/local/bin/svpn
 svpn --version
 ```
 
-On macOS:
-
-```sh
-shasum -a 256 -c svpn-0.2.0-macos-arm64.tar.gz.sha256
-tar -xzf svpn-0.2.0-macos-arm64.tar.gz
-sudo mkdir -p /usr/local/bin
-sudo install -m 755 svpn /usr/local/bin/svpn
-svpn --version
-```
-
-On OpenWrt, run as root:
-
-```sh
-sha256sum -c svpn-0.2.0-openwrt-aarch64.tar.gz.sha256
-tar -xzf svpn-0.2.0-openwrt-aarch64.tar.gz
-cp svpn /usr/bin/svpn
-svpn --version
-```
+On OpenWrt, as root: `tar -xzf svpn-*.tar.gz && cp svpn /usr/bin/svpn`.
 
 ## 2. Prepare the server (once)
 
