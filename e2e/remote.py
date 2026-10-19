@@ -6,7 +6,6 @@ Run `selftest` before `run`. The SSH-agent socket must exist inside the Docker V
 """
 import argparse
 import base64
-import contextlib
 import fcntl
 import hashlib
 import http.client
@@ -14,17 +13,16 @@ import http.server
 import ipaddress
 import json
 import os
-from pathlib import Path
 import select
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 LOCAL, PEER = '10.77.0.2', '10.77.0.1'
 SIZE = 64 * 1024 * 1024
@@ -32,7 +30,10 @@ SIZE = 64 * 1024 * 1024
 SNAPSHOT = r'''
 import hashlib,json,pathlib,re,shutil,subprocess
 out={}
-for key,args in [('links',['ip','-j','addr']),('routes4',['ip','-j','-4','route','show','table','all']),('routes6',['ip','-j','-6','route','show','table','all']),('rules',['ip','-j','rule'])]:
+for key,args in [('links',['ip','-j','addr']),
+                 ('routes4',['ip','-j','-4','route','show','table','all']),
+                 ('routes6',['ip','-j','-6','route','show','table','all']),
+                 ('rules',['ip','-j','rule'])]:
     value=json.loads(subprocess.check_output(args))
     if key=='links':
         value=[{k:x[k] for k in ('ifindex','ifname','mtu','flags','addr_info') if k in x} for x in value]
@@ -48,7 +49,8 @@ for name,args in [('iptables-save',[]),('ip6tables-save',[]),('nft',['-s','list'
     text='\n'.join(x for x in p.stdout.splitlines() if not x.startswith('#'))
     out[name]={'code':p.returncode,'rules':re.sub(r'\[\d+:\d+\]','[counters]',text)}
 p=subprocess.check_output(['ps','-eo','pid=,comm='],text=True)
-out['vpn_pids']=[line.split() for line in p.splitlines() if line.split()[-1] in ('openvpn','stunnel','stunnel4')]
+out['vpn_pids']=[line.split() for line in p.splitlines()
+                 if line.split()[-1] in ('openvpn','stunnel','stunnel4')]
 print(json.dumps(out))
 '''
 
@@ -295,7 +297,8 @@ def run(args):
         # No ping or data-path warmup: HTTP file download is the first inner flow.
         with (work / 'measurements.jsonl').open('wb') as output:
             process = subprocess.Popen(['docker', 'exec', container, 'python3', '-u', '/remote.py',
-                                        'probe', str(port), str(args.seconds)], stdout=output, stderr=subprocess.PIPE)
+                                        'probe', str(port), str(args.seconds)],
+                                       stdout=output, stderr=subprocess.PIPE)
             try:
                 _unused, errors = process.communicate(timeout=args.seconds + 1900)
             except BaseException:

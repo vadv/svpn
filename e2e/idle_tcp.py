@@ -3,7 +3,6 @@ import contextlib
 import socket
 import sys
 
-
 with contextlib.ExitStack() as stack:
     listener = stack.enter_context(socket.socket())
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

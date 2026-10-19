@@ -3,13 +3,13 @@ wire overhead, behavior under loss. Run:
 `docker compose run --rm --no-deps client python3 -u /e2e/load.py`.
 """
 import json
-import os
-import pathlib
 import socket
 import statistics
-import subprocess
 import threading
 import time
+
+from _lib import PEER, session, ssh
+
 
 def server_pid():
     result = ssh("for p in /proc/[0-9]*; do "
@@ -18,16 +18,6 @@ def server_pid():
     assert len(pids) == 1, f"expected one svpn process, got {pids}"
     return int(pids[0])
 
-import json
-import os
-import pathlib
-import socket
-import subprocess
-import sys
-import time
-
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from _lib import (LOCAL, PEER, session, ssh)
 
 def proc_sample(pid):
     def read(name):

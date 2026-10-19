@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import socket
+import struct
 import subprocess
 import time
 
@@ -130,10 +131,11 @@ def cleanup_verified(process, tun_name='svpn0', server_tun_name='svpn0', server_
         for host in hosts:
             until(lambda host=host: server_clean(host))
     except AssertionError:
-        raise AssertionError('server cleanup failed:\n'
-                             + command(SSH + ['ps -o pid,ppid,stat,args -C svpn'], check=False).stdout) from None
+        processes = command(SSH + ['ps -o pid,ppid,stat,args -C svpn'], check=False).stdout
+        raise AssertionError('server cleanup failed:\n' + processes) from None
     for host in hosts:
-        assert '"svpn"' not in command(ssh_to(host) + ['ss', '-H', '-uanp']).stdout, 'server UDP sockets survived'
+        sockets = command(ssh_to(host) + ['ss', '-H', '-uanp']).stdout
+        assert '"svpn"' not in sockets, 'server UDP sockets survived'
     assert '"svpn"' not in command(['ss', '-H', '-uanp']).stdout, 'client UDP sockets survived'
     time.sleep(0.3)
     assert not pathlib.Path('/sys/class/net/' + tun_name).exists(), 'client restarted'
@@ -148,3 +150,28 @@ def tcp_echo(index, timeout=15):
         while chunk := stream.recv(65536):
             received.extend(chunk)
     assert received == payload + b'EOF', 'TCP transfer or half-close failed'
+
+
+def recv_exact(stream, count, seconds=20):
+    """MSG_WAITALL with SO_RCVTIMEO returns partial data — read in a loop."""
+    deadline = time.monotonic() + seconds
+    data = bytearray()
+    while len(data) < count:
+        stream.settimeout(max(0.1, deadline - time.monotonic()))
+        chunk = stream.recv(count - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
+def assert_client_rst_delivery():
+    with socket.create_connection((PEER, 9000), timeout=5) as stream:
+        stream.sendall(b'in-window-rst')
+        assert stream.recv(13, socket.MSG_WAITALL) == b'in-window-rst'
+        port = stream.getsockname()[1]
+        query = f"ss -Htn state established '( sport = :9000 and dport = :{port} )'"
+        assert ssh(query).stdout.strip(), 'target TCP socket must exist before reset'
+        stream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    # A flow_close log proves only bookkeeping; the target's timeout is 20 s.
+    until(lambda: not ssh(query).stdout.strip(), seconds=4)

@@ -13,8 +13,11 @@ from unittest.mock import Mock, patch
 
 import integration
 import matrix
+import suite_bootstrap
+import suite_pool
+import suite_tcp_auto
+import suite_udp
 from test_artifacts import check
-
 
 # Independent snapshot of the pre-split runner: keep every case and its order.
 BASELINE = '''
@@ -42,14 +45,32 @@ MATRIX_BASELINE = (
 )
 
 
+# suite_pool's run() invokes these hooks sub-tests directly; they are not registry entries.
+HOOKS_SUBTESTS = {
+    'test_scripts', 'test_up_barrier_and_routes', 'test_up_failures', 'test_signals_during_up',
+    'test_failed_down_and_partial_up', 'test_fatal_during_up', 'test_blocked_hook_output',
+    'test_pool_transitions',
+}
+
+
 def integration_groups():
-    originals = {name: getattr(integration, name) for name in BASELINE}
+    suites = {'bootstrap': suite_bootstrap, 'lifecycle-pool': suite_pool,
+              'udp': suite_udp, 'tcp-auto': suite_tcp_auto}
+    assert set(suites) == set(integration.GROUPS)
+    by_fn = {test: (group, name)
+             for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    assert tests == list(originals.values()), 'all must preserve the original runner order'
-    discovered = {test for name, test in vars(integration).items()
-                  if name.startswith('test_') and callable(test)}
-    assert set(tests) == discovered, 'every test must be assigned'
-    assert len(tests) == len(set(tests)), 'a test is assigned twice'
+    assert [by_fn[test][1] for test in tests] == BASELINE, 'must preserve the original runner order'
+    assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
+    assert len(tests) == len(set(tests)) == len(by_fn), 'a test is assigned twice or dropped'
+    for group, suite in suites.items():
+        discovered = {test for name, test in vars(suite).items()
+                      if name.startswith('test_') and callable(test)}
+        assigned = {test for _, test in suite.TESTS}
+        extra = discovered - assigned
+        expected = {getattr(suite, name) for name in
+                    HOOKS_SUBTESTS if group == 'lifecycle-pool'}
+        assert extra == expected, (group, extra, 'every test must be assigned')
     assert collections.Counter(owner for owner, _ in integration.TESTS) == {
         'bootstrap': 11, 'lifecycle-pool': 14, 'udp': 5, 'tcp-auto': 10,
     }
@@ -57,10 +78,9 @@ def integration_groups():
         expected = [test for owner, test in integration.TESTS if group in ('all', owner)]
         for args in (['--group', group], []):
             called = []
-            stubs = {test: (lambda test=test: called.append(test)) for test in tests}
+            stubs = {test: (lambda test=test, called=called: called.append(test)) for test in tests}
             registry = [(owner, stubs[test]) for owner, test in integration.TESTS]
-            with (patch.multiple(integration, **{name: stubs[test] for name, test in originals.items()}),
-                  patch.object(integration, 'TESTS', registry),
+            with (patch.object(integration, 'TESTS', registry),
                   patch.object(integration, 'scrub_firewall'),
                   patch.object(integration, 'command', return_value=SimpleNamespace(returncode=1)),
                   patch.object(sys, 'argv', ['integration.py', *args]),
@@ -79,9 +99,13 @@ def matrix_groups():
         called = []
         expected = [(name, args) for name, args in MATRIX_BASELINE
                     if group == 'all' or name in matrix.GROUPS[group]]
+
+        def append_call(name, args, called=called):
+            called.append((name, tuple(args)))
+            return {}
+
         with (patch.object(matrix, 'command', return_value=SimpleNamespace(returncode=1)),
-              patch.object(matrix, 'run_config',
-                           side_effect=lambda name, args: called.append((name, tuple(args))) or {}),
+              patch.object(matrix, 'run_config', side_effect=append_call),
               patch.object(matrix.time, 'sleep'),
               patch.object(sys, 'argv', ['matrix.py', '--group', group]),
               contextlib.redirect_stdout(io.StringIO())):
@@ -95,7 +119,8 @@ def matrix_diagnostics():
         stop = Mock()
         stop.wait.side_effect = [False, True] if stalled else [True]
         output = io.StringIO()
-        results = [subprocess.TimeoutExpired('ss', 5) if failure else SimpleNamespace(stdout='client sockets'),
+        results = [subprocess.TimeoutExpired('ss', 5)
+                   if failure else SimpleNamespace(stdout='client sockets'),
                    SimpleNamespace(stdout='server sockets')]
         with (patch.object(matrix, 'command', side_effect=results) as command,
               contextlib.redirect_stdout(output)):

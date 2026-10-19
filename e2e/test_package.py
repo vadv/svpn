@@ -1,5 +1,4 @@
 """Check archive contents and labels with fake binaries; never execute a binary."""
-from contextlib import contextmanager, redirect_stderr
 import errno
 import hashlib
 import io
@@ -10,6 +9,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+from contextlib import contextmanager, redirect_stderr
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'build'))
@@ -34,7 +34,7 @@ def check_failure_cleanup(binary, payload, root):
         foreign = []
 
         @contextmanager
-        def failing_open(path, mode='r', *args, **kwargs):
+        def failing_open(path, mode='r', *args, failure=failure, foreign=foreign, **kwargs):
             archive = mode == 'xb'
             checksum = mode == 'x'
             if ((archive and failure == 'archive-conflict') or
@@ -70,7 +70,8 @@ def check_failure_cleanup(binary, payload, root):
         if remaining != foreign:
             failures.append(f'{failure}: own partial output remains: {[p.name for p in remaining]}')
         for path in foreign:
-            assert path.read_bytes() == b'foreign output\n', 'do not delete or modify another writer\'s output'
+            assert path.read_bytes() == b'foreign output\n', (
+                'do not delete or modify another writer\'s output')
     assert not failures, '\n'.join(failures)
     print('PASS rollback after archive/checksum failures and missing source; concurrent outputs preserved')
 
@@ -91,7 +92,8 @@ def check_cleanup_failures(binary, root):
             if mode == 'x':
                 raise OSError(errno.ENOSPC, 'injected primary checksum close failure')
 
-        def failing_unlink(path, *args, **kwargs):
+        def failing_unlink(path, *args, output=output, attempted=attempted,
+                           failure=failure, refused=refused, **kwargs):
             if path.parent == output:
                 attempted.append(path)
                 kind = 'checksum' if path.suffix == '.sha256' else 'archive'
@@ -228,7 +230,8 @@ def check():
                 repeated = package.pack(link, target, root / (target + '-again'))
                 assert archive.read_bytes() == repeated.read_bytes(), 'archive must be deterministic'
                 checksum = archive.with_name(archive.name + '.sha256').read_text()
-                assert checksum == hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n'
+                assert checksum == (hashlib.sha256(archive.read_bytes()).hexdigest()
+                                    + '  ' + archive.name + '\n')
                 with tarfile.open(archive) as tar:
                     assert tar.getnames() == ['svpn', 'build-info.json', 'LICENSE', 'THIRD-PARTY-NOTICES']
                     assert tar.extractfile('LICENSE').read() == (package.ROOT / 'LICENSE').read_bytes()
@@ -254,9 +257,11 @@ def check():
                     raise AssertionError('existing archive was overwritten')
                 assert archive.read_bytes() == before
             check_release(root)
-            replies[('file', '--brief', str(binary.resolve()))] = 'ELF 64-bit LSB pie executable, ARM aarch64, static-pie linked'
+            replies[('file', '--brief', str(binary.resolve()))] = (
+                'ELF 64-bit LSB pie executable, ARM aarch64, static-pie linked')
             package.pack(binary, 'openwrt-aarch64', root / 'static-pie')
-            print('PASS archive contents, three target labels, checksums, deterministic bytes, safe modes and no overwrite')
+            print('PASS archive contents, three target labels, checksums, deterministic bytes, '
+                  'safe modes and no overwrite')
 
             for target, description in [
                 ('linux-x86_64-gnu', DESCRIPTIONS['macos-arm64']),

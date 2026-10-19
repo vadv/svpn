@@ -1,17 +1,17 @@
 """Strategy matrix I11 (EPIC-005): every fixed strategy and auto,
 both traffic directions (echo = upload+download), full-MTU, idle survival.
-Run: `docker compose run --rm --no-deps -v "$(pwd)/tests:/e2e-ro:ro" \
+Run: `docker compose run --rm --no-deps -v "$(pwd)/e2e:/e2e-ro:ro" \
         -v /tmp/loadlogs:/testlogs client python3 -u /e2e-ro/matrix.py`.
 The field (real networks/filter) is out of scope here — see columns in docs/FIELD_MATRIX.md.
 """
 import argparse
 import json
 import os
-import pathlib
 import socket
-import subprocess
 import threading
 import time
+
+from _lib import CLIENT, PEER, SSH, command, session
 
 
 def tcp_diagnostics(stop):
@@ -59,16 +59,6 @@ def tcp_echo_both_ways(size_mib=4):
     assert bytes(received) == bytes(total) + b'EOF', 'echo mismatch'
     return round(wall, 2), round(total * 16 / wall / 1_000_000, 1)
 
-import json
-import os
-import pathlib
-import socket
-import subprocess
-import sys
-import time
-
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from _lib import (CLIENT, MTU, PEER, SSH, command, session, ssh)
 
 def udp_mtu_probe(count=3):
     """The largest UDP datagram fitting MTU 1280 without fragmentation:

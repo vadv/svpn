@@ -2,13 +2,11 @@
 through the 15-second dwell, not close instantly."""
 import re
 import socket
-import struct
 import sys
 import time
 
 sys.path.insert(0, '/tests-ro')
-import integration
-from integration import PEER, session, ssh, command, until
+from integration import PEER, session, ssh
 
 
 def forged_then_close():
@@ -32,7 +30,6 @@ def forged_then_close():
         target_ids = set(re.findall(r'flow_open role=client id=(\d+)', log)) - base_ids
         assert len(target_ids) == 1, target_ids
         target = target_ids.pop()
-        pattern = re.compile(r't=([0-9.]+).*close_flow id=' + target + rb'|close_flow id=' + target)
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
             text = path.read_text()

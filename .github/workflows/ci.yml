@@ -77,6 +77,7 @@ jobs:
       - name: Test harness cleanup and log retention without Docker
         run: |
           bash -n e2e/run.sh
+          pipx run ruff==0.14.3 check e2e
           python3 e2e/test_artifacts.py
           python3 e2e/test_groups.py
           python3 e2e/test_package.py
