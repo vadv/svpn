@@ -42,6 +42,7 @@ pub struct Link {
     pub epoch: Option<Epoch>,
     pub latest: Option<watch::Receiver<Stats>>,
     pub stats: stats::Snapshot,
+    pub last_reason: String,
 }
 
 pub struct Hub {
@@ -341,9 +342,10 @@ impl Hub {
                     }
                     link.epoch = None;
                     link.stats.reset();
+                    link.last_reason = reason.clone();
                     let now = Instant::now();
-                    if self.pool.failed(epoch, now)? {
-                        self.log_retry(epoch.link, now);
+                    if self.pool.failed(epoch, now, &reason)? {
+                        self.log_retry(epoch.link, now, &reason);
                         self.serving();
                     }
                 }
@@ -406,12 +408,16 @@ impl Hub {
         }
     }
 
-    fn log_retry(&self, link: usize, now: Instant) {
+    fn log_retry(&self, link: usize, now: Instant, reason: &str) {
         if let Some(at) = self.pool.retry_at(link) {
+            let attempt = self.pool.retry_attempt(link);
+            let reason_label = if reason.is_empty() { "unknown" } else { reason };
             crate::info!(
-                "ssh[{}]: retrying in {} s",
+                "ssh[{}]: retrying in {} s (attempt {}, last: {})",
                 self.links[link].params.server,
-                at.saturating_duration_since(now).as_secs()
+                at.saturating_duration_since(now).as_secs(),
+                attempt,
+                reason_label
             );
         }
     }
@@ -427,7 +433,7 @@ impl Hub {
         }
         let now = Instant::now();
         for link in 0..self.links.len() {
-            self.log_retry(link, now);
+            self.log_retry(link, now, &self.links[link].last_reason);
         }
     }
 }
@@ -452,6 +458,7 @@ pub async fn run(
                 epoch: None,
                 latest: None,
                 stats: stats::Snapshot::default(),
+                last_reason: String::new(),
             })
             .collect(),
         pool,

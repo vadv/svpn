@@ -77,10 +77,10 @@ fn preactive_queue_bounds() {
     selector
         .request(1, key(1), b"first", now)
         .expect("admission");
-    for _ in 0..3 {
+    for _ in 0..7 {
         assert!(selector.enqueue(1, &[0u8; 10]).is_ok());
     }
-    // 4 packets (1 + 3): the fifth is rejected.
+    // 8 packets (1 + 7): the ninth is rejected.
     assert_eq!(selector.enqueue(1, &[0u8; 10]), Err(Reject::PendingFull));
     // An active flow gets the queue after committed.
     selector.channel_ready(Candidate::Quic, 1, 100, now);
@@ -90,7 +90,7 @@ fn preactive_queue_bounds() {
     assert!(selector.take_queue(1).is_none()); // still Committing
     selector.committed(1);
     let queue = selector.take_queue(1).expect("active queue");
-    assert_eq!(queue.len(), 4);
+    assert_eq!(queue.len(), 8);
     assert_eq!(queue[0], b"first".to_vec());
     assert!(selector.take_queue(1).expect("second take").is_empty());
 }

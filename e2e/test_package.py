@@ -144,7 +144,7 @@ def check_release(root):
     for target in package.TARGETS:
         for path in (root / target).iterdir():
             shutil.copyfile(path, directory / path.name)
-    args = (directory, "v0.2.0", "a" * 40, "12345", "0.2.0")
+    args = (directory, "v0.3.0", "a" * 40, "12345", "0.3.0")
     assert len(release.validate(*args)) == 6
 
     def rejected(arguments=args):
@@ -244,7 +244,7 @@ def check():
         replies = {
             ("file", "--brief", str(binary.resolve())): DESCRIPTIONS["linux-x86_64-gnu"],
             ("cargo", "metadata", "--offline", "--locked", "--no-deps", "--format-version", "1"): json.dumps(
-                {"packages": [{"name": "svpn", "version": "0.2.0", "license": "MIT"}]}
+                {"packages": [{"name": "svpn", "version": "0.3.0", "license": "MIT"}]}
             ),
             ("git", "rev-parse", "HEAD"): "a" * 40,
             ("git", "show", "-s", "--format=%ct", "HEAD"): "1600000000",
@@ -278,7 +278,7 @@ def check():
                 assert info["binary_sha256"] == hashlib.sha256(payload).hexdigest()
                 assert info["commit"] == "a" * 40 and info["ci_run_id"] == "12345"
                 assert info["source_dirty"] is False and info["license"] == "MIT"
-                assert archive.name == f"svpn-0.2.0-{target}.tar.gz"
+                assert archive.name == f"svpn-0.3.0-{target}.tar.gz"
                 assert info["platform"] == target and info["rust_target"] == package.TARGETS[target][0]
                 assert info["cpu_requirement"] == "hardware AES"
                 before = archive.read_bytes()

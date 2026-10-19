@@ -1,10 +1,14 @@
-# SVPN v0.2.0
+# SVPN v0.3.0
 
-First binary release (pre-release).
+Field diagnostics and robustness release (pre-release).
 
-- IPv4 TUN VPN with SSH-key authentication and SSH control.
-- UDP camouflage modes and a TCP fallback; single-server and server-pool modes.
-- TOML configuration and client routing hooks.
+- Server now logs its active strategies and TCP fallback/camouflage on startup.
+- Server `flow_open` log includes the transport (strategy) of each flow.
+- Client logs selector backlog context when a pre-active packet is dropped,
+  showing the preparing candidate, pre-active flow count, and queued bytes.
+- Increased the selector pre-active queue limits (8 packets/flow, 2 MiB total)
+  to absorb bursts while a UDP channel is being prepared.
+- Pool retry log now includes the attempt number and the last failure reason.
 
 ## Downloads
 
