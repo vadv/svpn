@@ -2,6 +2,7 @@
 wire overhead, behavior under loss. Run:
 `docker compose run --rm --no-deps client python3 -u /e2e/load.py`.
 """
+
 import json
 import socket
 import statistics
@@ -12,8 +13,7 @@ from _lib import PEER, session, ssh
 
 
 def server_pid():
-    result = ssh("for p in /proc/[0-9]*; do "
-                 "grep -qa svpn $p/comm 2>/dev/null && basename $p; done; true")
+    result = ssh("for p in /proc/[0-9]*; do grep -qa svpn $p/comm 2>/dev/null && basename $p; done; true")
     pids = result.stdout.split()
     assert len(pids) == 1, f"expected one svpn process, got {pids}"
     return int(pids[0])
@@ -37,9 +37,13 @@ def time_to_ready(runs=10):
         with session(f"load-ready-{i}"):
             times.append(time.monotonic() - start)
         time.sleep(0.6)  # sshd releases the previous run's connection
-    return {"p50_s": round(statistics.median(times), 3),
-            "p95_s": round(sorted(times)[int(0.95 * runs) - 1], 3),
-            "min_s": round(min(times), 3), "max_s": round(max(times), 3), "runs": runs}
+    return {
+        "p50_s": round(statistics.median(times), 3),
+        "p95_s": round(sorted(times)[int(0.95 * runs) - 1], 3),
+        "min_s": round(min(times), 3),
+        "max_s": round(max(times), 3),
+        "runs": runs,
+    }
 
 
 def bulk(size_mib, rate_mbit=None, seconds_cap=120):
@@ -69,12 +73,14 @@ def bulk(size_mib, rate_mbit=None, seconds_cap=120):
                 time.sleep(interval)
         stream.shutdown(socket.SHUT_WR)
         thread.join()
-    assert bytes(received) == bytes(size_mib * 1024 * 1024) + b'EOF', 'echo mismatch'
+    assert bytes(received) == bytes(size_mib * 1024 * 1024) + b"EOF", "echo mismatch"
     wall = time.monotonic() - start
     pid1 = proc_sample(pid)
     ticks = pid1["cpu_ticks"] - pid0["cpu_ticks"]  # USER_HZ=100
     return {
-        "size_mib": size_mib, "rate_cap_mbit": rate_mbit, "wall_s": round(wall, 2),
+        "size_mib": size_mib,
+        "rate_cap_mbit": rate_mbit,
+        "wall_s": round(wall, 2),
         "throughput_mbit": round(total * 8 / wall / 1e6, 2),
         "server_cpu_s": round(ticks / 100, 2),
         "server_cpu_pct": round(ticks / 100 / wall * 100, 1),
@@ -100,14 +106,14 @@ def wire_overhead(size_mib=32):
             # -v: pkts bytes target prot … — bytes are the second field.
             wire += int(line.split()[1])
     inner = size_mib * 1024 * 1024
-    result.update({"wire_bytes": wire, "inner_bytes": inner,
-                   "overhead_pct": round((wire - inner) / inner * 100, 1)})
+    result.update(
+        {"wire_bytes": wire, "inner_bytes": inner, "overhead_pct": round((wire - inner) / inner * 100, 1)}
+    )
     return result
 
 
 def loss_run(drop_pct):
-    spec = (f"-p udp --dport {PORT_RANGE} "
-            f"-m statistic --mode random --probability {drop_pct / 100} -j DROP")
+    spec = f"-p udp --dport {PORT_RANGE} -m statistic --mode random --probability {drop_pct / 100} -j DROP"
     ssh(f"iptables -w -I INPUT 1 {spec}")
     try:
         result = bulk(16)
@@ -137,5 +143,5 @@ def main():
     print("LOAD-REPORT " + json.dumps(report))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
