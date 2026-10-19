@@ -1,4 +1,7 @@
+//! Wire profiles (plain, mosh, obfs): bounds, wrapping, and socket dances.
+
 use std::net::UdpSocket as SyncUdp;
+
 use svpn::channel::{self, Record};
 use svpn::pcap::PcapBuilder;
 use svpn::profile::*;
@@ -11,6 +14,8 @@ const V3: &[u8] = &[
     0x1d,
 ];
 
+// ── wire bounds ──
+
 #[test]
 fn plain_is_identity_within_bounds() {
     let mut bytes = V3.to_vec();
@@ -18,27 +23,6 @@ fn plain_is_identity_within_bounds() {
     assert_eq!(bytes, V3);
     Profile::Plain.unwrap_in_place(&mut bytes).unwrap();
     assert_eq!(bytes, V3);
-}
-
-#[test]
-fn mosh_prefix_is_little_endian_u64() {
-    let mut bytes = V3.to_vec();
-    Profile::Mosh.wrap_in_place(&mut bytes).unwrap();
-    // The seq=0 BE prefix is reversed — the LE representation of the
-    // same u64; ciphertext and tag are untouched.
-    assert_eq!(&bytes[..8], &V3[..8]);
-    assert_eq!(&bytes[8..], &V3[8..]);
-    // seq=0 is symmetric: verify the order on the server V4 (seq 2^63+5).
-    let v4: Vec<u8> = [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]
-        .iter()
-        .chain(V3[8..].iter())
-        .cloned()
-        .collect();
-    let mut wrapped = v4.clone();
-    Profile::Mosh.wrap_in_place(&mut wrapped).unwrap();
-    assert_eq!(&wrapped[..8], &[0x05, 0, 0, 0, 0, 0, 0, 0x80]);
-    Profile::Mosh.unwrap_in_place(&mut wrapped).unwrap();
-    assert_eq!(wrapped, v4);
 }
 
 #[test]
@@ -60,6 +44,29 @@ fn rejects_out_of_bounds_both_directions() {
     let mut pad_heavy = vec![0u8; OBF_HEADER + MIN_WIRE];
     pad_heavy[1] = 15;
     assert!(Profile::Obfs.unwrap_in_place(&mut pad_heavy).is_err());
+}
+
+// ── mosh ──
+
+#[test]
+fn mosh_prefix_is_little_endian_u64() {
+    let mut bytes = V3.to_vec();
+    Profile::Mosh.wrap_in_place(&mut bytes).unwrap();
+    // The seq=0 BE prefix is reversed — the LE representation of the
+    // same u64; ciphertext and tag are untouched.
+    assert_eq!(&bytes[..8], &V3[..8]);
+    assert_eq!(&bytes[8..], &V3[8..]);
+    // seq=0 is symmetric: verify the order on the server V4 (seq 2^63+5).
+    let v4: Vec<u8> = [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]
+        .iter()
+        .chain(V3[8..].iter())
+        .cloned()
+        .collect();
+    let mut wrapped = v4.clone();
+    Profile::Mosh.wrap_in_place(&mut wrapped).unwrap();
+    assert_eq!(&wrapped[..8], &[0x05, 0, 0, 0, 0, 0, 0, 0x80]);
+    Profile::Mosh.unwrap_in_place(&mut wrapped).unwrap();
+    assert_eq!(wrapped, v4);
 }
 
 #[test]
@@ -87,11 +94,6 @@ fn mosh_roundtrip_with_channel_records() {
     assert!(server.open(&wire, std::time::Instant::now()).is_err());
 }
 
-/// A full exchange over real UDP sockets with the mosh shape; every
-/// datagram lands in a pcap (DLT_RAW, IPv4+UDP wrapper, checksums 0) for
-/// manual inspection with dissectors. Outer IP fragmentation is ruled
-/// out by construction: one datagram = one packet, MF/offset flags are
-/// zero.
 #[test]
 fn mosh_socket_dance_writes_pcap() {
     let client_socket = SyncUdp::bind("127.0.0.1:0").unwrap();
@@ -184,6 +186,8 @@ fn mosh_socket_dance_writes_pcap() {
     assert!(std::fs::metadata(&path).unwrap().len() > 0);
 }
 
+// ── obfs ──
+
 #[test]
 fn obfs_roundtrip_with_channel_records() {
     let mut client = channel::Channel::new([0x33; 16], 5, true);
@@ -273,9 +277,6 @@ fn obfs_tampered_header_breaks_auth() {
     assert!(server.open(&wire, std::time::Instant::now()).is_err());
 }
 
-/// A full exchange over real UDP sockets with the obfs shape; datagram
-/// lengths are irregular, the pcap is for manual inspection with
-/// dissectors.
 #[test]
 fn obfs_socket_dance_writes_pcap() {
     let client_socket = SyncUdp::bind("127.0.0.1:0").unwrap();

@@ -1,3 +1,5 @@
+//! Stats reports: snapshot deltas, reconnect totals, saturation safety, formatting.
+
 use std::time::Duration;
 
 use svpn::control::Stats;
@@ -16,6 +18,8 @@ fn counters(value: u64, active: usize) -> Stats {
         active_flows: active,
     }
 }
+
+// ── snapshot deltas ──
 
 #[test]
 fn snapshots_count_deltas_not_repeated_heartbeats() {
@@ -49,6 +53,8 @@ fn reconnect_keeps_totals_and_unreported_traffic() {
     assert_eq!(total, counters(17, 1));
 }
 
+// ── unseen links and saturation ──
+
 #[test]
 fn unseen_links_zero_elapsed_and_saturation_are_safe() {
     let (delta, total) = Snapshot::default().sample();
@@ -61,6 +67,8 @@ fn unseen_links_zero_elapsed_and_saturation_are_safe() {
     add(&mut sum, &counters(1, 1));
     assert_eq!(sum, counters(u64::MAX, usize::MAX));
 }
+
+// ── report formatting ──
 
 #[test]
 fn report_labels_rates_interval_counters_and_totals() {

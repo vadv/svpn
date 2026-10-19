@@ -1,13 +1,12 @@
+//! Server pool: startup, checking state, stop rules, retry backoff, weighted picking.
+
 use std::time::Duration;
+
 use svpn::link_io::Epoch;
 use svpn::pool::*;
 use tokio::time::Instant;
-fn epoch(link: usize) -> Epoch {
-    Epoch {
-        link,
-        generation: 1,
-    }
-}
+
+// ── startup ──
 
 #[test]
 fn startup_has_one_attempt_each_and_no_retry_before_first_ready() {
@@ -35,6 +34,23 @@ fn all_initial_failures_stop_without_ready() {
     );
     assert_eq!(pool.next_retry(), None);
 }
+
+#[test]
+fn startup_round_failure_stops_despite_failed_peer() {
+    let now = Instant::now();
+    let mut pool = Pool::new([1, 1]);
+    // Server 0 never even established SSH; server 1 got control up but
+    // its startup round found no working mimic — the primary wave failed.
+    pool.failed(epoch(0), now).unwrap();
+    assert!(
+        pool.round_failed(epoch(1))
+            .unwrap_err()
+            .to_string()
+            .contains("no server available")
+    );
+}
+
+// ── checking ──
 
 #[test]
 fn checking_keeps_owner_flows_and_excludes_new_ones() {
@@ -80,6 +96,8 @@ fn checking_then_session_death_stops_only_without_other_ready() {
             .contains("no server available")
     );
 }
+
+// ── stop rules ──
 
 #[test]
 fn losing_last_ready_waits_for_another_connecting_round() {
@@ -149,20 +167,7 @@ fn round_failure_with_another_ready_keeps_serving() {
     assert!(!pool.round_failed(epoch(1)).unwrap());
 }
 
-#[test]
-fn startup_round_failure_stops_despite_failed_peer() {
-    let now = Instant::now();
-    let mut pool = Pool::new([1, 1]);
-    // Server 0 never even established SSH; server 1 got control up but
-    // its startup round found no working mimic — the primary wave failed.
-    pool.failed(epoch(0), now).unwrap();
-    assert!(
-        pool.round_failed(epoch(1))
-            .unwrap_err()
-            .to_string()
-            .contains("no server available")
-    );
-}
+// ── retry backoff ──
 
 #[test]
 fn retry_caps_at_sixty_and_success_resets_delay() {
@@ -185,6 +190,8 @@ fn retry_caps_at_sixty_and_success_resets_delay() {
     assert_eq!(pool.retry_at(1), Some(now + Duration::from_secs(1)));
 }
 
+// ── weighted pick ──
+
 #[test]
 fn smooth_weights_preserve_order_and_ignore_failed_servers() {
     let now = Instant::now();
@@ -202,4 +209,11 @@ fn smooth_weights_preserve_order_and_ignore_failed_servers() {
     pool.ready(retry, now);
     let selected: Vec<_> = (0..3).map(|_| pool.pick().unwrap().link).collect();
     assert_eq!(selected, [0, 1, 0]);
+}
+
+fn epoch(link: usize) -> Epoch {
+    Epoch {
+        link,
+        generation: 1,
+    }
 }

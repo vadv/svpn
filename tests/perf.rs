@@ -1,12 +1,12 @@
+//! Perf: HTTP request parsing, response head, interval report, measure deadline.
+
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use svpn::perf::*;
 use tokio::io::AsyncReadExt;
 
-fn get(size: &str) -> String {
-    format!("GET /seg?{size} HTTP/1.1\r\nHost: 10.77.0.1\r\n\r\n")
-}
+// ── request parsing ──
 
 #[test]
 fn parse_get_segment() {
@@ -83,6 +83,8 @@ fn parse_rejects_other_methods_and_paths() {
     assert!(matches!(parse(""), Request::Bad));
 }
 
+// ── response head ──
+
 #[test]
 fn head_declares_size() {
     assert_eq!(
@@ -90,6 +92,8 @@ fn head_declares_size() {
         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\n"
     );
 }
+
+// ── report ──
 
 #[test]
 fn summary_stats() {
@@ -137,6 +141,13 @@ fn rows_drop_partial_tail_and_omit() {
     assert_eq!(table[0].rtt_p50_ms, Some(40.0));
 }
 
+#[test]
+fn mbit_converts_bytes() {
+    assert!((mbit(1_048_576, 1) - 8.388_608).abs() < 1e-9);
+}
+
+// ── measure deadline ──
+
 #[tokio::test]
 async fn measure_deadline_bounds_stalled_transfers() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
@@ -178,7 +189,6 @@ async fn measure_deadline_bounds_stalled_transfers() {
         .unwrap();
 }
 
-#[test]
-fn mbit_converts_bytes() {
-    assert!((mbit(1_048_576, 1) - 8.388_608).abs() < 1e-9);
+fn get(size: &str) -> String {
+    format!("GET /seg?{size} HTTP/1.1\r\nHost: 10.77.0.1\r\n\r\n")
 }

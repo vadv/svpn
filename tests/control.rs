@@ -1,7 +1,11 @@
+//! Control channel: stats counters, JSONL framing, message wire format, send/recv.
+
 use svpn::control::*;
 use svpn::packet::FlowKey;
 use svpn::selector::Reason;
 use tokio::io::{AsyncWriteExt, BufReader};
+
+// ── stats ──
 
 #[test]
 fn count_drop_names_the_reason() {
@@ -11,6 +15,8 @@ fn count_drop_names_the_reason() {
     assert_eq!(stats.dropped_packets, 2);
     assert_eq!(stats.inner_tx_packets, 0);
 }
+
+// ── framing ──
 
 #[tokio::test]
 async fn reads_split_and_coalesced_messages() {
@@ -48,6 +54,8 @@ async fn rejects_oversized_incomplete_and_invalid_messages() {
         assert!(read_message(&mut reader).await.is_err());
     }
 }
+
+// ── message wire format ──
 
 #[tokio::test]
 async fn opened_token_round_trip() {
@@ -190,6 +198,8 @@ async fn endpoints_tcp_null_round_trip() {
     let back = serde_json::to_string(&serde_json::from_str::<Message>(&json).unwrap()).unwrap();
     assert_eq!(back, json);
 }
+
+// ── control send/recv ──
 
 #[tokio::test]
 async fn close_burst_waits_for_writer_then_delivers_heartbeat() {

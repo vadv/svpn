@@ -1,4 +1,5 @@
 """Expose SSH and test echo services only inside the Compose network."""
+
 import os
 import pathlib
 import signal
@@ -12,7 +13,7 @@ class TCP(socketserver.BaseRequestHandler):
         self.request.settimeout(20)
         while data := self.request.recv(65536):
             self.request.sendall(data)
-        self.request.sendall(b'EOF')
+        self.request.sendall(b"EOF")
 
 
 class UDP(socketserver.BaseRequestHandler):
@@ -28,12 +29,12 @@ class TCPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-for service in (TCPServer(('0.0.0.0', 9000), TCP), socketserver.ThreadingUDPServer(('0.0.0.0', 9000), UDP)):
+for service in (TCPServer(("0.0.0.0", 9000), TCP), socketserver.ThreadingUDPServer(("0.0.0.0", 9000), UDP)):
     threading.Thread(target=service.serve_forever, daemon=True).start()
 
-pathlib.Path('/run/sshd').mkdir(exist_ok=True)
-config = pathlib.Path('/tmp/sshd_config')
-config.write_text('''Port 22
+pathlib.Path("/run/sshd").mkdir(exist_ok=True)
+config = pathlib.Path("/tmp/sshd_config")
+config.write_text("""Port 22
 ListenAddress 0.0.0.0
 HostKey /keys/host
 AuthorizedKeysFile /keys/client.pub
@@ -48,10 +49,10 @@ AllowAgentForwarding no
 PermitTunnel no
 PrintMotd no
 LogLevel ERROR
-''')
+""")
 # Unlock only the disposable root account; SSH still accepts public keys only.
-subprocess.run(['passwd', '-d', 'root'], check=True, stdout=subprocess.DEVNULL)
-sshd = subprocess.Popen(['/usr/sbin/sshd', '-D', '-e', '-f', str(config)])
+subprocess.run(["passwd", "-d", "root"], check=True, stdout=subprocess.DEVNULL)
+sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(config)])
 
 
 def stop(_signal, _frame):
@@ -60,5 +61,5 @@ def stop(_signal, _frame):
 
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
-print('SSH and echo services ready', flush=True)
+print("SSH and echo services ready", flush=True)
 os._exit(sshd.wait())

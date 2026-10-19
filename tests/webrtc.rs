@@ -1,20 +1,12 @@
-use anyhow::ensure;
+//! WebRTC peer: real-socket handshake, send bounds, congestion recovery, wire artifact.
+
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
+
+use anyhow::ensure;
 use str0m::channel::Reliability;
 use svpn::pcap::PcapBuilder;
 use svpn::webrtc::*;
-
-fn deadline(secs: u64) -> Instant {
-    Instant::now() + Duration::from_secs(secs)
-}
-
-/// Write + drain Transmit — what the driver does in production.
-async fn send(peer: &mut Peer, data: &[u8]) -> anyhow::Result<()> {
-    ensure!(peer.write(data)?, "sctp send buffer full");
-    peer.poll().await?;
-    Ok(())
-}
 
 /// A real UDP exchange of two independent Rtc instances over OS loopback sockets.
 async fn pair() -> (Peer, Peer) {
@@ -29,26 +21,6 @@ async fn pair() -> (Peer, Peer) {
     client_ready.unwrap();
     server_ready.unwrap();
     (server, client)
-}
-
-#[tokio::test]
-async fn sctp_send_buffers_are_large_and_bounded() {
-    let (mut server, mut client) = pair().await;
-    for peer in [&mut server, &mut client] {
-        let mut buffered = 0;
-        let mut blocked = false;
-        for _ in 0..=2 * SCTP_SEND_BUFFER_SIZE / FRAGMENT_BUDGET {
-            if !peer.write(&[0; FRAGMENT_BUDGET]).unwrap() {
-                blocked = true;
-                break;
-            }
-            buffered += FRAGMENT_BUDGET;
-            peer.poll().await.unwrap();
-        }
-        assert!(blocked, "SCTP buffer must be bounded without ACKs");
-        assert!(buffered >= SCTP_SEND_BUFFER_SIZE - FRAGMENT_BUDGET);
-        assert!(buffered <= SCTP_SEND_BUFFER_SIZE);
-    }
 }
 
 /// Fill the real SCTP send buffer with no incoming ACKs.
@@ -74,6 +46,88 @@ async fn congested_driver() -> (Peer, svpn::drivers::Io, SocketAddr) {
     }
     (server, io, addr)
 }
+
+// ── handshake ──
+
+#[tokio::test]
+async fn handshake_and_exchange_over_real_sockets() {
+    let (mut server, mut client) = pair().await;
+    assert!(client.is_ready() && server.is_ready());
+    assert!(client.rtc.is_connected() && server.rtc.is_connected());
+
+    // The channel is indeed unordered with no retransmissions.
+    let config = client
+        .rtc
+        .channel(client.channel.unwrap())
+        .unwrap()
+        .config()
+        .cloned()
+        .unwrap();
+    assert!(!config.ordered);
+    assert_eq!(
+        config.reliability,
+        Reliability::MaxRetransmits { retransmits: 0 }
+    );
+
+    // A full fragment and a minimal payload in both directions.
+    let big = vec![0xA5; FRAGMENT_BUDGET];
+    send(&mut client, &big).await.unwrap();
+    assert_eq!(server.recv(deadline(10)).await.unwrap(), Some(big));
+    let small = b"svpn".to_vec();
+    send(&mut server, &small).await.unwrap();
+    assert_eq!(client.recv(deadline(10)).await.unwrap(), Some(small));
+}
+
+#[tokio::test]
+async fn wrong_fingerprint_fails_handshake() {
+    let (mut server, mut server_hello) =
+        Peer::server("127.0.0.1:0".parse().unwrap(), None).unwrap();
+    // Corrupt the last byte of the pin: DTLS with a foreign certificate will fail.
+    let mut parts: Vec<&str> = server_hello.fingerprint.split(':').collect();
+    let last = parts.pop().unwrap();
+    parts.push(if last == "FF" { "00" } else { "FF" });
+    server_hello.fingerprint = parts.join(":");
+
+    let (mut client, client_hello) = Peer::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.configure(&server_hello).unwrap();
+    server.configure(&client_hello).unwrap();
+    let (ready, _) = tokio::join!(
+        client.wait_ready(deadline(3)),
+        server.wait_ready(deadline(3)),
+    );
+    assert!(ready.is_err() && !client.is_ready());
+}
+
+// ── send bounds ──
+
+#[tokio::test]
+async fn sctp_send_buffers_are_large_and_bounded() {
+    let (mut server, mut client) = pair().await;
+    for peer in [&mut server, &mut client] {
+        let mut buffered = 0;
+        let mut blocked = false;
+        for _ in 0..=2 * SCTP_SEND_BUFFER_SIZE / FRAGMENT_BUDGET {
+            if !peer.write(&[0; FRAGMENT_BUDGET]).unwrap() {
+                blocked = true;
+                break;
+            }
+            buffered += FRAGMENT_BUDGET;
+            peer.poll().await.unwrap();
+        }
+        assert!(blocked, "SCTP buffer must be bounded without ACKs");
+        assert!(buffered >= SCTP_SEND_BUFFER_SIZE - FRAGMENT_BUDGET);
+        assert!(buffered <= SCTP_SEND_BUFFER_SIZE);
+    }
+}
+
+#[tokio::test]
+async fn oversize_write_is_rejected() {
+    let (_server, mut client) = pair().await;
+    let huge = vec![0u8; 300_000];
+    assert!(send(&mut client, &huge).await.is_err());
+}
+
+// ── congestion ──
 
 #[tokio::test]
 async fn active_sctp_congestion_recovers_after_queue_overflow() {
@@ -135,61 +189,7 @@ async fn active_sctp_congestion_does_not_block_close_or_drop() {
     }
 }
 
-#[tokio::test]
-async fn handshake_and_exchange_over_real_sockets() {
-    let (mut server, mut client) = pair().await;
-    assert!(client.is_ready() && server.is_ready());
-    assert!(client.rtc.is_connected() && server.rtc.is_connected());
-
-    // The channel is indeed unordered with no retransmissions.
-    let config = client
-        .rtc
-        .channel(client.channel.unwrap())
-        .unwrap()
-        .config()
-        .cloned()
-        .unwrap();
-    assert!(!config.ordered);
-    assert_eq!(
-        config.reliability,
-        Reliability::MaxRetransmits { retransmits: 0 }
-    );
-
-    // A full fragment and a minimal payload in both directions.
-    let big = vec![0xA5; FRAGMENT_BUDGET];
-    send(&mut client, &big).await.unwrap();
-    assert_eq!(server.recv(deadline(10)).await.unwrap(), Some(big));
-    let small = b"svpn".to_vec();
-    send(&mut server, &small).await.unwrap();
-    assert_eq!(client.recv(deadline(10)).await.unwrap(), Some(small));
-}
-
-#[tokio::test]
-async fn wrong_fingerprint_fails_handshake() {
-    let (mut server, mut server_hello) =
-        Peer::server("127.0.0.1:0".parse().unwrap(), None).unwrap();
-    // Corrupt the last byte of the pin: DTLS with a foreign certificate will fail.
-    let mut parts: Vec<&str> = server_hello.fingerprint.split(':').collect();
-    let last = parts.pop().unwrap();
-    parts.push(if last == "FF" { "00" } else { "FF" });
-    server_hello.fingerprint = parts.join(":");
-
-    let (mut client, client_hello) = Peer::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    client.configure(&server_hello).unwrap();
-    server.configure(&client_hello).unwrap();
-    let (ready, _) = tokio::join!(
-        client.wait_ready(deadline(3)),
-        server.wait_ready(deadline(3)),
-    );
-    assert!(ready.is_err() && !client.is_ready());
-}
-
-#[tokio::test]
-async fn oversize_write_is_rejected() {
-    let (_server, mut client) = pair().await;
-    let huge = vec![0u8; 300_000];
-    assert!(send(&mut client, &huge).await.is_err());
-}
+// ── wire artifact ──
 
 #[tokio::test]
 async fn writes_webrtc_pcap_artifact() {
@@ -212,4 +212,15 @@ async fn writes_webrtc_pcap_artifact() {
     let path = std::path::Path::new("target/pcap/webrtc-dance.pcap");
     client.wire.take().expect("wire recorder").finish(path);
     assert!(path.exists() && std::fs::metadata(path).unwrap().len() > 0);
+}
+
+fn deadline(secs: u64) -> Instant {
+    Instant::now() + Duration::from_secs(secs)
+}
+
+/// Write + drain Transmit — what the driver does in production.
+async fn send(peer: &mut Peer, data: &[u8]) -> anyhow::Result<()> {
+    ensure!(peer.write(data)?, "sctp send buffer full");
+    peer.poll().await?;
+    Ok(())
 }

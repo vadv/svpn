@@ -53,6 +53,19 @@ jobs:
       - name: Check all Rust targets
         run: cargo "+$RUST_TOOLCHAIN" clippy --locked --workspace --all-targets -- -D warnings
 
+  lint-python:
+    name: Python lint and formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check lint
+        run: pipx run ruff==0.14.3 check
+      - name: Check formatting
+        run: pipx run ruff==0.14.3 format --check
+
   native:
     name: Native tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -76,10 +89,10 @@ jobs:
         run: cargo "+$RUST_VERSION" test --locked --workspace --all-targets
       - name: Test harness cleanup and log retention without Docker
         run: |
-          bash -n tests/run.sh
-          python3 tests/test_artifacts.py
-          python3 tests/test_groups.py
-          python3 tests/test_package.py
+          bash -n e2e/run.sh
+          python3 e2e/test_artifacts.py
+          python3 e2e/test_groups.py
+          python3 e2e/test_package.py
 
   network:
     name: Network ${{ matrix.suite }} / ${{ matrix.group }}
@@ -116,9 +129,9 @@ jobs:
       - name: Run isolated network group
         run: |
           if [[ "$TEST_SUITE" == matrix ]]; then
-            tests/run.sh --matrix "$TEST_GROUP"
+            e2e/run.sh --matrix "$TEST_GROUP"
           else
-            tests/run.sh "$TEST_GROUP"
+            e2e/run.sh "$TEST_GROUP"
           fi
       - name: Retain only this job's test logs
         if: ${{ always() }}
@@ -126,8 +139,8 @@ jobs:
         with:
           name: network-${{ matrix.suite }}-${{ matrix.group }}-${{ github.run_attempt }}
           path: |
-            tests/.work/artifacts/run.*/*.log
-            tests/.work/artifacts/run.*/sessions/*.log
+            e2e/.work/artifacts/run.*/*.log
+            e2e/.work/artifacts/run.*/sessions/*.log
           # Explicit log paths only; .work itself is hidden and may contain keys.
           include-hidden-files: true
           if-no-files-found: error
@@ -211,7 +224,7 @@ jobs:
   release:
     name: Publish verified release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'vadv/svpn'
-    needs: [fmt, clippy, native, network, build-linux, build-macos]
+    needs: [fmt, clippy, lint-python, native, network, build-linux, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

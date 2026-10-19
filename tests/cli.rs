@@ -1,3 +1,5 @@
+//! CLI parsing: server cardinality and weights, config exclusivity, help and version.
+
 use clap::error::ErrorKind;
 use svpn::cli::*;
 use svpn::server_spec::resolve_servers;
@@ -11,6 +13,8 @@ fn client(args: &[&str]) -> ClientArgs {
         _ => panic!("expected client"),
     }
 }
+
+// ── cardinality and weights ──
 
 #[test]
 fn default_single_and_multi_have_separate_cardinality_and_weight_rules() {
@@ -59,6 +63,8 @@ fn default_single_and_multi_have_separate_cardinality_and_weight_rules() {
         assert!(Cli::try_parse_from(["svpn"].into_iter().chain(args)).is_err());
     }
 }
+
+// ── config exclusivity ──
 
 #[test]
 fn every_explicit_client_setting_conflicts_with_config_even_at_default() {
@@ -124,6 +130,8 @@ fn config_is_single_file_and_client_only() {
     }
 }
 
+// ── help and version ──
+
 #[test]
 fn help_and_version_do_not_read_config_or_require_a_server() {
     let no_args = Cli::try_parse_from(["svpn"]).err().unwrap();
@@ -153,6 +161,8 @@ fn help_and_version_do_not_read_config_or_require_a_server() {
         }
     }
 }
+
+// ── value normalization ──
 
 #[test]
 fn local_empty_tun_name_is_kernel_selected_and_stats_zero_is_off() {
