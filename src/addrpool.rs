@@ -1,31 +1,33 @@
-//! Tunnel address pair allocation via flock'd files (#181).
+//! Tunnel address pair allocation via loopback port tokens (#181).
 //!
 //! A pair is (server 10.77.<n>.1, client 10.77.<n>.2), n in 0..POOL_SIZE.
-//! Ownership is an exclusive flock on <dir>/net-<n> held for the session; the
-//! kernel releases it on process death, even SIGKILL. The directory lives on
-//! tmpfs (/run on the server, /tmp on the client), so stale files are reused.
+//! Ownership of pair n on a host is the portlock token LOCK_PORT_BASE + n:
+//! atomic in the kernel, released on process death, even SIGKILL. The port
+//! carries no traffic; it only names the pair. The kernel cannot arbitrate
+//! the addresses themselves: duplicate p2p addresses on different TUNs are
+//! legal on Linux and macOS and silently misroute instead of failing.
 
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    io,
     net::Ipv4Addr,
-    path::Path,
     sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
-use nix::fcntl::{Flock, FlockArg};
+
+use crate::portlock::PortLock;
 
 /// Pair count: third octets 0..=254 of 10.77.0.0/16, hosts .1/.2.
 pub const POOL_SIZE: u8 = 255;
 
-pub const SERVER_POOL_DIR: &str = "/run/svpn-pool";
-pub const CLIENT_POOL_DIR: &str = "/tmp/svpn-pool";
+/// Token port for pair n is LOCK_PORT_BASE + n; below the ephemeral ranges
+/// of Linux (32768+) and macOS (49152+), so outbound connections never take
+/// it.
+pub const LOCK_PORT_BASE: u16 = 29700;
 
-/// RAII hold on the pair lock file; dropping releases the flock.
-pub struct PairGuard {
-    _flock: Flock<File>,
-}
+/// RAII hold on the pair token; dropping releases the port.
+pub type PairGuard = PortLock;
 
 pub fn pair_of(n: u8) -> (Ipv4Addr, Ipv4Addr) {
     (Ipv4Addr::new(10, 77, n, 1), Ipv4Addr::new(10, 77, n, 2))
@@ -40,26 +42,15 @@ pub fn pool_index(server: Ipv4Addr, client: Ipv4Addr) -> Option<u8> {
     }
 }
 
-fn lock(dir: &Path, n: u8) -> Result<Option<PairGuard>> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(format!("net-{n}")))?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(_flock) => Ok(Some(PairGuard { _flock })),
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-        Err((_, error)) => Err(error).context("flock pair lock"),
-    }
+fn lock(n: u8) -> io::Result<Option<PairGuard>> {
+    PortLock::try_acquire(LOCK_PORT_BASE + u16::from(n))
 }
 
 /// Server side, auto mode: the first free pair, scanning from `start` so a
 /// declined pair is not offered again.
-pub fn claim(dir: &Path, start: u8) -> Result<(PairGuard, Ipv4Addr, Ipv4Addr)> {
+pub fn claim(start: u8) -> Result<(PairGuard, Ipv4Addr, Ipv4Addr)> {
     for n in (start..POOL_SIZE).chain(0..start) {
-        if let Some(guard) = lock(dir, n)? {
+        if let Some(guard) = lock(n)? {
             let (server, client) = pair_of(n);
             return Ok((guard, server, client));
         }
@@ -70,7 +61,6 @@ pub fn claim(dir: &Path, start: u8) -> Result<(PairGuard, Ipv4Addr, Ipv4Addr)> {
 /// Server side: auto → first free pair; explicit pool pair → lock it or fail;
 /// an explicit pair outside the pool subnet is honored unlocked.
 pub fn server_claim(
-    dir: &Path,
     auto: bool,
     pair: (Ipv4Addr, Ipv4Addr),
     start: u8,
@@ -80,16 +70,16 @@ pub fn server_claim(
         // reconnect, #181); busy or off-pool — fall back to the first free.
         if start == 0
             && let Some(n) = pool_index(pair.0, pair.1)
-            && let Some(guard) = lock(dir, n)?
+            && let Some(guard) = lock(n)?
         {
             return Ok((Some(guard), pair));
         }
-        let (guard, server, client) = claim(dir, start)?;
+        let (guard, server, client) = claim(start)?;
         return Ok((Some(guard), (server, client)));
     }
     match pool_index(pair.0, pair.1) {
         Some(n) => Ok((
-            Some(lock(dir, n)?.context("address pair already used by another svpn session")?),
+            Some(lock(n)?.context("address pair already used by another svpn session")?),
             pair,
         )),
         None => Ok((None, pair)),
@@ -97,7 +87,7 @@ pub fn server_claim(
 }
 
 /// Client side: process-wide registry, so pool members sharing one pair do
-/// not collide with themselves; distinct processes contend via flock.
+/// not collide with themselves; distinct processes contend via port tokens.
 /// Ok(None) — the pair is held by another local svpn process.
 pub fn client_claim(server: Ipv4Addr, client: Ipv4Addr) -> Result<Option<Arc<PairGuard>>> {
     type Claims = Mutex<HashMap<(Ipv4Addr, Ipv4Addr), Arc<PairGuard>>>;
@@ -110,7 +100,7 @@ pub fn client_claim(server: Ipv4Addr, client: Ipv4Addr) -> Result<Option<Arc<Pai
         return Ok(Some(guard.clone()));
     }
     let n = pool_index(server, client).context("client_claim requires a pool pair")?;
-    let Some(guard) = lock(Path::new(CLIENT_POOL_DIR), n)? else {
+    let Some(guard) = lock(n)? else {
         return Ok(None);
     };
     let guard = Arc::new(guard);

@@ -943,7 +943,7 @@ def test_auto_explicit_pair_lock():
     ):
         assert (local, peer) == ("10.77.9.2", "10.77.9.1")
         tcp_echo(3, peer=peer)
-        # Same explicit pair from a second client: flock collision, fast failure.
+        # Same explicit pair from a second client: lock-token collision, fast failure.
         log = LOG_DIR / "auto-explicit-busy.log"
         with log.open("w") as sink:
             busy = subprocess.Popen(auto_args(flags), stdout=subprocess.DEVNULL, stderr=sink)
@@ -998,6 +998,10 @@ TESTS = [
     ("test_sigkill_takeover", test_sigkill_takeover),
     ("test_checking_recovers_without_ssh_restart", test_checking_recovers_without_ssh_restart),
     ("test_checking_preserves_active_tcp_flows", test_checking_preserves_active_tcp_flows),
+    ("test_auto_assignment_and_restart", test_auto_assignment_and_restart),
+    ("test_auto_two_clients_one_server", test_auto_two_clients_one_server),
+    ("test_auto_explicit_pair_lock", test_auto_explicit_pair_lock),
+    ("test_auto_pool_shared_pair", test_auto_pool_shared_pair),
     ("test_auto_assignment_and_restart", test_auto_assignment_and_restart),
     ("test_auto_two_clients_one_server", test_auto_two_clients_one_server),
     ("test_auto_explicit_pair_lock", test_auto_explicit_pair_lock),

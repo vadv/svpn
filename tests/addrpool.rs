@@ -1,18 +1,16 @@
-//! Address pair pool: flock allocation semantics (#181).
+//! Address pair pool: port-token allocation semantics (#181).
+//!
+//! One sequential test: the token port space is host-global, so parallel
+//! tests scanning the pool would divert each other's claims.
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 
 use svpn::addrpool::*;
-
-fn tempdir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svpn-addrpool-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+use svpn::portlock::PortLock;
 
 #[test]
-fn pool_pairs_and_index_round_trip() {
+fn pool_allocation_lifecycle() {
+    // ── pair arithmetic ──
     for n in [0, 1, 254] {
         let (server, client) = pair_of(n);
         assert_eq!(server, Ipv4Addr::new(10, 77, n, 1));
@@ -27,98 +25,84 @@ fn pool_pairs_and_index_round_trip() {
         pool_index(Ipv4Addr::new(192, 168, 5, 1), Ipv4Addr::new(192, 168, 5, 2)),
         None
     );
-}
 
-#[test]
-fn claim_takes_first_free_skips_held_and_reuses_stale_files() {
-    let dir = tempdir("reuse");
-    let (_a, s0, _) = claim(dir.as_path(), 0).unwrap();
+    // ── claim: first free, skip held, start offset, reuse after drop ──
+    let (a, s0, _) = claim(0).unwrap();
     assert_eq!(s0, Ipv4Addr::new(10, 77, 0, 1));
-    // A stale file without a lock holder (dead process) is reused, not skipped.
-    std::fs::write(dir.join("net-1"), b"").unwrap();
-    let (_b, s1, _) = claim(dir.as_path(), 0).unwrap();
+    let (_b, s1, _) = claim(0).unwrap();
     assert_eq!(s1, Ipv4Addr::new(10, 77, 1, 1));
-    // Held pairs are skipped: next free is 2.
-    let (_c, s2, _) = claim(dir.as_path(), 0).unwrap();
+    let (_c, s2, _) = claim(0).unwrap();
     assert_eq!(s2, Ipv4Addr::new(10, 77, 2, 1));
-    // The start offset scans past already-offered pairs.
-    let (_d, s3, _) = claim(dir.as_path(), 3).unwrap();
+    let (_d, s3, _) = claim(3).unwrap();
     assert_eq!(s3, Ipv4Addr::new(10, 77, 3, 1));
-    // A dropped guard frees the pair for the next claim.
-    drop(_a);
-    let (_e, s0_back, _) = claim(dir.as_path(), 0).unwrap();
+    drop(a);
+    let (_e, s0_back, _) = claim(0).unwrap();
     assert_eq!(s0_back, Ipv4Addr::new(10, 77, 0, 1));
-}
 
-#[test]
-fn claim_scans_from_start_and_wraps() {
-    let dir = tempdir("wrap");
-    let (_a, s254, _) = claim(dir.as_path(), 254).unwrap();
+    // ── claim: scanning from start wraps around the pool ──
+    let (_f, s254, _) = claim(254).unwrap();
     assert_eq!(s254, Ipv4Addr::new(10, 77, 254, 1));
-    // 254 held: scanning wraps to the beginning of the pool.
-    let (_b, s0, _) = claim(dir.as_path(), 254).unwrap();
-    assert_eq!(s0, Ipv4Addr::new(10, 77, 0, 1));
-}
+    let (_g, s_wrap, _) = claim(254).unwrap();
+    assert_eq!(s_wrap, Ipv4Addr::new(10, 77, 4, 1), "wraps to first free");
 
-#[test]
-fn server_claim_modes() {
-    let dir = tempdir("modes");
-    // Auto claims the first free pair.
-    let (guard, pair) = server_claim(
-        dir.as_path(),
-        true,
-        (Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED),
-        0,
-    )
-    .unwrap();
-    assert!(guard.is_some());
-    assert_eq!(pair, pair_of(0));
-    // Explicit pool pair: locked, and busy for a second session.
-    let (g1, p1) = server_claim(dir.as_path(), false, pair_of(7), 0).unwrap();
-    assert!(g1.is_some());
-    assert_eq!(p1, pair_of(7));
-    match server_claim(dir.as_path(), false, pair_of(7), 0) {
+    // ── server_claim modes ──
+    let custom = (Ipv4Addr::new(192, 168, 5, 1), Ipv4Addr::new(192, 168, 5, 2));
+    let (g_unlocked, p_custom) = server_claim(false, custom, 0).unwrap();
+    assert!(
+        g_unlocked.is_none() && p_custom == custom,
+        "off-pool pair unlocked"
+    );
+    let (g7, p7) = server_claim(false, pair_of(7), 0).unwrap();
+    assert!(g7.is_some() && p7 == pair_of(7));
+    match server_claim(false, pair_of(7), 0) {
         Err(error) => assert!(error.to_string().contains("already used")),
         Ok(_) => panic!("busy pair must fail"),
     }
-    // Explicit pair outside the pool subnet: honored without a lock.
-    let custom = (Ipv4Addr::new(192, 168, 5, 1), Ipv4Addr::new(192, 168, 5, 2));
-    let (g2, p2) = server_claim(dir.as_path(), false, custom, 0).unwrap();
-    assert!(g2.is_none());
-    assert_eq!(p2, custom);
-    // Auto with start skips the busy explicit pair.
-    let (_g3, p3) = server_claim(dir.as_path(), true, pair, 7).unwrap();
-    assert_eq!(p3, pair_of(8));
-}
+    drop(g7);
+    let (g7_back, _) = server_claim(false, pair_of(7), 0).unwrap();
+    assert!(g7_back.is_some(), "dropped pair is lockable again");
 
-#[test]
-fn server_claim_honors_the_proposed_pool_pair() {
-    let dir = tempdir("proposed");
-    // Free proposal (a pinned pool pair on reconnect) is taken directly.
-    let (g1, p1) = server_claim(dir.as_path(), true, pair_of(5), 0).unwrap();
-    assert!(g1.is_some());
-    assert_eq!(p1, pair_of(5));
-    // Busy proposal falls back to the first free pair.
-    let (_g2, p2) = server_claim(dir.as_path(), true, pair_of(5), 0).unwrap();
-    assert_eq!(p2, pair_of(0));
-    // A retry after a decline (start > 0) scans instead of re-proposing.
-    let (_g3, p3) = server_claim(dir.as_path(), true, pair_of(1), 3).unwrap();
-    assert_eq!(p3, pair_of(3));
-}
+    // ── server_claim auto honors the proposed pool pair (#181) ──
+    let (g5, p5) = server_claim(true, pair_of(5), 0).unwrap();
+    assert!(g5.is_some() && p5 == pair_of(5), "free proposal is taken");
+    let (_g6, p6) = server_claim(true, pair_of(5), 0).unwrap();
+    assert_eq!(p6, pair_of(6), "busy proposal falls back to first free");
+    let (_g8, p8) = server_claim(true, pair_of(1), 8).unwrap();
+    assert_eq!(p8, pair_of(8), "a retry after decline scans from start");
 
-#[test]
-fn client_claim_dedupes_within_process_and_rejects_other_process_pair() {
-    // Pool pair: second in-process claim of the same pair reuses the guard.
+    // ── client_claim: in-process sharing, foreign holder rejection ──
     let (server, client) = pair_of(200);
     let first = client_claim(server, client).unwrap().unwrap();
     let second = client_claim(server, client).unwrap().unwrap();
-    assert!(std::sync::Arc::ptr_eq(&first, &second));
-    // A pair locked by a real file holder (simulating another process) is busy.
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "same process shares"
+    );
     let (server, client) = pair_of(201);
-    let _foreign = claim(std::path::Path::new(CLIENT_POOL_DIR), 201).unwrap();
-    assert!(client_claim(server, client).unwrap().is_none());
-    drop(_foreign);
+    let foreign = PortLock::try_acquire(LOCK_PORT_BASE + 201)
+        .unwrap()
+        .unwrap();
+    assert!(
+        client_claim(server, client).unwrap().is_none(),
+        "foreign holder wins"
+    );
+    drop(foreign);
     assert!(client_claim(server, client).unwrap().is_some());
-    // Non-pool pairs are rejected (explicit non-pool pairs never reach here).
-    assert!(client_claim(Ipv4Addr::new(192, 168, 5, 1), Ipv4Addr::new(192, 168, 5, 2)).is_err());
+    assert!(
+        client_claim(custom.0, custom.1).is_err(),
+        "non-pool pair rejected"
+    );
+
+    // ── exhaustion: every token held → clean error, no panic ──
+    let mut held = Vec::new();
+    for n in 0..POOL_SIZE {
+        if let Some(guard) = PortLock::try_acquire(LOCK_PORT_BASE + u16::from(n)).unwrap() {
+            held.push(guard);
+        }
+    }
+    match claim(0) {
+        Err(error) => assert!(error.to_string().contains("no free tunnel address pair")),
+        Ok(_) => panic!("a fully held pool must fail"),
+    }
+    drop(held);
 }

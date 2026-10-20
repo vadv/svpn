@@ -29,6 +29,7 @@ pub mod packet;
 pub mod pcap;
 pub mod perf;
 pub mod pool;
+pub mod portlock;
 pub mod probe;
 pub mod profile;
 pub mod quic;
@@ -508,12 +509,7 @@ async fn serve(
     let (mut pair, mut guard, mut skip, mut retries) = ((server_ip, client_ip), None, 0, 8);
     loop {
         if guard.is_none() {
-            let (g, p) = addrpool::server_claim(
-                std::path::Path::new(addrpool::SERVER_POOL_DIR),
-                addr_auto,
-                pair,
-                skip,
-            )?;
+            let (g, p) = addrpool::server_claim(addr_auto, pair, skip)?;
             (guard, pair) = (g, p);
         }
         control
@@ -527,7 +523,7 @@ async fn serve(
             Message::DeclineAddr if addr_auto && retries > 1 => {
                 retries -= 1;
                 skip = addrpool::pool_index(pair.0, pair.1).unwrap_or(skip) + 1;
-                guard = None; // dropped: flock released, next claim starts past this pair
+                guard = None; // dropped: port token released, next claim starts past this pair
             }
             Message::DeclineAddr => bail!("client declined the address pair"),
             _ => bail!("expected accept_addr or decline_addr"),

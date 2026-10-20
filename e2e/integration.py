@@ -28,6 +28,7 @@ _SEQUENCE = (
     + ("bootstrap",)
     + ("lifecycle-pool",) * 2
     + ("udp",)
+    + ("lifecycle-pool",) * 4
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,
