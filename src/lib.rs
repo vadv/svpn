@@ -237,6 +237,7 @@ pub(crate) struct LinkAddrs {
 pub(crate) async fn open_link(
     params: &LinkParams,
     tag: &str,
+    desired: Option<(Ipv4Addr, Ipv4Addr)>,
 ) -> Result<(
     Control,
     ssh::SshTail,
@@ -282,11 +283,15 @@ pub(crate) async fn open_link(
     .await?;
     let (stdin, stdout, tail) = session.into_io();
     let mut control = Control::new(stdout, stdin);
+    // desired (server, client) pins the shared pair: pool members and
+    // reconnects propose it in Hello and accept nothing else (#181).
+    let (hello_client, hello_server) =
+        desired.map_or((params.tun_addr, params.peer_addr), |(s, c)| (c, s));
     control
         .send(Message::Hello {
             version: VERSION,
-            client_ip: params.tun_addr,
-            server_ip: params.peer_addr,
+            client_ip: hello_client,
+            server_ip: hello_server,
             mtu: params.mtu,
             addr_auto: params.addr_auto,
         })
@@ -318,6 +323,16 @@ pub(crate) async fn open_link(
         else {
             bail!("expected assigned");
         };
+        // A pinned pair (pool member, reconnect with a live TUN) accepts
+        // only an exact match; a local lock collision declines as well.
+        if desired.is_some_and(|pair| pair != (server_ip, client_ip)) {
+            control.send(Message::DeclineAddr).await?;
+            ensure!(
+                params.addr_auto,
+                "server cannot offer the pinned address pair {server_ip}/{client_ip}"
+            );
+            continue;
+        }
         let guard = if addrpool::pool_index(server_ip, client_ip).is_some() {
             match addrpool::client_claim(server_ip, client_ip)? {
                 some @ Some(_) => some,

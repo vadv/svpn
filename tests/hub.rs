@@ -68,6 +68,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         incoming,
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
+        pair: watch::channel(None).0,
     }
 }
 

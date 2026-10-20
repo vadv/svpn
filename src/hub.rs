@@ -57,6 +57,9 @@ pub struct Hub {
     /// Destination tuples of flows retired with a lost link; answered as a
     /// CLOSED endpoint so client sockets fail fast instead of hanging.
     pub tombstones: session::Tombstones,
+    /// Shared tunnel pair (client, server) pinned by the first Ready link
+    /// (#181): later links and reconnects must negotiate the same pair.
+    pub pair: watch::Sender<Option<(Ipv4Addr, Ipv4Addr)>>,
 }
 
 impl Hub {
@@ -164,12 +167,30 @@ impl Hub {
                 if !self.pool.ready(epoch, now) {
                     return Ok(());
                 }
+                // The first Ready pins the shared tunnel pair (#181); a link
+                // that negotiated another pair is retired — dropping its
+                // channel ends the session, and the retry insists on the pin.
+                let pair = self.links[epoch.link]
+                    .assigned
+                    .get()
+                    .copied()
+                    .unwrap_or((params.tun_addr, params.peer_addr));
+                // Bind the borrow to a temporary first: `match *self.pair.borrow()`
+                // keeps the read guard alive into the match arms, and the None
+                // arm's send_replace self-deadlocks on the write lock.
+                let pinned = *self.pair.borrow();
+                let (tun_addr, peer_addr) = match pinned {
+                    None => {
+                        self.pair.send_replace(Some(pair));
+                        pair
+                    }
+                    Some(pinned) if pinned == pair => pinned,
+                    Some(_) => {
+                        self.links[epoch.link].outgoing = None;
+                        return Ok(());
+                    }
+                };
                 if tun.is_none() {
-                    let (tun_addr, peer_addr) = self.links[epoch.link]
-                        .assigned
-                        .get()
-                        .copied()
-                        .unwrap_or((params.tun_addr, params.peer_addr));
                     *tun = Some(crate::create_tun(
                         tun_addr,
                         peer_addr,
@@ -246,6 +267,8 @@ impl Hub {
         link.stats.reset();
         let assigned = Arc::new(std::sync::OnceLock::new());
         link.assigned = assigned.clone();
+        // Insist on the pinned shared pair when one exists (#181).
+        let desired = (*self.pair.borrow()).map(|(client, server)| (server, client));
         let (stats, latest) = watch::channel(Stats::default());
         link.latest = Some(latest);
         let (outgoing, packets) = mpsc::channel(QUEUE);
@@ -263,7 +286,7 @@ impl Hub {
         self.tasks.spawn(async move {
             let attempt = async {
                 let (control, tail, config, server_ip, addrs) =
-                    crate::open_link(&params, &io.tag).await?;
+                    crate::open_link(&params, &io.tag, desired).await?;
                 let _ = assigned.set((addrs.client_ip, addrs.server_ip));
                 io.peer_ip = addrs.server_ip;
                 let result =
@@ -311,11 +334,8 @@ impl Hub {
                 }, if !hooks.starting() => {
                     let length = read.context("read client TUN")?;
                     ensure!(length != 0, "client TUN closed");
-                    let local = self.links[0]
-                        .assigned
-                        .get()
-                        .copied()
-                        .map_or(params.tun_addr, |(client, _)| client);
+                    let local =
+                        (*self.pair.borrow()).map_or(params.tun_addr, |(client, _)| client);
                     if let Some(reset) = self.dispatch(&buffer[..length], local)? {
                         let tun = tun.as_ref().context("TCP reset without client TUN")?;
                         let result =
@@ -484,6 +504,7 @@ pub async fn run(
             })
             .collect(),
         pool,
+        pair: watch::channel(None).0,
         tasks: JoinSet::new(),
         events,
         incoming,
