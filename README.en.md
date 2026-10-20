@@ -8,6 +8,34 @@ as long as the connection does. No daemon, no certificates, no server-side
 config. On the wire the tunnel looks like QUIC, WebRTC, or mosh — and where
 UDP is blocked, like SSH over TCP.
 
+## What you get
+
+- **The server is one file.** Copy `svpn` to a server, add its address to the
+  client TOML — it is in the pool. No daemon, no config, no state on the
+  server: the process is launched by your SSH session and dies with it.
+- **One interface, as many servers as you want.** The pool hides behind a
+  single TUN on the client. A new server is three lines of config, not a new
+  VPN.
+- **Weights instead of a balancer.** A server's `weight` sets its share of
+  new connections.
+- **A dead server is routine, not an outage.** Each server is a state machine:
+  connecting, ready, checking, backoff. Five seconds of silence takes it out
+  of the pool, traffic moves to the living ones, and the dead one restarts
+  itself (1→2→4…→60 s). The VPN stops only when no server is left alive.
+- **Camouflage picked for your network.** `auto` tries transports from fast
+  to survivable — QUIC → WebRTC → obfs → mosh → SSH/TCP — and sticks with the
+  first one that actually works. The transport does not change for the rest
+  of the session.
+
+```text
+┌─────────────────┐        ┌──────────┐
+│ client: one TUN │───────▶│ server A │  weight 3 — carries traffic
+│                 │───────▶│ server B │  weight 1 — carries traffic
+│                 │────╳   │ server C │  down — restarts itself
+└─────────────────┘        └──────────┘
+    C is down — the VPN is fine: new connections go to A and B
+```
+
 ## Requirements
 
 - Server: Linux with TUN and nftables (Debian 12 / Ubuntu 24.04 out of the
@@ -147,13 +175,13 @@ are relative to the config directory).
 **Client** `up-command` / `down-command`: after the client TUN is configured
 and before it is closed. Environment: `SVPN_TUN_NAME`, `SVPN_TUN_ADDR`,
 `SVPN_PEER_ADDR`, `SVPN_EVENT`. An `up-command` failure aborts the
-connection; `down-command` still runs.
+connection. `down-command` still runs.
 
 **Server** `server-up` / `server-down`: after the server TUN is up and before
 the server process exits. Environment: `SVPN_PEER_ADDR` (client tunnel
 address) plus the same `SVPN_*` set. Command length is limited to 1500
 characters. The server returns the exit code and up to 600 bytes of
-stdout/stderr — enough for diagnostics; write real logs to a file on the
+stdout/stderr — enough for diagnostics. Write real logs to a file on the
 server. A `server-up` failure aborts the connection before the client TUN is
 created.
 
@@ -161,7 +189,7 @@ created.
 
 By default **auto** is active: four UDP candidates and TCP with `ssh`
 camouflage start simultaneously, the server is pinged through each, and the
-first responder wins. Start with auto; pin a list only when you know your
+first responder wins. Start with auto. Pin a list only when you know your
 network: `mimic = ['quic', 'mosh']` in TOML or repeated `--mimic` on the CLI.
 
 | Value    | Looks like | Choose when |
@@ -175,7 +203,7 @@ network: `mimic = ['quic', 'mosh']` in TOML or repeated `--mimic` on the CLI.
 | `none`   | plain TCP | debugging only |
 
 The winner runs until it fails (5 seconds without data or a transport
-break), then the race repeats; on a total failure it retries after 1, 2, 4,
+break), then the race repeats. On a total failure it retries after 1, 2, 4,
 8, 16, and then every 30 seconds. A candidate that cannot prepare its
 channel is excluded for the rest of the SSH session. Open connections are
 not moved to the new channel: TCP gets a RST and applications reconnect.
@@ -186,7 +214,7 @@ passing a particular filter — measure with `svpn perf`.
 ## Server firewall without hooks
 
 If server hooks do not fit, configure the server once by hand as root
-(iptables; the nftables equivalent is in the `server-up` example above):
+(iptables — the nftables equivalent is in the `server-up` example above):
 
 ```sh
 printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-svpn.conf
@@ -211,7 +239,7 @@ started by hand — the client launches it over SSH.
 - Fragmented IPv4 packets are dropped. Default MTU is 1280.
 - A LAN behind the client needs SNAT to the client tunnel address
   (`10.77.0.2`).
-- The server's SSH key is remembered on first connect; pin it explicitly with
+- The server's SSH key is remembered on first connect. Pin it explicitly with
   `ssh-host-key = "SHA256:…"`.
 - `svpn serve` refuses to run outside an SSH session.
 
@@ -232,7 +260,7 @@ through the tunnel.
 ### RU direct, world via VPN (Linux)
 
 Table 100 holds RU subnets via the regular gateway and a default route via
-the tunnel; rule 100 sends all traffic there, rule 99 serves local networks
+the tunnel. Rule 100 sends all traffic there, rule 99 serves local networks
 first. The subnet list (~9000 networks) is downloaded from ipdeny once and
 cached in `/etc/svpn-ru.zone`. The script reads server addresses from the
 client's open SSH connections. Tunnel down — traffic goes direct (fail-open).
@@ -340,7 +368,7 @@ fi
 
 - `svpn perf --help` — iperf3-style throughput measurement through the tunnel.
 - `svpn multi --help` — server pool, `[[servers]]` in TOML.
-- `svpn --help` — every CLI flag mirrors a TOML key; config file and CLI
+- `svpn --help` — every CLI flag mirrors a TOML key. Config file and CLI
   settings are mutually exclusive.
 
 ## Development
@@ -351,8 +379,6 @@ Install Rust 1.89+ and a C compiler:
 cargo build --locked
 cargo test --locked --workspace
 ```
-
-Release build recipes are in [build/README.md](build/README.md).
 
 ## License
 
