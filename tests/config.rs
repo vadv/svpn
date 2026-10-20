@@ -24,13 +24,21 @@ fn readme_configs_match_and_validate() {
     let blocks = configs(include_str!("../README.md"));
     assert_eq!(blocks, configs(include_str!("../README.en.md")));
     assert!(blocks.len() >= 3);
-    let base = blocks[0]
+    let client_config = blocks
+        .iter()
+        .find(|block| block.contains("server = \"vpn.example.com\""))
+        .expect("README must contain a client config example");
+    let macos_hooks = blocks
+        .iter()
+        .find(|block| block.contains("route -n add -host 1.1.1.1"))
+        .expect("README must contain a macOS hooks example");
+    let base = client_config
         .lines()
         .filter(|line| !line.starts_with("up-command") && !line.starts_with("down-command"))
         .collect::<Vec<_>>()
         .join("\n");
-    let macos = format!("{base}\n{}", blocks[1]);
-    for example in [blocks[0], &macos] {
+    let macos = format!("{base}\n{}", macos_hooks);
+    for example in [*client_config, &macos] {
         let args = parse(example, Path::new("/config"), false).unwrap();
         let servers = resolve_servers(&args.server, &args.globals).unwrap();
         assert_eq!(servers.len(), 1);
@@ -72,10 +80,14 @@ fn readme_configs_match_and_validate() {
         };
         assert_eq!(output.stdout, expected.as_bytes());
     }
+    let server_hooks_block = blocks
+        .iter()
+        .find(|block| block.contains("server-up"))
+        .expect("README must contain a server hooks example");
     let server_hooks = parse(
         &format!(
             "server = 'vpn.example.com'\npeer-tun-name = 'svpn0'\n{}",
-            blocks[2]
+            *server_hooks_block
         ),
         Path::new("/config"),
         false,

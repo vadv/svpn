@@ -5,8 +5,9 @@
 SVPN — зашифрованный IPv4-туннель до Linux-сервера под вашим контролем. Вся
 серверная часть — один бинарник: без демона, без сертификатов, без конфига.
 Клиент запускает его через SSH при подключении, и тот завершается вместе с
-сессией. Единственная подготовка сервера — обычная маршрутизация Linux:
-forwarding и правило маскарада, те же два шага, что у любого VPN.
+сессией. Единственная подготовка сервера — установить бинарник и выдать
+SSH-доступ. Маршрутизацию и маскарадинг можно настроить вручную (шаг 2) или
+автоматически через server hooks (шаг 3).
 
 В сети туннель выглядит как трафик QUIC, WebRTC или mosh либо как случайные
 байты. При подключении все варианты соревнуются, и побеждает первый рабочий.
@@ -50,9 +51,7 @@ svpn --version
 ## 2. Подготовьте сервер (один раз)
 
 Выполните **от root на чистом сервере Debian/Ubuntu без UFW и firewalld**.
-Используйте либо команды iptables ниже, либо эквивалент на nftables в конце
-этого шага, но не оба варианта. Оба добавляют правила, не очищая существующие
-цепочки и не меняя их политики:
+Установите бинарник и включите forwarding:
 
 ```sh
 apt-get update
@@ -60,7 +59,32 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
 
 printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-svpn.conf
 sysctl -p /etc/sysctl.d/90-svpn.conf
+```
 
+### Маршрутизация и маскарадинг
+
+Выберите один вариант.
+
+**Вариант A: server hooks (в конфиге клиента).** Ничего не настраивайте на
+сервере. Добавьте в `vpn.toml` (шаг 3):
+
+```toml
+server-up = '''
+EGRESS=$(ip -4 route show default | awk '{print $5; exit}')
+nft -f - <<NFT
+table ip svpn { set peers { type ipv4_addr; } chain post { type nat hook postrouting priority srcnat; policy accept; } }
+flush chain ip svpn post
+add rule ip svpn post ip saddr @peers oifname "$EGRESS" masquerade
+NFT
+nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
+'''
+server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
+```
+
+**Вариант B: ручная настройка.** Выполните от root (iptables или nftables, не
+оба):
+
+```sh
 iptables -I INPUT -p udp --dport 60000:60009 -j ACCEPT
 iptables -I INPUT -p tcp --dport 41020 -j ACCEPT
 iptables -I INPUT -i svpn0 -d 10.77.0.1 -p icmp --icmp-type echo-request -j ACCEPT
@@ -72,9 +96,9 @@ netfilter-persistent save
 systemctl enable netfilter-persistent
 ```
 
-Это включает forwarding, принимает трафик из туннеля и маскирует клиентов VPN
-под исходящий адрес сервера. Настройки переживают перезагрузку. Если у VPS
-есть файрвол в панели провайдера, откройте там UDP 60000–60009 и TCP 41020.
+Это принимает трафик из туннеля и маскирует клиентов VPN под исходящий адрес
+сервера. Настройки переживают перезагрузку. Если у VPS есть файрвол в панели
+провайдера, откройте там UDP 60000–60009 и TCP 41020.
 
 **На сервере nftables вместо iptables?** Выполните эквивалент (шаг с sysctl
 общий):
@@ -148,7 +172,7 @@ Hooks — обычные shell-команды, которые выполняют
 через `/bin/sh -c`. Ничего не нужно настраивать на сервере: конфигурация только
 в клиентском TOML. `server-up` запускается после поднятия серверного TUN,
 `server-down` — перед выходом серверного процесса. Сервер возвращает
-stdout/stderr (до 4 КиБ) и код возврата; ошибка `server-up` прерывает
+stdout/stderr (до 4 КиБ) и код возврата. Ошибка `server-up` прерывает
 подключение. Для per-server override задайте поля в `[[servers]]`.
 
 ```toml

@@ -5,8 +5,9 @@
 SVPN is an encrypted IPv4 tunnel to a Linux server you control. The whole
 server side is one binary: no daemon, no certificates, no config file. The
 client starts it over SSH when you connect, and it exits when the session
-ends. The only server preparation is plain Linux routing — IP forwarding and
-a masquerade rule, the same two steps every VPN needs.
+ends. The only server preparation is installing the binary and granting SSH
+access. Routing and masquerading can be configured manually (step 2) or
+automatically through server hooks (step 3).
 
 On the wire the tunnel passes for QUIC, WebRTC or mosh traffic, or for random
 bytes. At connect time all candidates race, and the first working one wins.
@@ -49,10 +50,8 @@ On OpenWrt, as root: `tar -xzf svpn-*.tar.gz && cp svpn /usr/bin/svpn`.
 
 ## 2. Prepare the server (once)
 
-Run **as root on a fresh Debian/Ubuntu server without UFW or firewalld**. Use
-either the iptables commands here or the nftables equivalent at the end of
-this step, not both. Both add rules without flushing existing chains or
-changing their policies:
+Run **as root on a fresh Debian/Ubuntu server without UFW or firewalld**.
+Install the binary and enable forwarding:
 
 ```sh
 apt-get update
@@ -60,7 +59,31 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
 
 printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-svpn.conf
 sysctl -p /etc/sysctl.d/90-svpn.conf
+```
 
+### Routing and masquerading
+
+Pick one variant.
+
+**Variant A: server hooks (in the client config).** Configure nothing on the
+server. Add to `vpn.toml` (step 3):
+
+```toml
+server-up = '''
+EGRESS=$(ip -4 route show default | awk '{print $5; exit}')
+nft -f - <<NFT
+table ip svpn { set peers { type ipv4_addr; } chain post { type nat hook postrouting priority srcnat; policy accept; } }
+flush chain ip svpn post
+add rule ip svpn post ip saddr @peers oifname "$EGRESS" masquerade
+NFT
+nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
+'''
+server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
+```
+
+**Variant B: manual setup.** Run as root (iptables or nftables, not both):
+
+```sh
 iptables -I INPUT -p udp --dport 60000:60009 -j ACCEPT
 iptables -I INPUT -p tcp --dport 41020 -j ACCEPT
 iptables -I INPUT -i svpn0 -d 10.77.0.1 -p icmp --icmp-type echo-request -j ACCEPT
@@ -72,10 +95,9 @@ netfilter-persistent save
 systemctl enable netfilter-persistent
 ```
 
-This enables forwarding, accepts traffic from the tunnel, and masquerades VPN
-clients behind the server's outgoing address. The settings survive a reboot.
-If your VPS also has a provider firewall, open UDP 60000–60009 and TCP 41020
-there as well.
+This accepts traffic from the tunnel and masquerades VPN clients behind the
+server's outgoing address. The settings survive a reboot. If your VPS also has
+a provider firewall, open UDP 60000–60009 and TCP 41020 there as well.
 
 **Using nftables instead of iptables?** Run this equivalent (the sysctl step
 is the same):
@@ -148,7 +170,7 @@ files instead of inline commands, use `up-script` / `down-script`.
 through `/bin/sh -c`. Nothing to configure on the server: everything lives in
 the client TOML. `server-up` runs after the server TUN is up, `server-down`
 before the server process exits. The server returns stdout/stderr (up to 4
-KiB) and the exit code; a failing `server-up` aborts the connection. For
+KiB) and the exit code. A failing `server-up` aborts the connection. For
 per-server overrides, set the fields in `[[servers]]`.
 
 ```toml
