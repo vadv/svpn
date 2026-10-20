@@ -71,7 +71,6 @@ to your key:
 server = "vpn.example.com"
 ssh-user = "root"
 ssh-identity = "/path/to/id_ed25519"
-peer-tun-name = "svpn0"
 tcp-port = 41020
 
 # All traffic goes through the tunnel: two /1 routes override the default
@@ -135,6 +134,12 @@ race, the first responder wins, and data flows.
 If your VPS has a firewall in the provider panel, open UDP 60000–60009 and
 TCP 41020.
 
+The TUN name and tunnel addresses are assigned automatically: the kernel
+picks a free name (tun0, utun4, …) and the addresses come from the
+10.77.0.0/16 pool — hooks see the actual values in $SVPN_TUN_NAME,
+$SVPN_TUN_ADDR and $SVPN_PEER_ADDR. To pin them: `peer-tun-name = "svpn0"`,
+and the addresses as a `tun-addr` + `peer-addr` pair (only together).
+
 ## 3. Multiple servers
 
 A weighted server pool — the `multi` command and `[[servers]]` sections in
@@ -143,7 +148,6 @@ the same TOML. Server fields override the root ones for that server only:
 ```toml
 ssh-user = "root"
 ssh-identity = "/path/to/id_ed25519"
-peer-tun-name = "svpn0"
 tcp-port = 41020
 # up-command / down-command / server-up / server-down — as in step 2.
 # Root server-up and server-down apply to every server.
