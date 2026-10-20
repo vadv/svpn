@@ -92,6 +92,21 @@ fn server_claim_modes() {
 }
 
 #[test]
+fn server_claim_honors_the_proposed_pool_pair() {
+    let dir = tempdir("proposed");
+    // Free proposal (a pinned pool pair on reconnect) is taken directly.
+    let (g1, p1) = server_claim(dir.as_path(), true, pair_of(5), 0).unwrap();
+    assert!(g1.is_some());
+    assert_eq!(p1, pair_of(5));
+    // Busy proposal falls back to the first free pair.
+    let (_g2, p2) = server_claim(dir.as_path(), true, pair_of(5), 0).unwrap();
+    assert_eq!(p2, pair_of(0));
+    // A retry after a decline (start > 0) scans instead of re-proposing.
+    let (_g3, p3) = server_claim(dir.as_path(), true, pair_of(1), 3).unwrap();
+    assert_eq!(p3, pair_of(3));
+}
+
+#[test]
 fn client_claim_dedupes_within_process_and_rejects_other_process_pair() {
     // Pool pair: second in-process claim of the same pair reuses the guard.
     let (server, client) = pair_of(200);

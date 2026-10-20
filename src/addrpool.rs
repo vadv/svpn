@@ -76,6 +76,14 @@ pub fn server_claim(
     start: u8,
 ) -> Result<(Option<PairGuard>, (Ipv4Addr, Ipv4Addr))> {
     if auto {
+        // Honor the client's proposed pool pair first (a pinned pool pair on
+        // reconnect, #181); busy or off-pool — fall back to the first free.
+        if start == 0
+            && let Some(n) = pool_index(pair.0, pair.1)
+            && let Some(guard) = lock(dir, n)?
+        {
+            return Ok((Some(guard), pair));
+        }
         let (guard, server, client) = claim(dir, start)?;
         return Ok((Some(guard), (server, client)));
     }
