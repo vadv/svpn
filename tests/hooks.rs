@@ -310,8 +310,10 @@ async fn run_with_capture_survives_detached_grandchild_holding_pipes() {
 async fn hook_result_with_binary_output_fits_control_line() {
     // Worst case for the control channel: invalid UTF-8 becomes replacement
     // chars, control bytes were sanitized away; the serialized message must
-    // stay within MAX_LINE so the peer reader never rejects it.
-    let hook = Hook::Command("head -c 5000 /dev/zero | tr '\\0' '\\377'".into());
+    // stay within MAX_LINE so the peer reader never rejects it. `printf` octal
+    // escapes emit raw bytes regardless of locale, unlike `tr`.
+    let bytes = "\\377".repeat(700);
+    let hook = Hook::Command(format!("printf '{bytes}'"));
     let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
     // 600 source bytes \u{FFFD}-replace into 3 UTF-8 bytes each.
     assert_eq!(stdout.len(), 1800);
