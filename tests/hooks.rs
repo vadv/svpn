@@ -249,3 +249,84 @@ async fn write_script(path: &std::path::Path) {
         .await
         .unwrap();
 }
+
+// ── capture ──
+
+#[tokio::test]
+async fn run_with_capture_returns_truncated_output() {
+    let hook =
+        Hook::Command("printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into());
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout.len(), 600);
+    assert!(stdout.starts_with("out"));
+    assert!(stdout.ends_with("y"));
+    assert_eq!(stderr, "err");
+}
+
+#[tokio::test]
+async fn run_with_capture_supports_script() {
+    let dir = temporary_dir();
+    let path = dir.join("script");
+    write_script(&path).await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hook = Hook::Script(path);
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn run_with_capture_enforces_deadline_and_kills_group() {
+    let hook = Hook::Command("sleep 60".into());
+    let start = Instant::now();
+    let result = run_with_capture(&hook, "up", &context()).await;
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.err().unwrap()).contains("timed out"));
+    assert!(start.elapsed() >= Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn run_with_capture_reports_failure() {
+    let hook = Hook::Command("exit 7".into());
+    let result = run_with_capture(&hook, "up", &context()).await;
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.err().unwrap()).contains("exit status: 7"));
+}
+
+#[tokio::test]
+async fn run_with_capture_survives_detached_grandchild_holding_pipes() {
+    // Regression: a background grandchild inherits stdout/stderr and never
+    // closes them; capture must finish within the read grace, not hang until
+    // the grandchild exits.
+    let hook = Hook::Command("sleep 60 & echo done".into());
+    let start = Instant::now();
+    let (stdout, _stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout, "done\n");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn hook_result_with_binary_output_fits_control_line() {
+    // Worst case for the control channel: invalid UTF-8 becomes replacement
+    // chars, control bytes were sanitized away; the serialized message must
+    // stay within MAX_LINE so the peer reader never rejects it. `printf` octal
+    // escapes emit raw bytes regardless of locale, unlike `tr`.
+    let bytes = "\\377".repeat(700);
+    let hook = Hook::Command(format!("printf '{bytes}'"));
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    // 600 source bytes \u{FFFD}-replace into 3 UTF-8 bytes each.
+    assert_eq!(stdout.len(), 1800);
+    assert_eq!(stderr, "");
+    let message = svpn::control::Message::HookResult {
+        ok: true,
+        stdout,
+        stderr,
+    };
+    let line = serde_json::to_vec(&message).unwrap();
+    assert!(
+        line.len() < svpn::control::MAX_LINE,
+        "serialized hook result is {} bytes",
+        line.len()
+    );
+}

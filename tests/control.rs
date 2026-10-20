@@ -199,6 +199,62 @@ async fn endpoints_tcp_null_round_trip() {
     assert_eq!(back, json);
 }
 
+#[tokio::test]
+async fn server_hooks_round_trip() {
+    let message = Message::ServerHooks {
+        up: Some("echo up".to_string()),
+        down: Some("echo down".to_string()),
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(
+        json,
+        "{\"type\":\"server_hooks\",\"up\":\"echo up\",\"down\":\"echo down\"}"
+    );
+    let back = serde_json::to_string(&serde_json::from_str::<Message>(&json).unwrap()).unwrap();
+    assert_eq!(back, json);
+
+    let message = Message::HookResult {
+        ok: true,
+        stdout: "out".to_string(),
+        stderr: "err".to_string(),
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(
+        json,
+        "{\"type\":\"hook_result\",\"ok\":true,\"stdout\":\"out\",\"stderr\":\"err\"}"
+    );
+    let back = serde_json::to_string(&serde_json::from_str::<Message>(&json).unwrap()).unwrap();
+    assert_eq!(back, json);
+}
+
+#[tokio::test]
+async fn server_hooks_and_hook_result_fit_control_line() {
+    let max = "x".repeat(svpn::config::MAX_SERVER_HOOK);
+    let message = Message::ServerHooks {
+        up: Some(max.clone()),
+        down: Some(max),
+    };
+    let line = serde_json::to_string(&message).unwrap();
+    assert!(
+        line.len() < MAX_LINE,
+        "ServerHooks line budget: {}",
+        line.len()
+    );
+
+    let max = "x".repeat(1500);
+    let message = Message::HookResult {
+        ok: true,
+        stdout: max.clone(),
+        stderr: max,
+    };
+    let line = serde_json::to_string(&message).unwrap();
+    assert!(
+        line.len() < MAX_LINE,
+        "HookResult line budget: {}",
+        line.len()
+    );
+}
+
 // ── control send/recv ──
 
 #[tokio::test]

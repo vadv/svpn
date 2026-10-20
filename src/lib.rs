@@ -296,6 +296,24 @@ pub(crate) async fn open_link(
         matches!(bootstrap(&mut control).await?, Message::TunReady),
         "server TUN not ready"
     );
+    if params.server_up.is_some() || params.server_down.is_some() {
+        control
+            .send(Message::ServerHooks {
+                up: params.server_up.clone(),
+                down: params.server_down.clone(),
+            })
+            .await?;
+        let Message::HookResult { ok, stdout, stderr } = bootstrap(&mut control).await? else {
+            bail!("expected hook_result");
+        };
+        if !stdout.is_empty() {
+            crate::info!("server hook stdout: {stdout}");
+        }
+        if !stderr.is_empty() {
+            crate::info!("server hook stderr: {stderr}");
+        }
+        ensure!(ok, "server up hook failed");
+    }
     // Ready to exchange transport probes, not to route user IP packets yet.
     control.send(Message::TunReady).await?;
     let config = match tcp {
@@ -451,10 +469,48 @@ async fn serve(
     };
     perf::spawn(server_ip);
     control.send(Message::TunReady).await?;
-    ensure!(
-        matches!(bootstrap(&mut control).await?, Message::TunReady),
-        "client TUN not ready"
-    );
+    let (server_down, expect_tun_ready) = match control.recv().await? {
+        Message::ServerHooks { up, down } => {
+            let context = hooks::TunContext {
+                name: tun.name().context("TUN name")?,
+                local: server_ip,
+                peer: client_ip,
+            };
+            if let Some(up) = up {
+                let hook = hooks::Hook::Command(up);
+                let (ok, stdout, stderr) =
+                    match hooks::run_with_capture(&hook, "up", &context).await {
+                        Ok((stdout, stderr)) => (true, stdout, stderr),
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            crate::error!("hook: up failed — {message}");
+                            (false, String::new(), message)
+                        }
+                    };
+                control
+                    .send(Message::HookResult { ok, stdout, stderr })
+                    .await?;
+                ensure!(ok, "server up hook failed");
+            } else {
+                control
+                    .send(Message::HookResult {
+                        ok: true,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                    .await?;
+            }
+            (down, true)
+        }
+        Message::TunReady => (None, false),
+        _ => bail!("expected server_hooks or tun_ready"),
+    };
+    if expect_tun_ready {
+        ensure!(
+            matches!(bootstrap(&mut control).await?, Message::TunReady),
+            "client TUN not ready"
+        );
+    }
     let config = match tcp {
         Some((mode, listener)) => session::TransportConfig::Tcp {
             mode,
@@ -467,7 +523,20 @@ async fn serve(
             tcp: tcp_candidate,
         },
     };
-    session::run(control, tun, None, client_ip, mtu, config).await
+    let tun_name = tun.name().context("TUN name")?;
+    let result = session::run(control, tun, None, client_ip, mtu, config).await;
+    if let Some(down) = server_down {
+        let context = hooks::TunContext {
+            name: tun_name,
+            local: server_ip,
+            peer: client_ip,
+        };
+        let hook = hooks::Hook::Command(down);
+        if let Err(error) = hooks::run_with_capture(&hook, "down", &context).await {
+            crate::error!("hook: down failed — {error:#}");
+        }
+    }
+    result
 }
 
 /// Allocates one UDP port per strategy from the range and brings up the

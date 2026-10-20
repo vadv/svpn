@@ -36,6 +36,8 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
         peer_addr: Ipv4Addr::new(10, 77, 0, 1),
         mtu: 1280,
         tun_name: None,
+        server_up: None,
+        server_down: None,
     }
 }
 

@@ -16,11 +16,19 @@ use nix::{
     unistd::{AccessFlags, Pid, faccessat},
 };
 use tokio::{
+    io::AsyncReadExt,
     process::{Child, Command},
     time::{Instant, sleep_until},
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
+/// Grace for draining hook output pipes after the process is gone: a detached
+/// grandchild (e.g. `setsid daemon &`) inherits them and never closes.
+const READ_GRACE: Duration = Duration::from_secs(1);
+/// Maximum captured bytes per stream in `run_with_capture`. The worst case
+/// after JSON escaping is ~6 bytes per source byte (see `sanitize`), so two
+/// streams must stay within the control channel line limit (`MAX_LINE`).
+const CAPTURE_LIMIT: usize = 600;
 
 #[derive(clap::Args, Default)]
 pub struct Args {
@@ -128,7 +136,7 @@ impl Hooks {
 }
 
 impl Running {
-    pub fn spawn(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Self> {
+    fn command(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Command> {
         let mut command = match hook {
             Hook::Script(path) => Command::new(path),
             Hook::Command(text) => {
@@ -143,10 +151,17 @@ impl Running {
             .env("SVPN_TUN_NAME", &context.name)
             .env("SVPN_TUN_ADDR", context.local.to_string())
             .env("SVPN_PEER_ADDR", context.peer.to_string())
+            .env("SVPN_SESSION_ID", std::process::id().to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
-            .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        Ok(command)
+    }
+
+    pub fn spawn(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Self> {
+        let mut command = Self::command(hook, event, context)?;
+        command
+            .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
+            .stderr(Stdio::inherit());
         let child = command
             .spawn()
             .with_context(|| format!("hook {event}: spawn failed"))?;
@@ -240,4 +255,89 @@ pub fn resolve(script: Option<PathBuf>, command: Option<String>) -> Result<Optio
         return Ok(Some(Hook::Command(command)));
     }
     Ok(None)
+}
+
+/// Runs a hook with piped stdout/stderr and returns the truncated output.
+/// Enforces the same 10-second deadline and process-group kill as `Running`.
+pub async fn run_with_capture(
+    hook: &Hook,
+    event: &'static str,
+    context: &TunContext,
+) -> Result<(String, String)> {
+    let mut command = Running::command(hook, event, context)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("hook {event}: spawn failed"))?;
+    let id = child.id().context("hook process has no id")?;
+    let group = Pid::from_raw(i32::try_from(id).context("hook process id is out of range")?);
+    crate::info!("hook: {event} started");
+
+    let mut stdout = child.stdout.take().context("hook stdout missing")?;
+    let mut stderr = child.stderr.take().context("hook stderr missing")?;
+    let deadline = Instant::now() + DEADLINE;
+
+    let read_stdout = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::take(&mut stdout, CAPTURE_LIMIT as u64)
+            .read_to_end(&mut buffer)
+            .await?;
+        Ok::<_, std::io::Error>(buffer)
+    });
+    let read_stderr = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::take(&mut stderr, CAPTURE_LIMIT as u64)
+            .read_to_end(&mut buffer)
+            .await?;
+        Ok::<_, std::io::Error>(buffer)
+    });
+
+    let result: Result<()> = tokio::select! {
+        result = child.wait() => {
+            let status = result.with_context(|| format!("hook {event}: wait failed"))?;
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error).context("terminate hook process group"),
+            }
+            ensure!(status.success(), "hook {event}: {status}");
+            crate::info!("hook: {event} completed");
+            Ok(())
+        }
+        _ = sleep_until(deadline) => {
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error).context("terminate hook process group"),
+            }
+            let _ = child.wait().await;
+            bail!("hook {event}: timed out after {} seconds", DEADLINE.as_secs())
+        }
+    };
+
+    let stdout = match tokio::time::timeout(READ_GRACE, read_stdout).await {
+        Ok(result) => result.context("read hook stdout")??,
+        Err(_) => Vec::new(),
+    };
+    let stderr = match tokio::time::timeout(READ_GRACE, read_stderr).await {
+        Ok(result) => result.context("read hook stderr")??,
+        Err(_) => Vec::new(),
+    };
+    result?;
+
+    let sanitize = |bytes: &[u8]| {
+        let end = bytes.len().min(CAPTURE_LIMIT);
+        // Control chars escape to 6 JSON bytes each; replace them to keep the
+        // worst case at 3 bytes per source byte (UTF-8 replacement chars).
+        let cleaned: Vec<u8> = bytes[..end]
+            .iter()
+            .map(|&b| {
+                if b < 0x20 && b != b'\n' && b != b'\t' {
+                    b' '
+                } else {
+                    b
+                }
+            })
+            .collect();
+        String::from_utf8_lossy(&cleaned).into_owned()
+    };
+    Ok((sanitize(&stdout), sanitize(&stderr)))
 }
