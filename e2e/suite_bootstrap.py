@@ -192,7 +192,7 @@ def test_server_hooks():
             f'server-down = "touch {down_marker} && echo down-done"\n'
         )
         with session("server-hooks", args=["svpn", "--config", str(config)]) as (process, log):
-            until(lambda: "serving" in log.read_text(), seconds=10)
+            until(lambda: "vpn: started" in log.read_text(), seconds=10)
             assert up_marker in command(ssh_to(SERVER) + [f"ls {shlex.quote(up_marker)}"]).stdout
         cleanup_verified(process)
         assert down_marker in command(ssh_to(SERVER) + [f"ls {shlex.quote(down_marker)}"]).stdout
