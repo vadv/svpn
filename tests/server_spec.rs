@@ -245,7 +245,7 @@ fn resolves_defaults_and_keeps_owned_retry_configuration() {
     assert!(retry.user.is_none());
     assert!(retry.host_key.is_none());
     assert_eq!(retry.remote_bin, "/usr/local/bin/svpn");
-    assert_eq!(retry.peer_tun_name, "svpn0");
+    assert_eq!(retry.peer_tun_name.as_deref(), Some("svpn0"));
     assert_eq!(retry.tun_addr, Ipv4Addr::new(10, 77, 0, 2));
     assert_eq!(retry.peer_addr, Ipv4Addr::new(10, 77, 0, 1));
     assert_eq!(retry.mtu, 1280);
@@ -266,6 +266,7 @@ fn per_server_values_override_all_link_defaults() {
     globals.tcp_port = Some(41000);
     globals.tun_name = Some("utun9".into());
     globals.log_level = logging::Level::Debug;
+    globals.tun_addr = Some(Ipv4Addr::new(10, 9, 0, 2));
     let value = format!(
         "198.51.100.7:2222,weight=3,user=override,identity=/key with space,hostkey={PIN},mimic=quic+mosh,remote-bin=/opt/svpn=dev,peer-tun=peer1,peer-addr=10.88.0.1,udp-ports=1-65535,tcp-port=0"
     );
@@ -281,7 +282,7 @@ fn per_server_values_override_all_link_defaults() {
     assert_eq!(params.identity, Some(PathBuf::from("/key with space")));
     assert_eq!(params.host_key, Some(PIN.parse().unwrap()));
     assert_eq!(params.remote_bin, "/opt/svpn=dev");
-    assert_eq!(params.peer_tun_name, "peer1");
+    assert_eq!(params.peer_tun_name.as_deref(), Some("peer1"));
     assert_eq!(params.peer_addr, Ipv4Addr::new(10, 88, 0, 1));
     assert_eq!(params.udp_port_range, (1, 65535));
     assert_eq!(params.tcp_port, Some(0));
@@ -307,8 +308,11 @@ fn validates_merged_configuration_before_bootstrap() {
         assert!(spec.resolve(&globals).is_err(), "{suffix}");
     }
     let spec: ServerSpec = "203.0.113.10".parse().unwrap();
+    // No peer-tun-name and no addresses: valid — automatic assignment (#181).
     globals.peer_tun_name = None;
-    assert!(spec.resolve(&globals).is_err());
+    let auto = spec.resolve(&globals).unwrap();
+    assert!(auto.addr_auto);
+    assert_eq!(auto.peer_tun_name, None);
     assert!(
         "203.0.113.10,peer-tun=tun0"
             .parse::<ServerSpec>()
@@ -317,7 +321,10 @@ fn validates_merged_configuration_before_bootstrap() {
             .is_ok()
     );
     globals.peer_tun_name = Some(String::new());
-    assert_eq!(spec.resolve(&globals).unwrap().peer_tun_name, "");
+    assert_eq!(
+        spec.resolve(&globals).unwrap().peer_tun_name.as_deref(),
+        Some("")
+    );
     globals.mtu = 575;
     assert!(spec.resolve(&globals).is_err());
     globals.mtu = 1401;

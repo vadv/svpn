@@ -33,13 +33,15 @@ pub struct Globals {
     /// Path to svpn on the server, launched over SSH.
     #[arg(long, default_value = "/usr/local/bin/svpn")]
     pub ssh_remote_bin: String,
-    /// Server TUN name; required unless overridden. Empty — let the kernel choose.
+    /// Server TUN name; unset — the kernel assigns one.
     #[arg(long)]
     pub peer_tun_name: Option<String>,
-    #[arg(long, default_value = "10.77.0.2")]
-    pub tun_addr: Ipv4Addr,
-    #[arg(long, default_value = "10.77.0.1")]
-    pub peer_addr: Ipv4Addr,
+    /// Client tunnel IPv4; unset (with peer-addr) — the server assigns a pair.
+    #[arg(long)]
+    pub tun_addr: Option<Ipv4Addr>,
+    /// Server tunnel IPv4; unset (with tun-addr) — the server assigns a pair.
+    #[arg(long)]
+    pub peer_addr: Option<Ipv4Addr>,
     #[arg(long, default_value_t = 1280)]
     pub mtu: u16,
     #[arg(long)]
@@ -104,13 +106,15 @@ pub struct LinkParams {
     pub ssh_port: u16,
     pub host_key: Option<Fingerprint>,
     pub remote_bin: String,
-    pub peer_tun_name: String,
+    pub peer_tun_name: Option<String>,
     pub log_level: logging::Level,
     pub udp_port_range: (u16, u16),
     pub mimic: Vec<MimicArg>,
     pub tcp_port: Option<u16>,
     pub tun_addr: Ipv4Addr,
     pub peer_addr: Ipv4Addr,
+    /// Server assigns the tunnel pair; tun_addr/peer_addr hold the preference.
+    pub addr_auto: bool,
     pub mtu: u16,
     pub tun_name: Option<String>,
     pub server_up: Option<String>,
@@ -189,6 +193,16 @@ impl ServerSpec {
     }
 
     pub fn resolve(&self, globals: &Globals) -> Result<LinkParams> {
+        let (tun_addr, peer_addr, addr_auto) =
+            match (globals.tun_addr, self.peer_addr.or(globals.peer_addr)) {
+                (None, None) => (
+                    crate::addrpool::pair_of(0).1,
+                    crate::addrpool::pair_of(0).0,
+                    true,
+                ),
+                (Some(tun), Some(peer)) => (tun, peer, false),
+                _ => bail!("set both tun-addr and peer-addr, or neither for automatic assignment"),
+            };
         let params = LinkParams {
             server: self.server.clone(),
             weight: self.weight.unwrap_or(1),
@@ -216,14 +230,14 @@ impl ServerSpec {
                 .peer_tun_name
                 .as_ref()
                 .or(globals.peer_tun_name.as_ref())
-                .context("peer-tun-name is required (global or per server)")?
-                .clone(),
+                .cloned(),
             log_level: globals.log_level,
             udp_port_range: self.udp_port_range.unwrap_or(globals.udp_port_range),
             mimic: self.mimic.as_ref().unwrap_or(&globals.mimic).clone(),
             tcp_port: self.tcp_port.or(globals.tcp_port),
-            tun_addr: globals.tun_addr,
-            peer_addr: self.peer_addr.unwrap_or(globals.peer_addr),
+            tun_addr,
+            peer_addr,
+            addr_auto,
             mtu: globals.mtu,
             tun_name: globals.tun_name.clone().filter(|name| !name.is_empty()),
             server_up: self.server_up.clone().or_else(|| globals.server_up.clone()),
@@ -254,8 +268,8 @@ impl ServerSpec {
             "identity must not be empty"
         );
         validate_addresses(params.tun_addr, params.peer_addr, params.mtu)?;
-        if !params.peer_tun_name.is_empty() {
-            validate_tun_name(&params.peer_tun_name)?;
+        if let Some(name) = params.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
+            validate_tun_name(name)?;
         }
         if let Some(name) = params.tun_name.as_deref().filter(|name| !name.is_empty()) {
             validate_local_tun_name(name, cfg!(target_os = "macos"))?;
@@ -367,7 +381,7 @@ impl Globals {
             parse_host_key(pin)?;
         }
         ensure!(
-            packet::unicast(self.tun_addr) && packet::unicast(self.peer_addr),
+            self.tun_addr.is_none_or(packet::unicast) && self.peer_addr.is_none_or(packet::unicast),
             "TUN addresses must be unicast IPv4"
         );
         ensure!(
@@ -470,9 +484,11 @@ pub fn resolve_perf(server: &ServerSpec, globals: &Globals) -> Result<LinkParams
     );
     globals.validate_fields()?;
     server.validate_fields()?;
-    let params = server
+    let mut params = server
         .resolve(globals)
         .with_context(|| format!("--server #1 ({})", server.server))?;
+    // Perf targets the peer address directly; keep it deterministic.
+    params.addr_auto = false;
     ensure!(
         params.mimic.len() == 1,
         "perf requires exactly one --mimic or per-server mimic"

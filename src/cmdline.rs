@@ -32,16 +32,15 @@ pub fn parse_byte_size(value: &str) -> Result<u64, String> {
 
 pub fn serve_command(
     remote_bin: &str,
-    tun_name: &str,
+    tun_name: Option<&str>,
     log_level: logging::Level,
     udp_ports: (u16, u16),
     mimic: &[MimicArg],
     tcp_port: Option<u16>,
 ) -> String {
     let mut command = format!(
-        "{} serve --tun-name {} --log-level {} --udp-port-range {}-{}",
+        "{} serve --log-level {} --udp-port-range {}-{}",
         shell_quote(remote_bin),
-        shell_quote(tun_name),
         match log_level {
             logging::Level::Error => "error",
             logging::Level::Info => "info",
@@ -50,6 +49,10 @@ pub fn serve_command(
         udp_ports.0,
         udp_ports.1,
     );
+    // No name — the server kernel assigns one; several clients never collide.
+    if let Some(name) = tun_name.filter(|name| !name.is_empty()) {
+        command.push_str(&format!(" --tun-name {}", shell_quote(name)));
+    }
     for value in mimic {
         command.push_str(" --mimic ");
         command.push_str(match value {

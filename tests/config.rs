@@ -55,7 +55,12 @@ fn typed_modes_defaults_and_inheritance() {
     assert_eq!(params[0].server, "vpn.example");
     assert_eq!((params[0].ssh_port, params[0].weight), (2222, 2));
     assert_eq!(params[0].mimic, [MimicArg::Mosh]);
-    assert!(params[0].peer_tun_name.is_empty());
+    assert!(
+        params[0]
+            .peer_tun_name
+            .as_deref()
+            .is_none_or(|v| v.is_empty())
+    );
     assert_eq!(params[1].ssh_port, 2200);
     assert!(params[1].mimic.is_empty());
 }

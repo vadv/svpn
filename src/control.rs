@@ -11,7 +11,7 @@ use tokio::{
 use crate::packet::FlowKey;
 use crate::selector::Reason;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_LINE: usize = 4096;
 pub const QUEUE: usize = 256;
 
@@ -80,10 +80,21 @@ pub enum Message {
         client_ip: Ipv4Addr,
         server_ip: Ipv4Addr,
         mtu: u16,
+        /// Client asks the server to assign a free tunnel address pair (#181).
+        addr_auto: bool,
     },
     Ready {
         version: u32,
     },
+    /// Server → client: the tunnel address pair to use (confirmed or freshly
+    /// assigned), before the server TUN is created. Client answers AcceptAddr
+    /// or DeclineAddr (address already taken locally, auto mode only).
+    Assigned {
+        server_ip: Ipv4Addr,
+        client_ip: Ipv4Addr,
+    },
+    AcceptAddr,
+    DeclineAddr,
     TunReady,
     /// Client → server: shell commands to run on the server after its TUN is up
     /// (`up`) and before it exits (`down`). Sent after server `TunReady`, before

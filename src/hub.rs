@@ -43,6 +43,8 @@ pub struct Link {
     pub latest: Option<watch::Receiver<Stats>>,
     pub stats: stats::Snapshot,
     pub last_reason: String,
+    /// Tunnel pair assigned by the server during the current attempt (#181).
+    pub assigned: Arc<std::sync::OnceLock<(Ipv4Addr, Ipv4Addr)>>,
 }
 
 pub struct Hub {
@@ -163,9 +165,14 @@ impl Hub {
                     return Ok(());
                 }
                 if tun.is_none() {
+                    let (tun_addr, peer_addr) = self.links[epoch.link]
+                        .assigned
+                        .get()
+                        .copied()
+                        .unwrap_or((params.tun_addr, params.peer_addr));
                     *tun = Some(crate::create_tun(
-                        params.tun_addr,
-                        params.peer_addr,
+                        tun_addr,
+                        peer_addr,
                         params.mtu,
                         params.tun_name.as_deref(),
                         true,
@@ -174,7 +181,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    hooks.start(name, params.tun_addr, params.peer_addr)?;
+                    hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
                     }
@@ -237,12 +244,14 @@ impl Hub {
         let link = &mut self.links[epoch.link];
         link.epoch = Some(epoch);
         link.stats.reset();
+        let assigned = Arc::new(std::sync::OnceLock::new());
+        link.assigned = assigned.clone();
         let (stats, latest) = watch::channel(Stats::default());
         link.latest = Some(latest);
         let (outgoing, packets) = mpsc::channel(QUEUE);
         link.outgoing = Some(outgoing);
         link.delivery = Arc::default();
-        let io = LinkIo {
+        let mut io = LinkIo {
             epoch,
             packets,
             events: self.events.clone(),
@@ -253,10 +262,14 @@ impl Hub {
         };
         self.tasks.spawn(async move {
             let attempt = async {
-                let (control, tail, config, server_ip) = crate::open_link(&params, &io.tag).await?;
+                let (control, tail, config, server_ip, addrs) =
+                    crate::open_link(&params, &io.tag).await?;
+                let _ = assigned.set((addrs.client_ip, addrs.server_ip));
+                io.peer_ip = addrs.server_ip;
                 let result =
-                    session::run_link(control, server_ip, params.tun_addr, params.mtu, config, io)
+                    session::run_link(control, server_ip, addrs.client_ip, params.mtu, config, io)
                         .await;
+                drop(addrs); // hold the local pair claim for the whole session
                 tail.close().await;
                 result
             };
@@ -298,7 +311,12 @@ impl Hub {
                 }, if !hooks.starting() => {
                     let length = read.context("read client TUN")?;
                     ensure!(length != 0, "client TUN closed");
-                    if let Some(reset) = self.dispatch(&buffer[..length], params.tun_addr)? {
+                    let local = self.links[0]
+                        .assigned
+                        .get()
+                        .copied()
+                        .map_or(params.tun_addr, |(client, _)| client);
+                    if let Some(reset) = self.dispatch(&buffer[..length], local)? {
                         let tun = tun.as_ref().context("TCP reset without client TUN")?;
                         let result =
                             tokio::time::timeout(Duration::from_millis(100), tun.send(&reset)).await;
@@ -462,6 +480,7 @@ pub async fn run(
                 latest: None,
                 stats: stats::Snapshot::default(),
                 last_reason: String::new(),
+                assigned: Arc::default(),
             })
             .collect(),
         pool,
