@@ -257,7 +257,7 @@ async fn run_with_capture_returns_truncated_output() {
     let hook =
         Hook::Command("printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into());
     let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
-    assert_eq!(stdout.len(), 1500);
+    assert_eq!(stdout.len(), 600);
     assert!(stdout.starts_with("out"));
     assert!(stdout.ends_with("y"));
     assert_eq!(stderr, "err");
@@ -292,4 +292,39 @@ async fn run_with_capture_reports_failure() {
     let result = run_with_capture(&hook, "up", &context()).await;
     assert!(result.is_err());
     assert!(format!("{:#}", result.err().unwrap()).contains("exit status: 7"));
+}
+
+#[tokio::test]
+async fn run_with_capture_survives_detached_grandchild_holding_pipes() {
+    // Regression: a background grandchild inherits stdout/stderr and never
+    // closes them; capture must finish within the read grace, not hang until
+    // the grandchild exits.
+    let hook = Hook::Command("sleep 60 & echo done".into());
+    let start = Instant::now();
+    let (stdout, _stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout, "done\n");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn hook_result_with_binary_output_fits_control_line() {
+    // Worst case for the control channel: invalid UTF-8 becomes replacement
+    // chars, control bytes were sanitized away; the serialized message must
+    // stay within MAX_LINE so the peer reader never rejects it.
+    let hook = Hook::Command("head -c 5000 /dev/zero | tr '\\0' '\\377'".into());
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    // 600 source bytes \u{FFFD}-replace into 3 UTF-8 bytes each.
+    assert_eq!(stdout.len(), 1800);
+    assert_eq!(stderr, "");
+    let message = svpn::control::Message::HookResult {
+        ok: true,
+        stdout,
+        stderr,
+    };
+    let line = serde_json::to_vec(&message).unwrap();
+    assert!(
+        line.len() < svpn::control::MAX_LINE,
+        "serialized hook result is {} bytes",
+        line.len()
+    );
 }

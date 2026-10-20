@@ -22,9 +22,13 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
-/// Maximum captured bytes per stream in `run_with_capture`, to keep
-/// `HookResult` within the control channel line limit (`MAX_LINE`).
-const CAPTURE_LIMIT: usize = 1500;
+/// Grace for draining hook output pipes after the process is gone: a detached
+/// grandchild (e.g. `setsid daemon &`) inherits them and never closes.
+const READ_GRACE: Duration = Duration::from_secs(1);
+/// Maximum captured bytes per stream in `run_with_capture`. The worst case
+/// after JSON escaping is ~6 bytes per source byte (see `sanitize`), so two
+/// streams must stay within the control channel line limit (`MAX_LINE`).
+const CAPTURE_LIMIT: usize = 600;
 
 #[derive(clap::Args, Default)]
 pub struct Args {
@@ -309,13 +313,31 @@ pub async fn run_with_capture(
         }
     };
 
-    let stdout = read_stdout.await.context("read hook stdout")??;
-    let stderr = read_stderr.await.context("read hook stderr")??;
+    let stdout = match tokio::time::timeout(READ_GRACE, read_stdout).await {
+        Ok(result) => result.context("read hook stdout")??,
+        Err(_) => Vec::new(),
+    };
+    let stderr = match tokio::time::timeout(READ_GRACE, read_stderr).await {
+        Ok(result) => result.context("read hook stderr")??,
+        Err(_) => Vec::new(),
+    };
     result?;
 
-    let truncate = |bytes: &[u8]| {
+    let sanitize = |bytes: &[u8]| {
         let end = bytes.len().min(CAPTURE_LIMIT);
-        String::from_utf8_lossy(&bytes[..end]).into_owned()
+        // Control chars escape to 6 JSON bytes each; replace them to keep the
+        // worst case at 3 bytes per source byte (UTF-8 replacement chars).
+        let cleaned: Vec<u8> = bytes[..end]
+            .iter()
+            .map(|&b| {
+                if b < 0x20 && b != b'\n' && b != b'\t' {
+                    b' '
+                } else {
+                    b
+                }
+            })
+            .collect();
+        String::from_utf8_lossy(&cleaned).into_owned()
     };
-    Ok((truncate(&stdout), truncate(&stderr)))
+    Ok((sanitize(&stdout), sanitize(&stderr)))
 }
