@@ -349,12 +349,16 @@ fn identity_from_private_key_file() {
 }
 
 #[test]
-fn identity_from_public_key_file_loads_agent_identity() {
+fn identity_from_public_key_file_fails() {
     let dir = std::env::temp_dir().join("svpn_ssh_tests");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("id_ed25519.pub");
     std::fs::write(&path, ED25519_PUBLIC).unwrap();
-    assert!(matches!(load_identity(&path), Ok(Identity::Agent(_))));
+    let err = load_identity(&path)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("agent"), "unexpected: {err}");
 }
 
 #[test]
