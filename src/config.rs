@@ -44,6 +44,8 @@ struct FileConfig {
     down_script: Option<PathBuf>,
     up_command: Option<String>,
     down_command: Option<String>,
+    server_up: Option<String>,
+    server_down: Option<String>,
 }
 
 pub fn load(path: &Path, multi: bool) -> Result<ClientArgs> {
@@ -144,6 +146,8 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         udp_port_range: file.udp_port_range.unwrap_or((60000, 60009)),
         mimic: file.mimic.unwrap_or_default(),
         tcp_port: file.tcp_port,
+        server_up: file.server_up,
+        server_down: file.server_down,
     };
     // Check raw values before inheritance or join("") can conceal an error.
     globals.validate_fields()?;

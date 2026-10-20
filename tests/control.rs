@@ -199,6 +199,34 @@ async fn endpoints_tcp_null_round_trip() {
     assert_eq!(back, json);
 }
 
+#[tokio::test]
+async fn server_hooks_round_trip() {
+    let message = Message::ServerHooks {
+        up: Some("echo up".to_string()),
+        down: Some("echo down".to_string()),
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(
+        json,
+        "{\"type\":\"server_hooks\",\"up\":\"echo up\",\"down\":\"echo down\"}"
+    );
+    let back = serde_json::to_string(&serde_json::from_str::<Message>(&json).unwrap()).unwrap();
+    assert_eq!(back, json);
+
+    let message = Message::HookResult {
+        ok: true,
+        stdout: "out".to_string(),
+        stderr: "err".to_string(),
+    };
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(
+        json,
+        "{\"type\":\"hook_result\",\"ok\":true,\"stdout\":\"out\",\"stderr\":\"err\"}"
+    );
+    let back = serde_json::to_string(&serde_json::from_str::<Message>(&json).unwrap()).unwrap();
+    assert_eq!(back, json);
+}
+
 // ── control send/recv ──
 
 #[tokio::test]

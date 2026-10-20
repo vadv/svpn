@@ -249,3 +249,35 @@ async fn write_script(path: &std::path::Path) {
         .await
         .unwrap();
 }
+
+// ── capture ──
+
+#[tokio::test]
+async fn run_with_capture_returns_truncated_output() {
+    let hook = Hook::Command(
+        "printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into(),
+    );
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout.len(), 4096);
+    assert!(stdout.starts_with("out"));
+    assert!(stdout.ends_with("y"));
+    assert_eq!(stderr, "err");
+}
+
+#[tokio::test]
+async fn run_with_capture_enforces_deadline_and_kills_group() {
+    let hook = Hook::Command("sleep 60".into());
+    let start = Instant::now();
+    let result = run_with_capture(&hook, "up", &context()).await;
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.err().unwrap()).contains("timed out"));
+    assert!(start.elapsed() >= Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn run_with_capture_reports_failure() {
+    let hook = Hook::Command("exit 7".into());
+    let result = run_with_capture(&hook, "up", &context()).await;
+    assert!(result.is_err());
+    assert!(format!("{:#}", result.err().unwrap()).contains("exit status: 7"));
+}

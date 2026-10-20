@@ -143,6 +143,7 @@ impl Running {
             .env("SVPN_TUN_NAME", &context.name)
             .env("SVPN_TUN_ADDR", context.local.to_string())
             .env("SVPN_PEER_ADDR", context.peer.to_string())
+            .env("SVPN_SESSION_ID", std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
             .stderr(Stdio::inherit())
@@ -240,4 +241,85 @@ pub fn resolve(script: Option<PathBuf>, command: Option<String>) -> Result<Optio
         return Ok(Some(Hook::Command(command)));
     }
     Ok(None)
+}
+
+/// Runs a hook with piped stdout/stderr and returns the truncated output.
+/// Enforces the same 10-second deadline and process-group kill as `Running`.
+pub async fn run_with_capture(
+    hook: &Hook,
+    event: &'static str,
+    context: &TunContext,
+) -> Result<(String, String)> {
+    let mut command = match hook {
+        Hook::Script(path) => Command::new(path),
+        Hook::Command(text) => {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", text]);
+            command
+        }
+    };
+    command.as_std_mut().process_group(0);
+    command
+        .env("SVPN_EVENT", event)
+        .env("SVPN_TUN_NAME", &context.name)
+        .env("SVPN_TUN_ADDR", context.local.to_string())
+        .env("SVPN_PEER_ADDR", context.peer.to_string())
+        .env("SVPN_SESSION_ID", std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("hook {event}: spawn failed"))?;
+    let id = child.id().context("hook process has no id")?;
+    let group = Pid::from_raw(i32::try_from(id).context("hook process id is out of range")?);
+    crate::info!("hook: {event} started");
+
+    let mut stdout = child.stdout.take().context("hook stdout missing")?;
+    let mut stderr = child.stderr.take().context("hook stderr missing")?;
+    let deadline = Instant::now() + DEADLINE;
+
+    let read_stdout = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buffer).await?;
+        Ok::<_, std::io::Error>(buffer)
+    });
+    let read_stderr = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buffer).await?;
+        Ok::<_, std::io::Error>(buffer)
+    });
+
+    let result: Result<()> = tokio::select! {
+        result = child.wait() => {
+            let status = result.with_context(|| format!("hook {event}: wait failed"))?;
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error).context("terminate hook process group"),
+            }
+            ensure!(status.success(), "hook {event}: {status}");
+            crate::info!("hook: {event} completed");
+            Ok(())
+        }
+        _ = sleep_until(deadline) => {
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error).context("terminate hook process group"),
+            }
+            let _ = child.wait().await;
+            bail!("hook {event}: timed out after {} seconds", DEADLINE.as_secs())
+        }
+    };
+
+    let stdout = read_stdout.await.context("read hook stdout")??;
+    let stderr = read_stderr.await.context("read hook stderr")??;
+    result?;
+
+    const CAPTURE_LIMIT: usize = 4096;
+    let truncate = |bytes: &[u8]| {
+        let end = bytes.len().min(CAPTURE_LIMIT);
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    };
+    Ok((truncate(&stdout), truncate(&stderr)))
 }

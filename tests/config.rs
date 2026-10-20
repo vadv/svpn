@@ -297,3 +297,70 @@ fn malformed_values_are_not_echoed_in_errors() {
         assert!(error.contains("line 3") && error.contains(field), "{error}");
     }
 }
+
+// ── server hooks ──
+
+#[test]
+fn server_hooks_root_and_per_server_override() {
+    let text = "server = 'vpn.example'\npeer-tun-name = 'svpn0'\n\
+                server-up = 'echo root-up'\nserver-down = 'echo root-down'\n";
+    let args = parse(text, Path::new("/config"), false).unwrap();
+    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(params[0].server_up.as_deref(), Some("echo root-up"));
+    assert_eq!(params[0].server_down.as_deref(), Some("echo root-down"));
+
+    let text = "peer-tun-name = 'svpn0'\nserver-up = 'echo root-up'\n\
+                [[servers]]\naddress = 'a.example'\n\
+                [[servers]]\naddress = 'b.example'\nserver-up = 'echo b-up'\n";
+    let args = parse(text, Path::new("/config"), true).unwrap();
+    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(params[0].server_up.as_deref(), Some("echo root-up"));
+    assert_eq!(params[1].server_up.as_deref(), Some("echo b-up"));
+    assert_eq!(params[1].server_down, None);
+}
+
+#[test]
+fn server_hooks_empty_rejected() {
+    for field in ["server-up", "server-down"] {
+        let text = format!("{SINGLE}{field} = ''\n");
+        let error = parse(&text, Path::new("."), false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("must not be empty"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+    for field in ["server-up", "server-down"] {
+        let text = format!("peer-tun-name = 'ok'\n[[servers]]\naddress = 'a.example'\n{field} = '  '\n");
+        let error = parse(&text, Path::new("."), true)
+            .err()
+            .unwrap();
+        let error = format!("{error:#}");
+        assert!(error.contains("must not be empty"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
+fn server_hooks_cli_parity() {
+    let cli = match Cli::try_parse_from([
+        "svpn",
+        "--server",
+        "vpn.example",
+        "--peer-tun-name",
+        "svpn0",
+        "--server-up",
+        "echo cli-up",
+        "--server-down",
+        "echo cli-down",
+    ])
+    .unwrap()
+    .command
+    {
+        Mode::Client(args) => args,
+        _ => unreachable!(),
+    };
+    let params = resolve_servers(&cli.server, &cli.globals).unwrap();
+    assert_eq!(params[0].server_up.as_deref(), Some("echo cli-up"));
+    assert_eq!(params[0].server_down.as_deref(), Some("echo cli-down"));
+}
