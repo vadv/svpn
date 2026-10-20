@@ -469,7 +469,7 @@ async fn serve(
     };
     perf::spawn(server_ip);
     control.send(Message::TunReady).await?;
-    let server_down = match control.recv().await? {
+    let (server_down, expect_tun_ready) = match control.recv().await? {
         Message::ServerHooks { up, down } => {
             let context = hooks::TunContext {
                 name: tun.name().context("TUN name")?,
@@ -500,15 +500,17 @@ async fn serve(
                     })
                     .await?;
             }
-            down
+            (down, true)
         }
-        Message::TunReady => None,
+        Message::TunReady => (None, false),
         _ => bail!("expected server_hooks or tun_ready"),
     };
-    ensure!(
-        matches!(bootstrap(&mut control).await?, Message::TunReady),
-        "client TUN not ready"
-    );
+    if expect_tun_ready {
+        ensure!(
+            matches!(bootstrap(&mut control).await?, Message::TunReady),
+            "client TUN not ready"
+        );
+    }
     let config = match tcp {
         Some((mode, listener)) => session::TransportConfig::Tcp {
             mode,

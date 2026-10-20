@@ -165,6 +165,67 @@ nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
 server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
 ```
 
+### Как это работает
+
+```
+Client (Router)                    Server (VDS)
+     |                                  |
+     |== 1. SSH handshake =============|
+     |-------- TCP connect ------------>|
+     |<------- SSH key exchange ------->|
+     |-------- auth (publickey) ------->|
+     |-------- channel open ----------->|
+     |-------- exec "svpn serve" ------>|
+     |                                  |
+     |== 2. Control bootstrap =========|
+     |<--------- Hello ----------------|
+     |<--------- Ready ----------------|
+     |<--------- Endpoints ------------|
+     |                                  |
+     |== 3. Server TUN + Hooks ========|
+     |                                  |--- create TUN
+     |<--------- TunReady --------------|
+     |-------- ServerHooks {up,down} -->|
+     |                                  |--- run up (sh -c, 10s)
+     |<--------- HookResult {ok,logs} --|
+     |-- ok? --+-- No ---------------> fail fast
+     |         |
+     |         +-- Yes --> create client TUN
+     |-------- TunReady --------------->|
+     |                                  |
+     |== 4. Transport selection =======|
+     |-------- ChannelPrepare --------->| (per candidate)
+     |<-------- ChannelReady -----------|
+     |-------- ICMP echo -------------->|
+     |<-------- ICMP reply -------------|
+     |-- first round-trip wins ---------|
+     |-- close others ------------------|
+     |                                  |
+     |== 5. Data flow =================|
+     |<======== IP packets ============>|
+     |                                  |
+     |== 6. Shutdown ==================|
+     |-------- EOF / SIGTERM ---------->|
+     |                                  |--- run down
+     |                                  |--- exit
+```
+
+### Приоритет конфигурации
+
+```toml
+server-up = "default"           # root: applies to all servers
+
+[[servers]]
+host = "a.example.com"
+server-up = "custom-a"          # overrides root for this server
+
+[[servers]]
+host = "b.example.com"
+# no override -> uses root "default"
+```
+
+Разрешение: per-server > root. Нет нигде — нет hooks.
+
 `tcp-port` закрепляет TCP-запасной канал за портом, открытым на шаге 2. Без
 него fallback выберет эфемерный порт, который файрвол, скорее всего, отбросит.
 
