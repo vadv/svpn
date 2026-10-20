@@ -478,15 +478,15 @@ async fn serve(
             };
             if let Some(up) = up {
                 let hook = hooks::Hook::Command(up);
-                let (ok, stdout, stderr) = match hooks::run_with_capture(&hook, "up", &context).await
-                {
-                    Ok((stdout, stderr)) => (true, stdout, stderr),
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        crate::error!("hook: up failed — {message}");
-                        (false, String::new(), message)
-                    }
-                };
+                let (ok, stdout, stderr) =
+                    match hooks::run_with_capture(&hook, "up", &context).await {
+                        Ok((stdout, stderr)) => (true, stdout, stderr),
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            crate::error!("hook: up failed — {message}");
+                            (false, String::new(), message)
+                        }
+                    };
                 control
                     .send(Message::HookResult { ok, stdout, stderr })
                     .await?;

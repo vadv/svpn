@@ -142,6 +142,29 @@ Hooks — обычные shell-команды, которые выполняют
 Ошибка `up-command` прерывает подключение и всё равно вызывает down hook для
 уборки. Для исполняемых файлов вместо строк есть `up-script` / `down-script`.
 
+### Server hooks
+
+`server-up` / `server-down` — shell-команды, которые выполняются **на сервере**
+через `/bin/sh -c`. Ничего не нужно настраивать на сервере: конфигурация только
+в клиентском TOML. `server-up` запускается после поднятия серверного TUN,
+`server-down` — перед выходом серверного процесса. Сервер возвращает
+stdout/stderr (до 4 КиБ) и код возврата; ошибка `server-up` прерывает
+подключение. Для per-server override задайте поля в `[[servers]]`.
+
+```toml
+server-up = '''
+sysctl -q net.ipv4.ip_forward=1 || exit 1
+EGRESS=$(ip -4 route show default | awk '{print $5; exit}')
+nft -f - <<NFT
+table ip svpn { set peers { type ipv4_addr; } chain post { type nat hook postrouting priority srcnat; policy accept; } }
+flush chain ip svpn post
+add rule ip svpn post ip saddr @peers oifname "$EGRESS" masquerade
+NFT
+nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
+'''
+server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
+```
+
 `tcp-port` закрепляет TCP-запасной канал за портом, открытым на шаге 2. Без
 него fallback выберет эфемерный порт, который файрвол, скорее всего, отбросит.
 

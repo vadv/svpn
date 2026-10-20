@@ -254,9 +254,8 @@ async fn write_script(path: &std::path::Path) {
 
 #[tokio::test]
 async fn run_with_capture_returns_truncated_output() {
-    let hook = Hook::Command(
-        "printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into(),
-    );
+    let hook =
+        Hook::Command("printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into());
     let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
     assert_eq!(stdout.len(), 4096);
     assert!(stdout.starts_with("out"));

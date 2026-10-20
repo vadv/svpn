@@ -142,6 +142,29 @@ never have to guess `utunN`. Hooks get 10 seconds. A failing `up-command`
 aborts the connection and still runs the down hook for cleanup. For executable
 files instead of inline commands, use `up-script` / `down-script`.
 
+### Server hooks
+
+`server-up` / `server-down` are shell commands that run **on the server**
+through `/bin/sh -c`. Nothing to configure on the server: everything lives in
+the client TOML. `server-up` runs after the server TUN is up, `server-down`
+before the server process exits. The server returns stdout/stderr (up to 4
+KiB) and the exit code; a failing `server-up` aborts the connection. For
+per-server overrides, set the fields in `[[servers]]`.
+
+```toml
+server-up = '''
+sysctl -q net.ipv4.ip_forward=1 || exit 1
+EGRESS=$(ip -4 route show default | awk '{print $5; exit}')
+nft -f - <<NFT
+table ip svpn { set peers { type ipv4_addr; } chain post { type nat hook postrouting priority srcnat; policy accept; } }
+flush chain ip svpn post
+add rule ip svpn post ip saddr @peers oifname "$EGRESS" masquerade
+NFT
+nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
+'''
+server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
+```
+
 `tcp-port` pins the TCP fallback to the port you opened in step 2. Without it
 the fallback picks an ephemeral port that your firewall will most likely drop.
 

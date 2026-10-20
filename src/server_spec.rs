@@ -371,9 +371,7 @@ impl Globals {
             validate_local_tun_name(name, cfg!(target_os = "macos")).context("tun-name")?;
         }
         ensure!(
-            self.server_up
-                .as_ref()
-                .is_none_or(|v| !v.trim().is_empty()),
+            self.server_up.as_ref().is_none_or(|v| !v.trim().is_empty()),
             "server-up must not be empty"
         );
         ensure!(

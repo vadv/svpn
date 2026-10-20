@@ -23,7 +23,7 @@ fn readme_configs_match_and_validate() {
     }
     let blocks = configs(include_str!("../README.md"));
     assert_eq!(blocks, configs(include_str!("../README.en.md")));
-    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks.len(), 3);
     let base = blocks[0]
         .lines()
         .filter(|line| !line.starts_with("up-command") && !line.starts_with("down-command"))
@@ -72,6 +72,17 @@ fn readme_configs_match_and_validate() {
         };
         assert_eq!(output.stdout, expected.as_bytes());
     }
+    let server_hooks = parse(
+        &format!(
+            "server = 'vpn.example.com'\npeer-tun-name = 'svpn0'\n{}",
+            blocks[2]
+        ),
+        Path::new("/config"),
+        false,
+    )
+    .unwrap();
+    assert!(server_hooks.globals.server_up.is_some());
+    assert!(server_hooks.globals.server_down.is_some());
 }
 
 // ── defaults and inheritance ──
@@ -331,10 +342,9 @@ fn server_hooks_empty_rejected() {
         assert!(error.contains(field), "{error}");
     }
     for field in ["server-up", "server-down"] {
-        let text = format!("peer-tun-name = 'ok'\n[[servers]]\naddress = 'a.example'\n{field} = '  '\n");
-        let error = parse(&text, Path::new("."), true)
-            .err()
-            .unwrap();
+        let text =
+            format!("peer-tun-name = 'ok'\n[[servers]]\naddress = 'a.example'\n{field} = '  '\n");
+        let error = parse(&text, Path::new("."), true).err().unwrap();
         let error = format!("{error:#}");
         assert!(error.contains("must not be empty"), "{error}");
         assert!(error.contains(field), "{error}");
