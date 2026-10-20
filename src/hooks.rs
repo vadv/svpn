@@ -216,7 +216,9 @@ impl Running {
 
     fn kill_group(&self) -> Result<()> {
         match killpg(self.group, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            // macOS returns EPERM when the group has only unsignalable zombies
+            // (BSD killpg quirk); both mean the group is effectively gone.
+            Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => Ok(()),
             Err(error) => Err(error).context("terminate hook process group"),
         }
     }
@@ -296,7 +298,7 @@ pub async fn run_with_capture(
         result = child.wait() => {
             let status = result.with_context(|| format!("hook {event}: wait failed"))?;
             match killpg(group, Signal::SIGKILL) {
-                Ok(()) | Err(Errno::ESRCH) => {}
+                Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => {}
                 Err(error) => return Err(error).context("terminate hook process group"),
             }
             ensure!(status.success(), "hook {event}: {status}");
