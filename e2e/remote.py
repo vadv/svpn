@@ -239,10 +239,7 @@ def run(args):
     work, bandwidth = base / (ip + "-" + token), base / "bandwidth"
     work.mkdir(parents=True, mode=0o700)
     bandwidth.mkdir(exist_ok=True)
-    binary, known, identity = (Path(x).resolve() for x in (args.binary, args.known_hosts, args.ssh_identity))
-    public = identity.read_text().strip()
-    assert public.startswith(("ssh-rsa ", "ssh-ed25519 ", "ecdsa-sha2-")), "identity must be PUBLIC"
-    (work / "identity.pub").write_text(public + "\n")
+    binary, known = (Path(x).resolve() for x in (args.binary, args.known_hosts))
     host_pin = known_host_pin(command(["ssh-keygen", "-F", ip, "-f", str(known)]).stdout.decode())
     ssh = [
         "ssh",
@@ -339,8 +336,6 @@ def run(args):
                 ip,
                 "--ssh-user",
                 "root",
-                "--ssh-identity",
-                "/run/check/identity.pub",
                 "--ssh-host-key",
                 host_pin,
                 "--ssh-remote-bin",
@@ -489,7 +484,6 @@ if __name__ == "__main__":
         required=True,
         help="OpenSSH known_hosts with exactly one unmarked key for this server",
     )
-    p.add_argument("--ssh-identity", required=True, help="public key available in the VM SSH agent")
     p.add_argument("--agent-socket", default="/run/host-services/ssh-auth.sock")
     p.add_argument("--seconds", type=int, default=900)
     p.add_argument("--image", default="svpn-test:local")
