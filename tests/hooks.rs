@@ -257,10 +257,23 @@ async fn run_with_capture_returns_truncated_output() {
     let hook =
         Hook::Command("printf 'out'; printf 'err' >&2; printf '%*s' 5000 x | tr ' ' y".into());
     let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
-    assert_eq!(stdout.len(), 4096);
+    assert_eq!(stdout.len(), 1500);
     assert!(stdout.starts_with("out"));
     assert!(stdout.ends_with("y"));
     assert_eq!(stderr, "err");
+}
+
+#[tokio::test]
+async fn run_with_capture_supports_script() {
+    let dir = temporary_dir();
+    let path = dir.join("script");
+    write_script(&path).await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hook = Hook::Script(path);
+    let (stdout, stderr) = run_with_capture(&hook, "up", &context()).await.unwrap();
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

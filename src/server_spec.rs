@@ -156,10 +156,24 @@ impl ServerSpec {
             "server-up must not be empty"
         );
         ensure!(
+            self.server_up
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-up exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
+        );
+        ensure!(
             self.server_down
                 .as_ref()
                 .is_none_or(|v| !v.trim().is_empty()),
             "server-down must not be empty"
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-down exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
         );
         if let Some(name) = self.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
             validate_tun_name(name).context("peer-tun-name")?;
@@ -375,10 +389,24 @@ impl Globals {
             "server-up must not be empty"
         );
         ensure!(
+            self.server_up
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-up exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
+        );
+        ensure!(
             self.server_down
                 .as_ref()
                 .is_none_or(|v| !v.trim().is_empty()),
             "server-down must not be empty"
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-down exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
         );
         validate_mimic_fields(&self.mimic)
     }

@@ -16,11 +16,15 @@ use nix::{
     unistd::{AccessFlags, Pid, faccessat},
 };
 use tokio::{
+    io::AsyncReadExt,
     process::{Child, Command},
     time::{Instant, sleep_until},
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
+/// Maximum captured bytes per stream in `run_with_capture`, to keep
+/// `HookResult` within the control channel line limit (`MAX_LINE`).
+const CAPTURE_LIMIT: usize = 1500;
 
 #[derive(clap::Args, Default)]
 pub struct Args {
@@ -128,7 +132,7 @@ impl Hooks {
 }
 
 impl Running {
-    pub fn spawn(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Self> {
+    fn command(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Command> {
         let mut command = match hook {
             Hook::Script(path) => Command::new(path),
             Hook::Command(text) => {
@@ -145,9 +149,15 @@ impl Running {
             .env("SVPN_PEER_ADDR", context.peer.to_string())
             .env("SVPN_SESSION_ID", std::process::id().to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
-            .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        Ok(command)
+    }
+
+    pub fn spawn(hook: &Hook, event: &'static str, context: &TunContext) -> Result<Self> {
+        let mut command = Self::command(hook, event, context)?;
+        command
+            .stdout(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
+            .stderr(Stdio::inherit());
         let child = command
             .spawn()
             .with_context(|| format!("hook {event}: spawn failed"))?;
@@ -250,25 +260,8 @@ pub async fn run_with_capture(
     event: &'static str,
     context: &TunContext,
 ) -> Result<(String, String)> {
-    let mut command = match hook {
-        Hook::Script(path) => Command::new(path),
-        Hook::Command(text) => {
-            let mut command = Command::new("/bin/sh");
-            command.args(["-c", text]);
-            command
-        }
-    };
-    command.as_std_mut().process_group(0);
-    command
-        .env("SVPN_EVENT", event)
-        .env("SVPN_TUN_NAME", &context.name)
-        .env("SVPN_TUN_ADDR", context.local.to_string())
-        .env("SVPN_PEER_ADDR", context.peer.to_string())
-        .env("SVPN_SESSION_ID", std::process::id().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut command = Running::command(hook, event, context)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("hook {event}: spawn failed"))?;
@@ -282,12 +275,16 @@ pub async fn run_with_capture(
 
     let read_stdout = tokio::spawn(async move {
         let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buffer).await?;
+        tokio::io::AsyncReadExt::take(&mut stdout, CAPTURE_LIMIT as u64)
+            .read_to_end(&mut buffer)
+            .await?;
         Ok::<_, std::io::Error>(buffer)
     });
     let read_stderr = tokio::spawn(async move {
         let mut buffer = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buffer).await?;
+        tokio::io::AsyncReadExt::take(&mut stderr, CAPTURE_LIMIT as u64)
+            .read_to_end(&mut buffer)
+            .await?;
         Ok::<_, std::io::Error>(buffer)
     });
 
@@ -316,7 +313,6 @@ pub async fn run_with_capture(
     let stderr = read_stderr.await.context("read hook stderr")??;
     result?;
 
-    const CAPTURE_LIMIT: usize = 4096;
     let truncate = |bytes: &[u8]| {
         let end = bytes.len().min(CAPTURE_LIMIT);
         String::from_utf8_lossy(&bytes[..end]).into_owned()

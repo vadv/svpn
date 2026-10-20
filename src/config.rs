@@ -18,6 +18,9 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 pub const MAX_CONFIG: u64 = 1024 * 1024;
+/// Maximum length of a server hook command, to keep `ServerHooks` within the
+/// control channel line limit (`MAX_LINE`).
+pub const MAX_SERVER_HOOK: usize = 1500;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]

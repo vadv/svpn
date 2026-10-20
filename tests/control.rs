@@ -227,6 +227,34 @@ async fn server_hooks_round_trip() {
     assert_eq!(back, json);
 }
 
+#[tokio::test]
+async fn server_hooks_and_hook_result_fit_control_line() {
+    let max = "x".repeat(svpn::config::MAX_SERVER_HOOK);
+    let message = Message::ServerHooks {
+        up: Some(max.clone()),
+        down: Some(max),
+    };
+    let line = serde_json::to_string(&message).unwrap();
+    assert!(
+        line.len() < MAX_LINE,
+        "ServerHooks line budget: {}",
+        line.len()
+    );
+
+    let max = "x".repeat(1500);
+    let message = Message::HookResult {
+        ok: true,
+        stdout: max.clone(),
+        stderr: max,
+    };
+    let line = serde_json::to_string(&message).unwrap();
+    assert!(
+        line.len() < MAX_LINE,
+        "HookResult line budget: {}",
+        line.len()
+    );
+}
+
 // ── control send/recv ──
 
 #[tokio::test]
