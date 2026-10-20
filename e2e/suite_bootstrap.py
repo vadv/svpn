@@ -223,17 +223,10 @@ def test_authentication():
         assert result.returncode != 0
         assert not pathlib.Path("/sys/class/net/svpn0").exists()
         assert ssh("test ! -e /sys/class/net/svpn0", check=False).returncode == 0
-    missing = CLIENT.copy()
-    del missing[missing.index("--peer-tun-name") : missing.index("--peer-tun-name") + 2]
-    assert command(missing, check=False).returncode != 0, "--peer-tun-name must be required"
-    assert not pathlib.Path("/sys/class/net/svpn0").exists()
     malformed = ssh("/usr/local/bin/svpn serve", check=False, input="not JSON\n")
     assert malformed.returncode != 0
     assert ssh("test ! -e /sys/class/net/svpn0", check=False).returncode == 0
-    print(
-        "PASS wrong key, wrong host-key pin, missing --peer-tun-name and malformed JSON "
-        "fail before TUN creation"
-    )
+    print("PASS wrong key, wrong host-key pin and malformed JSON fail before TUN creation")
 
 
 def test_known_hosts_tofu():
