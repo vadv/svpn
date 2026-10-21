@@ -266,3 +266,17 @@ fn repeated_bans_double_the_backoff_and_success_resets_it() {
         "reset backoff expires at 12m"
     );
 }
+
+// ── e2e hook (EPIC-016) ──
+
+#[test]
+fn ban_backoff_hook_only_shortens_the_first_ban() {
+    use std::time::Duration;
+    use svpn::selector::ban_backoff_from;
+    let start = Duration::from_secs(600);
+    assert_eq!(ban_backoff_from(None), start, "unset keeps the default");
+    assert_eq!(ban_backoff_from(Some("garbage")), start);
+    assert_eq!(ban_backoff_from(Some("0")), start, "zero is not a shrink");
+    assert_eq!(ban_backoff_from(Some("3")), Duration::from_secs(3));
+    assert_eq!(ban_backoff_from(Some("999999")), start, "never lengthens");
+}

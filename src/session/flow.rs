@@ -224,6 +224,7 @@ impl Session {
         if plane.flows.contains_key(&flow_id)
             || (flow_id != PREFLIGHT_ID && plane.by_key.contains_key(&flow))
         {
+            crate::debug!("flow_open reject duplicate id={flow_id}");
             return self
                 .control
                 .send(Message::FlowReject {

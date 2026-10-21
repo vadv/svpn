@@ -284,7 +284,10 @@ impl Session {
         let Plane::Channels(plane) = &mut self.plane else {
             unreachable!()
         };
-        plane.flows.insert(attempt, Flow::new(key, now));
+        // The committed probe requires the bound channel on the flow.
+        let mut probe = Flow::new(key, now);
+        probe.channel = Some(channel);
+        plane.flows.insert(attempt, probe);
         crate::debug!(
             "{} health: burst attempt={attempt} channel={channel} icmp_id={icmp_id} borrowed={borrowed}",
             prefixed(self.tag(), "channel")

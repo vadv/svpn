@@ -13,12 +13,34 @@ use tokio::task::JoinSet;
 
 #[allow(dead_code)] // unused by some of the including test targets
 pub fn link_session(tcp: bool) -> (Session, mpsc::Receiver<(link_io::Epoch, link_io::Event)>) {
-    link_session_cap(tcp, 1)
+    link_session_with(tcp, Control::new(tokio::io::empty(), tokio::io::sink()))
+}
+
+/// `link_session` with an injectable control transport: tests read the
+/// JSONL the session actually puts on the wire.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn link_session_with(
+    tcp: bool,
+    control: Control,
+) -> (Session, mpsc::Receiver<(link_io::Epoch, link_io::Event)>) {
+    link_session_cap_with(tcp, control, 1)
 }
 
 #[allow(dead_code)] // unused by some of the including test targets
 pub fn link_session_cap(
     tcp: bool,
+    events_capacity: usize,
+) -> (Session, mpsc::Receiver<(link_io::Epoch, link_io::Event)>) {
+    link_session_cap_with(
+        tcp,
+        Control::new(tokio::io::empty(), tokio::io::sink()),
+        events_capacity,
+    )
+}
+
+fn link_session_cap_with(
+    tcp: bool,
+    control: Control,
     events_capacity: usize,
 ) -> (Session, mpsc::Receiver<(link_io::Epoch, link_io::Event)>) {
     let (events, returned) = mpsc::channel(events_capacity);
@@ -46,7 +68,7 @@ pub fn link_session_cap(
     };
     (
         Session {
-            control: Control::new(tokio::io::empty(), tokio::io::sink()),
+            control,
             io: PacketIo::Link(LinkIo {
                 epoch: link_io::Epoch {
                     link: 2,

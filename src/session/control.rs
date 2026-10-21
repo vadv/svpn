@@ -359,6 +359,7 @@ impl Session {
             if challenger.channel.is_some() {
                 return Ok(());
             }
+            crate::debug!("challenge: channel_ready bound attempt={attempt} channel={channel}");
             (challenger.candidate, challenger.peer.take())
         } else {
             let Some((pending_attempt, candidate, pending_channel, peer)) = plane.attempt.as_mut()

@@ -115,6 +115,23 @@ struct FlowSel {
 
 /// First ban duration; doubles per consecutive failure, capped (EPIC-016).
 const BAN_BACKOFF_START: Duration = Duration::from_secs(600);
+
+/// e2e hook: `SVPN_TEST_BAN_BACKOFF_SECS` shrinks the first ban (and, while
+/// set, pins every re-ban to the same value) so ban-expiry recovery fits
+/// test budgets. Unset in production; a malformed value keeps the default.
+/// Can only shorten bans, never lengthen them.
+fn ban_backoff_start() -> Duration {
+    ban_backoff_from(std::env::var("SVPN_TEST_BAN_BACKOFF_SECS").ok().as_deref())
+}
+
+/// Pure parse behind the e2e hook: tested directly in tests/selector_proactive.rs.
+pub fn ban_backoff_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(BAN_BACKOFF_START, |secs| {
+            BAN_BACKOFF_START.min(Duration::from_secs(secs))
+        })
+}
 /// Ban backoff never grows past this.
 const BAN_BACKOFF_CAP: Duration = Duration::from_secs(2 * 3600);
 
@@ -606,9 +623,15 @@ impl Selector {
             .ban_backoff
             .get(&candidate)
             .copied()
-            .unwrap_or(BAN_BACKOFF_START);
-        self.ban_backoff
-            .insert(candidate, (base * 2).min(BAN_BACKOFF_CAP));
+            .unwrap_or_else(ban_backoff_start);
+        // With the e2e hook active every re-ban stays pinned to it: the
+        // doubling would push ban-expiry recovery past any test budget.
+        let next = if ban_backoff_start() < BAN_BACKOFF_START {
+            ban_backoff_start()
+        } else {
+            (base * 2).min(BAN_BACKOFF_CAP)
+        };
+        self.ban_backoff.insert(candidate, next);
         // Deterministic jitter in ±20%: decorrelates fleet retries without a RNG.
         let pct = (self.ban_seq % 41) as i64 - 20;
         self.ban_seq = self.ban_seq.wrapping_add(1);

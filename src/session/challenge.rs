@@ -36,7 +36,7 @@ pub struct Challenge {
     /// Bound attempts waiting for the burst slot.
     pub queue: VecDeque<u64>,
     /// Finished bursts: (candidate, channel, outcome).
-    pub measured: Vec<(Candidate, u64, Outcome)>,
+    pub measured: Vec<(Candidate, u64, u64, Outcome)>,
     pub deadline: Instant,
 }
 
@@ -153,7 +153,11 @@ impl Session {
     }
 
     /// A challenger channel bound: build its probe flow and queue the burst.
-    /// Called from `channel_ready`, before the channel task reports `Bound`.
+    /// Called from `channel_ready` (QUIC: from the handshake task event),
+    /// before the channel task reports `Established`. The probe `FlowOpen`
+    /// goes out on `Established` — announcing earlier races the server's
+    /// channel-task spawn, and the `Established` handler is the single sender
+    /// (a bind-time send duplicates it and draws a `FlowReject`).
     pub(crate) fn challenge_channel_bound(&mut self, attempt: u64, channel: u64) -> Result<()> {
         let PacketIo::Link(io) = &self.io else {
             bail!("challenge requires a packet port");
@@ -189,7 +193,10 @@ impl Session {
             source_port: icmp_id,
             destination_port: 0,
         };
-        plane.flows.insert(attempt, Flow::new(key, Instant::now()));
+        // The committed probe requires the bound channel on the flow.
+        let mut probe = Flow::new(key, Instant::now());
+        probe.channel = Some(channel);
+        plane.flows.insert(attempt, probe);
         let mut payload = vec![0u8; 32];
         getrandom::fill(&mut payload).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
         let base_seq = u16::from_ne_bytes(crypto::random()?);
@@ -249,7 +256,7 @@ impl Session {
             };
             challenge
                 .measured
-                .push((challenger.candidate, channel, outcome));
+                .push((challenger.candidate, channel, attempt, outcome));
         }
         self.challenge_drive(Instant::now()).await
     }
@@ -295,8 +302,9 @@ impl Session {
 
     /// Verdict: the measured challenger with the lowest p90 replaces the
     /// TCP incumbent immediately (UDP beats TCP by construction); the
-    /// losers' channels retire. With no measurement every challenger is
-    /// already banned and the incumbent keeps serving.
+    /// losers' channels retire. Dead challengers (no reply at all) re-ban
+    /// with the doubled backoff — keeping them allowed would restart the
+    /// challenge on every health tick. Every probe flow closes.
     async fn finish_challenge(&mut self, expired: bool) -> Result<()> {
         let Some(mut challenge) = self.challenge.take() else {
             return Ok(());
@@ -350,12 +358,23 @@ impl Session {
         let best = challenge
             .measured
             .iter()
-            .filter_map(|(candidate, channel, outcome)| {
-                outcome.p90.map(|p90| (*candidate, *channel, p90))
+            .filter_map(|(candidate, channel, attempt, outcome)| {
+                outcome.p90.map(|p90| (*candidate, *channel, *attempt, p90))
             })
             .min_by_key(|(.., p90)| *p90);
         let winner_channel = best.map(|(_, channel, ..)| channel);
-        for (candidate, channel, _) in &challenge.measured {
+        for (candidate, _, _, outcome) in &challenge.measured {
+            if outcome.p90.is_none()
+                && let Plane::Channels(plane) = &mut self.plane
+                && let Some(selector) = plane.selector.as_mut()
+            {
+                selector.ban_candidate(*candidate, Reason::PathTimeout, StdInstant::now());
+            }
+        }
+        for (candidate, channel, attempt, _) in &challenge.measured {
+            // The probe flow served its purpose even for the winner; its
+            // channel stays and later health bursts open fresh flows.
+            self.close_flow(*attempt, true).await?;
             if winner_channel == Some(*channel) {
                 continue;
             }
@@ -377,7 +396,7 @@ impl Session {
                 .await?;
         }
         match best {
-            Some((candidate, channel, p90)) => {
+            Some((candidate, channel, _, p90)) => {
                 if let Plane::Channels(plane) = &mut self.plane
                     && let Some(selector) = plane.selector.as_mut()
                 {
