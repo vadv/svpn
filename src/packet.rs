@@ -305,21 +305,30 @@ pub fn icmp_echo_request(
 /// intact checksum, and the exact id/seq/payload we sent. The caller already
 /// knows the packet arrived on the probe flow; this verifies the content.
 pub fn icmp_echo_reply_matches(bytes: &[u8], id: u16, seq: u16, payload: &[u8]) -> bool {
+    icmp_echo_reply_seq(bytes, id, payload) == Some(seq)
+}
+
+/// Like [`icmp_echo_reply_matches`], but the sequence number is unknown
+/// upfront: the caller decides whether the returned sequence is ours.
+pub fn icmp_echo_reply_seq(bytes: &[u8], id: u16, payload: &[u8]) -> Option<u16> {
     if bytes.len() < 28 || bytes[0] >> 4 != 4 {
-        return false;
+        return None;
     }
     let header = usize::from(bytes[0] & 15) * 4;
     if header < 20 || bytes.len() < header + 8 || bytes[9] != 1 {
-        return false;
+        return None;
     }
     if usize::from(u16::from_be_bytes([bytes[2], bytes[3]])) != bytes.len() {
-        return false;
+        return None;
     }
     let icmp = &bytes[header..];
     if icmp[0] != 0 || icmp[1] != 0 || !icmp_checksum_ok(icmp) {
-        return false;
+        return None;
     }
-    icmp[4..6] == id.to_be_bytes() && icmp[6..8] == seq.to_be_bytes() && icmp[8..] == *payload
+    if icmp[4..6] != id.to_be_bytes() || icmp[8..] != *payload {
+        return None;
+    }
+    Some(u16::from_be_bytes([icmp[6], icmp[7]]))
 }
 
 fn icmp_checksum_ok(icmp: &[u8]) -> bool {

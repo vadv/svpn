@@ -397,6 +397,45 @@ impl Session {
     /// Client: `committed` received — the pre-active queue drains to the channel.
     pub async fn committed(&mut self, flow_id: u64) -> Result<()> {
         if is_probe_flow(flow_id) {
+            // EPIC-016: a health burst owns this probe id, not the round.
+            if self
+                .burst
+                .as_ref()
+                .is_some_and(|burst| burst.attempt == flow_id)
+            {
+                let now = tokio::time::Instant::now();
+                let Some(burst) = self.burst.as_mut() else {
+                    return Ok(());
+                };
+                let Plane::Channels(plane) = &mut self.plane else {
+                    return Ok(());
+                };
+                let Some(flow) = plane.flows.get_mut(&flow_id) else {
+                    return Ok(());
+                };
+                ensure!(
+                    flow.channel == Some(burst.channel),
+                    "unexpected burst committed channel"
+                );
+                flow.active = true;
+                let request = packet::icmp_echo_request(
+                    flow.key.source,
+                    flow.key.destination,
+                    burst.icmp_id,
+                    burst.seq(0),
+                    &burst.payload,
+                );
+                if let Some(handle) = plane.channels.get(&burst.channel) {
+                    // A full datagram queue is packet loss; it ends as loss.
+                    handle
+                        .command
+                        .try_send(TaskCommand::Data(flow_id, request))
+                        .ok();
+                }
+                burst.arm(now);
+                burst.mark_sent(now);
+                return Ok(());
+            }
             let Some(rc) = self
                 .round
                 .as_mut()

@@ -803,6 +803,10 @@ impl Session {
         }
         permit.send((io.epoch, link_io::Event::Ready));
         self.readiness = Some(Readiness::Ready);
+        // EPIC-016: health bursts start once the link is Ready.
+        self.health_at = self
+            .client()
+            .then_some(now + crate::session::burst::HEALTH_INTERVAL);
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {

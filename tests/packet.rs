@@ -417,3 +417,29 @@ fn segment_meta(bytes: &[u8]) -> (u8, u32, u32) {
         dword(bytes, 28).unwrap(),
     )
 }
+
+// ── burst echo matching (EPIC-016) ──
+
+#[test]
+fn echo_reply_seq_matches_id_and_payload_without_seq() {
+    let request = svpn::packet::icmp_echo_request(
+        std::net::Ipv4Addr::new(10, 77, 0, 2),
+        std::net::Ipv4Addr::new(10, 77, 0, 1),
+        4242,
+        7,
+        &[9, 9, 9],
+    );
+    let reply = common::echo_reply(&request);
+    assert_eq!(
+        svpn::packet::icmp_echo_reply_seq(&reply, 4242, &[9, 9, 9]),
+        Some(7)
+    );
+    assert_eq!(
+        svpn::packet::icmp_echo_reply_seq(&reply, 4243, &[9, 9, 9]),
+        None
+    );
+    assert_eq!(
+        svpn::packet::icmp_echo_reply_seq(&reply, 4242, &[9, 9, 8]),
+        None
+    );
+}

@@ -350,9 +350,17 @@ impl Hub {
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
                     let reason = result.err().map_or_else(|| "session ended".to_string(), |e| format!("{e:#}"));
+                    let link = &self.links[epoch.link];
+                    // EPIC-016: name the transport that was live when the link died.
+                    let transport = link
+                        .latest
+                        .as_ref()
+                        .and_then(|rx| rx.borrow().active_candidate.clone())
+                        .map(|candidate| format!(" ({candidate})"))
+                        .unwrap_or_default();
                     if self.links.len() > 1 {
-                        crate::error!("vpn[{}]: link failed — {reason}", self.links[epoch.link].params.server);
-                    } else { crate::error!("vpn: link failed — {reason}"); }
+                        crate::error!("vpn[{}]: link failed{transport} — {reason}", link.params.server);
+                    } else { crate::error!("vpn: link failed{transport} — {reason}"); }
                     // A Ready of another link may already sit in `incoming`
                     // while this completion was picked first: pool.failed()
                     // counts ready links, so drain everything queued before

@@ -31,6 +31,7 @@ use crate::selector::{Allowed, Candidate, Reason, Selector};
 use crate::udp::Incoming;
 use crate::{channel, quic};
 
+pub mod burst;
 mod control;
 mod event;
 mod flow;
@@ -102,6 +103,10 @@ pub struct Session {
     pub stats: Stats,
     /// Precomputed `drop[host]:` prefix — every loss logs its reason (#124).
     pub drop_prefix: String,
+    /// EPIC-016: next health burst at; armed on Ready, re-armed per burst.
+    pub health_at: Option<tokio::time::Instant>,
+    /// EPIC-016: in-flight probe burst over the live channel.
+    pub burst: Option<burst::Burst>,
 }
 
 impl Session {
@@ -164,6 +169,7 @@ impl Session {
                 deadline = deadline.min(sd);
             }
             let round_wake = self.round.as_ref().and_then(|round| round.decide_at);
+            let health_wake = self.health_wake();
             let result = with_heartbeat_deadline(deadline, async {
                 tokio::select! {
                     message = self.control.recv() => {
@@ -233,6 +239,10 @@ impl Session {
                         // waiting for the heartbeat tick.
                         self.poll_round(tokio::time::Instant::now()).await?;
                     }
+                    _ = tokio::time::sleep_until(health_wake.unwrap_or(deadline)), if health_wake.is_some() => {
+                        // Health burst due or in flight (EPIC-016).
+                        self.poll_burst(tokio::time::Instant::now()).await?;
+                    }
                     _ = tick.tick() => {
                         let now = tokio::time::Instant::now();
                         self.expire_flows(now).await?;
@@ -261,6 +271,7 @@ impl Session {
                             self.execute_actions(actions).await?;
                         }
                         self.poll_round(now).await?;
+                        self.poll_burst(now).await?;
                     }
                 }
                 if !self.accepts_packets()
@@ -508,6 +519,8 @@ async fn run_io(
         stats: Stats::default(),
         round: None,
         next_round_attempt: u64::MAX / 2,
+        health_at: None,
+        burst: None,
         drop_prefix,
     }
     .event_loop()

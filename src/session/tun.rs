@@ -445,6 +445,7 @@ impl Session {
             );
             return Ok(());
         }
+        let now = tokio::time::Instant::now();
         if is_probe_flow(incoming.id) && self.client() {
             if incoming.channel != channel {
                 return Ok(());
@@ -461,6 +462,14 @@ impl Session {
             });
             if verdict {
                 self.round_verified(channel, incoming.id).await?;
+            } else if let Some(burst) = self.burst.as_mut()
+                && incoming.channel == Some(burst.channel)
+                && let Some(seq) =
+                    packet::icmp_echo_reply_seq(&incoming.packet, burst.icmp_id, &burst.payload)
+                && burst.record_echo(seq, now)
+                && burst.finished(now)
+            {
+                self.finish_burst(now).await?;
             }
             return Ok(());
         }
@@ -468,7 +477,6 @@ impl Session {
             return Ok(());
         }
         let from_target = self.client();
-        let now = tokio::time::Instant::now();
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {

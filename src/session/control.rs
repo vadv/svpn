@@ -525,6 +525,22 @@ impl Session {
         let Plane::Channels(plane) = &mut self.plane else {
             bail!("channel_failed outside channels mode");
         };
+        // EPIC-016: count the failure under the channel's transport. A burst
+        // riding this channel dies with it; the timer waits for the next Ready.
+        if let Some(id) = channel {
+            if let Some(handle) = plane.channels.get(&id) {
+                let entry = self
+                    .stats
+                    .transport_failures
+                    .entry(handle.candidate.as_str().to_owned())
+                    .or_default();
+                *entry = entry.saturating_add(1);
+            }
+            if self.burst.as_ref().is_some_and(|burst| burst.channel == id) {
+                self.burst = None;
+                self.health_at = None;
+            }
+        }
         let recheck = self.readiness == Some(Readiness::Ready)
             && self.round.is_none()
             && channel.is_some_and(|id| {
