@@ -11,7 +11,7 @@ use crate::link_io::{self, PREFLIGHT_ID, is_probe_flow};
 use crate::packet::{self, FlowKey};
 use crate::selector::{Candidate, Reason};
 
-use super::round::ROUND_RESEND;
+use super::round::{ROUND_RESEND, unanswered};
 use super::{FLOW_IDLE, Flow, PacketIo, Plane, Readiness, Session, TaskCommand};
 
 impl Session {
@@ -42,6 +42,11 @@ impl Session {
                 ensure!(connecting, "unexpected TCP preflight success");
             }
             // The binding is authenticated; only its ICMP reply can win the round.
+            // The probe left inside the transport handshake and `Connected`
+            // fires right after — this is the RTT baseline.
+            if let Some(round) = self.round.as_mut() {
+                round.tcp_started.get_or_insert(tokio::time::Instant::now());
+            }
             match &mut self.plane {
                 Plane::Channels(plane) => {
                     if let Some(flow) = plane.flows.get_mut(&id) {
@@ -108,13 +113,17 @@ impl Session {
             };
             round.tcp_id = None;
             round.failures.push((Candidate::Tcp, Reason::PathTimeout));
+            // A candidate that failed after its echo must not win the verdict.
+            round.verified.retain(|(attempt, ..)| *attempt != id);
             self.close_flow(id, true).await?;
             if self
                 .round
                 .as_ref()
-                .is_some_and(|round| round.pending.is_empty())
+                .is_some_and(|round| unanswered(round).is_empty())
             {
-                self.round_failed().await?;
+                // A verified echo in the grace window still wins; decide_round
+                // fails the round when nothing was verified.
+                self.decide_round().await?;
             }
             return Ok(());
         }
@@ -410,10 +419,14 @@ impl Session {
             rc.resend_at = Some(tokio::time::Instant::now() + ROUND_RESEND);
             if let Some(handle) = rc.channel.and_then(|id| plane.channels.get(&id)) {
                 // A full datagram queue is packet loss; ROUND_RESEND retries the probe.
-                handle
+                if handle
                     .command
                     .try_send(TaskCommand::Data(flow_id, rc.request.clone()))
-                    .ok();
+                    .is_ok()
+                {
+                    // First send wins: resends never move the RTT baseline.
+                    rc.sent_at.get_or_insert(tokio::time::Instant::now());
+                }
             }
             return Ok(());
         }
