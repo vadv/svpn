@@ -88,6 +88,7 @@ pub fn server_claim(
 
 /// Client side: process-wide registry, so pool members sharing one pair do
 /// not collide with themselves; distinct processes contend via port tokens.
+/// The claim is held until process exit, so reconnects keep the pair.
 /// Ok(None) — the pair is held by another local svpn process.
 pub fn client_claim(server: Ipv4Addr, client: Ipv4Addr) -> Result<Option<Arc<PairGuard>>> {
     type Claims = Mutex<HashMap<(Ipv4Addr, Ipv4Addr), Arc<PairGuard>>>;

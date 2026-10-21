@@ -5,6 +5,38 @@ Each section starts with `## vX.Y.Z` matching the git tag. The release
 pipeline publishes exactly that section as the GitHub release notes, so a
 release without a changelog section fails the pipeline.
 
+## v0.5.0
+
+Automatic tunnel names and address assignment release.
+
+- **Breaking: control protocol v2.** Client and server negotiate tunnel
+  addresses during the handshake (`assigned`/`accept_addr`/`decline_addr`)
+  and both sides must run 0.5.0. Upgrade the server together with the
+  clients; mixing with 0.4.x fails fast at the greeting.
+- `tun-name`, `peer-tun-name`, `tun-addr`, and `peer-addr` are optional now.
+  Both sides pick free TUN names themselves and take an address pair from a
+  built-in pool (255 pairs, `10.77.n.0/30`). Zero-addressing quick start:
+  one flag-less `svpn single` is enough.
+- Address pairs are claimed with loopback UDP port tokens: the kernel hands
+  a pair to exactly one svpn process per host and releases it the moment the
+  process dies, so parallel sessions never share addresses and nothing is
+  left behind on disk.
+- Server-pool members share one address pair, so every link of the pool
+  keeps the same tunnel addresses and reconnects resume on the same pair.
+
+### Downloads
+
+Each archive includes `svpn`, build metadata, the MIT license, and dependency
+notices. Verify it with the matching `.sha256` file before installation.
+
+| Archive | Requirements |
+| --- | --- |
+| `linux-x86_64-gnu` | Linux x86-64, hardware AES, glibc 2.36+ |
+| `openwrt-aarch64` | OpenWrt ARM64 with ARMv8 crypto; static musl binary |
+| `macos-arm64` | macOS on Apple Silicon; unsigned, not notarized |
+
+The server runs on Linux. See the README for installation and network setup.
+
 ## v0.4.0
 
 Server hooks and robustness release.
