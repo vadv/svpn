@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.1
+
+Transport selection release.
+
+- All allowed candidates now arm in the same round: the CPU-heavy WebRTC
+  peer builds in the background and can no longer delay the other
+  candidates' start by ~300 ms.
+- After the first verified ICMP echo the remaining candidates get a 400 ms
+  grace window, driven by a dedicated timer; the verdict picks the lowest
+  measured probe RTT (counted from the first send of the probe, not the
+  attempt start), with TCP carrying a 50 ms penalty. UDP transports no
+  longer lose photo-finishes to TCP or get punished for handshakes they had
+  already finished.
+- One completion rule for rounds: a round where every candidate answered
+  or died decides immediately instead of waiting out the grace window.
+- Fixed the fixed-TCP plane failing its round with `TCP attempt without
+  start time`.
+
 ## v0.5.0
 
 Automatic tunnel names and address assignment release.
