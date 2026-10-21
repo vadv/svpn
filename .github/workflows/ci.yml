@@ -247,8 +247,13 @@ jobs:
       - name: Upload, verify downloads, then publish
         run: |
           mapfile -t files < dist/release-files.txt
+          # The changelog is append-only; publish exactly this tag's section.
+          awk -v h="## $GITHUB_REF_NAME" \
+            '$0 == h { found = 1; next } found && /^## / { exit } found' \
+            CHANGELOG.md > dist/notes.md
+          test -s dist/notes.md || { echo "::error::no changelog section for $GITHUB_REF_NAME"; exit 1; }
           gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag \
-            --draft --prerelease --title "SVPN $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
+            --draft --prerelease --title "SVPN $GITHUB_REF_NAME" --notes-file dist/notes.md
           gh release download "$GITHUB_REF_NAME" --dir dist/downloaded
           RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/release.py \
             dist/downloaded "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID"
