@@ -1,10 +1,5 @@
 # Changelog
 
-Append-only: new releases go on top, past entries never change.
-Each section starts with `## vX.Y.Z` matching the git tag. The release
-pipeline publishes exactly that section as the GitHub release notes, so a
-release without a changelog section fails the pipeline.
-
 ## v0.5.0
 
 Automatic tunnel names and address assignment release.
