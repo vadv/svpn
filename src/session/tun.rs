@@ -80,13 +80,16 @@ impl Session {
         let Some(packet) = parsed.as_ref().filter(|packet| {
             bytes.len() <= self.mtu as usize && packet.flow.valid_for(self.client_ip)
         }) else {
-            self.stats.count_drop(
-                &self.drop_prefix,
-                &format!(
-                    "unparseable or oversized packet from TUN ({} B)",
-                    bytes.len()
+            match packet::unsupported(bytes).filter(|_| bytes.len() <= self.mtu as usize) {
+                Some(reason) => self.stats.count_drop_expected(&self.drop_prefix, &reason),
+                None => self.stats.count_drop(
+                    &self.drop_prefix,
+                    &format!(
+                        "unparseable or oversized packet from TUN ({} B)",
+                        bytes.len()
+                    ),
                 ),
-            );
+            }
             if let Some(id) = explicit_id
                 && !self.has_flow(id)
             {
@@ -250,19 +253,28 @@ impl Session {
                 } else if fresh {
                     // The flow's first packet is already queued in selector.request().
                 } else if let Some(selector) = plane.selector.as_mut() {
-                    if selector.enqueue(flow_id, bytes).is_err() {
-                        crate::debug!(
-                            "{} selector backlog: flow={} pre_active={} queued_bytes={} preparing={:?}",
-                            self.drop_prefix,
-                            flow_id,
-                            selector.pre_active_count(),
-                            selector.queued_bytes(),
-                            selector.preparation_candidate()
-                        );
-                        self.stats.count_drop(
+                    match selector.enqueue(flow_id, bytes) {
+                        Ok(()) => {}
+                        // The flow already went live or finished: a late
+                        // duplicate, not queue pressure.
+                        Err(crate::selector::Reject::Duplicate) => self.stats.count_drop_expected(
                             &self.drop_prefix,
-                            &format!("flow {flow_id} selector queue full"),
-                        );
+                            &format!("flow {flow_id} duplicate packet"),
+                        ),
+                        Err(crate::selector::Reject::PendingFull) => {
+                            crate::debug!(
+                                "{} selector backlog: flow={} pre_active={} queued_bytes={} preparing={:?}",
+                                self.drop_prefix,
+                                flow_id,
+                                selector.pre_active_count(),
+                                selector.queued_bytes(),
+                                selector.preparation_candidate()
+                            );
+                            self.stats.count_drop(
+                                &self.drop_prefix,
+                                &format!("flow {flow_id} selector queue full"),
+                            );
+                        }
                     }
                 } else if flow_state.pending.len() < FLOW_PENDING {
                     flow_state.pending.push_back(bytes.to_vec());
@@ -425,7 +437,9 @@ impl Session {
             || !active
             || client_address != self.client_ip.octets()
         {
-            self.stats.count_drop(
+            // The control handshake and the data raced (a channel backlog
+            // drained after FlowClose): expected, the kernel retransmits.
+            self.stats.count_drop_expected(
                 &self.drop_prefix,
                 &format!("stale or unowned packet from link id {}", incoming.id),
             );

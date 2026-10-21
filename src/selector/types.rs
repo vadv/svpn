@@ -13,7 +13,9 @@ pub const FLOW_BUDGET: Duration = Duration::from_secs(30);
 /// Hold-down for a failed candidate and a total failure.
 pub const HOLD_DOWN: Duration = Duration::from_secs(30);
 /// Pre-active queue: packets of a flow waiting for transport readiness.
-pub const PREACTIVE_PACKETS: usize = 8;
+/// Sized for a UDP burst (browser QUIC) in the first RTT of a flow; the
+/// global byte budget below stays the real cap.
+pub const PREACTIVE_PACKETS: usize = 64;
 /// Pre-active queue: concurrently waiting flows.
 pub const PENDING_FLOWS: usize = 64;
 /// Pre-active queue: total size of waiting packets.

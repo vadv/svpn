@@ -71,7 +71,7 @@ impl Hub {
                 drop_note(
                     &self.links[0].delivery,
                     &self.links,
-                    0,
+                    None,
                     "foreign source in client TUN packet",
                 );
                 return Ok(None);
@@ -80,7 +80,7 @@ impl Hub {
                 drop_note(
                     &self.links[0].delivery,
                     &self.links,
-                    0,
+                    None,
                     "unparseable packet from client TUN",
                 );
                 return Ok(None);
@@ -232,14 +232,14 @@ impl Hub {
                 }
                 let delivery = self.links[epoch.link].delivery.clone();
                 if !self.pool.is_serving(epoch) {
-                    drop_note(&delivery, &self.links, epoch.link, "link not serving");
+                    drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
                     return Ok(());
                 }
                 if !self.routes.accepts(epoch, &packet) {
                     drop_note(
                         &delivery,
                         &self.links,
-                        epoch.link,
+                        Some(epoch.link),
                         "no owner for packet from link",
                     );
                     return Ok(());
@@ -551,15 +551,15 @@ pub fn report_timer(seconds: u32) -> Option<tokio::time::Interval> {
 }
 
 /// Every counted loss names its reason in the log (#124).
-fn drop_note(delivery: &Delivery, links: &[Link], link: usize, reason: &str) {
+fn drop_note(delivery: &Delivery, links: &[Link], link: Option<usize>, reason: &str) {
     delivery.dropped();
-    if links.len() > 1 {
-        crate::error!(
+    match link {
+        // dispatch() runs before a link is chosen: there is no index to blame.
+        Some(index) if links.len() > 1 => crate::error!(
             "vpn[{}]: dropped packet — {reason}",
-            links[link].params.server
-        );
-    } else {
-        crate::error!("vpn: dropped packet — {reason}");
+            links[index].params.server
+        ),
+        _ => crate::error!("vpn: dropped packet — {reason}"),
     }
 }
 
