@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.2
+
+Honest transport selection and quiet logs release.
+
+- The verdict window now scales with the measured probe RTT: after the
+  first verified echo the remaining candidates get `max(400 ms, 8 RTT)`,
+  and every candidate that finishes its handshake inside the window
+  extends it by another 6 RTT. webrtc and quic finally reach the verdict
+  on links with RTT above ~40 ms instead of losing by construction.
+- The round log names each silent candidate's stage (`handshake` or
+  `probe`) and shows probe RTTs separately, so a blocked transport is
+  distinguishable from a slow one.
+- webrtc crypto is prewarmed in a background thread at startup: the
+  first peer no longer pays ~340 ms of lazy initialization inside the
+  session loop (measured on an OpenWrt router).
+- Drop logs are classified: expected noise (IPv6 router chatter, IGMP,
+  fragments, protocol races after `FlowClose`) is counted in stats but
+  logged at debug. ERROR stays for bugs and real data loss. Hub drops
+  before link selection no longer blame the first server's IP.
+- The selector pre-active queue holds 64 packets per flow instead of 8,
+  so a UDP burst in a flow's first RTT no longer triggers `selector
+  queue full`; the 2 MiB byte budget still caps memory.
+
 ## v0.5.1
 
 Transport selection release.
