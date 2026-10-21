@@ -128,6 +128,7 @@ pub fn test_plane(selector: Option<Selector>) -> ChannelsPlane {
         server_ip: None,
         quic_pin: None,
         tcp_port: None,
+        tcp_camouflage: None,
         token_index: HashMap::new(),
         ports: HashMap::new(),
         bind: Ipv4Addr::UNSPECIFIED,

@@ -93,6 +93,6 @@ re-downloads and verifies its assets, then publishes it as a pre-release. Only
 the publisher job has `contents: write`. Known issues are listed in
 [RELEASE_NOTES.md](../RELEASE_NOTES.md).
 
-Release files use stable names such as `svpn-0.2.0-linux-x86_64-gnu.tar.gz`.
+Release files use stable names such as `svpn-0.3.0-linux-x86_64-gnu.tar.gz`.
 The exact source commit remains in `build-info.json`. SVPN is MIT-licensed;
 dependency notices travel inside each archive.

@@ -12,7 +12,7 @@ use tokio::time::Instant;
 fn startup_has_one_attempt_each_and_no_retry_before_first_ready() {
     let now = Instant::now();
     let mut pool = Pool::new([1, 1]);
-    assert!(pool.failed(epoch(0), now).unwrap());
+    assert!(pool.failed(epoch(0), now, "test").unwrap());
     assert_eq!(pool.ready_count(), 0);
     assert_eq!(pool.next_retry(), None);
     assert!(pool.ready(epoch(1), now));
@@ -25,9 +25,9 @@ fn startup_has_one_attempt_each_and_no_retry_before_first_ready() {
 fn all_initial_failures_stop_without_ready() {
     let now = Instant::now();
     let mut pool = Pool::new([1, 1]);
-    pool.failed(epoch(0), now).unwrap();
+    pool.failed(epoch(0), now, "test").unwrap();
     assert!(
-        pool.failed(epoch(1), now)
+        pool.failed(epoch(1), now, "test")
             .unwrap_err()
             .to_string()
             .contains("no server available")
@@ -41,7 +41,7 @@ fn startup_round_failure_stops_despite_failed_peer() {
     let mut pool = Pool::new([1, 1]);
     // Server 0 never even established SSH; server 1 got control up but
     // its startup round found no working mimic — the primary wave failed.
-    pool.failed(epoch(0), now).unwrap();
+    pool.failed(epoch(0), now, "test").unwrap();
     assert!(
         pool.round_failed(epoch(1))
             .unwrap_err()
@@ -84,13 +84,13 @@ fn checking_then_session_death_stops_only_without_other_ready() {
     pool.ready(epoch(1), now);
     pool.checking(epoch(0));
     // The session died while checking: the slot fails, the other stays.
-    assert!(pool.failed(epoch(0), now).unwrap());
+    assert!(pool.failed(epoch(0), now, "test").unwrap());
     assert_eq!(pool.ready_count(), 1);
     assert!(!pool.is_serving(epoch(0)));
     // Losing the last one while checking still stops the VPN.
     pool.checking(epoch(1));
     assert!(
-        pool.failed(epoch(1), now)
+        pool.failed(epoch(1), now, "test")
             .unwrap_err()
             .to_string()
             .contains("no server available")
@@ -107,7 +107,7 @@ fn losing_last_ready_waits_for_another_connecting_round() {
     let mut pool = Pool::new([1, 1]);
     pool.ready(epoch(0), now);
     // Slot 1 is still Connecting with its startup round armed: hope stays.
-    pool.failed(epoch(0), now).unwrap();
+    pool.failed(epoch(0), now, "test").unwrap();
     assert_eq!(pool.ready_count(), 0);
     assert_eq!(pool.retry_at(0), Some(now + Duration::from_secs(1)));
     // Its round fails too — no hope anywhere, the VPN stops.
@@ -127,7 +127,7 @@ fn round_failure_waits_for_in_flight_rounds_of_other_servers() {
     pool.ready(epoch(1), now);
     pool.checking(epoch(1));
     // Server 0 dies outright; server 1 still has its round in flight.
-    pool.failed(epoch(0), now).unwrap();
+    pool.failed(epoch(0), now, "test").unwrap();
     // That round fails — nothing can reach Ready anymore: stop.
     assert!(
         pool.round_failed(epoch(1))
@@ -147,7 +147,7 @@ fn retry_round_keeps_hope_when_last_ready_is_lost() {
     pool.round_failed(epoch(1)).unwrap();
     // The next round starts while server 0 is still Ready.
     pool.checking(epoch(1));
-    assert!(pool.failed(epoch(0), now).is_ok());
+    assert!(pool.failed(epoch(0), now, "test").is_ok());
     // Only the retry's verdict can exhaust the remaining hope.
     assert!(pool.round_failed(epoch(1)).is_err());
 }
@@ -176,17 +176,17 @@ fn retry_caps_at_sixty_and_success_resets_delay() {
     pool.ready(epoch(0), now);
     let mut failed = epoch(1);
     for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
-        pool.failed(failed, now).unwrap();
+        pool.failed(failed, now, "test").unwrap();
         now += Duration::from_secs(seconds);
         assert_eq!(pool.retry_at(1), Some(now));
         let retries = pool.retry_due(now).unwrap();
         assert_eq!(retries.len(), 1);
         assert!(!pool.ready(failed, now));
-        assert!(!pool.failed(failed, now).unwrap());
+        assert!(!pool.failed(failed, now, "test").unwrap());
         failed = retries[0];
     }
     assert!(pool.ready(failed, now));
-    pool.failed(failed, now).unwrap();
+    pool.failed(failed, now, "test").unwrap();
     assert_eq!(pool.retry_at(1), Some(now + Duration::from_secs(1)));
 }
 
@@ -201,7 +201,7 @@ fn smooth_weights_preserve_order_and_ignore_failed_servers() {
     pool.ready(epoch(1), now);
     let selected: Vec<_> = (0..6).map(|_| pool.pick().unwrap().link).collect();
     assert_eq!(selected, [0, 1, 0, 0, 1, 0]);
-    pool.failed(epoch(0), now).unwrap();
+    pool.failed(epoch(0), now, "test").unwrap();
     for _ in 0..6 {
         assert_eq!(pool.pick(), Some(epoch(1)));
     }

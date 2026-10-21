@@ -28,7 +28,6 @@ pub enum Strategy {
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Stats {
     pub inner_tx_packets: u64,
     pub inner_rx_packets: u64,
@@ -39,6 +38,9 @@ pub struct Stats {
     pub open_failed_flows: u64,
     pub closed_flows: u64,
     pub active_flows: usize,
+    /// Last winning transport candidate on the client; server leaves it None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_candidate: Option<String>,
 }
 
 impl Stats {

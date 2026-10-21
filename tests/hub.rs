@@ -54,6 +54,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
                     generation: 1,
                 }),
                 latest: None,
+                last_reason: String::new(),
                 stats: stats::Snapshot::default(),
             })
             .collect(),
@@ -238,6 +239,7 @@ async fn reports_cover_pool_single_server_and_unseen_links() {
                 generation: 1,
             },
             Instant::now(),
+            "test",
         )
         .unwrap();
     assert!(
@@ -276,10 +278,33 @@ async fn snapshots_are_isolated_between_generations() {
 }
 
 #[tokio::test]
+async fn active_candidate_appears_in_per_link_label() {
+    let mut hub = test_hub([
+        Ipv4Addr::new(203, 0, 113, 10),
+        Ipv4Addr::new(198, 51, 100, 7),
+    ]);
+    hub.pool.ready(
+        Epoch {
+            link: 0,
+            generation: 1,
+        },
+        Instant::now(),
+    );
+    let (_, latest) = watch::channel(Stats {
+        active_candidate: Some("mosh".to_string()),
+        ..Stats::default()
+    });
+    hub.links[0].latest = Some(latest);
+    let output = hub.stats_report(Duration::from_secs(30));
+    assert!(output.contains("[203.0.113.10 (mosh)] ready"));
+    assert!(output.contains("[198.51.100.7] connecting"));
+}
+
+#[tokio::test]
 async fn startup_failure_is_not_reported_as_connecting() {
     let mut hub = test_hub([Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)]);
     let epoch = hub.links[0].epoch.take().unwrap();
-    hub.pool.failed(epoch, Instant::now()).unwrap();
+    hub.pool.failed(epoch, Instant::now(), "test").unwrap();
     let report = hub.stats_report(Duration::from_secs(1));
     assert!(report.contains("[127.0.0.1] failed"));
     assert!(report.contains("[127.0.0.2] connecting"));
