@@ -311,3 +311,42 @@ async fn control_round_trip() {
         Message::Ready { version: VERSION }
     ));
 }
+
+// ── address assignment (#181) ──
+
+#[test]
+fn address_assignment_messages_round_trip() {
+    let cases: Vec<(Message, &str)> = vec![
+        (
+            Message::Hello {
+                version: VERSION,
+                client_ip: "10.77.3.2".parse().unwrap(),
+                server_ip: "10.77.3.1".parse().unwrap(),
+                mtu: 1400,
+                addr_auto: true,
+            },
+            "{\"type\":\"hello\",\"version\":2,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400,\"addr_auto\":true}",
+        ),
+        (
+            Message::Assigned {
+                server_ip: "10.77.3.1".parse().unwrap(),
+                client_ip: "10.77.3.2".parse().unwrap(),
+            },
+            "{\"type\":\"assigned\",\"server_ip\":\"10.77.3.1\",\"client_ip\":\"10.77.3.2\"}",
+        ),
+        (Message::AcceptAddr, "{\"type\":\"accept_addr\"}"),
+        (Message::DeclineAddr, "{\"type\":\"decline_addr\"}"),
+    ];
+    for (message, json) in cases {
+        assert_eq!(serde_json::to_string(&message).unwrap(), json);
+        let back = serde_json::to_string(&serde_json::from_str::<Message>(json).unwrap()).unwrap();
+        assert_eq!(back, json, "round trip {json}");
+    }
+    // A Hello without addr_auto (a pre-#181 client) must fail to parse.
+    assert!(
+        serde_json::from_str::<Message>(
+            "{\"type\":\"hello\",\"version\":2,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400}"
+        )
+        .is_err()
+    );
+}

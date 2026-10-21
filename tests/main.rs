@@ -94,7 +94,7 @@ fn legacy_client_and_perf_flags_resolve_identically() {
         assert_eq!(params.ssh_port, 2222);
         assert_eq!(params.host_key.unwrap().to_string(), flags[9]);
         assert_eq!(params.remote_bin, "/opt/svpn");
-        assert_eq!(params.peer_tun_name, "svpn0");
+        assert_eq!(params.peer_tun_name.as_deref(), Some("svpn0"));
         assert_eq!(params.tun_name.as_deref(), Some("utun9"));
         assert_eq!(params.tun_addr, Ipv4Addr::new(10, 9, 0, 2));
         assert_eq!(params.peer_addr, Ipv4Addr::new(10, 9, 0, 1));
@@ -230,7 +230,8 @@ fn cli_enforces_server_cardinality_and_valid_syntax() {
 fn cli_merges_global_and_per_server_requirements() {
     for mode in ["multi", "perf"] {
         for (args, valid) in [
-            (vec!["--server", "203.0.113.10", "--mimic", "mosh"], false),
+            // No TUN names or addresses: valid — automatic assignment (#181).
+            (vec!["--server", "203.0.113.10", "--mimic", "mosh"], true),
             (
                 vec![
                     "--server",
@@ -426,7 +427,7 @@ async fn exhausts_port_range() {
 fn builds_remote_command_with_quoted_tun_name() {
     let command = serve_command(
         "/usr/local/bin/svpn",
-        "my'tun",
+        Some("my'tun"),
         logging::Level::Info,
         (60000, 60009),
         &[],
@@ -434,7 +435,7 @@ fn builds_remote_command_with_quoted_tun_name() {
     );
     assert_eq!(
         command,
-        "'/usr/local/bin/svpn' serve --tun-name 'my'\\''tun' --log-level info --udp-port-range 60000-60009"
+        "'/usr/local/bin/svpn' serve --log-level info --udp-port-range 60000-60009 --tun-name 'my'\\''tun'"
     );
 }
 
@@ -442,7 +443,7 @@ fn builds_remote_command_with_quoted_tun_name() {
 fn builds_remote_command_with_mimics() {
     let command = serve_command(
         "/usr/local/bin/svpn",
-        "svpn0",
+        Some("svpn0"),
         logging::Level::Debug,
         (41000, 42000),
         &[
@@ -453,16 +454,17 @@ fn builds_remote_command_with_mimics() {
         ],
         None,
     );
-    assert!(command.ends_with(
-        "--udp-port-range 41000-42000 --mimic quic --mimic mosh --mimic webrtc --mimic ssh"
-    ));
+    assert!(
+        command.ends_with("--mimic quic --mimic mosh --mimic webrtc --mimic ssh")
+            && command.contains("--udp-port-range 41000-42000")
+    );
 }
 
 #[test]
 fn builds_remote_command_with_tcp_port() {
     let command = serve_command(
         "/usr/local/bin/svpn",
-        "svpn0",
+        Some("svpn0"),
         logging::Level::Info,
         (60000, 60009),
         &[MimicArg::Ssh],

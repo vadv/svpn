@@ -113,14 +113,19 @@ fn semantic_errors_keep_file_and_field_but_not_raw_tun_values() {
             true,
             "peer-tun",
         ),
-        ("server = 'a.example'", false, "peer-tun-name"),
+        // No addresses and no TUN names: valid — automatic assignment (#181).
+        (
+            "server = 'a.example'\ntun-addr = '10.77.0.2'",
+            false,
+            "set both tun-addr and peer-addr",
+        ),
         (
             "peer-tun-name = 'ok'\n[[servers]]\naddress = 'a.example'\n[[servers]]\naddress = 'a.example'",
             true,
             "servers[1]",
         ),
         (
-            "server = 'a.example'\npeer-tun-name = 'ok'\ntun-addr = '10.77.0.1'",
+            "server = 'a.example'\npeer-tun-name = 'ok'\ntun-addr = '10.77.0.1'\npeer-addr = '10.77.0.1'",
             false,
             "point-to-point",
         ),
@@ -201,7 +206,7 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
                     format!("{p:?}"),
                     svpn::serve_command(
                         &p.remote_bin,
-                        &p.peer_tun_name,
+                        p.peer_tun_name.as_deref(),
                         p.log_level,
                         p.udp_port_range,
                         &p.mimic,

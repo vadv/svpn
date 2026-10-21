@@ -208,9 +208,9 @@ def cleanup_verified(process, tun_name="svpn0", server_tun_name="svpn0", server_
     assert not pathlib.Path("/sys/class/net/" + tun_name).exists(), "client restarted"
 
 
-def tcp_echo(index, timeout=15):
+def tcp_echo(index, timeout=15, peer=PEER):
     payload = bytes([index]) * 65536
-    with socket.create_connection((PEER, 9000), timeout=timeout) as stream:
+    with socket.create_connection((peer, 9000), timeout=timeout) as stream:
         stream.sendall(payload)
         stream.shutdown(socket.SHUT_WR)
         received = bytearray()

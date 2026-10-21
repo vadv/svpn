@@ -10,6 +10,7 @@ const _: () = {
     );
 };
 
+pub mod addrpool;
 pub mod channel;
 pub mod cli;
 mod cmdline;
@@ -28,6 +29,7 @@ pub mod packet;
 pub mod pcap;
 pub mod perf;
 pub mod pool;
+pub mod portlock;
 pub mod probe;
 pub mod profile;
 pub mod quic;
@@ -223,12 +225,27 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Tunnel address pair confirmed by the server, plus the local pool claim
+/// that keeps another local svpn process from taking the same pair (#181).
+pub(crate) struct LinkAddrs {
+    pub server_ip: Ipv4Addr,
+    pub client_ip: Ipv4Addr,
+    _guard: Option<std::sync::Arc<addrpool::PairGuard>>,
+}
+
 /// Bootstrap SSH and the server TUN. The packet port can run probes before
 /// the supervisor creates the single client TUN. Shared by client and perf.
 pub(crate) async fn open_link(
     params: &LinkParams,
     tag: &str,
-) -> Result<(Control, ssh::SshTail, session::TransportConfig, Ipv4Addr)> {
+    desired: Option<(Ipv4Addr, Ipv4Addr)>,
+) -> Result<(
+    Control,
+    ssh::SshTail,
+    session::TransportConfig,
+    Ipv4Addr,
+    LinkAddrs,
+)> {
     let plan = plan_mimic(&params.mimic, params.tcp_port)?;
     // TCP-only: connect to the given port with the given camouflage; in auto
     // the fallback candidate port comes from endpoints.
@@ -240,7 +257,7 @@ pub(crate) async fn open_link(
         .context("user not set: pass --ssh-user or set USER")?;
     let command = serve_command(
         &params.remote_bin,
-        &params.peer_tun_name,
+        params.peer_tun_name.as_deref(),
         params.log_level,
         params.udp_port_range,
         &params.mimic,
@@ -267,12 +284,17 @@ pub(crate) async fn open_link(
     .await?;
     let (stdin, stdout, tail) = session.into_io();
     let mut control = Control::new(stdout, stdin);
+    // desired (server, client) pins the shared pair: pool members and
+    // reconnects propose it in Hello and accept nothing else (#181).
+    let (hello_client, hello_server) =
+        desired.map_or((params.tun_addr, params.peer_addr), |(s, c)| (c, s));
     control
         .send(Message::Hello {
             version: VERSION,
-            client_ip: params.tun_addr,
-            server_ip: params.peer_addr,
+            client_ip: hello_client,
+            server_ip: hello_server,
             mtu: params.mtu,
+            addr_auto: params.addr_auto,
         })
         .await?;
     ensure!(
@@ -291,6 +313,48 @@ pub(crate) async fn open_link(
     } = bootstrap(&mut control).await?
     else {
         bail!("expected endpoints");
+    };
+    // Address assignment before the server TUN: confirm the pair, or decline
+    // it on a local collision and take the next one (auto mode only, #181).
+    let addrs = loop {
+        let Message::Assigned {
+            server_ip,
+            client_ip,
+        } = bootstrap(&mut control).await?
+        else {
+            bail!("expected assigned");
+        };
+        // A pinned pair (pool member, reconnect with a live TUN) accepts
+        // only an exact match; a local lock collision declines as well.
+        if desired.is_some_and(|pair| pair != (server_ip, client_ip)) {
+            control.send(Message::DeclineAddr).await?;
+            ensure!(
+                params.addr_auto,
+                "server cannot offer the pinned address pair {server_ip}/{client_ip}"
+            );
+            continue;
+        }
+        let guard = if addrpool::pool_index(server_ip, client_ip).is_some() {
+            match addrpool::client_claim(server_ip, client_ip)? {
+                some @ Some(_) => some,
+                None => {
+                    control.send(Message::DeclineAddr).await?;
+                    ensure!(
+                        params.addr_auto,
+                        "address pair {server_ip}/{client_ip} already used by a local svpn session"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        control.send(Message::AcceptAddr).await?;
+        break LinkAddrs {
+            server_ip,
+            client_ip,
+            _guard: guard,
+        };
     };
     ensure!(
         matches!(bootstrap(&mut control).await?, Message::TunReady),
@@ -330,7 +394,7 @@ pub(crate) async fn open_link(
             tcp_camouflage: plan.tcp.as_ref().map(|(_, camouflage)| *camouflage),
         },
     };
-    Ok((control, tail, config, server_ip))
+    Ok((control, tail, config, server_ip, addrs))
 }
 
 async fn serve(
@@ -347,6 +411,7 @@ async fn serve(
         client_ip,
         server_ip,
         mtu,
+        addr_auto,
     } = bootstrap(&mut control).await?
     else {
         bail!("expected hello");
@@ -437,6 +502,34 @@ async fn serve(
             );
         }
     }
+    // Address assignment before the TUN: auto claims a free pool pair,
+    // explicit locks the requested pool pair (outside the pool subnet the
+    // admin's pair is honored unlocked). A client may decline a pair that
+    // collides on its machine; auto then offers the next one (#181).
+    let (mut pair, mut guard, mut skip, mut retries) = ((server_ip, client_ip), None, 0, 8);
+    loop {
+        if guard.is_none() {
+            let (g, p) = addrpool::server_claim(addr_auto, pair, skip)?;
+            (guard, pair) = (g, p);
+        }
+        control
+            .send(Message::Assigned {
+                server_ip: pair.0,
+                client_ip: pair.1,
+            })
+            .await?;
+        match bootstrap(&mut control).await? {
+            Message::AcceptAddr => break,
+            Message::DeclineAddr if addr_auto && retries > 1 => {
+                retries -= 1;
+                skip = addrpool::pool_index(pair.0, pair.1).unwrap_or(skip) + 1;
+                guard = None; // dropped: port token released, next claim starts past this pair
+            }
+            Message::DeclineAddr => bail!("client declined the address pair"),
+            _ => bail!("expected accept_addr or decline_addr"),
+        }
+    }
+    let (server_ip, client_ip, _pair_guard) = (pair.0, pair.1, guard);
     let name = match tun_name {
         None | Some("") => None,
         Some(name) => {

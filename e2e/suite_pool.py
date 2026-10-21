@@ -806,6 +806,183 @@ def test_checking_preserves_active_tcp_flows():
     print("PASS Checking: one TCP reset, other committed flows survive failed kernel round")
 
 
+# ── automatic TUN name and address assignment (#181) ──
+
+POOL_ADDR = re.compile(r"^10\.77\.(\d{1,3})\.([12])$")
+
+
+def auto_args(extra=None):
+    # No --tun-name/--peer-tun-name/--tun-addr/--peer-addr: automatic mode.
+    return [
+        "svpn",
+        "--server",
+        SERVER,
+        "--ssh-user",
+        "root",
+        "--ssh-identity",
+        "/keys/client",
+        "--log-level",
+        "debug",
+    ] + (extra or [])
+
+
+def check_pool_pair(local, peer):
+    match = POOL_ADDR.match(peer)
+    assert match and match.group(2) == "1", (local, peer)
+    assert local == "10.77." + match.group(1) + ".2", (local, peer)
+
+
+@contextlib.contextmanager
+def auto_client(name, args, hosts):
+    """Automatic-mode client: the TUN name and addresses come from hook events."""
+    with tempfile.TemporaryDirectory(prefix="svpn-auto-") as temporary:
+        directory = pathlib.Path(temporary)
+        path = LOG_DIR / (name + ".log")
+        with path.open("w") as log:
+            process = subprocess.Popen(
+                args + ["--up-command", record(directory), "--down-command", record(directory)],
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+            )
+            tun = local = peer = None
+            try:
+                until(lambda: (directory / "events").exists() and (directory / "events").read_text())
+                row = [line.split("|") for line in (directory / "events").read_text().splitlines()][0]
+                assert row[0] == "up", row
+                tun, local, peer = row[1], row[2], row[3]
+                until(lambda: "vpn: started" in path.read_text())
+                assert process.poll() is None, path.read_text()
+                command(["ip", "route", "replace", peer + "/32", "dev", tun, "src", local])
+                for host in hosts:
+                    command(
+                        ssh_to(host)
+                        + [
+                            "dev=$(ip -o -4 addr show | awk '$4 == \"" + peer + "\" {print $2}'); "
+                            'test -n "$dev" && ip route replace ' + local + '/32 dev "$dev" src ' + peer
+                        ]
+                    )
+                yield process, path, (tun, local, peer), directory
+            except BaseException:
+                print(path.read_text(), flush=True)
+                raise
+            finally:
+                if peer is not None:
+                    subprocess.run(
+                        ["ip", "route", "del", peer + "/32", "dev", tun],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=25)
+
+
+def assert_fully_stopped(process, directory, hosts):
+    assert process.returncode == 0, process.returncode
+    rows = [line.split("|") for line in (directory / "events").read_text().splitlines()]
+    assert [row[0] for row in rows] == ["up", "down"], rows
+    assert rows[0][1:] == rows[1][1:], "up/down must see the same TUN name and addresses"
+
+    def clean():
+        if command(["ip", "-o", "link", "show", "type", "tun"], check=False).stdout.strip():
+            return False
+        for host in hosts:
+            if command(ssh_to(host) + ["ip -o link show type tun"], check=False).stdout.strip():
+                return False
+            if command(ssh_to(host) + ["pgrep -x svpn"], check=False).returncode != 1:
+                return False
+        return True
+
+    until(clean)
+
+
+def test_auto_assignment_and_restart():
+    pair = None
+    for _ in range(2):
+        with auto_client("auto-single", auto_args(), [SERVER]) as (
+            process,
+            path,
+            (tun, local, peer),
+            directory,
+        ):
+            check_pool_pair(local, peer)
+            tcp_echo(0, peer=peer)
+            server_view = ssh("ip -o -4 addr show | awk '$4 == \"" + peer + "\"'").stdout
+            assert server_view.split()[5].startswith(local + "/"), server_view
+            process.terminate()
+            process.wait(timeout=25)
+            assert_fully_stopped(process, directory, [SERVER])
+        if pair is None:
+            pair = (local, peer)
+        else:
+            assert (local, peer) == pair, "the freed pool pair must be reused"
+    print("PASS auto single: kernel TUN names, pool pair, reused after restart")
+
+
+def test_auto_two_clients_one_server():
+    with (
+        auto_client("auto-a", auto_args(), [SERVER]) as (_, _, (tun_a, local_a, peer_a), _),
+        auto_client("auto-b", auto_args(), [SERVER]) as (_, _, (tun_b, local_b, peer_b), _),
+    ):
+        assert (local_a, peer_a) != (local_b, peer_b), "two clients must get distinct pairs"
+        assert tun_a != tun_b
+        check_pool_pair(local_a, peer_a)
+        check_pool_pair(local_b, peer_b)
+        tcp_echo(1, peer=peer_a)
+        tcp_echo(2, peer=peer_b)
+    print("PASS auto two clients: distinct pairs and TUN names on one server")
+
+
+def test_auto_explicit_pair_lock():
+    flags = ["--tun-addr", "10.77.9.2", "--peer-addr", "10.77.9.1"]
+    with auto_client("auto-explicit", auto_args(flags), [SERVER]) as (
+        process,
+        _,
+        (_, local, peer),
+        directory,
+    ):
+        assert (local, peer) == ("10.77.9.2", "10.77.9.1")
+        tcp_echo(3, peer=peer)
+        # Same explicit pair from a second client: lock-token collision, fast failure.
+        log = LOG_DIR / "auto-explicit-busy.log"
+        with log.open("w") as sink:
+            busy = subprocess.Popen(auto_args(flags), stdout=subprocess.DEVNULL, stderr=sink)
+            assert busy.wait(timeout=30) != 0
+        assert "already used" in log.read_text(), log.read_text()
+        # An explicit pair outside the pool subnet needs no lock and works.
+        with auto_client(
+            "auto-custom", auto_args(["--tun-addr", "192.168.55.2", "--peer-addr", "192.168.55.1"]), [SERVER]
+        ) as (_, _, (_, custom_local, custom_peer), _):
+            assert (custom_local, custom_peer) == ("192.168.55.2", "192.168.55.1")
+            tcp_echo(4, peer=custom_peer)
+    print("PASS auto explicit: honored pair, flock collision fails fast, custom subnet unlocked")
+
+
+def test_auto_pool_shared_pair():
+    args = [
+        "svpn",
+        "multi",
+        "--server",
+        f"{SERVER},user=root,identity=/keys/client",
+        "--server",
+        f"{SERVER2},user=root,identity=/keys/client",
+        "--log-level",
+        "debug",
+    ]
+    with auto_client("auto-pool", args, [SERVER, SERVER2]) as (process, path, (tun, local, peer), directory):
+        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=20)
+        check_pool_pair(local, peer)
+        for host in (SERVER, SERVER2):
+            view = command(ssh_to(host) + ["ip -o -4 addr show | awk '$4 == \"" + peer + "\"'"]).stdout
+            assert view.split()[5].startswith(local + "/"), (host, view)
+        for index in range(4):
+            tcp_echo(10 + index, peer=peer)
+        process.terminate()
+        process.wait(timeout=25)
+        assert_fully_stopped(process, directory, [SERVER, SERVER2])
+    print("PASS auto pool: both servers share one pair, traffic flows")
+
+
 TESTS = [
     ("test_lifecycle_hooks", run),
     ("test_hostname_servers", test_hostname_servers),
@@ -821,4 +998,12 @@ TESTS = [
     ("test_sigkill_takeover", test_sigkill_takeover),
     ("test_checking_recovers_without_ssh_restart", test_checking_recovers_without_ssh_restart),
     ("test_checking_preserves_active_tcp_flows", test_checking_preserves_active_tcp_flows),
+    ("test_auto_assignment_and_restart", test_auto_assignment_and_restart),
+    ("test_auto_two_clients_one_server", test_auto_two_clients_one_server),
+    ("test_auto_explicit_pair_lock", test_auto_explicit_pair_lock),
+    ("test_auto_pool_shared_pair", test_auto_pool_shared_pair),
+    ("test_auto_assignment_and_restart", test_auto_assignment_and_restart),
+    ("test_auto_two_clients_one_server", test_auto_two_clients_one_server),
+    ("test_auto_explicit_pair_lock", test_auto_explicit_pair_lock),
+    ("test_auto_pool_shared_pair", test_auto_pool_shared_pair),
 ]

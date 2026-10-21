@@ -33,6 +33,8 @@ test_tcp_transport test_tcp_ephemeral test_tcp_udp_blocked test_tcp_teardown
 test_tcp_l0_l1 test_tcp_camouflage_ssh test_auto_tcp_fallback test_auto_exhausted
 test_readiness_requires_kernel_reply test_checking_recovers_without_ssh_restart
 test_checking_preserves_active_tcp_flows test_perf
+test_auto_assignment_and_restart test_auto_two_clients_one_server test_auto_explicit_pair_lock
+test_auto_pool_shared_pair
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -82,7 +84,7 @@ def integration_groups():
         assert extra == expected, (group, extra, "every test must be assigned")
     assert collections.Counter(owner for owner, _ in integration.TESTS) == {
         "bootstrap": 12,
-        "lifecycle-pool": 14,
+        "lifecycle-pool": 18,
         "udp": 5,
         "tcp-auto": 10,
     }
@@ -102,7 +104,7 @@ def integration_groups():
             ):
                 integration.main()
             assert called == expected, (group, args)
-    print("PASS integration: 41 cases assigned once, CLI/env selection and original order")
+    print("PASS integration: 45 cases assigned once, CLI/env selection and original order")
 
 
 def matrix_groups():

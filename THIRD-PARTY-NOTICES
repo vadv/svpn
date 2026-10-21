@@ -1,5 +1,5 @@
-Cargo.lock sha256: fe6c4683a71bf0f89170531d7c3fe14f02be0958dbda66f048699629b820cf2a
-THIRD-PARTY NOTICES — SVPN v0.4.0
+Cargo.lock sha256: 43a8ce4df344f27a561a7e9af88e694095f83f5ff53aa0719558d16639a75acb
+THIRD-PARTY NOTICES — SVPN v0.5.0
 Prepared from the union of the three release target dependency graphs.
 Some notices cover source components not linked into every binary.
 Original license and copyright texts follow; SVPN itself remains MIT-licensed.

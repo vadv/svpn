@@ -35,10 +35,22 @@ try:
         assert line, "server exited during bootstrap"
         return json.loads(line)
 
-    send({"type": "hello", "version": 1, "client_ip": "10.77.0.2", "server_ip": "10.77.0.1", "mtu": 1280})
+    hello = {
+        "type": "hello",
+        "version": 2,
+        "client_ip": "10.77.0.2",
+        "server_ip": "10.77.0.1",
+        "mtu": 1280,
+        "addr_auto": False,
+    }
+    send(hello)
     assert receive()["type"] == "ready"
     assert receive()["type"] == "endpoints"
-    assert receive()["type"] == "tun_ready"
+    message = receive()
+    assert message["type"] == "assigned", message
+    send({"type": "accept_addr"})
+    message = receive()
+    assert message["type"] == "tun_ready", message
     assert pathlib.Path("/sys/class/net/stderr0").exists(), "server did not create TUN"
     started = time.monotonic()
     send({"type": "tun_ready"})

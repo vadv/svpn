@@ -68,7 +68,6 @@ sudo install -m 755 svpn /usr/local/bin/svpn
 server = "vpn.example.com"
 ssh-user = "root"
 ssh-identity = "/path/to/id_ed25519"
-peer-tun-name = "svpn0"
 tcp-port = 41020
 
 # All traffic goes through the tunnel: two /1 routes override the default
@@ -133,6 +132,12 @@ ping -c 3 1.1.1.1
 
 Если у VPS файрвол в панели провайдера, откройте UDP 60000–60009 и TCP 41020.
 
+Имя TUN и адреса туннеля назначаются автоматически: ядро выбирает свободное
+имя (tun0, utun4, …), а адреса выделяются из пула 10.77.0.0/16 — hooks видят
+фактические значения в $SVPN_TUN_NAME, $SVPN_TUN_ADDR и $SVPN_PEER_ADDR.
+Зафиксировать можно вручную: `peer-tun-name = "svpn0"`, а адреса — парой
+`tun-addr` + `peer-addr` (только вместе).
+
 ## 3. Несколько серверов
 
 Пул серверов с балансировкой по весам — команда `multi` и секции `[[servers]]`
@@ -141,7 +146,6 @@ ping -c 3 1.1.1.1
 ```toml
 ssh-user = "root"
 ssh-identity = "/path/to/id_ed25519"
-peer-tun-name = "svpn0"
 tcp-port = 41020
 # up-command / down-command / server-up / server-down — as in step 2.
 # Root server-up and server-down apply to every server.

@@ -27,13 +27,14 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
         ssh_port: 22,
         host_key: None,
         remote_bin: "svpn".to_string(),
-        peer_tun_name: "tun0".to_string(),
+        peer_tun_name: Some("tun0".to_string()),
         log_level: svpn::logging::Level::Info,
         udp_port_range: (0, 0),
         mimic: Vec::new(),
         tcp_port: None,
         tun_addr: Ipv4Addr::new(10, 77, 0, 2),
         peer_addr: Ipv4Addr::new(10, 77, 0, 1),
+        addr_auto: false,
         mtu: 1280,
         tun_name: None,
         server_up: None,
@@ -58,6 +59,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
                 latest: None,
                 last_reason: String::new(),
                 stats: stats::Snapshot::default(),
+                assigned: Arc::default(),
             })
             .collect(),
         pool: Pool::new([1, 1]),
@@ -66,6 +68,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         incoming,
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
+        pair: watch::channel(None).0,
     }
 }
 
