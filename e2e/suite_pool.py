@@ -465,13 +465,22 @@ def test_pool_two_servers():
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=10)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(tcp_echo, range(30)))
+
+        # One-shot flow_open lines can be lost by the SSH stderr relay; the
+        # heartbeat stats repeat every second, so they converge.
+        def opened():
+            log = path.read_text()
+            result = []
+            for host in (SERVER, SERVER2):
+                found = re.findall(rf"\[server {re.escape(host)}\][^\n]*opened_flows: (\d+)", log)
+                result.append(int(found[-1]) if found else 0)
+            return result
+
+        until(lambda: opened() == [20, 10], seconds=15)
         log = path.read_text()
         assert f"[server {SERVER}]" in log and f"[server {SERVER2}]" in log, (
             "both servers must relay stderr with a host tag"
         )
-        first = len(re.findall(rf"\[server {SERVER}\].*flow_open role=server", log))
-        second = len(re.findall(rf"\[server {SERVER2}\].*flow_open role=server", log))
-        assert (first, second) == (20, 10), (first, second)
     cleanup_verified(process, server_hosts=[SERVER, SERVER2])
     print("PASS pool distribution: 2:1 weights split 30 flows exactly 20/10")
 
