@@ -272,25 +272,17 @@ def test_agent_identity():
     try:
         command(["ssh-add", "/keys/client"], env={"SSH_AUTH_SOCK": sock, "PATH": os.environ["PATH"]})
         env = dict(os.environ, SSH_AUTH_SOCK=sock)
-        # Two scenarios: an explicit .pub key and no --ssh-identity at all — the agent
-        # remains the only key source.
-        for label, mutate in [
-            ("identity.pub", lambda a: a.__setitem__(a.index("--ssh-identity") + 1, "/keys/client.pub")),
-            (
-                "no-flag",
-                lambda a: a.__delitem__(slice(a.index("--ssh-identity"), a.index("--ssh-identity") + 2)),
-            ),
-        ]:
-            args = CLIENT.copy()
-            mutate(args)
-            with session(f"agent-{label}", env=env, args=args) as (process, path):
-                command(["ping", "-n", "-c", "1", "-W", "3", PEER])
-                tcp_echo(1)
-            cleanup_verified(process)
-            assert process.returncode == 0, path.read_text()
+        # No --ssh-identity: the agent is the only key source.
+        args = CLIENT.copy()
+        del args[args.index("--ssh-identity") : args.index("--ssh-identity") + 2]
+        with session("agent-no-flag", env=env, args=args) as (process, path):
+            command(["ping", "-n", "-c", "1", "-W", "3", PEER])
+            tcp_echo(1)
+        cleanup_verified(process)
+        assert process.returncode == 0, path.read_text()
     finally:
         os.kill(agent_pid, signal.SIGTERM)
-    print("PASS ssh-agent: .pub key and run without --ssh-identity")
+    print("PASS ssh-agent: run without --ssh-identity")
 
 
 def test_no_ssh_binary():

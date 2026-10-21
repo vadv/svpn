@@ -1,5 +1,5 @@
 //! Built-in SSH client (N06): connection, private-key authentication from
-//! a file or via the ssh agent (identity.pub), exec of the server binary
+//! a file or via the ssh agent, exec of the server binary
 //! without a PTY. Strict host-key pinning is optional (`--host-key SHA256:…`);
 //! without a pin, TOFU checks saved fingerprints when a known-hosts path is available.
 
@@ -15,7 +15,7 @@ use russh::{
     Disconnect,
     client::{AuthResult, Config, Handle, Handler},
     keys::{
-        HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
+        HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
         agent::client::AgentClient, ssh_key::Fingerprint,
     },
 };
@@ -47,7 +47,7 @@ static KNOWN_HOSTS_LOCK: Mutex<()> = Mutex::new(());
 /// Credentials for the SSH connection.
 pub struct SshTarget {
     pub user: String,
-    /// Key file: private or `.pub`; `None` — any key from the ssh agent.
+    /// Private key file; `None` — any key from the ssh agent.
     pub identity: Option<PathBuf>,
     /// Host-key fingerprint of the form `SHA256:…`; without it — TOFU via known_hosts.
     pub host_key: Option<Fingerprint>,
@@ -55,12 +55,11 @@ pub struct SshTarget {
     pub host_label: String,
 }
 
-/// Loaded identity: a private key from a file, a specific agent public
-/// key, or any agent key (tried in turn).
+/// Loaded identity: a private key from a file or any agent key
+/// (tried in turn).
 #[derive(Debug)]
 pub enum Identity {
     Key(Arc<PrivateKey>),
-    Agent(PublicKey),
     /// No key specified: try every ssh-agent key in turn.
     AgentAny,
 }
@@ -336,26 +335,6 @@ pub async fn authenticate(
                 .await
                 .context("authenticating with the key from file")?
         }
-        Identity::Agent(public) => {
-            let mut agent = AgentClient::connect_env()
-                .await
-                .context("ssh agent unavailable (SSH_AUTH_SOCK); a password-protected key requires the agent")?;
-            let identities = agent
-                .request_identities()
-                .await
-                .context("agent did not return the key list")?;
-            ensure!(
-                identities
-                    .iter()
-                    .any(|id| id.public_key().key_data() == public.key_data()),
-                "agent does not hold a key matching the specified public key"
-            );
-            let hash = rsa_hash(handle, public.algorithm().is_rsa()).await?;
-            handle
-                .authenticate_publickey_with(user, public.clone(), hash, &mut agent)
-                .await
-                .context("agent authentication")?
-        }
         Identity::AgentAny => {
             let mut agent = AgentClient::connect_env()
                 .await
@@ -403,8 +382,9 @@ pub async fn authenticate(
     }
 }
 
-/// Reads `path` as an OpenSSH private key; if that fails — as a public
-/// key (then authentication goes through the agent).
+/// Reads `path` as an OpenSSH private key. Public keys and
+/// password-protected keys are not accepted: those authenticate through
+/// the ssh agent (omit --ssh-identity).
 pub fn load_identity(path: &Path) -> Result<Identity> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -413,19 +393,14 @@ pub fn load_identity(path: &Path) -> Result<Identity> {
         "key file is empty: {}",
         path.display()
     );
-    let private_err = match PrivateKey::from_openssh(&content) {
-        Ok(key) => return Ok(Identity::Key(Arc::new(key))),
-        Err(private_err) => private_err,
-    };
-    let public_err = match PublicKey::from_openssh(content.trim()) {
-        Ok(public) => return Ok(Identity::Agent(public)),
-        Err(public_err) => public_err,
-    };
-    bail!(
-        "{} is not a readable private key ({private_err}) and not a public key ({public_err}); \
-         password-protected keys are supported only via the agent: pass --ssh-identity <file>.pub",
-        path.display()
-    )
+    match PrivateKey::from_openssh(&content) {
+        Ok(key) => Ok(Identity::Key(Arc::new(key))),
+        Err(err) => bail!(
+            "{} is not a readable private key: {err}; \
+             password-protected keys work through the ssh agent — omit --ssh-identity",
+            path.display()
+        ),
+    }
 }
 
 pub fn decide_known_hosts(entries: &str, host_label: &str, fingerprint: &str) -> HostKeyDecision {
