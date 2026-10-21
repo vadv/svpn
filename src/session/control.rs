@@ -576,6 +576,16 @@ impl Session {
                 prefixed(&tag, "channel"),
                 handle.candidate.as_str()
             );
+            // A round candidate with a live channel may still win the
+            // verdict: mark its progress so decide_round extends the window.
+            if let Some(rc) = self.round.as_mut().and_then(|round| {
+                round
+                    .pending
+                    .values_mut()
+                    .find(|rc| rc.channel == Some(channel))
+            }) {
+                rc.established = true;
+            }
             self.execute_actions(actions).await?;
         } else {
             crate::debug!("channel_verified id={channel} role=server");

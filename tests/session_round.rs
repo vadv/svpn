@@ -850,6 +850,188 @@ async fn round_starts_webrtc_last_so_it_cannot_delay_the_others() {
     );
 }
 
+// ── verdict window ──
+
+/// The window scales with the measured RTT; a candidate that reached
+/// `established` inside it gets 6 more RTTs and can still win.
+#[tokio::test(start_paused = true)]
+async fn established_candidate_extends_the_window_and_can_win() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    let t0 = tokio::time::Instant::now();
+    // TCP answers first: its probe left 100 ms ago.
+    let (tcp_id, request) = {
+        let round = session.round.as_mut().unwrap();
+        round.tcp_started = Some(t0 - Duration::from_millis(100));
+        (round.tcp_id.unwrap(), round.request.clone())
+    };
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&tcp_id).unwrap().active = true;
+    session
+        .deliver_to_tun(Incoming {
+            id: tcp_id,
+            channel: None,
+            packet: echo_reply_for(&request),
+        })
+        .await
+        .unwrap();
+    // 8 × 100 ms beats the 400 ms floor.
+    let decide_at = session.round.as_ref().unwrap().decide_at.unwrap();
+    assert_eq!(decide_at, t0 + Duration::from_millis(800));
+    // Mosh reaches `established` right at the end of the window.
+    tokio::time::advance(Duration::from_millis(800)).await;
+    session
+        .round
+        .as_mut()
+        .unwrap()
+        .pending
+        .get_mut(&probes[0].0)
+        .unwrap()
+        .established = true;
+    session
+        .poll_round(t0 + Duration::from_millis(800))
+        .await
+        .unwrap();
+    // Extended by 6 RTT from now: the window moves from 800 to 1400 ms.
+    assert!(session.round.is_some());
+    assert_eq!(
+        session.round.as_ref().unwrap().decide_at.unwrap(),
+        t0 + Duration::from_millis(1400)
+    );
+    // Mosh's echo arrives inside the extension with a far better RTT and wins.
+    session
+        .round
+        .as_mut()
+        .unwrap()
+        .pending
+        .get_mut(&probes[0].0)
+        .unwrap()
+        .sent_at = Some(tokio::time::Instant::now() - Duration::from_millis(50));
+    session
+        .deliver_to_tun(Incoming {
+            id: probes[0].0,
+            channel: Some(probes[0].1),
+            packet: echo_reply_for(&probes[0].4),
+        })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(600)).await;
+    session
+        .poll_round(t0 + Duration::from_millis(1400))
+        .await
+        .unwrap();
+    assert!(session.round.is_none());
+    assert_eq!(session.readiness, Some(Readiness::Verified(Some(100))));
+}
+
+/// A candidate that never reports `established` extends nothing: the verdict
+/// comes exactly at the window end.
+#[tokio::test(start_paused = true)]
+async fn silent_candidates_do_not_extend_the_window() {
+    let (mut session, _keep, _probes) = parallel_round().await;
+    let t0 = tokio::time::Instant::now();
+    let (tcp_id, request) = {
+        let round = session.round.as_mut().unwrap();
+        round.tcp_started = Some(t0 - Duration::from_millis(100));
+        (round.tcp_id.unwrap(), round.request.clone())
+    };
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&tcp_id).unwrap().active = true;
+    session
+        .deliver_to_tun(Incoming {
+            id: tcp_id,
+            channel: None,
+            packet: echo_reply_for(&request),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.round.as_ref().unwrap().decide_at.unwrap(),
+        t0 + Duration::from_millis(800)
+    );
+    tokio::time::advance(Duration::from_millis(800)).await;
+    session
+        .poll_round(t0 + Duration::from_millis(800))
+        .await
+        .unwrap();
+    assert!(session.round.is_none());
+    assert_eq!(session.readiness, Some(Readiness::Verified(None)));
+}
+
+/// The extension is capped by the round deadline; past it the verdict runs.
+#[tokio::test(start_paused = true)]
+async fn window_extension_never_crosses_the_round_deadline() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    let t0 = tokio::time::Instant::now();
+    let (tcp_id, request) = {
+        let round = session.round.as_mut().unwrap();
+        round.tcp_started = Some(t0 - Duration::from_millis(100));
+        (round.tcp_id.unwrap(), round.request.clone())
+    };
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&tcp_id).unwrap().active = true;
+    session
+        .deliver_to_tun(Incoming {
+            id: tcp_id,
+            channel: None,
+            packet: echo_reply_for(&request),
+        })
+        .await
+        .unwrap();
+    session
+        .round
+        .as_mut()
+        .unwrap()
+        .pending
+        .get_mut(&probes[0].0)
+        .unwrap()
+        .established = true;
+    // The round deadline lands inside the would-be extension (t0+1400).
+    session.round.as_mut().unwrap().deadline = t0 + Duration::from_millis(900);
+    tokio::time::advance(Duration::from_millis(800)).await;
+    session
+        .poll_round(t0 + Duration::from_millis(800))
+        .await
+        .unwrap();
+    assert!(session.round.is_some());
+    assert_eq!(
+        session.round.as_ref().unwrap().decide_at.unwrap(),
+        t0 + Duration::from_millis(900)
+    );
+    // At the deadline the window cannot grow further: decide with what we have.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    session
+        .poll_round(t0 + Duration::from_millis(900))
+        .await
+        .unwrap();
+    assert!(session.round.is_none());
+    assert_eq!(session.readiness, Some(Readiness::Verified(None)));
+}
+
+/// The `no answer` list says how far each candidate got.
+#[tokio::test]
+async fn unanswered_reports_the_stage_of_each_candidate() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    session
+        .round
+        .as_mut()
+        .unwrap()
+        .pending
+        .get_mut(&probes[0].0)
+        .unwrap()
+        .established = true;
+    let round = session.round.as_ref().unwrap();
+    assert_eq!(
+        unanswered(round),
+        "mosh (probe), obfs (handshake), tcp (probe)"
+    );
+}
+
 /// A started round with mosh (channel 100) and obfs (channel 101) armed next
 /// to tcp, every attempt registered on the plane. Returns the session, the
 /// handles that keep its ports open, and the probes sorted by channel.

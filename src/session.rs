@@ -41,7 +41,7 @@ mod tcp;
 mod tun;
 
 pub use pump::{ChannelCtx, ChannelHandle, ChannelReadyParams, TaskCommand, TaskEvent, pump};
-pub use round::{Round, RoundCandidate, pick_verified};
+pub use round::{Round, RoundCandidate, pick_verified, unanswered};
 
 pub use state::{
     ChannelsPlane, Flow, FlowTcp, PacketIo, Plane, Readiness, TcpFlow, TcpPlane, Tombstone,
@@ -403,6 +403,11 @@ async fn run_io(
             }
             // The TCP candidate is not part of the UDP strategies: only via the announced port.
             allowed.tcp = tcp.is_some();
+            if allowed.webrtc {
+                // The first webrtc peer pays the one-time crypto init; hide
+                // it behind the SSH bootstrap instead of the first round.
+                crate::webrtc::prewarm();
+            }
             ensure!(
                 allowed.quic || allowed.webrtc || allowed.obfs || allowed.mosh || allowed.tcp,
                 "no available strategy: server offered {offer:?}, client allows {strategies:?}"

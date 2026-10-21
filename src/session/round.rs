@@ -22,9 +22,20 @@ use super::{
 
 /// N3: a liveness round caps all in-flight attempts (UDP) after this.
 const ROUND_CAP: Duration = Duration::from_secs(10);
-/// After the first verified echo the remaining candidates get this long
-/// to finish their verification; then the fastest of all verified wins.
+/// After the first verified echo the remaining candidates get at least this
+/// long to finish their verification; then the fastest of all verified wins.
+/// The window never shrinks below this floor: on fast links the CPU and the
+/// jitter decide, not the RTT.
 const VERDICT_GRACE: Duration = Duration::from_millis(400);
+/// The verdict window scales with the measured RTT: the parts it must cover
+/// — a slower handshake (webrtc runs ~6 RTT behind TCP) and the
+/// `established` → `verified` chain (~4.3 RTT) — are all counted in RTTs, so
+/// a fixed 400 ms window structurally cuts webrtc off past ~40 ms RTT.
+const WINDOW_RTTS: u32 = 8;
+/// A candidate that reaches `established` inside the window extends it by
+/// this many RTTs — the `established` → `verified` chain with slack. A
+/// candidate that stays silent extends nothing.
+const ESTABLISHED_RTTS: u32 = 6;
 /// TCP counts as this much slower in the verdict. A TCP tunnel stalls on
 /// packet loss in a way one echo cannot show, so UDP wins unless TCP is
 /// faster by more than this.
@@ -52,6 +63,10 @@ pub struct RoundCandidate {
     /// When the probe first left this client — the RTT baseline.
     /// None until the channel activates and carries the request.
     pub sent_at: Option<tokio::time::Instant>,
+    /// The channel reported `established` (transport handshake done); only
+    /// the commit chain and the probe remain. A candidate that got this far
+    /// extends the verdict window; a silent one does not.
+    pub established: bool,
     pub icmp_id: u16,
     pub request: Vec<u8>,
     pub deadline: tokio::time::Instant,
@@ -279,6 +294,7 @@ impl Session {
                     RoundCandidate {
                         candidate,
                         sent_at: None,
+                        established: false,
                         channel,
                         owned: channel.is_none(),
                         peer,
@@ -599,7 +615,7 @@ impl Session {
             if unanswered(round).is_empty() {
                 true
             } else if round.decide_at.is_none() {
-                let at = (now + VERDICT_GRACE).min(round.deadline);
+                let at = (now + VERDICT_GRACE.max(rtt * WINDOW_RTTS)).min(round.deadline);
                 round.decide_at = Some(at);
                 let waiting = unanswered(round);
                 crate::info!(
@@ -626,6 +642,32 @@ impl Session {
 
     /// The grace window closed — the fastest verified candidate wins.
     pub async fn decide_round(&mut self) -> Result<()> {
+        // A candidate that reached `established` inside the window gets its
+        // chain time (~4.3 RTT to `verified`); silent candidates extend
+        // nothing. The window only grows and never crosses the round
+        // deadline; re-arming happens through `round.decide_at` on the next
+        // loop iteration.
+        {
+            let now = tokio::time::Instant::now();
+            let Some(round) = self.round.as_mut() else {
+                return Ok(());
+            };
+            if let (Some(at), Some(rtt)) = (
+                round.decide_at,
+                round.verified.iter().map(|(.., rtt)| *rtt).min(),
+            ) {
+                let progressing = round.pending.iter().any(|(attempt, rc)| {
+                    rc.established && !round.verified.iter().any(|(id, ..)| id == attempt)
+                });
+                if progressing {
+                    let extended = at.max(now + rtt * ESTABLISHED_RTTS).min(round.deadline);
+                    if extended > now {
+                        round.decide_at = Some(extended);
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let Some(round) = self.round.as_ref() else {
             return Ok(());
         };
@@ -784,17 +826,20 @@ pub fn pick_verified(verified: &[(u64, Candidate, Option<u64>, Duration)]) -> Op
 }
 
 /// Names of the candidates that have not verified yet, for the logs and
-/// the round-completion rule.
-pub(crate) fn unanswered(round: &Round) -> String {
+/// the round-completion rule; the stage in parentheses says how far the
+/// candidate got: `(handshake)` — `established` has not arrived, `(probe)` —
+/// the channel is up and only the echo is missing.
+pub fn unanswered(round: &Round) -> String {
     let done = |attempt: &u64| round.verified.iter().any(|(id, ..)| id == attempt);
-    let mut names: Vec<&str> = round
+    let stage = |established: bool| if established { "probe" } else { "handshake" };
+    let mut names: Vec<String> = round
         .pending
         .iter()
         .filter(|(id, _)| !done(id))
-        .map(|(_, rc)| rc.candidate.as_str())
+        .map(|(_, rc)| format!("{} ({})", rc.candidate.as_str(), stage(rc.established)))
         .collect();
     if round.tcp_id.is_some_and(|id| !done(&id)) {
-        names.push(Candidate::Tcp.as_str());
+        names.push(format!("tcp ({})", stage(round.tcp_started.is_some())));
     }
     names.sort_unstable();
     names.join(", ")
