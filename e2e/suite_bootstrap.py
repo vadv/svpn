@@ -174,6 +174,43 @@ def test_configuration():
         )
 
 
+def test_server_hooks():
+    with tempfile.TemporaryDirectory(prefix="svpn server hooks ") as directory:
+        base = pathlib.Path(directory)
+        (base / "identity").symlink_to("/keys/client")
+        up_marker = "/tmp/svpn-server-up"
+        down_marker = "/tmp/svpn-server-down"
+        for marker in (up_marker, down_marker):
+            command(ssh_to(SERVER) + [f"rm -f {shlex.quote(marker)}"])
+        config = base / "config.toml"
+        config.write_text(
+            'ssh-user = "root"\nssh-identity = "identity"\n'
+            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
+            'log-level = "debug"\nmimic = ["mosh"]\n'
+            f'server = "{SERVER}"\nstats-interval = 0\n'
+            f'server-up = "touch {up_marker} && echo up-done"\n'
+            f'server-down = "touch {down_marker} && echo down-done"\n'
+        )
+        with session("server-hooks", args=["svpn", "--config", str(config)]) as (process, log):
+            until(lambda: "vpn: started" in log.read_text(), seconds=10)
+            assert up_marker in command(ssh_to(SERVER) + [f"ls {shlex.quote(up_marker)}"]).stdout
+        cleanup_verified(process)
+        assert down_marker in command(ssh_to(SERVER) + [f"ls {shlex.quote(down_marker)}"]).stdout
+        print("PASS server hooks: up/down executed on server")
+
+        config.write_text(
+            'ssh-user = "root"\nssh-identity = "identity"\n'
+            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
+            'log-level = "debug"\nmimic = ["mosh"]\n'
+            f'server = "{SERVER}"\nstats-interval = 0\n'
+            'server-up = "exit 1"\n'
+        )
+        result = command(["svpn", "--config", str(config)], check=False, timeout=10)
+        assert result.returncode != 0
+        assert "server up hook failed" in result.stdout
+        print("PASS server hooks: up failure fails fast")
+
+
 def test_authentication():
     wrong_pin = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     for flag, value in [("--ssh-identity", "/keys/wrong"), ("--ssh-host-key", wrong_pin)]:
@@ -411,6 +448,7 @@ def test_readiness_requires_kernel_reply():
 
 TESTS = [
     ("test_configuration", test_configuration),
+    ("test_server_hooks", test_server_hooks),
     ("test_authentication", test_authentication),
     ("test_known_hosts_tofu", test_known_hosts_tofu),
     ("test_agent_identity", test_agent_identity),

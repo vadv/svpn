@@ -17,7 +17,7 @@ GROUPS = ("bootstrap", "lifecycle-pool", "udp", "tcp-auto")
 # The pre-split registry interleaved the groups; keep the exact overall sequence.
 _SEQUENCE = (
     ("lifecycle-pool",)
-    + ("bootstrap",) * 10
+    + ("bootstrap",) * 11
     + ("lifecycle-pool",) * 6
     + ("udp",)
     + ("tcp-auto",) * 2

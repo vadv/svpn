@@ -22,7 +22,7 @@ from test_artifacts import check
 
 # Independent snapshot of the pre-split runner: keep every case and its order.
 BASELINE = """
-test_lifecycle_hooks test_configuration test_authentication test_known_hosts_tofu
+test_lifecycle_hooks test_configuration test_server_hooks test_authentication test_known_hosts_tofu
 test_agent_identity test_no_ssh_binary test_custom_tun_name test_kernel_tun_name
 test_log_levels test_client_stats test_secondary_server_address test_hostname_servers
 test_pool_two_servers test_pool_udp_ports test_pool_failover test_pool_backoff
@@ -81,7 +81,7 @@ def integration_groups():
         expected = {getattr(suite, name) for name in HOOKS_SUBTESTS if group == "lifecycle-pool"}
         assert extra == expected, (group, extra, "every test must be assigned")
     assert collections.Counter(owner for owner, _ in integration.TESTS) == {
-        "bootstrap": 11,
+        "bootstrap": 12,
         "lifecycle-pool": 14,
         "udp": 5,
         "tcp-auto": 10,
@@ -102,7 +102,7 @@ def integration_groups():
             ):
                 integration.main()
             assert called == expected, (group, args)
-    print("PASS integration: 40 cases assigned once, CLI/env selection and original order")
+    print("PASS integration: 41 cases assigned once, CLI/env selection and original order")
 
 
 def matrix_groups():

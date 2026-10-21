@@ -85,6 +85,20 @@ pub enum Message {
         version: u32,
     },
     TunReady,
+    /// Client → server: shell commands to run on the server after its TUN is up
+    /// (`up`) and before it exits (`down`). Sent after server `TunReady`, before
+    /// client `TunReady`. Server replies with `HookResult` once `up` finishes.
+    ServerHooks {
+        up: Option<String>,
+        down: Option<String>,
+    },
+    /// Server → client: result of the `up` hook. `stdout`/`stderr` are truncated
+    /// to 4 KiB each.
+    HookResult {
+        ok: bool,
+        stdout: String,
+        stderr: String,
+    },
     Open {
         id: u64,
         flow: FlowKey,

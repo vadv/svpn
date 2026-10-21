@@ -30,6 +30,12 @@ impl Session {
             Message::Heartbeat { stats } => {
                 crate::debug!("heartbeat received stats={stats:?}");
             }
+            Message::ServerHooks { .. } => {
+                bail!("unexpected server_hooks in session");
+            }
+            Message::HookResult { .. } => {
+                bail!("unexpected hook_result in session");
+            }
             Message::ChannelPrepare {
                 attempt,
                 strategy,

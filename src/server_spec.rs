@@ -57,6 +57,12 @@ pub struct Globals {
     /// Server TCP fallback port; 0 — ephemeral (default in auto).
     #[arg(long)]
     pub tcp_port: Option<u16>,
+    /// Shell command run on the server after its TUN is up; empty — no hook.
+    #[arg(long)]
+    pub server_up: Option<String>,
+    /// Shell command run on the server before it exits; empty — no hook.
+    #[arg(long)]
+    pub server_down: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -84,6 +90,8 @@ pub struct ServerSpec {
     #[serde(default, deserialize_with = "crate::config::port_range")]
     udp_port_range: Option<(u16, u16)>,
     tcp_port: Option<u16>,
+    server_up: Option<String>,
+    server_down: Option<String>,
 }
 
 /// Owned configuration retained across future supervisor retries.
@@ -105,6 +113,8 @@ pub struct LinkParams {
     pub peer_addr: Ipv4Addr,
     pub mtu: u16,
     pub tun_name: Option<String>,
+    pub server_up: Option<String>,
+    pub server_down: Option<String>,
 }
 
 impl ServerSpec {
@@ -140,6 +150,30 @@ impl ServerSpec {
         ensure!(
             self.peer_addr.is_none_or(packet::unicast),
             "peer-addr must be unicast IPv4"
+        );
+        ensure!(
+            self.server_up.as_ref().is_none_or(|v| !v.trim().is_empty()),
+            "server-up must not be empty"
+        );
+        ensure!(
+            self.server_up
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-up exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| !v.trim().is_empty()),
+            "server-down must not be empty"
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-down exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
         );
         if let Some(name) = self.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
             validate_tun_name(name).context("peer-tun-name")?;
@@ -192,6 +226,11 @@ impl ServerSpec {
             peer_addr: self.peer_addr.unwrap_or(globals.peer_addr),
             mtu: globals.mtu,
             tun_name: globals.tun_name.clone().filter(|name| !name.is_empty()),
+            server_up: self.server_up.clone().or_else(|| globals.server_up.clone()),
+            server_down: self
+                .server_down
+                .clone()
+                .or_else(|| globals.server_down.clone()),
         };
         ensure!(params.weight != 0, "weight must be nonzero");
         ensure!(params.ssh_port != 0, "SSH port must be 1..=65535");
@@ -255,6 +294,8 @@ impl FromStr for ServerSpec {
                 peer_addr: None,
                 udp_port_range: None,
                 tcp_port: None,
+                server_up: None,
+                server_down: None,
             };
             let mut seen = HashSet::new();
             for part in parts {
@@ -343,6 +384,30 @@ impl Globals {
         if let Some(name) = self.tun_name.as_deref().filter(|v| !v.is_empty()) {
             validate_local_tun_name(name, cfg!(target_os = "macos")).context("tun-name")?;
         }
+        ensure!(
+            self.server_up.as_ref().is_none_or(|v| !v.trim().is_empty()),
+            "server-up must not be empty"
+        );
+        ensure!(
+            self.server_up
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-up exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| !v.trim().is_empty()),
+            "server-down must not be empty"
+        );
+        ensure!(
+            self.server_down
+                .as_ref()
+                .is_none_or(|v| v.len() <= crate::config::MAX_SERVER_HOOK),
+            "server-down exceeds {} bytes",
+            crate::config::MAX_SERVER_HOOK
+        );
         validate_mimic_fields(&self.mimic)
     }
 }
