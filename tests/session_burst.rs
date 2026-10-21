@@ -131,3 +131,64 @@ async fn health_wake_follows_the_timer_then_the_burst() {
         session.burst.as_ref().unwrap().wake_at()
     );
 }
+
+// ── session wiring ──
+
+#[tokio::test]
+async fn committed_arms_burst_and_sends_first_echo() {
+    use svpn::selector::Candidate;
+    use svpn::session::ChannelHandle;
+    use svpn::session::TaskCommand;
+
+    let (mut session, _events) = common::session::link_session(false);
+    let channel = 1u64;
+    let (command, mut commands) = tokio::sync::mpsc::channel(8);
+    let task = tokio::spawn(async move {});
+    let svpn::session::Plane::Channels(plane) = &mut session.plane else {
+        panic!("channels plane")
+    };
+    plane.channels.insert(
+        channel,
+        ChannelHandle {
+            candidate: Candidate::Mosh,
+            cancel: None,
+            command,
+            task,
+            relay: None,
+        },
+    );
+    // Probe flows live above FIRST_PROBE_ID, like round attempts.
+    let attempt = svpn::link_io::FIRST_PROBE_ID;
+    let now = tokio::time::Instant::now();
+    let mut probe = Burst::new(channel, attempt, 4242, 100, vec![9; 32]);
+    let key = svpn::packet::FlowKey {
+        protocol: 1,
+        source: session.client_ip,
+        destination: std::net::Ipv4Addr::new(10, 77, 0, 1),
+        source_port: 4242,
+        destination_port: 0,
+    };
+    let mut flow = svpn::session::Flow::new(key, now);
+    flow.channel = Some(channel);
+    plane.flows.insert(attempt, flow);
+    probe.arm(now);
+    session.burst = Some(probe);
+
+    session.committed(attempt).await.unwrap();
+
+    let burst = session.burst.as_ref().unwrap();
+    assert!(burst.finished(now + BURST_TAIL + BURST_SPACING * 10));
+    let outcome = burst.outcome();
+    assert_eq!((outcome.received, outcome.lost), (0, BURST_LEN));
+    match commands.try_recv() {
+        Ok(TaskCommand::Data(id, packet)) => {
+            assert_eq!(id, attempt);
+            assert_eq!(
+                svpn::packet::icmp_echo_reply_seq(&packet, 4242, &[9; 32]),
+                None,
+                "outgoing request is no reply"
+            );
+        }
+        _ => panic!("expected the first echo Data"),
+    }
+}
