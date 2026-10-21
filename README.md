@@ -213,13 +213,6 @@ sudo env SSH_AUTH_SOCK="$SSH_AUTH_SOCK" /usr/local/bin/svpn multi --config vpn.t
 Маскировка воспроизводит формат протокола на проводе, но не гарантирует
 проходимость через конкретный фильтр — измеряйте через `svpn perf`.
 
-Сервер в heartbeat-статистике считает причины отказов по каждому
-транспорту: udp-refused, tcp-refused, no-server-answer, address-taken,
-udp-garbage, tcp-garbage. Garbage — датаграммы, прошедшие внешний
-протокол, но сломанные внутри: характерный след контент-фильтра,
-портящего пакеты. Строки stats появляются в логе клиента с интервалом
-stats-interval.
-
 ## Файрвол сервера без hooks
 
 Если server hooks не подходят, настройте сервер один раз вручную от root

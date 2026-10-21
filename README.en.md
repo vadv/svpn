@@ -216,12 +216,6 @@ not moved to the new channel: TCP gets a RST and applications reconnect.
 Camouflage reproduces the protocol format on the wire but does not guarantee
 passing a particular filter — measure with `svpn perf`.
 
-The server counts per-transport failure causes in its heartbeat stats:
-udp-refused, tcp-refused, no-server-answer, address-taken, udp-garbage,
-tcp-garbage. Garbage means datagrams that passed the outer protocol but
-broke the inner framing — the signature of a content filter mangling
-packets. Stats lines appear in the client log every stats-interval.
-
 ## Server firewall without hooks
 
 If server hooks do not fit, configure the server once by hand as root
