@@ -31,7 +31,7 @@ pub struct Burst {
     base_seq: u16,
     pub payload: Vec<u8>,
     /// None until the probe flow commits: sends and the deadline start then.
-    armed: Option<Instant>,
+    pub(crate) armed: Option<Instant>,
     sent: [Option<Instant>; BURST_LEN],
     rtts: [Option<Duration>; BURST_LEN],
     next: usize,
@@ -173,8 +173,25 @@ impl Session {
     /// Drive the burst: start when due, send the echoes that are due, close
     /// out at the deadline. Runs from the health timer arm and the tick.
     pub(crate) async fn poll_burst(&mut self, now: Instant) -> Result<()> {
+        // A probe flow reaped underneath an unarmed health burst would stall
+        // health forever: drop the dead burst and re-arm the interval. The
+        // challenge deadline owns its own zombie bursts.
+        let zombie = match &self.burst {
+            Some(burst) if burst.armed.is_none() => {
+                !self
+                    .challenge
+                    .as_ref()
+                    .is_some_and(|c| c.owns(burst.attempt))
+                    && matches!(&self.plane, Plane::Channels(plane) if !plane.flows.contains_key(&burst.attempt))
+            }
+            _ => false,
+        };
+        if zombie {
+            self.burst = None;
+            self.health_at = Some(now + HEALTH_INTERVAL);
+        }
         if self.health_due(now) {
-            self.maybe_start_challenge().await?;
+            self.maybe_start_challenge(false).await?;
             if self.challenge.is_none() {
                 self.start_burst(now).await?;
             }
@@ -343,9 +360,40 @@ impl Session {
                 prefixed(self.tag(), "channel"),
                 outcome.lost
             );
-            let entry = self.stats.transport_failures.entry(name).or_default();
+            let entry = self
+                .stats
+                .transport_failures
+                .entry(name.clone())
+                .or_default();
             *entry = entry.saturating_add(outcome.lost as u64);
         }
-        self.close_flow(burst.attempt, true).await
+        // S3 trigger 2: the incumbent's own burst degraded — loss ≥ 3 or
+        // p90 ≥ 2× the adoption baseline. A borrowed channel says nothing
+        // about the incumbent's path, so only the adopted channel counts.
+        let degraded = match &self.plane {
+            Plane::Channels(plane) => plane.selector.as_ref().is_some_and(|selector| {
+                let Some(incumbent) = selector.last_good else {
+                    return false;
+                };
+                if selector.ready_channel(incumbent) != Some(burst.channel) {
+                    return false;
+                }
+                outcome.lost >= 3
+                    || match (outcome.p90, selector.baseline_p90) {
+                        (Some(p90), Some(baseline)) => p90 >= baseline * 2,
+                        _ => false,
+                    }
+            }),
+            Plane::Tcp(_) => false,
+        };
+        self.close_flow(burst.attempt, true).await?;
+        if degraded {
+            crate::debug!(
+                "{} health: {name} degraded past the baseline — challenger round",
+                prefixed(self.tag(), "channel")
+            );
+            self.maybe_start_challenge(true).await?;
+        }
+        Ok(())
     }
 }

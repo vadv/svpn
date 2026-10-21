@@ -1,6 +1,6 @@
 //! Shared session fixtures: link-level Session builders and packet helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use svpn::control::{Control, Stats};
@@ -99,6 +99,7 @@ fn link_session_cap_with(
             health_at: None,
             burst: None,
             challenge: None,
+            switch_pending: None,
         },
         returned,
     )
@@ -159,6 +160,7 @@ pub fn test_plane(selector: Option<Selector>) -> ChannelsPlane {
         bind: Ipv4Addr::UNSPECIFIED,
         quic: None,
         channels: HashMap::new(),
+        draining: HashSet::new(),
         next_channel_id: 0,
         attempt: None,
         flows: HashMap::new(),

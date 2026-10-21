@@ -38,7 +38,7 @@ test_auto_assignment_and_restart test_auto_two_clients_one_server test_auto_expl
 test_auto_pool_shared_pair
 """.split()
 RESELECT_BASELINE = """
-test_udp_reselect_after_ban_expiry
+test_udp_reselect_after_ban_expiry test_degraded_incumbent_switches_and_drains
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -92,7 +92,7 @@ def integration_groups():
         "lifecycle-pool": 18,
         "udp": 5,
         "tcp-auto": 10,
-        "reselect": 1,
+        "reselect": 2,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]

@@ -331,12 +331,18 @@ impl Session {
             flow_state.channel = Some(channel);
             // N3 round mode commits directly; the verdict (ICMP reply) ends
             // the round instead of a selector transition. Challenge probe
-            // flows follow the same path.
+            // flows follow the same path — and so do health-burst probes:
+            // without the Commit the server never sends Committed and the
+            // burst stays unarmed forever.
             if self.round.is_some()
                 || self
                     .challenge
                     .as_ref()
                     .is_some_and(|challenge| challenge.owns(flow_id))
+                || self
+                    .burst
+                    .as_ref()
+                    .is_some_and(|burst| burst.attempt == flow_id)
             {
                 crate::debug!("round: flow_opened preflight channel={channel}, committing");
                 return self
@@ -402,6 +408,46 @@ impl Session {
     }
 
     /// Client: `committed` received — the pre-active queue drains to the channel.
+    /// Arm the burst in the slot and send its first probe echo. Called from
+    /// `committed` (the commit lands while the burst owns the slot) and from
+    /// `challenge_drive` (the commit landed while the burst waited).
+    pub(crate) fn arm_slotted_burst(&mut self, now: tokio::time::Instant) -> Result<()> {
+        let Some(burst) = self.burst.as_mut() else {
+            return Ok(());
+        };
+        if burst.armed.is_some() {
+            return Ok(());
+        }
+        let Plane::Channels(plane) = &mut self.plane else {
+            return Ok(());
+        };
+        let Some(flow) = plane.flows.get_mut(&burst.attempt) else {
+            return Ok(());
+        };
+        ensure!(
+            flow.channel == Some(burst.channel),
+            "unexpected burst committed channel"
+        );
+        flow.active = true;
+        let request = packet::icmp_echo_request(
+            flow.key.source,
+            flow.key.destination,
+            burst.icmp_id,
+            burst.seq(0),
+            &burst.payload,
+        );
+        if let Some(handle) = plane.channels.get(&burst.channel) {
+            // A full datagram queue is packet loss; it ends as loss.
+            handle
+                .command
+                .try_send(TaskCommand::Data(burst.attempt, request))
+                .ok();
+        }
+        burst.arm(now);
+        burst.mark_sent(now);
+        Ok(())
+    }
+
     pub async fn committed(&mut self, flow_id: u64) -> Result<()> {
         if is_probe_flow(flow_id) {
             // EPIC-016: a health burst owns this probe id, not the round.
@@ -410,37 +456,22 @@ impl Session {
                 .as_ref()
                 .is_some_and(|burst| burst.attempt == flow_id)
             {
-                let now = tokio::time::Instant::now();
-                let Some(burst) = self.burst.as_mut() else {
-                    return Ok(());
-                };
-                let Plane::Channels(plane) = &mut self.plane else {
-                    return Ok(());
-                };
-                let Some(flow) = plane.flows.get_mut(&flow_id) else {
-                    return Ok(());
-                };
-                ensure!(
-                    flow.channel == Some(burst.channel),
-                    "unexpected burst committed channel"
-                );
-                flow.active = true;
-                let request = packet::icmp_echo_request(
-                    flow.key.source,
-                    flow.key.destination,
-                    burst.icmp_id,
-                    burst.seq(0),
-                    &burst.payload,
-                );
-                if let Some(handle) = plane.channels.get(&burst.channel) {
-                    // A full datagram queue is packet loss; it ends as loss.
-                    handle
-                        .command
-                        .try_send(TaskCommand::Data(flow_id, request))
-                        .ok();
+                return self.arm_slotted_burst(tokio::time::Instant::now());
+            }
+            // A challenge burst waiting for the slot: the server commits
+            // probes as soon as they echo, long before the burst runs. Do
+            // not drop the commit — activate the flow; challenge_drive arms
+            // the burst when it enters the slot.
+            if self
+                .challenge
+                .as_ref()
+                .is_some_and(|challenge| challenge.owns(flow_id))
+            {
+                if let Plane::Channels(plane) = &mut self.plane
+                    && let Some(flow) = plane.flows.get_mut(&flow_id)
+                {
+                    flow.active = true;
                 }
-                burst.arm(now);
-                burst.mark_sent(now);
                 return Ok(());
             }
             let Some(rc) = self
@@ -615,10 +646,12 @@ impl Session {
         }
         let mut actions = Vec::new();
         let mut closed_key = None;
+        let mut closed_channel = None;
         match &mut self.plane {
             Plane::Channels(plane) => {
                 if let Some(flow_state) = plane.flows.remove(&flow_id) {
                     closed_key = Some(flow_state.key);
+                    closed_channel = flow_state.channel;
                     if plane.by_key.get(&flow_state.key) == Some(&flow_id) {
                         plane.by_key.remove(&flow_state.key);
                     }
@@ -650,12 +683,47 @@ impl Session {
                 }
             }
         }
+        // A draining channel retires once its last flow closes (S3).
+        if let Some(channel) = closed_channel {
+            self.maybe_drain(channel).await?;
+        }
         // execute_actions may return CloseFlow — break the recursion with a
         // box (only for close with binding failure; empty actions are not boxed).
         if !actions.is_empty() {
             Box::pin(self.execute_actions(actions)).await?;
         }
         Ok(())
+    }
+
+    /// Draining channel (EPIC-016 S3): the replaced incumbent serves its
+    /// remaining flows; once the last one closes, retire the channel.
+    pub(crate) async fn maybe_drain(&mut self, channel: u64) -> Result<()> {
+        {
+            let Plane::Channels(plane) = &self.plane else {
+                return Ok(());
+            };
+            if !plane.draining.contains(&channel)
+                || plane
+                    .flows
+                    .values()
+                    .any(|flow| flow.channel == Some(channel))
+            {
+                return Ok(());
+            }
+        }
+        crate::debug!("drain: channel {channel} retired (last flow closed)");
+        self.stop_channel(channel).await;
+        if let Plane::Channels(plane) = &mut self.plane {
+            plane.draining.remove(&channel);
+            plane.channels.remove(&channel);
+        }
+        self.control
+            .send(Message::ChannelFailed {
+                attempt: None,
+                channel: Some(channel),
+                reason: Reason::ChannelFailed,
+            })
+            .await
     }
 
     // ────────────────────────── Accessors ──────────────────────────

@@ -39,7 +39,7 @@ const ESTABLISHED_RTTS: u32 = 6;
 /// TCP counts as this much slower in the verdict. A TCP tunnel stalls on
 /// packet loss in a way one echo cannot show, so UDP wins unless TCP is
 /// faster by more than this.
-const TCP_PENALTY: Duration = Duration::from_millis(50);
+pub(crate) const TCP_PENALTY: Duration = Duration::from_millis(50);
 /// A datagram request can vanish anywhere (driver burst drops, UDP loss):
 /// re-send until the verdict or the round deadline; replies are idempotent.
 pub(crate) const ROUND_RESEND: Duration = Duration::from_secs(2);
@@ -176,6 +176,8 @@ impl Session {
             }
         }
         self.readiness = Some(Readiness::Probing);
+        // A fresh round replaces the world: any pending switch dies with it.
+        self.switch_pending = None;
         self.round = Some(Round {
             id,
             seq,
@@ -691,11 +693,16 @@ impl Session {
             candidate.as_str(),
             if silent.is_empty() { "none" } else { &silent },
         );
-        self.round_won(channel).await
+        self.round_won(channel, Some(rtt)).await
     }
 
     /// The first matching echo wins; retire only this round's losers.
-    pub async fn round_won(&mut self, channel: Option<u64>) -> Result<()> {
+    /// `baseline` is the winner's raw RTT — the degradation reference.
+    pub async fn round_won(
+        &mut self,
+        channel: Option<u64>,
+        baseline: Option<Duration>,
+    ) -> Result<()> {
         let Some(round) = self.round.take() else {
             return Ok(());
         };
@@ -734,7 +741,7 @@ impl Session {
                 None => Candidate::Tcp,
             };
             if let Some(selector) = plane.selector.as_mut() {
-                selector.adopt(candidate, channel);
+                selector.adopt(candidate, channel, baseline);
             }
             candidate
         } else {

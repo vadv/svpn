@@ -255,7 +255,7 @@ fn repeated_bans_double_the_backoff_and_success_resets_it() {
     );
 
     // Success resets the backoff: the next ban is ~10 minutes again.
-    selector.adopt(Candidate::Quic, Some(10));
+    selector.adopt(Candidate::Quic, Some(10), None);
     selector
         .channels
         .insert(Candidate::Quic, ReadyChannel::new(11, false));

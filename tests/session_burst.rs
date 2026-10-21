@@ -171,7 +171,6 @@ async fn committed_arms_burst_and_sends_first_echo() {
     let mut flow = svpn::session::Flow::new(key, now);
     flow.channel = Some(channel);
     plane.flows.insert(attempt, flow);
-    probe.arm(now);
     session.burst = Some(probe);
 
     session.committed(attempt).await.unwrap();
@@ -191,4 +190,56 @@ async fn committed_arms_burst_and_sends_first_echo() {
         }
         _ => panic!("expected the first echo Data"),
     }
+}
+
+// ── flow_opened wiring ──
+
+#[tokio::test]
+async fn health_probe_flow_opened_commits_on_the_wire() {
+    // Regression: a health-burst probe is owned by neither the round nor the
+    // challenge; flow_opened fell through to the selector, no Commit ever
+    // left, the server never sent Committed — the burst stayed unarmed
+    // forever and health silently stalled.
+    let (client_half, mut wire) = tokio::io::duplex(4096);
+    let control = svpn::control::Control::new(tokio::io::empty(), client_half);
+    let (mut session, _events) = common::session::link_session_with(false, control);
+    session.readiness = Some(Readiness::Ready);
+    let attempt = svpn::link_io::FIRST_PROBE_ID;
+    let channel = 7u64;
+    let key = svpn::packet::FlowKey {
+        protocol: 1,
+        source: session.client_ip,
+        destination: std::net::Ipv4Addr::new(10, 77, 0, 1),
+        source_port: 4242,
+        destination_port: 0,
+    };
+    let mut flow = svpn::session::Flow::new(key, Instant::now());
+    flow.channel = Some(channel);
+    let svpn::session::Plane::Channels(plane) = &mut session.plane else {
+        panic!("channels plane")
+    };
+    plane.flows.insert(attempt, flow);
+    session.burst = Some(Burst::new(channel, attempt, 4242, 100, vec![9; 32]));
+
+    session
+        .dispatch_control(svpn::control::Message::FlowOpened {
+            flow_id: attempt,
+            flow: key,
+            channel,
+        })
+        .await
+        .unwrap();
+
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(&mut wire);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_millis(100), lines.read_line(&mut line))
+        .await
+        .expect("a Commit must leave right away")
+        .unwrap();
+    let message: svpn::control::Message = serde_json::from_str(line.trim()).unwrap();
+    assert!(
+        matches!(message, svpn::control::Message::Commit { flow_id, .. } if flow_id == attempt),
+        "health probe commits: {line}"
+    );
 }

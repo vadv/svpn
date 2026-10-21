@@ -16,7 +16,7 @@
 //! selector actions, `tun` the packet path, `tcp` the EPIC-003 mode.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::Ipv4Addr,
     time::{Duration, Instant as StdInstant},
 };
@@ -109,6 +109,9 @@ pub struct Session {
     /// EPIC-016: in-flight probe burst over the live channel.
     pub burst: Option<burst::Burst>,
     pub challenge: Option<challenge::Challenge>,
+    /// EPIC-016 S3: first-round winner awaiting the confirming round
+    /// (candidate, first win at). Reset by any round without that winner.
+    pub switch_pending: Option<(Candidate, StdInstant)>,
 }
 
 impl Session {
@@ -444,6 +447,7 @@ async fn run_io(
                 bind: Ipv4Addr::UNSPECIFIED,
                 quic: None,
                 channels: HashMap::new(),
+                draining: HashSet::new(),
                 next_channel_id: 0,
                 attempt: None,
                 flows: HashMap::new(),
@@ -471,6 +475,7 @@ async fn run_io(
                 bind,
                 quic,
                 channels: HashMap::new(),
+                draining: HashSet::new(),
                 next_channel_id: 0,
                 attempt: None,
                 flows: HashMap::new(),
@@ -524,6 +529,7 @@ async fn run_io(
         health_at: None,
         burst: None,
         challenge: None,
+        switch_pending: None,
         drop_prefix,
     }
     .event_loop()

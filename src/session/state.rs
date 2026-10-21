@@ -2,7 +2,7 @@
 //! tombstone table of retired flows.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::Ipv4Addr,
     time::{Duration, Instant as StdInstant},
 };
@@ -221,6 +221,9 @@ pub struct ChannelsPlane {
     pub bind: Ipv4Addr,
     pub quic: Option<(quinn::Endpoint, [u8; 32])>,
     pub channels: HashMap<u64, ChannelHandle>,
+    /// Channels of a replaced incumbent (EPIC-016 S3): no new flows, not
+    /// probed; torn down once the last bound flow closes.
+    pub draining: HashSet<u64>,
     pub prepared: HashMap<u64, u64>,
     pub next_channel_id: u64,
     /// Client: preparation in flight (attempt, candidate, channel, webrtc peer).

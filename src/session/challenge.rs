@@ -1,6 +1,9 @@
-//! Background re-selection (EPIC-016 S2): while the link runs on a TCP
+//! Background re-selection (EPIC-016): while the link runs on a TCP
 //! incumbent, expired UDP bans get a challenger round in the background —
-//! traffic keeps flowing, and a healthy UDP challenger takes over.
+//! traffic keeps flowing, and a healthy UDP challenger takes over. S3: a
+//! degraded incumbent is probed alongside its challengers, a switch needs
+//! the margin (20 % and 5 ms) twice in a row, and the replaced channel
+//! drains instead of dying mid-flow.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -14,7 +17,8 @@ use crate::link_io::PREFLIGHT_ID;
 use crate::selector::{Candidate, Reason};
 use crate::{crypto, packet, webrtc};
 
-use super::burst::{Burst, HEALTH_INTERVAL, Outcome};
+use super::burst::{BURST_LEN, Burst, HEALTH_INTERVAL, Outcome};
+use super::round::TCP_PENALTY;
 use super::{Flow, PacketIo, Plane, Readiness, Session, candidate_strategy, prefixed, reason_en};
 
 /// A background challenge caps all in-flight challenger work after this.
@@ -35,8 +39,11 @@ pub struct Challenge {
     pub attempts: HashMap<u64, Challenger>,
     /// Bound attempts waiting for the burst slot.
     pub queue: VecDeque<u64>,
-    /// Finished bursts: (candidate, channel, outcome).
+    /// Finished bursts: (candidate, channel, attempt, outcome).
     pub measured: Vec<(Candidate, u64, u64, Outcome)>,
+    /// S3: the probed incumbent (attempt, candidate, channel), if any.
+    /// Never re-banned, never retired — it is serving traffic.
+    pub incumbent: Option<(u64, Candidate, u64)>,
     pub deadline: Instant,
 }
 
@@ -59,10 +66,13 @@ impl Challenge {
 }
 
 impl Session {
-    /// Trigger 1: the incumbent is TCP and a UDP candidate is eligible
-    /// again (its ban expired). Runs without pausing admission: the link
-    /// stays Ready and flows keep binding to the incumbent.
-    pub async fn maybe_start_challenge(&mut self) -> Result<()> {
+    /// Trigger 1 (`degraded = false`): the incumbent is TCP and a UDP
+    /// candidate is eligible again (its ban expired). Trigger 2
+    /// (`degraded = true`, S3): the incumbent's health burst degraded —
+    /// the incumbent is probed alongside its challengers and keeps
+    /// serving unless beaten by the margin twice in a row. Runs without
+    /// pausing admission: the link stays Ready and flows keep binding.
+    pub async fn maybe_start_challenge(&mut self, degraded: bool) -> Result<()> {
         if !self.client()
             || self.readiness != Some(Readiness::Ready)
             || self.round.is_some()
@@ -71,24 +81,35 @@ impl Session {
         {
             return Ok(());
         }
-        let candidates = {
+        let (incumbent, incumbent_channel, candidates) = {
             let Plane::Channels(plane) = &self.plane else {
                 unreachable!()
             };
             let Some(selector) = plane.selector.as_ref() else {
                 return Ok(());
             };
-            if selector.last_good != Some(Candidate::Tcp) {
+            let Some(incumbent) = selector.last_good else {
+                return Ok(());
+            };
+            if degraded == (incumbent == Candidate::Tcp) {
+                // Expiry trigger: TCP incumbent. Degradation: UDP only —
+                // TCP carries no health bursts to degrade.
                 return Ok(());
             }
             // The `allowed` field is live eligibility (bans retained out);
             // the `allowed()` method returns the configured list.
-            selector
+            let candidates = selector
                 .allowed
                 .iter()
                 .copied()
-                .filter(|candidate| *candidate != Candidate::Tcp)
-                .collect::<Vec<_>>()
+                .filter(|candidate| *candidate != Candidate::Tcp && *candidate != incumbent)
+                .collect::<Vec<_>>();
+            let channel = if incumbent == Candidate::Tcp {
+                None
+            } else {
+                selector.ready_channel(incumbent)
+            };
+            (incumbent, channel, candidates)
         };
         if candidates.is_empty() {
             return Ok(());
@@ -101,6 +122,41 @@ impl Session {
             })
         });
         let mut attempts = HashMap::new();
+        let mut queue = VecDeque::new();
+        let mut incumbent_probe = None;
+        // The incumbent is probed on its live channel, first in the queue:
+        // the margin verdict compares like for like. The channel is long
+        // established, so the FlowOpen goes out immediately.
+        if let Some(channel) = incumbent_channel {
+            let attempt = self.next_round_attempt;
+            self.next_round_attempt = attempt.checked_add(1).context("probe ID space exhausted")?;
+            ensure!(attempt < PREFLIGHT_ID, "probe ID space exhausted");
+            let burst = self.open_probe(attempt, channel)?;
+            let key = {
+                let Plane::Channels(plane) = &self.plane else {
+                    unreachable!()
+                };
+                plane.flows[&attempt].key
+            };
+            self.control
+                .send(Message::FlowOpen {
+                    flow_id: attempt,
+                    flow: key,
+                    channel: Some(channel),
+                })
+                .await?;
+            attempts.insert(
+                attempt,
+                Challenger {
+                    candidate: incumbent,
+                    channel: Some(channel),
+                    peer: None,
+                    burst: Some(burst),
+                },
+            );
+            queue.push_back(attempt);
+            incumbent_probe = Some((attempt, incumbent, channel));
+        }
         let mut names = Vec::new();
         for candidate in candidates {
             let attempt = self.next_round_attempt;
@@ -140,14 +196,20 @@ impl Session {
         }
         self.challenge = Some(Challenge {
             attempts,
-            queue: VecDeque::new(),
+            queue,
             measured: Vec::new(),
+            incumbent: incumbent_probe,
             deadline: Instant::now() + CHALLENGE_CAP,
         });
         crate::info!(
-            "{} challenge: probing {} in the background (tcp keeps serving)",
+            "{} challenge: probing {} in the background ({} keeps serving)",
             prefixed(self.tag(), "channel"),
-            names.join(", ")
+            names.join(", "),
+            if incumbent == Candidate::Tcp {
+                "tcp"
+            } else {
+                incumbent.as_str()
+            }
         );
         Ok(())
     }
@@ -159,10 +221,6 @@ impl Session {
     /// channel-task spawn, and the `Established` handler is the single sender
     /// (a bind-time send duplicates it and draws a `FlowReject`).
     pub(crate) fn challenge_channel_bound(&mut self, attempt: u64, channel: u64) -> Result<()> {
-        let PacketIo::Link(io) = &self.io else {
-            bail!("challenge requires a packet port");
-        };
-        let peer_ip = io.peer_ip;
         let Some(challenge) = self.challenge.as_mut() else {
             return Ok(());
         };
@@ -170,6 +228,25 @@ impl Session {
             return Ok(());
         };
         challenger.channel = Some(channel);
+        let burst = self.open_probe(attempt, channel)?;
+        let challenge = self.challenge.as_mut().context("challenge disappeared")?;
+        challenge
+            .attempts
+            .get_mut(&attempt)
+            .context("challenger disappeared")?
+            .burst = Some(burst);
+        challenge.queue.push_back(attempt);
+        Ok(())
+    }
+
+    /// Probe flow + burst over an established channel: the ICMP echo id
+    /// avoids every live 5-tuple, and the flow carries the channel for
+    /// `committed()`.
+    fn open_probe(&mut self, attempt: u64, channel: u64) -> Result<Burst> {
+        let PacketIo::Link(io) = &self.io else {
+            bail!("challenge requires a packet port");
+        };
+        let peer_ip = io.peer_ip;
         // Same rule as rounds: no live flow may share the ICMP 5-tuple.
         let base = u16::from_ne_bytes(crypto::random()?);
         let Plane::Channels(plane) = &mut self.plane else {
@@ -200,13 +277,7 @@ impl Session {
         let mut payload = vec![0u8; 32];
         getrandom::fill(&mut payload).map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
         let base_seq = u16::from_ne_bytes(crypto::random()?);
-        challenge
-            .attempts
-            .get_mut(&attempt)
-            .context("challenger disappeared")?
-            .burst = Some(Burst::new(channel, attempt, icmp_id, base_seq, payload));
-        challenge.queue.push_back(attempt);
-        Ok(())
+        Ok(Burst::new(channel, attempt, icmp_id, base_seq, payload))
     }
 
     /// The burst slot is free: start the next queued challenger. Finishes
@@ -224,21 +295,50 @@ impl Session {
             }
             return Ok(());
         }
-        let attempt = self
+        let mut attempt = self
             .challenge
             .as_mut()
-            .and_then(|challenge| challenge.queue.pop_front())
-            .context("challenge queue disappeared")?;
-        let burst = self
-            .challenge
-            .as_mut()
-            .and_then(|challenge| challenge.attempts.get_mut(&attempt))
-            .and_then(|challenger| challenger.burst.take());
-        let Some(burst) = burst else {
-            // Failed between queueing and driving: nothing to start.
-            return Ok(());
+            .and_then(|challenge| challenge.queue.pop_front());
+        // A challenger that failed between queueing and driving leaves a
+        // dead entry behind: skip it and keep draining the queue, or the
+        // rest waits for the deadline for no reason.
+        let burst = loop {
+            let Some(queued) = attempt else {
+                let done = self
+                    .challenge
+                    .as_ref()
+                    .is_some_and(|challenge| challenge.done());
+                if done && self.burst.is_none() {
+                    return self.finish_challenge(false).await;
+                }
+                return Ok(());
+            };
+            let burst = self
+                .challenge
+                .as_mut()
+                .and_then(|challenge| challenge.attempts.get_mut(&queued))
+                .and_then(|challenger| challenger.burst.take());
+            if burst.is_some() {
+                break burst;
+            }
+            attempt = self
+                .challenge
+                .as_mut()
+                .and_then(|challenge| challenge.queue.pop_front());
         };
-        self.burst = Some(burst);
+        self.burst = burst;
+        // The server may have committed the probe while the burst waited for
+        // the slot (committed() activated the flow): arm it now instead of
+        // leaving the burst unarmed until the challenge deadline.
+        let pre_committed = {
+            let Some(burst) = self.burst.as_ref() else {
+                return Ok(());
+            };
+            matches!(&self.plane, Plane::Channels(plane) if plane.flows.get(&burst.attempt).is_some_and(|flow| flow.active))
+        };
+        if pre_committed {
+            self.arm_slotted_burst(now)?;
+        }
         Ok(())
     }
 
@@ -263,7 +363,9 @@ impl Session {
 
     /// A challenger failed (prepare rejected or its channel died): re-ban
     /// the candidate with the doubled backoff and move on. Returns true
-    /// when the attempt/channel belonged to the challenge. Generic channel
+    /// when the attempt/channel belonged to the challenge. The incumbent
+    /// dying is not a challenger failure: the challenge aborts and the
+    /// ordinary dead-incumbent path (already run) decides. Generic channel
     /// cleanup (stats, channel removal, burst clearing) has already run.
     pub(crate) async fn challenge_channel_failed(
         &mut self,
@@ -271,6 +373,16 @@ impl Session {
         channel: Option<u64>,
         reason: Reason,
     ) -> Result<bool> {
+        let incumbent = self
+            .challenge
+            .as_ref()
+            .and_then(|challenge| challenge.incumbent);
+        if let Some((inc_attempt, _, inc_channel)) = incumbent
+            && (attempt == Some(inc_attempt) || channel == Some(inc_channel))
+        {
+            self.abort_challenge().await?;
+            return Ok(false);
+        }
         let Some(challenge) = self.challenge.as_mut() else {
             return Ok(false);
         };
@@ -300,11 +412,13 @@ impl Session {
         Ok(true)
     }
 
-    /// Verdict: the measured challenger with the lowest p90 replaces the
-    /// TCP incumbent immediately (UDP beats TCP by construction); the
-    /// losers' channels retire. Dead challengers (no reply at all) re-ban
-    /// with the doubled backoff — keeping them allowed would restart the
-    /// challenge on every health tick. Every probe flow closes.
+    /// Verdict (S3): the incumbent is probed alongside the challengers; a
+    /// challenger must beat it by 20 % and 5 ms (TCP carries its round
+    /// penalty) with loss ≤ 1 to win the round. A winner must repeat in a
+    /// confirming round after at least one health interval before the
+    /// switch lands; until then its channel retires like any loser's. On
+    /// the switch the replaced incumbent's channel drains: no new flows,
+    /// the last bound flow's close tears it down. Every probe flow closes.
     async fn finish_challenge(&mut self, expired: bool) -> Result<()> {
         let Some(mut challenge) = self.challenge.take() else {
             return Ok(());
@@ -315,14 +429,28 @@ impl Session {
             self.health_at = Some(Instant::now() + HEALTH_INTERVAL);
         }
         let tag = self.tag().to_owned();
+        let incumbent = challenge.incumbent;
+        let incumbent_attempt = incumbent.map(|(attempt, ..)| attempt);
         if expired {
             // Whatever never answered by the deadline is a failure: re-ban
-            // with the doubled backoff, retire the half-built channel.
+            // with the doubled backoff, retire the half-built channel. The
+            // incumbent only lost the slot race — it keeps serving.
             let attempts: Vec<u64> = challenge.attempts.keys().copied().collect();
             for attempt in attempts {
                 let Some(challenger) = challenge.attempts.remove(&attempt) else {
                     continue;
                 };
+                if self
+                    .burst
+                    .as_ref()
+                    .is_some_and(|burst| burst.attempt == attempt)
+                {
+                    self.burst = None;
+                }
+                self.close_flow(attempt, true).await?;
+                if Some(attempt) == incumbent_attempt {
+                    continue;
+                }
                 if let Plane::Channels(plane) = &mut self.plane
                     && let Some(selector) = plane.selector.as_mut()
                 {
@@ -332,14 +460,6 @@ impl Session {
                         StdInstant::now(),
                     );
                 }
-                if self
-                    .burst
-                    .as_ref()
-                    .is_some_and(|burst| burst.attempt == attempt)
-                {
-                    self.burst = None;
-                }
-                self.close_flow(attempt, true).await?;
                 if let Some(channel) = challenger.channel {
                     self.stop_channel(channel).await;
                     if let Plane::Channels(plane) = &mut self.plane {
@@ -355,27 +475,67 @@ impl Session {
                     .await?;
             }
         }
+        // The margin verdict, on adjusted p90 (TCP carries its penalty).
+        let incumbent_adjusted = incumbent.and_then(|(attempt, candidate, _)| {
+            challenge
+                .measured
+                .iter()
+                .find(|(.., measured_attempt, _)| *measured_attempt == attempt)
+                .and_then(|(.., outcome)| outcome.p90)
+                .map(|p90| adjusted_p90(candidate, p90))
+        });
         let best = challenge
             .measured
             .iter()
-            .filter_map(|(candidate, channel, attempt, outcome)| {
-                outcome.p90.map(|p90| (*candidate, *channel, *attempt, p90))
+            .filter(|(.., attempt, _)| Some(*attempt) != incumbent_attempt)
+            .filter(|(.., outcome)| outcome.lost <= 1)
+            .filter_map(|(candidate, channel, _, outcome)| {
+                outcome
+                    .p90
+                    .map(|p90| (*candidate, *channel, p90, outcome.lost))
             })
-            .min_by_key(|(.., p90)| *p90);
-        let winner_channel = best.map(|(_, channel, ..)| channel);
-        for (candidate, _, _, outcome) in &challenge.measured {
+            .min_by_key(|(candidate, _, p90, _)| adjusted_p90(*candidate, *p90));
+        let winner = best.filter(|(candidate, _, p90, _)| match incumbent_adjusted {
+            Some(reference) => adjusted_p90(*candidate, *p90) + win_margin(reference) <= reference,
+            None => true,
+        });
+        // Two consecutive rounds confirm the switch; the first win only
+        // arms the retry and the winner's channel retires like a loser's.
+        let deciding = winner.filter(|(candidate, ..)| {
+            self.switch_pending.is_some_and(|(pending, armed_at)| {
+                pending == *candidate && armed_at.elapsed() >= HEALTH_INTERVAL
+            })
+        });
+        self.switch_pending = match (winner, deciding) {
+            (Some((candidate, ..)), None) => {
+                crate::debug!(
+                    "{} challenge: {} won this round — retried next interval to confirm",
+                    prefixed(&tag, "channel"),
+                    candidate.as_str()
+                );
+                Some((candidate, StdInstant::now()))
+            }
+            _ => None,
+        };
+        // Dead challengers re-ban — a live incumbent never does.
+        for (candidate, _, attempt, outcome) in &challenge.measured {
             if outcome.p90.is_none()
+                && Some(*attempt) != incumbent_attempt
                 && let Plane::Channels(plane) = &mut self.plane
                 && let Some(selector) = plane.selector.as_mut()
             {
                 selector.ban_candidate(*candidate, Reason::PathTimeout, StdInstant::now());
             }
         }
+        // Probe flows close; channels retire except the incumbent's and
+        // the deciding winner's.
+        let incumbent_channel = incumbent.map(|(.., channel)| channel);
+        let deciding_channel = deciding.map(|(_, channel, ..)| channel);
         for (candidate, channel, attempt, _) in &challenge.measured {
             // The probe flow served its purpose even for the winner; its
             // channel stays and later health bursts open fresh flows.
             self.close_flow(*attempt, true).await?;
-            if winner_channel == Some(*channel) {
+            if Some(*channel) == incumbent_channel || Some(*channel) == deciding_channel {
                 continue;
             }
             crate::debug!(
@@ -395,25 +555,50 @@ impl Session {
                 })
                 .await?;
         }
-        match best {
-            Some((candidate, channel, _, p90)) => {
-                if let Plane::Channels(plane) = &mut self.plane
-                    && let Some(selector) = plane.selector.as_mut()
-                {
-                    selector.adopt(candidate, Some(channel));
-                }
+        match deciding {
+            Some((candidate, channel, p90, loss)) => {
+                let Plane::Channels(plane) = &mut self.plane else {
+                    unreachable!()
+                };
+                let Some(selector) = plane.selector.as_mut() else {
+                    return Ok(());
+                };
+                let old_incumbent = selector.last_good;
+                let old_channel = old_incumbent
+                    .filter(|old| *old != Candidate::Tcp)
+                    .and_then(|old| selector.ready_channel(old));
+                selector.adopt(candidate, Some(channel), Some(p90));
                 crate::info!(
-                    "{} challenge: {} wins (p90 {}ms) — new flows leave tcp",
+                    "{} reselection: {} replaces {} (p90 {}ms vs {}ms, loss {}/{BURST_LEN})",
                     prefixed(&tag, "channel"),
                     candidate.as_str(),
-                    p90.as_millis()
+                    old_incumbent.map(|old| old.as_str()).unwrap_or("-"),
+                    p90.as_millis(),
+                    incumbent_adjusted
+                        .map(|reference| reference.as_millis().to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    loss
                 );
+                if let (Some(old), Some(old_channel)) = (old_incumbent, old_channel) {
+                    selector.channels.remove(&old);
+                    plane.draining.insert(old_channel);
+                    self.maybe_drain(old_channel).await?;
+                }
             }
-            None => {
+            None if incumbent.is_none() && winner.is_none() => {
                 crate::info!(
                     "{} challenge: udp still unavailable — tcp keeps serving",
                     prefixed(&tag, "channel")
                 );
+            }
+            None => {
+                // A pending winner already logged its own line above.
+                if winner.is_none() {
+                    crate::debug!(
+                        "{} challenge: the incumbent holds (no challenger beat the margin)",
+                        prefixed(&tag, "channel")
+                    );
+                }
             }
         }
         Ok(())
@@ -432,8 +617,14 @@ impl Session {
         {
             self.burst = None;
         }
+        let incumbent_attempt = challenge.incumbent.map(|(attempt, ..)| attempt);
         for (attempt, challenger) in challenge.attempts {
             self.close_flow(attempt, true).await?;
+            if Some(attempt) == incumbent_attempt {
+                // The incumbent's channel is serving traffic — the round
+                // machinery or the dead-incumbent path retires it.
+                continue;
+            }
             if let Some(channel) = challenger.channel {
                 self.stop_channel(channel).await;
                 if let Plane::Channels(plane) = &mut self.plane {
@@ -450,4 +641,18 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// Verdict comparison: TCP carries its round penalty (round.rs).
+fn adjusted_p90(candidate: Candidate, p90: Duration) -> Duration {
+    if candidate == Candidate::Tcp {
+        p90 + TCP_PENALTY
+    } else {
+        p90
+    }
+}
+
+/// The switch margin (S3): at least 20 % and at least 5 ms better.
+fn win_margin(reference: Duration) -> Duration {
+    (reference / 5).max(Duration::from_millis(5))
 }

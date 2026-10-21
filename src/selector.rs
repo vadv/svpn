@@ -147,6 +147,9 @@ pub struct Selector {
     hold_down: HashMap<Candidate, Instant>,
     /// RAM hint for this SSH session; stores no keys/ports.
     pub last_good: Option<Candidate>,
+    /// Incumbent's p90 recorded at adoption (raw, no TCP penalty): the
+    /// degradation baseline — a health burst at ≥ 2× starts a challenge.
+    pub baseline_p90: Option<Duration>,
     /// Proactive-auto: a preparation failure bans the candidate for the session.
     proactive: bool,
     /// Expiry of the current ban per candidate (EPIC-016): the candidate is
@@ -190,6 +193,7 @@ impl Selector {
             ban_backoff: HashMap::new(),
             ban_seq: 0,
             last_good: None,
+            baseline_p90: None,
             proactive,
             banned: Vec::new(),
             exhausted: false,
@@ -252,7 +256,13 @@ impl Selector {
     }
 
     /// Remember the round winner; TCP has no shared channel to adopt.
-    pub fn adopt(&mut self, candidate: Candidate, channel_id: Option<u64>) {
+    /// `baseline` is the winner's raw p90 — the degradation reference.
+    pub fn adopt(
+        &mut self,
+        candidate: Candidate,
+        channel_id: Option<u64>,
+        baseline: Option<Duration>,
+    ) {
         if let Some(id) = channel_id {
             self.channels.insert(candidate, ReadyChannel::new(id, true));
         }
@@ -261,6 +271,7 @@ impl Selector {
         }
         self.exhausted = false;
         self.last_good = Some(candidate);
+        self.baseline_p90 = baseline;
         self.hold_down.remove(&candidate);
         // A proven candidate starts with a clean ban backoff (EPIC-016).
         self.ban_backoff.remove(&candidate);
@@ -601,6 +612,7 @@ impl Selector {
         self.hold_down.insert(candidate, now + HOLD_DOWN);
         if self.last_good == Some(candidate) {
             self.last_good = None;
+            self.baseline_p90 = None;
         }
         if matches!(reason, Reason::Unsupported | Reason::EndpointUnavailable) {
             // Exclude the candidate for the rest of the session: it will not "cool down" into anything useful.
@@ -618,6 +630,7 @@ impl Selector {
         }
         if self.last_good == Some(candidate) {
             self.last_good = None;
+            self.baseline_p90 = None;
         }
         let base = self
             .ban_backoff

@@ -7,8 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use svpn::selector::{Candidate, Reason};
-use svpn::session::burst::{BURST_LEN, Outcome};
-use svpn::session::challenge::Challenge;
+use svpn::session::burst::{BURST_LEN, Burst, Outcome};
+use svpn::session::challenge::{Challenge, Challenger};
 use svpn::session::{ChannelHandle, ChannelReadyParams, Plane, Readiness};
 use tokio::time::Instant;
 
@@ -46,7 +46,9 @@ fn dummy_handle() -> ChannelHandle {
 // there `close_flow` skips the link Closed event an undrained fixture
 // channel would block on.
 const PROBE_A: u64 = u64::MAX / 2;
-const PROBE_B: u64 = PROBE_A - 1;
+const PROBE_B: u64 = PROBE_A + 1;
+const PROBE_C: u64 = PROBE_A + 2;
+const PROBE_I: u64 = PROBE_A + 3; // the incumbent's probe
 
 fn dummy_icmp_key(id: u16) -> svpn::packet::FlowKey {
     svpn::packet::FlowKey {
@@ -64,14 +66,14 @@ fn dummy_icmp_key(id: u16) -> svpn::packet::FlowKey {
 async fn challenge_starts_on_tcp_incumbent_with_udp_allowed() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     let challenge = session.challenge.as_ref().expect("challenge started");
     assert_eq!(challenge.attempts.len(), 1, "only mosh is allowed");
     let challenger = challenge.attempts.values().next().unwrap();
     assert_eq!(challenger.candidate, Candidate::Mosh);
     assert_eq!(challenger.channel, None, "not bound yet");
     // A second trigger while one runs is a no-op.
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     assert_eq!(session.challenge.as_ref().unwrap().attempts.len(), 1);
 }
 
@@ -80,7 +82,7 @@ async fn no_challenge_on_udp_incumbent() {
     let (mut session, _events) = common::session::link_session(false);
     session.readiness = Some(Readiness::Ready);
     channels(&mut session).selector.as_mut().unwrap().last_good = Some(Candidate::Mosh);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     assert!(session.challenge.is_none());
 }
 
@@ -88,7 +90,7 @@ async fn no_challenge_on_udp_incumbent() {
 async fn no_challenge_before_ready() {
     let (mut session, _events) = common::session::link_session(false);
     channels(&mut session).selector.as_mut().unwrap().last_good = Some(Candidate::Tcp);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     assert!(session.challenge.is_none(), "not Ready yet");
 }
 
@@ -98,7 +100,7 @@ async fn no_challenge_before_ready() {
 async fn failed_prepare_rebans_and_finishes() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -132,7 +134,7 @@ async fn failed_prepare_rebans_and_finishes() {
 async fn bound_challenger_builds_probe_flow_and_queues_burst() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -188,7 +190,7 @@ async fn bound_challenger_sends_flow_open_on_the_wire() {
     let control = svpn::control::Control::new(tokio::io::empty(), client_half);
     let (mut session, _events) = common::session::link_session_with(false, control);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -279,6 +281,7 @@ async fn fastest_challenger_wins_and_losers_retire() {
         );
     }
     session.challenge = Some(Challenge {
+        incumbent: None,
         attempts: HashMap::new(),
         queue: VecDeque::new(),
         measured: vec![
@@ -289,19 +292,189 @@ async fn fastest_challenger_wins_and_losers_retire() {
     });
     session.challenge_drive(Instant::now()).await.unwrap();
     assert!(session.challenge.is_none(), "nothing left: verdict");
+    // S3: the first win only arms the retry — the incumbent still serves,
+    // and the winner's channel retires like any loser's.
+    let pending = session.switch_pending.map(|(candidate, _)| candidate);
+    {
+        let plane = channels(&mut session);
+        let selector = plane.selector.as_ref().unwrap();
+        assert_eq!(selector.last_good, Some(Candidate::Tcp), "no switch yet");
+        assert_eq!(pending, Some(Candidate::Quic), "quic won the round");
+        assert!(
+            !plane.channels.contains_key(&77) && !plane.channels.contains_key(&78),
+            "every challenger channel retires, the winner's included"
+        );
+        assert!(
+            !plane.flows.contains_key(&PROBE_A) && !plane.flows.contains_key(&PROBE_B),
+            "every probe flow closes"
+        );
+    }
+    // The confirming round (at least one health interval later) lands it.
+    session.switch_pending = Some((
+        Candidate::Quic,
+        std::time::Instant::now() - Duration::from_secs(31),
+    ));
+    {
+        let plane = channels(&mut session);
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(79, quic);
+        plane.flows.insert(
+            PROBE_C,
+            svpn::session::Flow::new(dummy_icmp_key(3), Instant::now()),
+        );
+    }
+    session.challenge = Some(Challenge {
+        incumbent: None,
+        attempts: HashMap::new(),
+        queue: VecDeque::new(),
+        measured: vec![(Candidate::Quic, 79, PROBE_C, outcome(50))],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.challenge_drive(Instant::now()).await.unwrap();
+    assert!(session.switch_pending.is_none(), "pending consumed");
     let plane = channels(&mut session);
     let selector = plane.selector.as_ref().unwrap();
-    assert_eq!(selector.last_good, Some(Candidate::Quic), "lowest p90 wins");
-    assert!(plane.channels.contains_key(&78), "winner channel stays");
-    assert!(!plane.channels.contains_key(&77), "loser channel retired");
-    assert!(
-        !plane.flows.contains_key(&PROBE_A) && !plane.flows.contains_key(&PROBE_B),
-        "every probe flow closes, winner included"
+    assert_eq!(
+        selector.last_good,
+        Some(Candidate::Quic),
+        "confirmed: switch"
     );
-    assert!(
-        selector.allowed.contains(&Candidate::Mosh),
-        "a living loser is slower, not dead: stays eligible"
+    assert_eq!(
+        selector.baseline_p90,
+        Some(Duration::from_millis(50)),
+        "the baseline is the winner's raw p90"
     );
+    assert!(plane.channels.contains_key(&79), "winner channel stays");
+}
+
+#[tokio::test]
+async fn challenger_within_margin_keeps_the_incumbent() {
+    let (mut session, _events) = common::session::link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    {
+        let plane = channels(&mut session);
+        plane.channels.insert(77, dummy_handle());
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(78, quic);
+        plane.flows.insert(
+            PROBE_I,
+            svpn::session::Flow::new(dummy_icmp_key(10), Instant::now()),
+        );
+        plane.flows.insert(
+            PROBE_A,
+            svpn::session::Flow::new(dummy_icmp_key(1), Instant::now()),
+        );
+        let selector = plane.selector.as_mut().unwrap();
+        selector.last_good = Some(Candidate::Mosh);
+        selector
+            .channels
+            .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
+        selector.baseline_p90 = Some(Duration::from_millis(50));
+        selector.allowed.push(Candidate::Quic);
+    }
+    // Incumbent p90 50 ms: the margin is max(50/5, 5) = 10 ms, so 45 ms
+    // does not win (45 + 10 > 50).
+    session.challenge = Some(Challenge {
+        incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
+        attempts: HashMap::new(),
+        queue: VecDeque::new(),
+        measured: vec![
+            (Candidate::Mosh, 77, PROBE_I, outcome(50)),
+            (Candidate::Quic, 78, PROBE_A, outcome(45)),
+        ],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.challenge_drive(Instant::now()).await.unwrap();
+    assert!(session.switch_pending.is_none(), "no win, no pending");
+    let plane = channels(&mut session);
+    let selector = plane.selector.as_ref().unwrap();
+    assert_eq!(
+        selector.last_good,
+        Some(Candidate::Mosh),
+        "margin not met: the incumbent holds"
+    );
+    assert!(plane.channels.contains_key(&77), "incumbent keeps serving");
+    assert!(!plane.channels.contains_key(&78), "challenger retired");
+    assert!(
+        selector.allowed.contains(&Candidate::Quic),
+        "slower, not dead: stays eligible"
+    );
+}
+
+#[tokio::test]
+async fn replaced_incumbent_drains_then_retires() {
+    let (mut session, _events) = common::session::link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    {
+        let plane = channels(&mut session);
+        plane.channels.insert(77, dummy_handle());
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(78, quic);
+        // One live data flow bound to the incumbent's channel.
+        let mut data = svpn::session::Flow::new(
+            svpn::packet::FlowKey {
+                protocol: 6,
+                source: std::net::Ipv4Addr::new(10, 77, 0, 2),
+                destination: std::net::Ipv4Addr::new(10, 77, 0, 1),
+                source_port: 40000,
+                destination_port: 9000,
+            },
+            Instant::now(),
+        );
+        data.channel = Some(77);
+        plane.flows.insert(7, data);
+        plane.flows.insert(
+            PROBE_I,
+            svpn::session::Flow::new(dummy_icmp_key(10), Instant::now()),
+        );
+        plane.flows.insert(
+            PROBE_A,
+            svpn::session::Flow::new(dummy_icmp_key(1), Instant::now()),
+        );
+        let selector = plane.selector.as_mut().unwrap();
+        selector.last_good = Some(Candidate::Mosh);
+        selector
+            .channels
+            .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
+        selector.baseline_p90 = Some(Duration::from_millis(100));
+    }
+    // Quic at 10 ms beats the 100 ms incumbent by the margin; the
+    // confirming round is aged past the interval.
+    session.switch_pending = Some((
+        Candidate::Quic,
+        std::time::Instant::now() - Duration::from_secs(31),
+    ));
+    session.challenge = Some(Challenge {
+        incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
+        attempts: HashMap::new(),
+        queue: VecDeque::new(),
+        measured: vec![
+            (Candidate::Mosh, 77, PROBE_I, outcome(100)),
+            (Candidate::Quic, 78, PROBE_A, outcome(10)),
+        ],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.challenge_drive(Instant::now()).await.unwrap();
+    {
+        let plane = channels(&mut session);
+        let selector = plane.selector.as_ref().unwrap();
+        assert_eq!(selector.last_good, Some(Candidate::Quic));
+        assert!(
+            selector.ready_channel(Candidate::Mosh).is_none(),
+            "replaced: no new flows to mosh"
+        );
+        assert!(plane.draining.contains(&77), "old channel draining");
+        assert!(plane.channels.contains_key(&77), "data flow still served");
+    }
+    // The last bound flow closes: the drained channel retires.
+    session.close_flow(7, true).await.unwrap();
+    let plane = channels(&mut session);
+    assert!(plane.draining.is_empty(), "drain done");
+    assert!(!plane.channels.contains_key(&77), "drained channel retired");
+    assert!(plane.channels.contains_key(&78), "winner keeps serving");
 }
 
 #[tokio::test]
@@ -317,6 +490,7 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
         );
     }
     session.challenge = Some(Challenge {
+        incumbent: None,
         attempts: HashMap::new(),
         queue: VecDeque::new(),
         measured: vec![(
@@ -352,9 +526,39 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
 async fn fresh_round_aborts_the_challenge() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge().await.unwrap();
+    session.maybe_start_challenge(false).await.unwrap();
     assert!(session.challenge.is_some());
     session.arm_round().await.unwrap();
     assert!(session.challenge.is_none(), "round kills the challenge");
     assert!(session.round.is_some(), "round armed");
+}
+
+#[tokio::test]
+async fn drive_skips_challengers_that_failed_before_their_burst() {
+    // Regression: a dead queue entry stalled every challenger queued behind
+    // it until the challenge deadline (drive returned instead of draining).
+    let (mut session, _events) = common::session::link_session(false);
+    set_tcp_incumbent(&mut session);
+    let (dead, live) = (PROBE_A, PROBE_A + 1);
+    session.challenge = Some(Challenge {
+        incumbent: None,
+        attempts: HashMap::from([(
+            live,
+            Challenger {
+                candidate: Candidate::Mosh,
+                channel: Some(71),
+                peer: None,
+                burst: Some(Burst::new(71, live, 9, 100, b"x".to_vec())),
+            },
+        )]),
+        queue: VecDeque::from([dead, live]),
+        measured: Vec::new(),
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.challenge_drive(Instant::now()).await.unwrap();
+    assert_eq!(
+        session.burst.as_ref().map(|burst| burst.attempt),
+        Some(live),
+        "dead queue entry skipped"
+    );
 }
