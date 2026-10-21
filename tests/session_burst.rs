@@ -160,7 +160,7 @@ async fn committed_arms_burst_and_sends_first_echo() {
     // Probe flows live above FIRST_PROBE_ID, like round attempts.
     let attempt = svpn::link_io::FIRST_PROBE_ID;
     let now = tokio::time::Instant::now();
-    let mut probe = Burst::new(channel, attempt, 4242, 100, vec![9; 32]);
+    let probe = Burst::new(channel, attempt, 4242, 100, vec![9; 32]);
     let key = svpn::packet::FlowKey {
         protocol: 1,
         source: session.client_ip,
