@@ -77,10 +77,10 @@ fn preactive_queue_bounds() {
     selector
         .request(1, key(1), b"first", now)
         .expect("admission");
-    for _ in 0..7 {
+    for _ in 0..63 {
         assert!(selector.enqueue(1, &[0u8; 10]).is_ok());
     }
-    // 8 packets (1 + 7): the ninth is rejected.
+    // 64 packets (1 + 63): the 65th is rejected.
     assert_eq!(selector.enqueue(1, &[0u8; 10]), Err(Reject::PendingFull));
     // An active flow gets the queue after committed.
     selector.channel_ready(Candidate::Quic, 1, 100, now);
@@ -90,9 +90,24 @@ fn preactive_queue_bounds() {
     assert!(selector.take_queue(1).is_none()); // still Committing
     selector.committed(1);
     let queue = selector.take_queue(1).expect("active queue");
-    assert_eq!(queue.len(), 8);
+    assert_eq!(queue.len(), 64);
     assert_eq!(queue[0], b"first".to_vec());
     assert!(selector.take_queue(1).expect("second take").is_empty());
+}
+
+#[test]
+fn preactive_queue_byte_budget_holds_before_the_packet_limit() {
+    let mut selector = Selector::new(all());
+    let now = Instant::now();
+    selector
+        .request(1, key(1), &[0u8; PREACTIVE_BYTES - 100], now)
+        .expect("admission");
+    assert_eq!(
+        selector.enqueue(1, &[0u8; 200]),
+        Err(Reject::PendingFull),
+        "2 MiB budget beats the per-flow packet limit"
+    );
+    assert!(selector.enqueue(1, &[0u8; 50]).is_ok());
 }
 
 #[test]

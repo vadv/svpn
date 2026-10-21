@@ -11,7 +11,7 @@
 //! - after `Commit` there is no fallback — only closing on timeout;
 //! - a bind failure affects one flow, a channel failure affects all its flows;
 //! - the 30 s hold-down is not extended by packets; everyone in cooldown — immediate failure;
-//! - the pre-active queue is bounded (4 packets/flow, 64 flows, 1 MiB);
+//! - the pre-active queue is bounded (64 packets/flow, 64 flows, 2 MiB);
 //! - proactive-auto: a preparation failure (including the first TCP connect) bans
 //!   the candidate for the rest of the session; exhausting them all — one `Exhausted`, stop.
 //!

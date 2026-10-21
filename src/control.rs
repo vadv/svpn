@@ -62,6 +62,13 @@ impl Stats {
         self.dropped_packets += 1;
         crate::error!("{prefix} {reason}");
     }
+
+    /// An expected drop (a protocol race, traffic we do not carry): counted
+    /// the same, logged at debug — ERROR stays for bugs and real data loss.
+    pub fn count_drop_expected(&mut self, prefix: &str, reason: &str) {
+        self.dropped_packets += 1;
+        crate::debug!("{prefix} {reason}");
+    }
 }
 
 /// The strategy's actual UDP port.

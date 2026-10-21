@@ -28,6 +28,40 @@ fn full_tcp(flags: u8, seq: u32, ack: u32, payload_len: usize) -> Vec<u8> {
 // ── flow parsing ──
 
 #[test]
+fn unsupported_classification_picks_the_log_level() {
+    // IPv6 router solicitation from the local OS.
+    let mut ipv6 = vec![0u8; 48];
+    ipv6[0] = 0x60;
+    assert_eq!(
+        unsupported(&ipv6).as_deref(),
+        Some("IPv6 packet (not supported)")
+    );
+    // IPv4 IGMP (protocol 2).
+    let mut igmp = vec![0u8; 20];
+    igmp[0] = 0x45;
+    igmp[9] = 2;
+    assert_eq!(
+        unsupported(&igmp).as_deref(),
+        Some("unsupported IPv4 protocol 2")
+    );
+    // Fragmented IPv4 TCP (MF set).
+    let mut frag = vec![0u8; 20];
+    frag[0] = 0x45;
+    frag[9] = 6;
+    frag[6] = 0x20;
+    assert_eq!(
+        unsupported(&frag).as_deref(),
+        Some("fragmented IPv4 packet (not supported)")
+    );
+    // Malformed stays an error: bad version nibble, then a broken TCP header.
+    assert!(unsupported(&[0x99, 1, 2]).is_none());
+    let mut broken = vec![0u8; 20];
+    broken[0] = 0x45;
+    broken[9] = 6;
+    assert!(unsupported(&broken).is_none());
+}
+
+#[test]
 fn matches_both_directions() {
     let outgoing = parse(&udp_packet(false), true).unwrap();
     let incoming = parse(&udp_packet(true), false).unwrap();

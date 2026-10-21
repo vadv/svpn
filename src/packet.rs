@@ -54,6 +54,25 @@ pub fn parse(bytes: &[u8], from_client: bool) -> Option<Packet> {
     parse_ip(bytes, from_client, false)
 }
 
+/// Why a rejected packet is still expected noise: the local OS chatters on
+/// the TUN (IPv6 RS/ND, IGMP, fragments) and none of it is a bug. `None` —
+/// the packet is malformed and the drop stays an error.
+pub fn unsupported(bytes: &[u8]) -> Option<String> {
+    if bytes.first().is_some_and(|first| first >> 4 == 6) {
+        return Some("IPv6 packet (not supported)".to_owned());
+    }
+    if bytes.len() >= 20 && bytes[0] >> 4 == 4 {
+        let protocol = bytes[9];
+        if !matches!(protocol, 1 | 6 | 17) {
+            return Some(format!("unsupported IPv4 protocol {protocol}"));
+        }
+        if u16::from_be_bytes([bytes[6], bytes[7]]) & 0xbfff != 0 {
+            return Some("fragmented IPv4 packet (not supported)".to_owned());
+        }
+    }
+    None
+}
+
 fn parse_ip(bytes: &[u8], from_client: bool, quoted: bool) -> Option<Packet> {
     if bytes.len() < 20 || bytes[0] >> 4 != 4 {
         return None;

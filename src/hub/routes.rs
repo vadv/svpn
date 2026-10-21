@@ -49,7 +49,7 @@ impl Routes {
                 drop_note(
                     delivery,
                     links,
-                    epoch.link,
+                    Some(epoch.link),
                     "foreign source in client TUN packet",
                 );
                 return Ok(());
@@ -58,7 +58,7 @@ impl Routes {
                 drop_note(
                     delivery,
                     links,
-                    epoch.link,
+                    Some(epoch.link),
                     "unparseable packet from client TUN",
                 );
                 return Ok(());
@@ -77,7 +77,7 @@ impl Routes {
                 drop_note(
                     delivery,
                     links,
-                    epoch.link,
+                    Some(epoch.link),
                     "flow owned by another link or not openable",
                 );
                 return Ok(());
@@ -92,7 +92,7 @@ impl Routes {
             }
             Ok(()) => {}
             // A closed receiver is reported by its task; never fail other links here.
-            Err(_) => drop_note(delivery, links, epoch.link, "link packet queue full"),
+            Err(_) => drop_note(delivery, links, Some(epoch.link), "link packet queue full"),
         }
         Ok(())
     }
