@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.4
+
+Transport health groundwork release.
+
+- Server heartbeat stats now report why transports fail: per-transport
+  counters for udp-refused, tcp-refused, no-server-answer, address-taken,
+  and garbage — udp-garbage and tcp-garbage count datagrams that pass the
+  outer protocol but fail the inner framing, the signature of a content
+  filter mangling packets.
+- New burst prober: a channel can carry a short ICMP echo series (10
+  echoes, 100 ms apart) and report p90 RTT and loss. Groundwork for the
+  upcoming background re-selection; no behavior change yet.
+
 ## v0.5.3
 
 Hotfix release.

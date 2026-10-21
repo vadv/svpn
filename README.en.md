@@ -209,11 +209,18 @@ network: `mimic = ['quic', 'mosh']` in TOML or repeated `--mimic` on the CLI.
 The winner runs until it fails (5 seconds without data or a transport
 break), then the race repeats. On a total failure it retries after 1, 2, 4,
 8, 16, and then every 30 seconds. A candidate that cannot prepare its
-channel is excluded for the rest of the SSH session. Open connections are
+channel rests: banned for 10 minutes, doubling to 2 hours on repeat
+(with ±20% jitter), then eligible for the race again. Open connections are
 not moved to the new channel: TCP gets a RST and applications reconnect.
 
 Camouflage reproduces the protocol format on the wire but does not guarantee
 passing a particular filter — measure with `svpn perf`.
+
+The server counts per-transport failure causes in its heartbeat stats:
+udp-refused, tcp-refused, no-server-answer, address-taken, udp-garbage,
+tcp-garbage. Garbage means datagrams that passed the outer protocol but
+broke the inner framing — the signature of a content filter mangling
+packets. Stats lines appear in the client log every stats-interval.
 
 ## Server firewall without hooks
 
