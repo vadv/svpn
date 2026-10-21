@@ -45,6 +45,19 @@ pub fn difference(now: &Stats, before: &Stats) -> Stats {
         closed_flows: now.closed_flows.saturating_sub(before.closed_flows),
         active_flows: now.active_flows,
         active_candidate: None,
+        // Monotonic per-transport counters: keys the newer snapshot still
+        // reports, minus what we knew. A restarted peer keeps its own value.
+        transport_failures: now
+            .transport_failures
+            .iter()
+            .map(|(name, count)| {
+                (
+                    name.clone(),
+                    count.saturating_sub(before.transport_failures.get(name).copied().unwrap_or(0)),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect(),
     }
 }
 
@@ -64,6 +77,14 @@ pub fn add(total: &mut Stats, stats: &Stats) {
         .saturating_add(stats.open_failed_flows);
     total.closed_flows = total.closed_flows.saturating_add(stats.closed_flows);
     total.active_flows = total.active_flows.saturating_add(stats.active_flows);
+    for (name, count) in &stats.transport_failures {
+        *total.transport_failures.entry(name.clone()).or_default() = total
+            .transport_failures
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(*count);
+    }
 }
 
 pub fn format(label: &str, delta: &Stats, total: &Stats, elapsed: Duration) -> String {
@@ -75,7 +96,7 @@ pub fn format(label: &str, delta: &Stats, total: &Stats, elapsed: Duration) -> S
         }
     };
     let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
-    format!(
+    let mut out = format!(
         "stats: {label} | RX {:>8.2} Mbit/s ({:>8} packets) | TX {:>8.2} Mbit/s ({:>8} packets)\n\
          stats: {label} | total RX {:.2} MiB / TX {:.2} MiB | drops +{} (total {})\n\
          stats: {label} | flows {} active | +{} opened / +{} failed / +{} closed",
@@ -91,5 +112,17 @@ pub fn format(label: &str, delta: &Stats, total: &Stats, elapsed: Duration) -> S
         delta.opened_flows,
         delta.open_failed_flows,
         delta.closed_flows,
-    )
+    );
+    let failures: Vec<String> = delta
+        .transport_failures
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+    if !failures.is_empty() {
+        out.push_str(&format!(
+            "\nstats: {label} | failures (packet-level): {}",
+            failures.join(", ")
+        ));
+    }
+    out
 }

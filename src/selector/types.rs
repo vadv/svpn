@@ -122,6 +122,8 @@ pub enum Action {
     CloseFlow { flow_id: u64 },
     /// Proactive-auto: no candidates left — the session stops.
     Exhausted { reasons: Vec<(Candidate, Reason)> },
+    /// EPIC-016: the backoff ban expired; the candidate is eligible again.
+    BanExpired { candidate: Candidate },
 }
 
 /// Admission rejection of a new flow.

@@ -41,6 +41,9 @@ pub struct Stats {
     /// Last winning transport candidate on the client; server leaves it None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_candidate: Option<String>,
+    /// Packet-level failure counters per transport since start (EPIC-016).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transport_failures: std::collections::BTreeMap<String, u64>,
 }
 
 impl Stats {

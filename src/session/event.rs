@@ -298,6 +298,13 @@ impl Session {
                 Action::CloseFlow { flow_id } => {
                     self.close_flow(flow_id, false).await?;
                 }
+                Action::BanExpired { candidate } => {
+                    crate::info!(
+                        "{} candidate {} eligible again (ban expired)",
+                        prefixed(self.tag(), "channel"),
+                        format!("{:?}", candidate_strategy(candidate)).to_lowercase()
+                    );
+                }
                 Action::Exhausted { reasons } => {
                     // Proactive-auto: nothing could be raised — bail out (m06456).
                     let table = reasons

@@ -17,6 +17,7 @@ fn counters(value: u64, active: usize) -> Stats {
         closed_flows: value,
         active_flows: active,
         active_candidate: None,
+        transport_failures: Default::default(),
     }
 }
 
@@ -84,10 +85,12 @@ fn report_labels_rates_interval_counters_and_totals() {
         closed_flows: 2,
         active_flows: 3,
         active_candidate: None,
+        transport_failures: Default::default(),
     };
     let total = Stats {
         inner_rx_bytes: 64 * 1_048_576,
         active_candidate: None,
+        transport_failures: Default::default(),
         ..delta.clone()
     };
     assert_eq!(
@@ -100,5 +103,35 @@ fn report_labels_rates_interval_counters_and_totals() {
         "stats: [203.0.113.10] ready | RX     3.20 Mbit/s (    8000 packets) | TX     0.80 Mbit/s (    2000 packets)\n\
          stats: [203.0.113.10] ready | total RX 64.00 MiB / TX 2.86 MiB | drops +2 (total 2)\n\
          stats: [203.0.113.10] ready | flows 3 active | +4 opened / +1 failed / +2 closed"
+    );
+}
+
+// ── transport failures (EPIC-016) ──
+
+#[test]
+fn difference_and_add_carry_per_transport_failures() {
+    let mut before = counters(0, 0);
+    before.transport_failures.insert("quic".into(), 2);
+    let mut now = counters(0, 0);
+    now.transport_failures.insert("quic".into(), 5);
+    now.transport_failures.insert("tcp-ssh".into(), 1);
+    let delta = difference(&now, &before);
+    assert_eq!(delta.transport_failures.get("quic"), Some(&3));
+    assert_eq!(delta.transport_failures.get("tcp-ssh"), Some(&1));
+    let mut total = Stats::default();
+    add(&mut total, &delta);
+    add(&mut total, &delta);
+    assert_eq!(total.transport_failures.get("quic"), Some(&6));
+}
+
+#[test]
+fn report_lists_transport_failures_only_when_present() {
+    let mut delta = counters(0, 0);
+    assert!(!format("x", &delta, &delta, Duration::from_secs(1)).contains("failures"));
+    delta.transport_failures.insert("quic".into(), 3);
+    let report = format("x", &delta, &delta, Duration::from_secs(1));
+    assert!(
+        report.contains("stats: x | failures (packet-level): quic=3"),
+        "{report}"
     );
 }

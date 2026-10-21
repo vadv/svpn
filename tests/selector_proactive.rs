@@ -10,7 +10,7 @@ use svpn::selector::*;
 // ── attempt failure ──
 
 #[test]
-fn proactive_attempt_failure_bans_until_end_of_session() {
+fn proactive_attempt_failure_bans_until_the_backoff_expires() {
     let mut selector = Selector::new_proactive(all());
     let now = Instant::now();
     let actions = selector
@@ -31,8 +31,8 @@ fn proactive_attempt_failure_bans_until_end_of_session() {
             attempt: 2
         }]
     ));
-    // Hold-down expired, but the ban lasts the session: quic does not return
-    // (webrtc preparation is already running for flow 1 — a new flow waits).
+    // Hold-down expired, but the ban holds until its backoff expires: quic
+    // does not return (webrtc preparation is already running for flow 1).
     let later = now + HOLD_DOWN + Duration::from_secs(1);
     // poll at later also bans webrtc (its preparation expired by then
     // too) — the point of the check: quic did NOT return after hold-down.
@@ -187,4 +187,82 @@ fn proactive_channel_lost_is_not_banned() {
             ..
         }]
     ));
+}
+
+// ── ban expiry (EPIC-016) ──
+
+#[test]
+fn ban_expires_after_backoff_and_restores_cold_order_position() {
+    let mut selector = Selector::new_proactive(all());
+    let now = Instant::now();
+    selector
+        .request(1, key(1), b"first", now)
+        .expect("admission");
+    selector.attempt_failed(Candidate::Quic, 1, Reason::PathTimeout, now);
+    assert!(!selector.allowed.contains(&Candidate::Quic));
+
+    // 10 min ± 20% jitter: still banned at 7 min, restored by 13 min.
+    let actions = selector.poll(now + Duration::from_secs(7 * 60));
+    assert!(
+        !actions.iter().any(
+            |a| matches!(a, Action::BanExpired { candidate } if *candidate == Candidate::Quic)
+        )
+    );
+    let actions = selector.poll(now + Duration::from_secs(13 * 60));
+    assert!(
+        actions.iter().any(
+            |a| matches!(a, Action::BanExpired { candidate } if *candidate == Candidate::Quic)
+        )
+    );
+    // The cold-order position is restored: quic leads again.
+    assert_eq!(selector.allowed.first(), Some(&Candidate::Quic));
+    // The chronicle keeps the reason for the exhaustion table.
+    assert!(
+        selector
+            .banned
+            .contains(&(Candidate::Quic, Reason::PathTimeout))
+    );
+}
+
+#[test]
+fn repeated_bans_double_the_backoff_and_success_resets_it() {
+    let mut selector = Selector::new_proactive(all());
+    let t0 = Instant::now();
+    selector
+        .request(1, key(1), b"first", t0)
+        .expect("admission");
+    selector.attempt_failed(Candidate::Quic, 1, Reason::PathTimeout, t0);
+    let t1 = t0 + Duration::from_secs(13 * 60);
+    selector.poll(t1);
+    assert!(selector.allowed.contains(&Candidate::Quic));
+
+    // Second failure (channel lost before verification): ~20 minutes out.
+    selector
+        .channels
+        .insert(Candidate::Quic, ReadyChannel::new(9, false));
+    selector.channel_lost(Candidate::Quic, 9, Reason::ChannelFailed, t1);
+    assert!(!selector.allowed.contains(&Candidate::Quic));
+    selector.poll(t1 + Duration::from_secs(15 * 60));
+    assert!(
+        !selector.allowed.contains(&Candidate::Quic),
+        "doubled ban holds at 15m"
+    );
+    let t2 = t1 + Duration::from_secs(25 * 60);
+    selector.poll(t2);
+    assert!(
+        selector.allowed.contains(&Candidate::Quic),
+        "doubled ban expired by 25m"
+    );
+
+    // Success resets the backoff: the next ban is ~10 minutes again.
+    selector.adopt(Candidate::Quic, Some(10));
+    selector
+        .channels
+        .insert(Candidate::Quic, ReadyChannel::new(11, false));
+    selector.channel_lost(Candidate::Quic, 11, Reason::ChannelFailed, t2);
+    selector.poll(t2 + Duration::from_secs(12 * 60));
+    assert!(
+        selector.allowed.contains(&Candidate::Quic),
+        "reset backoff expires at 12m"
+    );
 }

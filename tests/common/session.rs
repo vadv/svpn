@@ -74,6 +74,8 @@ pub fn link_session_cap(
             stats: Stats::default(),
             round: None,
             next_round_attempt: u64::MAX / 2,
+            health_at: None,
+            burst: None,
         },
         returned,
     )
