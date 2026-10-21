@@ -406,7 +406,7 @@ async fn run_io(
             if allowed.webrtc {
                 // The first webrtc peer pays the one-time crypto init; hide
                 // it behind the SSH bootstrap instead of the first round.
-                crate::webrtc::prewarm();
+                drop(crate::webrtc::prewarm());
             }
             ensure!(
                 allowed.quic || allowed.webrtc || allowed.obfs || allowed.mosh || allowed.tcp,

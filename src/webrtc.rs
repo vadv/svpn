@@ -74,11 +74,14 @@ pub struct Peer {
 /// peer in the process pays tens of milliseconds (up to ~350 ms on a
 /// router) for it, later peers cost microseconds; a round that builds the
 /// first peer synchronously stalls every other candidate behind it. Call
-/// once at startup; the built peer is discarded.
-pub fn prewarm() {
-    std::thread::spawn(|| {
+/// once at startup; the built peer is discarded. spawn_blocking keeps the
+/// runtime context: Peer::client wraps its socket with
+/// tokio::net::UdpSocket::from_std, which panics without a reactor (the
+/// context is thread-local and does not cross std::thread::spawn).
+pub fn prewarm() -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(|| {
         let _ = Peer::client(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)));
-    });
+    })
 }
 
 impl Peer {
