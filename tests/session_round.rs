@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::time::Instant as StdInstant;
 
 use common::session::{assert_closed, link_session, link_session_cap, test_key};
-use svpn::control::{Control, Message, Stats};
+use svpn::control::{Control, Message, Stats, Strategy};
 use svpn::link_io::{self, FIRST_PROBE_ID, PREFLIGHT_ID};
 use svpn::packet;
 use svpn::selector::{Action, Allowed, Candidate, Reason, Selector};
@@ -48,76 +48,7 @@ async fn round_probes_every_udp_candidate_and_keys_preflight_by_icmp_identity() 
 
 #[tokio::test]
 async fn parallel_candidates_have_independent_tun_verdicts() {
-    let (mut session, _events) = link_session(false);
-    let (local, remote) = tokio::io::duplex(8192);
-    let (reader, writer) = tokio::io::split(local);
-    session.control = Control::new(reader, writer);
-    let (reader, writer) = tokio::io::split(remote);
-    let mut peer = Control::new(reader, writer);
-    let Plane::Channels(plane) = &mut session.plane else {
-        unreachable!()
-    };
-    plane.selector = Some(Selector::new_proactive(Allowed {
-        mosh: true,
-        obfs: true,
-        tcp: true,
-        ..Allowed::default()
-    }));
-    session.begin_preflight().await.unwrap();
-    // All three start before any candidate receives a reply.
-    let mut prepares = 0;
-    let mut tcp = false;
-    for _ in 0..3 {
-        match tokio::time::timeout(Duration::from_secs(1), peer.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            Message::Open { id, .. } => {
-                assert_eq!(Some(id), session.round.as_ref().unwrap().tcp_id);
-                tcp = true;
-            }
-            Message::ChannelPrepare { .. } => prepares += 1,
-            _ => panic!("unexpected round start message"),
-        }
-    }
-    assert!(tcp);
-    assert_eq!(prepares, 2);
-    let round = session.round.as_mut().unwrap();
-    let mut probes: Vec<_> = round
-        .pending
-        .iter_mut()
-        .map(|(&id, rc)| {
-            let channel = if rc.candidate == Candidate::Mosh {
-                100
-            } else {
-                101
-            };
-            rc.channel = Some(channel);
-            (id, channel, rc.candidate, rc.icmp_id, rc.request.clone())
-        })
-        .collect();
-    probes.sort_by_key(|probe| probe.1);
-    assert_ne!(probes[0].3, probes[1].3);
-    assert!(probes.iter().all(|probe| probe.3 != round.id));
-    let Plane::Channels(plane) = &mut session.plane else {
-        unreachable!()
-    };
-    for (id, channel, candidate, _, _) in &probes {
-        let flow = plane.flows.get_mut(id).unwrap();
-        flow.channel = Some(*channel);
-        flow.active = true;
-        plane.channels.insert(
-            *channel,
-            ChannelHandle {
-                candidate: *candidate,
-                command: mpsc::channel(1).0,
-                cancel: None,
-                task: tokio::spawn(std::future::pending()),
-                relay: None,
-            },
-        );
-    }
+    let (mut session, _keep, probes) = parallel_round().await;
     // A reply from the faster handshake cannot prove another candidate's TUN path.
     session
         .deliver_to_tun(Incoming {
@@ -150,6 +81,11 @@ async fn parallel_candidates_have_independent_tun_verdicts() {
         })
         .await
         .unwrap();
+    // The first verified echo opens the grace window; mosh and tcp are still out.
+    let round = session.round.as_ref().expect("grace window is open");
+    let decide_at = round.decide_at.expect("window deadline set");
+    assert_eq!(round.verified.len(), 1);
+    session.poll_round(decide_at).await.unwrap();
     assert!(session.round.is_none());
     assert_eq!(session.readiness, Some(Readiness::Verified(Some(101))));
     let Plane::Channels(plane) = &session.plane else {
@@ -166,6 +102,79 @@ async fn parallel_candidates_have_independent_tun_verdicts() {
             .ready_channel(Candidate::Obfs),
         Some(101)
     );
+}
+
+#[tokio::test]
+async fn every_candidate_verified_decides_without_the_window() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    let round = session.round.as_ref().unwrap();
+    let tcp_id = round.tcp_id.unwrap();
+    let request = round.request.clone();
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&tcp_id).unwrap().active = true;
+    session
+        .deliver_to_tun(Incoming {
+            id: tcp_id,
+            channel: None,
+            packet: echo_reply_for(&request),
+        })
+        .await
+        .unwrap();
+    // The window opened: two UDP candidates have not answered yet.
+    assert!(session.round.as_ref().unwrap().decide_at.is_some());
+    for (id, channel, _, _, probe_request) in &probes {
+        session
+            .deliver_to_tun(Incoming {
+                id: *id,
+                channel: Some(*channel),
+                packet: echo_reply_for(probe_request),
+            })
+            .await
+            .unwrap();
+    }
+    // Everyone answered: the verdict is immediate, not after the window.
+    // Equal RTTs: the first verified UDP candidate (mosh) beats TCP's penalty.
+    assert!(session.round.is_none());
+    assert_eq!(session.readiness, Some(Readiness::Verified(Some(100))));
+}
+
+#[tokio::test]
+async fn faster_candidate_verified_inside_the_window_wins() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    // Obfs (channel 101) answers first, but its probe left 300 ms ago.
+    session
+        .round
+        .as_mut()
+        .unwrap()
+        .pending
+        .get_mut(&probes[1].0)
+        .unwrap()
+        .sent_at = Some(tokio::time::Instant::now() - Duration::from_millis(300));
+    for (verified, probe) in [(1, &probes[1]), (2, &probes[0])] {
+        session
+            .deliver_to_tun(Incoming {
+                id: probe.0,
+                channel: Some(probe.1),
+                packet: echo_reply_for(&probe.4),
+            })
+            .await
+            .unwrap();
+        // Tcp is still out, so neither echo decides on its own.
+        let round = session.round.as_ref().expect("window still open");
+        assert_eq!(round.verified.len(), verified);
+    }
+    let decide_at = session.round.as_ref().unwrap().decide_at.unwrap();
+    session.poll_round(decide_at).await.unwrap();
+    assert!(session.round.is_none());
+    // Mosh verified later but with a far better RTT bucket.
+    assert_eq!(session.readiness, Some(Readiness::Verified(Some(100))));
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    assert!(plane.channels.contains_key(&100));
+    assert!(!plane.channels.contains_key(&101));
 }
 
 #[tokio::test]
@@ -186,6 +195,8 @@ async fn round_verdict_reply_wins_and_noise_is_ignored() {
         unreachable!()
     };
     plane.flows.get_mut(&id).unwrap().active = true;
+    // The fixture bypasses the TCP send path; mark the probe as sent.
+    session.round.as_mut().unwrap().tcp_started = Some(tokio::time::Instant::now());
     // Unrelated packet on the preflight flow: no verdict, round stands.
     session
         .deliver_to_tun(Incoming {
@@ -708,6 +719,222 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
         assert_eq!(plane.channels.contains_key(&10), !transport_failed);
         assert_eq!(plane.by_key.contains_key(&key), !transport_failed);
     }
+}
+
+// ── grace-window verdict ──
+
+fn verified(entries: &[(u64, Candidate, u64)]) -> Vec<(u64, Candidate, Option<u64>, Duration)> {
+    entries
+        .iter()
+        .map(|(attempt, candidate, rtt_ms)| {
+            (
+                *attempt,
+                *candidate,
+                Some(*attempt + 100),
+                Duration::from_millis(*rtt_ms),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn pick_verified_prefers_the_lowest_time() {
+    let entries = verified(&[
+        (1, Candidate::Quic, 130),
+        (2, Candidate::Obfs, 90),
+        (3, Candidate::Tcp, 200),
+    ]);
+    assert_eq!(pick_verified(&entries), Some(1));
+    // Two UDP candidates are compared exactly, even below the TCP penalty.
+    let entries = verified(&[(1, Candidate::Mosh, 40), (2, Candidate::Obfs, 10)]);
+    assert_eq!(pick_verified(&entries), Some(1));
+    assert!(pick_verified(&[]).is_none());
+}
+
+#[test]
+fn pick_verified_counts_tcp_fifty_milliseconds_slower() {
+    // Quic is 25 ms slower than tcp and still wins.
+    let entries = verified(&[(1, Candidate::Tcp, 430), (2, Candidate::Quic, 455)]);
+    assert_eq!(pick_verified(&entries), Some(1));
+    // 60 ms slower is too much for the head start.
+    let entries = verified(&[(1, Candidate::Tcp, 430), (2, Candidate::Quic, 490)]);
+    assert_eq!(pick_verified(&entries), Some(0));
+}
+
+#[test]
+fn pick_verified_head_start_boundary_is_exact() {
+    // Exactly 50 ms apart is a tie: the earliest verification wins.
+    let entries = verified(&[(1, Candidate::Tcp, 100), (2, Candidate::Quic, 150)]);
+    assert_eq!(pick_verified(&entries), Some(0));
+    let entries = verified(&[(1, Candidate::Quic, 150), (2, Candidate::Tcp, 100)]);
+    assert_eq!(pick_verified(&entries), Some(0));
+    // One millisecond either side of the boundary flips the verdict.
+    let entries = verified(&[(1, Candidate::Tcp, 100), (2, Candidate::Quic, 151)]);
+    assert_eq!(pick_verified(&entries), Some(0));
+    let entries = verified(&[(1, Candidate::Tcp, 100), (2, Candidate::Quic, 149)]);
+    assert_eq!(pick_verified(&entries), Some(1));
+}
+
+#[test]
+fn pick_verified_keeps_earliest_verification_on_full_tie() {
+    let entries = verified(&[(1, Candidate::Obfs, 80), (2, Candidate::Mosh, 80)]);
+    assert_eq!(pick_verified(&entries), Some(0));
+}
+
+#[tokio::test]
+async fn candidate_that_fails_after_its_echo_cannot_win() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    // Obfs (channel 101) verifies first, then its path dies inside the window.
+    session
+        .deliver_to_tun(Incoming {
+            id: probes[1].0,
+            channel: Some(probes[1].1),
+            packet: echo_reply_for(&probes[1].4),
+        })
+        .await
+        .unwrap();
+    session
+        .round_attempt_failed(probes[1].0, Reason::PathTimeout)
+        .await
+        .unwrap();
+    assert!(session.round.as_ref().unwrap().verified.is_empty());
+    // Mosh verifies; it is the only live verified candidate when the window ends.
+    session
+        .deliver_to_tun(Incoming {
+            id: probes[0].0,
+            channel: Some(probes[0].1),
+            packet: echo_reply_for(&probes[0].4),
+        })
+        .await
+        .unwrap();
+    let decide_at = session.round.as_ref().unwrap().decide_at.unwrap();
+    session.poll_round(decide_at).await.unwrap();
+    assert!(session.round.is_none());
+    assert_eq!(session.readiness, Some(Readiness::Verified(Some(100))));
+}
+
+#[tokio::test]
+async fn round_starts_webrtc_last_so_it_cannot_delay_the_others() {
+    let (mut session, _events) = link_session(false);
+    let (local, remote) = tokio::io::duplex(8192);
+    let (reader, writer) = tokio::io::split(local);
+    session.control = Control::new(reader, writer);
+    let (reader, writer) = tokio::io::split(remote);
+    let mut peer = Control::new(reader, writer);
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.selector = Some(Selector::new_proactive(Allowed {
+        webrtc: true,
+        obfs: true,
+        mosh: true,
+        ..Allowed::default()
+    }));
+    session.begin_preflight().await.unwrap();
+    let mut strategies = Vec::new();
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_secs(5), peer.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::ChannelPrepare { strategy, .. } => strategies.push(strategy),
+            _ => panic!("unexpected round start message"),
+        }
+    }
+    // Cold order is webrtc, obfs, mosh; building the WebRTC peer takes
+    // hundreds of milliseconds on a router, so it must not hold up the rest.
+    assert_eq!(
+        strategies,
+        [Strategy::Obfs, Strategy::Mosh, Strategy::WebRtc]
+    );
+}
+
+/// A started round with mosh (channel 100) and obfs (channel 101) armed next
+/// to tcp, every attempt registered on the plane. Returns the session, the
+/// handles that keep its ports open, and the probes sorted by channel.
+async fn parallel_round() -> (
+    Session,
+    (mpsc::Receiver<(link_io::Epoch, link_io::Event)>, Control),
+    Vec<(u64, u64, Candidate, u16, Vec<u8>)>,
+) {
+    let (mut session, events) = link_session(false);
+    let (local, remote) = tokio::io::duplex(8192);
+    let (reader, writer) = tokio::io::split(local);
+    session.control = Control::new(reader, writer);
+    let (reader, writer) = tokio::io::split(remote);
+    let mut peer = Control::new(reader, writer);
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.selector = Some(Selector::new_proactive(Allowed {
+        mosh: true,
+        obfs: true,
+        tcp: true,
+        ..Allowed::default()
+    }));
+    session.begin_preflight().await.unwrap();
+    // All three start before any candidate receives a reply.
+    let mut prepares = 0;
+    let mut tcp = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::Open { id, .. } => {
+                assert_eq!(Some(id), session.round.as_ref().unwrap().tcp_id);
+                tcp = true;
+            }
+            Message::ChannelPrepare { .. } => prepares += 1,
+            _ => panic!("unexpected round start message"),
+        }
+    }
+    assert!(tcp);
+    assert_eq!(prepares, 2);
+    let round = session.round.as_mut().unwrap();
+    let mut probes: Vec<_> = round
+        .pending
+        .iter_mut()
+        .map(|(&id, rc)| {
+            let channel = if rc.candidate == Candidate::Mosh {
+                100
+            } else {
+                101
+            };
+            rc.channel = Some(channel);
+            (id, channel, rc.candidate, rc.icmp_id, rc.request.clone())
+        })
+        .collect();
+    probes.sort_by_key(|probe| probe.1);
+    assert_ne!(probes[0].3, probes[1].3);
+    assert!(probes.iter().all(|probe| probe.3 != round.id));
+    // The fixture bypasses the send paths; mark every probe as already sent.
+    let sent = tokio::time::Instant::now();
+    for rc in round.pending.values_mut() {
+        rc.sent_at = Some(sent);
+    }
+    round.tcp_started = Some(sent);
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    for (id, channel, candidate, _, _) in &probes {
+        let flow = plane.flows.get_mut(id).unwrap();
+        flow.channel = Some(*channel);
+        flow.active = true;
+        plane.channels.insert(
+            *channel,
+            ChannelHandle {
+                candidate: *candidate,
+                command: mpsc::channel(1).0,
+                cancel: None,
+                task: tokio::spawn(std::future::pending()),
+                relay: None,
+            },
+        );
+    }
+    (session, (events, peer), probes)
 }
 
 /// N3 unit helper: the OS-style echo reply for a round's request

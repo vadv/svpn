@@ -446,7 +446,7 @@ impl Session {
                 })
             });
             if verdict {
-                self.round_won(channel).await?;
+                self.round_verified(channel, incoming.id).await?;
             }
             return Ok(());
         }

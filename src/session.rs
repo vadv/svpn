@@ -41,7 +41,8 @@ mod tcp;
 mod tun;
 
 pub use pump::{ChannelCtx, ChannelHandle, ChannelReadyParams, TaskCommand, TaskEvent, pump};
-pub use round::{Round, RoundCandidate};
+pub use round::{Round, RoundCandidate, pick_verified};
+
 pub use state::{
     ChannelsPlane, Flow, FlowTcp, PacketIo, Plane, Readiness, TcpFlow, TcpPlane, Tombstone,
     Tombstones, TransportConfig,
@@ -162,6 +163,7 @@ impl Session {
             if !accepts_packets && let Some(sd) = startup_deadline {
                 deadline = deadline.min(sd);
             }
+            let round_wake = self.round.as_ref().and_then(|round| round.decide_at);
             let result = with_heartbeat_deadline(deadline, async {
                 tokio::select! {
                     message = self.control.recv() => {
@@ -225,6 +227,11 @@ impl Session {
                                 crate::error!("session task failed — {error}");
                             }
                         }
+                    }
+                    _ = tokio::time::sleep_until(round_wake.unwrap_or(deadline)), if round_wake.is_some() => {
+                        // The grace window closed: bring the verdict without
+                        // waiting for the heartbeat tick.
+                        self.poll_round(tokio::time::Instant::now()).await?;
                     }
                     _ = tick.tick() => {
                         let now = tokio::time::Instant::now();

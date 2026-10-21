@@ -22,6 +22,13 @@ use super::{
 
 /// N3: a liveness round caps all in-flight attempts (UDP) after this.
 const ROUND_CAP: Duration = Duration::from_secs(10);
+/// After the first verified echo the remaining candidates get this long
+/// to finish their verification; then the fastest of all verified wins.
+const VERDICT_GRACE: Duration = Duration::from_millis(400);
+/// TCP counts as this much slower in the verdict. A TCP tunnel stalls on
+/// packet loss in a way one echo cannot show, so UDP wins unless TCP is
+/// faster by more than this.
+const TCP_PENALTY: Duration = Duration::from_millis(50);
 /// A datagram request can vanish anywhere (driver burst drops, UDP loss):
 /// re-send until the verdict or the round deadline; replies are idempotent.
 pub(crate) const ROUND_RESEND: Duration = Duration::from_secs(2);
@@ -42,6 +49,9 @@ pub struct RoundCandidate {
     pub channel: Option<u64>,
     pub owned: bool,
     pub peer: Option<webrtc::Peer>,
+    /// When the probe first left this client — the RTT baseline.
+    /// None until the channel activates and carries the request.
+    pub sent_at: Option<tokio::time::Instant>,
     pub icmp_id: u16,
     pub request: Vec<u8>,
     pub deadline: tokio::time::Instant,
@@ -58,6 +68,14 @@ pub struct Round {
     pub pending: HashMap<u64, RoundCandidate>,
     pub failures: Vec<(Candidate, Reason)>,
     pub tcp_id: Option<u64>,
+    /// When the TCP probe first left this client — set when the transport
+    /// handshake reports `Connected`, right after the probe is written.
+    pub tcp_started: Option<tokio::time::Instant>,
+    /// Verified echoes while the grace window runs: (attempt, candidate,
+    /// channel, rtt).
+    pub verified: Vec<(u64, Candidate, Option<u64>, Duration)>,
+    /// Grace-window deadline; None until the first verification.
+    pub decide_at: Option<tokio::time::Instant>,
     pub backoff_step: u32,
     pub deadline: tokio::time::Instant,
     /// Failed round's retry time; None while attempts are in flight.
@@ -148,6 +166,9 @@ impl Session {
             pending: HashMap::new(),
             failures: Vec::new(),
             tcp_id: None,
+            tcp_started: None,
+            verified: Vec::new(),
+            decide_at: None,
             backoff_step,
             deadline: now + ROUND_CAP,
             retry_at: None,
@@ -161,7 +182,7 @@ impl Session {
     /// Send `ChannelPrepare` for every allowed UDP candidate; a fresh
     /// attempt id each — the round owns them, not `plane.attempt`.
     async fn start_round(&mut self) -> Result<()> {
-        let candidates: Vec<Candidate> = {
+        let mut candidates: Vec<Candidate> = {
             let Plane::Channels(plane) = &self.plane else {
                 bail!("liveness round requires the channels plane");
             };
@@ -174,6 +195,27 @@ impl Session {
                 .filter(|candidate| candidate != &Candidate::Tcp)
                 .collect()
         };
+        // WebRTC goes last: its peer is built in the background while the
+        // others start, and awaiting it earlier would delay every candidate
+        // behind it.
+        candidates.sort_by_key(|candidate| *candidate == Candidate::WebRtc);
+        // WebRTC peer creation is CPU-heavy (~300 ms on routers); run it in
+        // the background so every candidate starts the round together.
+        let needs_webrtc = candidates.contains(&Candidate::WebRtc) && {
+            let Plane::Channels(plane) = &self.plane else {
+                unreachable!()
+            };
+            plane
+                .selector
+                .as_ref()
+                .and_then(|selector| selector.ready_channel(Candidate::WebRtc))
+                .is_none()
+        };
+        let mut webrtc_task = needs_webrtc.then(|| {
+            tokio::task::spawn_blocking(|| {
+                webrtc::Peer::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            })
+        });
         // TCP participates immediately; transport establishment is not a verdict.
         self.start_round_tcp().await?;
         for candidate in candidates {
@@ -220,8 +262,14 @@ impl Session {
             let mut hello = None;
             let mut peer = None;
             if candidate == Candidate::WebRtc && channel.is_none() {
-                let (p, h) = webrtc::Peer::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-                    .context("WebRTC client peer")?;
+                let (p, h) = match webrtc_task.take() {
+                    Some(task) => task
+                        .await
+                        .context("WebRTC peer task")?
+                        .context("WebRTC client peer")?,
+                    None => webrtc::Peer::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                        .context("WebRTC client peer")?,
+                };
                 hello = Some(serde_json::to_string(&h).context("serialize WebRTC hello")?);
                 peer = Some(p);
             }
@@ -230,6 +278,7 @@ impl Session {
                     attempt,
                     RoundCandidate {
                         candidate,
+                        sent_at: None,
                         channel,
                         owned: channel.is_none(),
                         peer,
@@ -327,7 +376,8 @@ impl Session {
                 key
             }
         };
-        self.round.as_mut().context("round disappeared")?.tcp_id = Some(id);
+        let round_mut = self.round.as_mut().context("round disappeared")?;
+        round_mut.tcp_id = Some(id);
         crate::info!(
             "{} round: probing tcp (attempt {id})",
             prefixed(self.tag(), "channel")
@@ -346,6 +396,8 @@ impl Session {
         };
         if let Some(round) = self.round.as_mut() {
             round.failures.push((rc.candidate, reason));
+            // A candidate that failed after its echo must not win the verdict.
+            round.verified.retain(|(id, ..)| *id != attempt);
         }
         self.close_flow(attempt, true).await?;
         if rc.owned {
@@ -366,9 +418,11 @@ impl Session {
         if self
             .round
             .as_ref()
-            .is_some_and(|round| round.pending.is_empty() && round.tcp_id.is_none())
+            .is_some_and(|round| unanswered(round).is_empty())
         {
-            self.round_failed().await?;
+            // A verified echo in the grace window still wins; decide_round
+            // fails the round when nothing was verified.
+            self.decide_round().await?;
         }
         Ok(())
     }
@@ -459,6 +513,9 @@ impl Session {
             }
             return Ok(());
         }
+        if round.decide_at.is_some_and(|at| now >= at) {
+            return self.decide_round().await;
+        }
         if now >= round.deadline {
             return self.round_failed().await;
         }
@@ -494,14 +551,102 @@ impl Session {
                 continue;
             }
             rc.resend_at = Some(now + ROUND_RESEND);
-            if let Some(handle) = rc.channel.and_then(|channel| plane.channels.get(&channel)) {
-                handle
-                    .command
-                    .try_send(TaskCommand::Data(id, rc.request.clone()))
-                    .ok();
+            if rc
+                .channel
+                .and_then(|channel| plane.channels.get(&channel))
+                .is_some_and(|handle| {
+                    handle
+                        .command
+                        .try_send(TaskCommand::Data(id, rc.request.clone()))
+                        .is_ok()
+                })
+            {
+                // First send wins: resends never move the RTT baseline.
+                rc.sent_at.get_or_insert(now);
             }
         }
         Ok(())
+    }
+
+    /// An echo matched — record the RTT and open the grace window;
+    /// decide immediately when no competitor is left.
+    pub async fn round_verified(&mut self, channel: Option<u64>, attempt: u64) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        let decide = {
+            let Some(round) = self.round.as_mut() else {
+                return Ok(());
+            };
+            if round.verified.iter().any(|(id, ..)| *id == attempt) {
+                return Ok(());
+            }
+            let (candidate, rtt) = if round.tcp_id == Some(attempt) {
+                let started = round
+                    .tcp_started
+                    .context("TCP attempt without start time")?;
+                (Candidate::Tcp, now.duration_since(started))
+            } else {
+                let Some(rc) = round.pending.get(&attempt) else {
+                    // Echo of an attempt that already failed: too late.
+                    return Ok(());
+                };
+                let Some(sent) = rc.sent_at else {
+                    // Echo of an attempt whose probe never left: too late.
+                    return Ok(());
+                };
+                (rc.candidate, now.duration_since(sent))
+            };
+            round.verified.push((attempt, candidate, channel, rtt));
+            if unanswered(round).is_empty() {
+                true
+            } else if round.decide_at.is_none() {
+                let at = (now + VERDICT_GRACE).min(round.deadline);
+                round.decide_at = Some(at);
+                let waiting = unanswered(round);
+                crate::info!(
+                    "{} {} verified in {rtt:?}; waiting up to {:?} for: {waiting}",
+                    prefixed(self.tag(), "channel"),
+                    candidate.as_str(),
+                    at.saturating_duration_since(now),
+                );
+                false
+            } else {
+                crate::info!(
+                    "{} {} verified in {rtt:?} inside the grace window",
+                    prefixed(self.tag(), "channel"),
+                    candidate.as_str(),
+                );
+                false
+            }
+        };
+        if decide {
+            self.decide_round().await?;
+        }
+        Ok(())
+    }
+
+    /// The grace window closed — the fastest verified candidate wins.
+    pub async fn decide_round(&mut self) -> Result<()> {
+        let Some(round) = self.round.as_ref() else {
+            return Ok(());
+        };
+        let Some(best) = pick_verified(&round.verified) else {
+            return self.round_failed().await;
+        };
+        let (_, candidate, channel, rtt) = round.verified[best];
+        let verified = round
+            .verified
+            .iter()
+            .map(|(_, candidate, _, rtt)| format!("{} {rtt:?}", candidate.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let silent = unanswered(round);
+        crate::info!(
+            "{} round verdict: {} wins ({rtt:?}); verified: {verified}; no answer: {}",
+            prefixed(self.tag(), "channel"),
+            candidate.as_str(),
+            if silent.is_empty() { "none" } else { &silent },
+        );
+        self.round_won(channel).await
     }
 
     /// The first matching echo wins; retire only this round's losers.
@@ -623,4 +768,34 @@ impl Session {
         }
         Ok(true)
     }
+}
+
+/// Winner of the grace window: the lowest time, TCP counted `TCP_PENALTY`
+/// slower; remaining ties go to the earliest verification.
+pub fn pick_verified(verified: &[(u64, Candidate, Option<u64>, Duration)]) -> Option<usize> {
+    verified
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, candidate, _, rtt))| match candidate {
+            Candidate::Tcp => *rtt + TCP_PENALTY,
+            _ => *rtt,
+        })
+        .map(|(index, _)| index)
+}
+
+/// Names of the candidates that have not verified yet, for the logs and
+/// the round-completion rule.
+pub(crate) fn unanswered(round: &Round) -> String {
+    let done = |attempt: &u64| round.verified.iter().any(|(id, ..)| id == attempt);
+    let mut names: Vec<&str> = round
+        .pending
+        .iter()
+        .filter(|(id, _)| !done(id))
+        .map(|(_, rc)| rc.candidate.as_str())
+        .collect();
+    if round.tcp_id.is_some_and(|id| !done(&id)) {
+        names.push(Candidate::Tcp.as_str());
+    }
+    names.sort_unstable();
+    names.join(", ")
 }
