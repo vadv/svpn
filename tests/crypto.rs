@@ -1,5 +1,9 @@
+//! Wire cipher: AES-GCM primitive, seal/open behavior, replay window, counter budgets.
+
 use aes_gcm::{AeadInPlace, Aes128Gcm, KeyInit};
 use svpn::crypto::*;
+
+// ── aead primitive ──
 
 #[test]
 fn gcm_matches_nist_empty_vector() {
@@ -17,6 +21,8 @@ fn gcm_matches_nist_empty_vector() {
         ]
     );
 }
+
+// ── seal and open ──
 
 #[test]
 fn round_trip_bounds_and_direction() {
@@ -49,6 +55,8 @@ fn tampering_wrong_key_and_wrong_flow_are_rejected() {
     assert!(Cipher::new([8; 16], 42, false).open(&packet).is_err());
     assert!(Cipher::new([7; 16], 43, false).open(&packet).is_err());
 }
+
+// ── replay window ──
 
 #[test]
 fn replay_window_accepts_reordering_not_duplicates_or_old_packets() {
@@ -109,6 +117,8 @@ fn forged_high_counter_does_not_move_replay_window() {
     assert!(server.open(&forged).is_err());
     assert!(server.open(&packet).is_ok());
 }
+
+// ── counters and budgets ──
 
 #[test]
 fn counters_and_key_budgets_never_wrap() {

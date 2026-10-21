@@ -23,9 +23,9 @@ case "$SVPN_TEST_GROUP" in
 esac
 cd "$(dirname "$0")/.."
 compose=(docker compose -f "$PWD/compose.yaml" -p svpn-test)
-mkdir -p tests/.work/artifacts
+mkdir -p e2e/.work/artifacts
 export SVPN_TEST_ARTIFACTS
-SVPN_TEST_ARTIFACTS=$(mktemp -d "$PWD/tests/.work/artifacts/run.XXXXXX")
+SVPN_TEST_ARTIFACTS=$(mktemp -d "$PWD/e2e/.work/artifacts/run.XXXXXX")
 mkdir "$SVPN_TEST_ARTIFACTS/sessions"
 printf 'Test artifacts: %s\n' "$SVPN_TEST_ARTIFACTS"
 child=
@@ -86,7 +86,7 @@ run "$SVPN_TEST_ARTIFACTS/build.log" "${compose[@]}" build
 run "$SVPN_TEST_ARTIFACTS/startup.log" "${compose[@]}" up -d --wait server server2 target
 if (( matrix )); then
     run "$SVPN_TEST_ARTIFACTS/runner.log" "${compose[@]}" run --rm --no-deps -T client \
-        python3 -u /tests/matrix.py --group "$SVPN_TEST_GROUP"
+        python3 -u /e2e/matrix.py --group "$SVPN_TEST_GROUP"
 else
     run "$SVPN_TEST_ARTIFACTS/runner.log" "${compose[@]}" run --rm --no-deps -T client
 fi

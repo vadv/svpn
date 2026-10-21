@@ -1,11 +1,10 @@
+//! Channel: record codec and golden vectors, authentication, reassembly, socket exchange.
+
 use std::net::UdpSocket as SyncUdp;
 use std::time::{Duration, Instant};
+
 use svpn::channel::*;
 use svpn::crypto;
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 fn sample_data() -> Record {
     Record::Data {
@@ -16,6 +15,8 @@ fn sample_data() -> Record {
         fragment: b"SVPN".to_vec(),
     }
 }
+
+// ── records ──
 
 #[test]
 fn golden_vectors_match_wire_md() {
@@ -124,6 +125,8 @@ fn decode_rejects_malformed_records() {
     assert!(Record::decode(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]).is_err());
 }
 
+// ── authentication ──
+
 #[test]
 fn tampered_wire_fails_authentication() {
     let wire = Channel::new([0x07; 16], 1, true)
@@ -140,6 +143,8 @@ fn tampered_wire_fails_authentication() {
     assert!(Channel::new([0x07; 16], 2, false).open(&wire, now).is_err());
     server.open(&wire, now).unwrap();
 }
+
+// ── reassembly ──
 
 #[test]
 fn fragments_of_1400_bytes_assemble() {
@@ -212,6 +217,8 @@ fn pending_limits_drop_new_packets_not_channel() {
     assert!(reassembly.insert(&extra, later).unwrap().is_none());
     assert_eq!(reassembly.pending(), 1);
 }
+
+// ── socket exchange ──
 
 #[tokio::test]
 async fn plain_channel_socket_dance() {
@@ -359,4 +366,8 @@ async fn plain_channel_socket_dance() {
         }
     }
     assert_eq!(assembled, Some(inner));
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -28,42 +28,24 @@ forwarding и правило маскарада, те же два шага, чт
 
 ## 1. Установите готовый бинарник
 
-Скачайте архив для сервера и клиента из [Releases](https://github.com/vadv/svpn/releases/tag/v0.2.0).
-Rust и Cargo для запуска не нужны.
+Скачайте из [Releases](https://github.com/vadv/svpn/releases) архив для вашей
+системы и его `.sha256`:
 
-| Система | Архив |
-| --- | --- |
-| Linux x86-64, glibc 2.36+ (Debian 12 / Ubuntu 24.04 и новее) | [linux-x86_64-gnu](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-linux-x86_64-gnu.tar.gz) |
-| OpenWrt ARM64 с ARMv8 crypto | [openwrt-aarch64](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-openwrt-aarch64.tar.gz) |
-| macOS, Apple Silicon | [macos-arm64](https://github.com/vadv/svpn/releases/download/v0.2.0/svpn-0.2.0-macos-arm64.tar.gz) |
+- `linux-x86_64-gnu` — сервер и клиент Linux (glibc 2.36+: Debian 12,
+  Ubuntu 24.04 и новее)
+- `openwrt-aarch64` — клиент на роутере OpenWrt ARM64
+- `macos-arm64` — клиент macOS на Apple Silicon
 
-Рядом с архивом скачайте его `.sha256`. Пример установки на Linux x86-64:
+Проверьте сумму и установите бинарник (на macOS сумма — `shasum -a 256 -c`):
 
 ```sh
-sha256sum -c svpn-0.2.0-linux-x86_64-gnu.tar.gz.sha256
-tar -xzf svpn-0.2.0-linux-x86_64-gnu.tar.gz
+sha256sum -c svpn-*.tar.gz.sha256
+tar -xzf svpn-*.tar.gz
 sudo install -m 755 svpn /usr/local/bin/svpn
 svpn --version
 ```
 
-На macOS:
-
-```sh
-shasum -a 256 -c svpn-0.2.0-macos-arm64.tar.gz.sha256
-tar -xzf svpn-0.2.0-macos-arm64.tar.gz
-sudo mkdir -p /usr/local/bin
-sudo install -m 755 svpn /usr/local/bin/svpn
-svpn --version
-```
-
-На OpenWrt выполните от root:
-
-```sh
-sha256sum -c svpn-0.2.0-openwrt-aarch64.tar.gz.sha256
-tar -xzf svpn-0.2.0-openwrt-aarch64.tar.gz
-cp svpn /usr/bin/svpn
-svpn --version
-```
+На OpenWrt выполните от root: `tar -xzf svpn-*.tar.gz && cp svpn /usr/bin/svpn`.
 
 ## 2. Подготовьте сервер (один раз)
 

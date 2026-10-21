@@ -7,7 +7,8 @@
 !README.en.md
 !src/
 !src/**
-!tests/
-!tests/**
-tests/.work/
-tests/__pycache__/
+!tests/stderr.rs
+!e2e/
+!e2e/**
+e2e/.work/
+e2e/__pycache__/

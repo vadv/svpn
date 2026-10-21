@@ -1,9 +1,31 @@
+//! Packet: flow parsing, validation, TCP metadata and resets, ICMP probes.
+
 mod common;
 
 use std::net::Ipv4Addr;
 
 use common::{echo_reply, udp_packet};
 use svpn::packet::*;
+
+/// Complete client TCP packet: client 10.77.0.2:40000 → server 10.77.0.1:9000.
+fn full_tcp(flags: u8, seq: u32, ack: u32, payload_len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; 40 + payload_len];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&(40 + payload_len as u16).to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 6;
+    bytes[12..16].copy_from_slice(&[10, 77, 0, 2]);
+    bytes[16..20].copy_from_slice(&[10, 77, 0, 1]);
+    bytes[20..22].copy_from_slice(&40000u16.to_be_bytes());
+    bytes[22..24].copy_from_slice(&9000u16.to_be_bytes());
+    bytes[24..28].copy_from_slice(&seq.to_be_bytes());
+    bytes[28..32].copy_from_slice(&ack.to_be_bytes());
+    bytes[32] = 0x50;
+    bytes[33] = flags;
+    bytes
+}
+
+// ── flow parsing ──
 
 #[test]
 fn matches_both_directions() {
@@ -47,6 +69,8 @@ fn echo_identifier_survives_reverse_direction() {
     );
 }
 
+// ── validation ──
+
 #[test]
 fn accepts_trailing_padding_beyond_total_length() {
     // Real-world case: Linux forwards frames with ethernet padding; TCP ACKs
@@ -80,6 +104,8 @@ fn rejects_fragments_ipv6_and_bad_lengths() {
         assert!(parse(&bad, true).is_none());
     }
 }
+
+// ── TCP flags and metadata ──
 
 #[test]
 fn only_initial_syn_can_open_tcp() {
@@ -116,32 +142,6 @@ fn tcp_rst_flag_is_detected_udp_never() {
     // A UDP packet is never marked as RST.
     let udp = udp_packet(false);
     assert!(!parse(&udp, true).unwrap().is_rst);
-}
-
-/// Complete client TCP packet: client 10.77.0.2:40000 → server 10.77.0.1:9000.
-fn full_tcp(flags: u8, seq: u32, ack: u32, payload_len: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; 40 + payload_len];
-    bytes[0] = 0x45;
-    bytes[2..4].copy_from_slice(&(40 + payload_len as u16).to_be_bytes());
-    bytes[8] = 64;
-    bytes[9] = 6;
-    bytes[12..16].copy_from_slice(&[10, 77, 0, 2]);
-    bytes[16..20].copy_from_slice(&[10, 77, 0, 1]);
-    bytes[20..22].copy_from_slice(&40000u16.to_be_bytes());
-    bytes[22..24].copy_from_slice(&9000u16.to_be_bytes());
-    bytes[24..28].copy_from_slice(&seq.to_be_bytes());
-    bytes[28..32].copy_from_slice(&ack.to_be_bytes());
-    bytes[32] = 0x50;
-    bytes[33] = flags;
-    bytes
-}
-
-fn segment_meta(bytes: &[u8]) -> (u8, u32, u32) {
-    (
-        bytes[33],
-        dword(bytes, 24).unwrap(),
-        dword(bytes, 28).unwrap(),
-    )
 }
 
 #[test]
@@ -182,6 +182,8 @@ fn tcp_meta_is_present_for_full_tcp_only() {
     assert_eq!(quoted.flow, parse(&inner, true).unwrap().flow);
     assert!(quoted.tcp.is_none());
 }
+
+// ── TCP reset and probe ──
 
 #[test]
 fn tcp_reset_for_follows_closed_endpoint_rules() {
@@ -280,8 +282,7 @@ fn reset_and_probe_checksums_match_reference_math() {
     assert_eq!(internet_checksum(&pseudo), 0);
 }
 
-/// Kernel-style echo reply for a probe: swap addresses, flip the type,
-/// recompute the ICMP checksum.
+// ── ICMP probe ──
 
 #[test]
 fn icmp_probe_round_trip() {
@@ -373,4 +374,12 @@ fn icmp_probe_fits_mtu() {
         1,
         &[0u8; 1400]
     ));
+}
+
+fn segment_meta(bytes: &[u8]) -> (u8, u32, u32) {
+    (
+        bytes[33],
+        dword(bytes, 24).unwrap(),
+        dword(bytes, 28).unwrap(),
+    )
 }

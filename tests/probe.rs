@@ -1,4 +1,7 @@
+//! Channel establishment probe: full dance, wrong key, silent peer, size cap.
+
 use std::time::Duration;
+
 use svpn::channel::Channel;
 use svpn::drivers;
 use svpn::drivers::Io;
@@ -25,6 +28,8 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
+// ── establishment ──
+
 #[tokio::test]
 async fn full_dance_verifies_both_sides() {
     let (mut s_io, mut s_ch, mut c_io, mut c_ch) = mosh_pair().await;
@@ -35,6 +40,8 @@ async fn full_dance_verifies_both_sides() {
     server.unwrap();
     client.unwrap();
 }
+
+// ── failure modes ──
 
 #[tokio::test]
 async fn wrong_key_fails_both_sides() {

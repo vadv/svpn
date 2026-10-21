@@ -1,3 +1,5 @@
+//! Binary entry: CLI mode resolution, early validation, port claiming, remote command building.
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
@@ -6,20 +8,11 @@ use svpn::framing::Camouflage;
 use svpn::server_spec::{resolve_perf, resolve_servers};
 use svpn::*;
 
-#[test]
-fn busy_tun_error_detected() {
-    let busy = anyhow::Error::from(std::io::Error::from_raw_os_error(16))
-        .context("create/configure TUN (requires network privileges)");
-    assert!(is_busy_tun(&busy));
-    let eperm = anyhow::Error::from(std::io::Error::from_raw_os_error(1))
-        .context("create/configure TUN (requires network privileges)");
-    assert!(!is_busy_tun(&eperm));
-    assert!(!is_busy_tun(&anyhow::anyhow!("plain failure")));
-}
-
 fn parse_cli(mode: &str, args: &[&str]) -> Cli {
     Cli::try_parse_from(["svpn", mode].into_iter().chain(args.iter().copied())).unwrap()
 }
+
+// ── cli mode resolution ──
 
 #[test]
 fn hook_options_belong_only_to_client() {
@@ -45,30 +38,6 @@ fn hook_options_belong_only_to_client() {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["svpn", "serve", flag, "value"]).is_err());
-    }
-}
-
-#[tokio::test]
-async fn invalid_hooks_fail_before_ssh_bootstrap() {
-    for flag in ["--up-command", "--down-command"] {
-        let cli = Cli::try_parse_from([
-            "svpn",
-            "multi",
-            "--server",
-            "203.0.113.1",
-            "--ssh-user",
-            "root",
-            "--peer-tun-name",
-            "svpn0",
-            flag,
-            " ",
-        ])
-        .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), run(cli))
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("hook command is empty"));
     }
 }
 
@@ -328,6 +297,32 @@ fn cli_merges_global_and_per_server_requirements() {
     }
 }
 
+// ── early validation before bootstrap ──
+
+#[tokio::test]
+async fn invalid_hooks_fail_before_ssh_bootstrap() {
+    for flag in ["--up-command", "--down-command"] {
+        let cli = Cli::try_parse_from([
+            "svpn",
+            "multi",
+            "--server",
+            "203.0.113.1",
+            "--ssh-user",
+            "root",
+            "--peer-tun-name",
+            "svpn0",
+            flag,
+            " ",
+        ])
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), run(cli))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("hook command is empty"));
+    }
+}
+
 #[test]
 fn invalid_server_fails_before_any_network_bootstrap() {
     let error = match Cli::try_parse_from([
@@ -382,6 +377,8 @@ async fn invalid_perf_measurements_fail_before_network_bootstrap() {
     assert_eq!((time, bytes), (0, Some(1 << 20)));
 }
 
+// ── udp port claiming ──
+
 #[tokio::test]
 async fn final_udp_port_does_not_wrap() {
     let mut next = 65535;
@@ -394,28 +391,6 @@ async fn final_udp_port_does_not_wrap() {
             .await
             .is_err()
     );
-}
-
-#[test]
-fn parses_byte_sizes() {
-    assert_eq!(parse_byte_size("1M").unwrap(), 1 << 20);
-    assert_eq!(parse_byte_size("512K").unwrap(), 512 << 10);
-    assert_eq!(parse_byte_size("1G").unwrap(), 1 << 30);
-    assert_eq!(parse_byte_size("2m").unwrap(), 2 << 20);
-    assert_eq!(parse_byte_size("1048576").unwrap(), 1 << 20);
-    for bad in ["", "M", "1X", "-1", "1.5M", "0", "2G", "9999999999999"] {
-        assert!(parse_byte_size(bad).is_err(), "{bad}");
-    }
-}
-
-#[test]
-fn validates_tun_configuration() {
-    let local = Ipv4Addr::new(10, 77, 0, 2);
-    let peer = Ipv4Addr::new(10, 77, 0, 1);
-    assert!(validate_addresses(local, peer, 1280).is_ok());
-    assert!(validate_addresses(local, local, 1280).is_err());
-    assert!(validate_addresses(local, peer, 1500).is_err());
-    assert!(validate_addresses(Ipv4Addr::UNSPECIFIED, peer, 1280).is_err());
 }
 
 #[tokio::test]
@@ -445,31 +420,7 @@ async fn exhausts_port_range() {
     assert!(error.to_string().contains("exhausted"));
 }
 
-#[test]
-fn uses_ssh_destination_not_client_address_for_udp_bind() {
-    assert_eq!(
-        ssh_server_address("10.9.0.2 50000 72.56.22.122 22").unwrap(),
-        Ipv4Addr::new(72, 56, 22, 122)
-    );
-    for value in [
-        "",
-        "a b",
-        "1.2.3.4 50000 ::1 22",
-        "1.2.3.4 50000 0.0.0.0 22",
-    ] {
-        assert!(ssh_server_address(value).is_err(), "{value}");
-    }
-}
-
-#[test]
-fn validates_tun_names() {
-    for name in ["tun9", "svpn0", "a", "abcdefghijklmno", "15-characters-x"] {
-        assert!(validate_tun_name(name).is_ok(), "{name}");
-    }
-    for name in ["", "abcdefghijklmnop", "a/b", "a b", "a\tb", "a\nb", "tün"] {
-        assert!(validate_tun_name(name).is_err(), "{name:?}");
-    }
-}
+// ── remote serve command ──
 
 #[test]
 fn builds_remote_command_with_quoted_tun_name() {
@@ -545,6 +496,56 @@ fn plans_mimic_variants() {
 }
 
 #[test]
+fn quotes_remote_executable_without_shell_expansion() {
+    assert_eq!(shell_quote("/opt/svpn"), "'/opt/svpn'");
+    assert_eq!(
+        shell_quote("x'; touch /tmp/bad; '"),
+        "'x'\\''; touch /tmp/bad; '\\'''"
+    );
+}
+
+#[test]
+fn uses_ssh_destination_not_client_address_for_udp_bind() {
+    assert_eq!(
+        ssh_server_address("10.9.0.2 50000 72.56.22.122 22").unwrap(),
+        Ipv4Addr::new(72, 56, 22, 122)
+    );
+    for value in [
+        "",
+        "a b",
+        "1.2.3.4 50000 ::1 22",
+        "1.2.3.4 50000 0.0.0.0 22",
+    ] {
+        assert!(ssh_server_address(value).is_err(), "{value}");
+    }
+}
+
+// ── parsing and validation ──
+
+#[test]
+fn busy_tun_error_detected() {
+    let busy = anyhow::Error::from(std::io::Error::from_raw_os_error(16))
+        .context("create/configure TUN (requires network privileges)");
+    assert!(is_busy_tun(&busy));
+    let eperm = anyhow::Error::from(std::io::Error::from_raw_os_error(1))
+        .context("create/configure TUN (requires network privileges)");
+    assert!(!is_busy_tun(&eperm));
+    assert!(!is_busy_tun(&anyhow::anyhow!("plain failure")));
+}
+
+#[test]
+fn parses_byte_sizes() {
+    assert_eq!(parse_byte_size("1M").unwrap(), 1 << 20);
+    assert_eq!(parse_byte_size("512K").unwrap(), 512 << 10);
+    assert_eq!(parse_byte_size("1G").unwrap(), 1 << 30);
+    assert_eq!(parse_byte_size("2m").unwrap(), 2 << 20);
+    assert_eq!(parse_byte_size("1048576").unwrap(), 1 << 20);
+    for bad in ["", "M", "1X", "-1", "1.5M", "0", "2G", "9999999999999"] {
+        assert!(parse_byte_size(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn parses_udp_port_ranges() {
     assert_eq!(parse_port_range("60000-60009").unwrap(), (60000, 60009));
     assert_eq!(parse_port_range("1-1").unwrap(), (1, 1));
@@ -564,10 +565,21 @@ fn parses_udp_port_ranges() {
 }
 
 #[test]
-fn quotes_remote_executable_without_shell_expansion() {
-    assert_eq!(shell_quote("/opt/svpn"), "'/opt/svpn'");
-    assert_eq!(
-        shell_quote("x'; touch /tmp/bad; '"),
-        "'x'\\''; touch /tmp/bad; '\\'''"
-    );
+fn validates_tun_configuration() {
+    let local = Ipv4Addr::new(10, 77, 0, 2);
+    let peer = Ipv4Addr::new(10, 77, 0, 1);
+    assert!(validate_addresses(local, peer, 1280).is_ok());
+    assert!(validate_addresses(local, local, 1280).is_err());
+    assert!(validate_addresses(local, peer, 1500).is_err());
+    assert!(validate_addresses(Ipv4Addr::UNSPECIFIED, peer, 1280).is_err());
+}
+
+#[test]
+fn validates_tun_names() {
+    for name in ["tun9", "svpn0", "a", "abcdefghijklmno", "15-characters-x"] {
+        assert!(validate_tun_name(name).is_ok(), "{name}");
+    }
+    for name in ["", "abcdefghijklmnop", "a/b", "a b", "a\tb", "a\nb", "tün"] {
+        assert!(validate_tun_name(name).is_err(), "{name:?}");
+    }
 }

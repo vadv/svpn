@@ -1,3 +1,5 @@
+//! Stderr: a full stderr pipe does not block process exit.
+
 use std::{
     io::{ErrorKind, Write},
     os::{fd::OwnedFd, unix::net::UnixStream},

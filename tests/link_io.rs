@@ -1,9 +1,13 @@
+//! Link I/O: delivery counters and bounded packet/event channels.
+
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use svpn::control::Stats;
 use svpn::link_io::*;
 use tokio::sync::{mpsc, watch};
+
+// ── delivery counters ──
 
 #[test]
 fn delivery_counts_only_completed_writes_and_never_double_counts_drops() {
@@ -35,6 +39,8 @@ fn delivery_counts_only_completed_writes_and_never_double_counts_drops() {
         (2, 100, 4)
     );
 }
+
+// ── bounded channels ──
 
 #[tokio::test]
 async fn bounded_port_preserves_packet_id_and_epoch() {

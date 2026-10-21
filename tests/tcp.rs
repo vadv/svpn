@@ -1,13 +1,32 @@
+//! TCP transport: fixed-port rebind, frame pump, preflight, and flow binding.
+
 use std::net::SocketAddr;
 use std::time::Duration;
-use svpn::crypto::Cipher;
+
+use svpn::crypto::{Cipher, random};
 use svpn::framing::{self, Camouflage, TOKEN_BYTES};
+use svpn::link_io::PREFLIGHT_ID;
 use svpn::tcp::*;
-use svpn::{crypto::random, link_io::PREFLIGHT_ID};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+
+const FLOW_TEST_QUEUE: usize = 8;
+
+async fn spawn_serve(camouflage: Camouflage) -> (SocketAddr, mpsc::Receiver<Event>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (events, incoming) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        serve(stream, camouflage, events).await.unwrap();
+    });
+    (address, incoming)
+}
+
+// ── listener ──
 
 #[tokio::test]
 async fn fixed_port_rebinds_despite_time_wait() {
@@ -28,17 +47,7 @@ async fn fixed_port_rebinds_despite_time_wait() {
         .expect("rebind fixed port while TIME_WAIT lingers");
 }
 
-async fn spawn_serve(camouflage: Camouflage) -> (SocketAddr, mpsc::Receiver<Event>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (events, incoming) = mpsc::channel(16);
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        serve(stream, camouflage, events).await.unwrap();
-    });
-    (address, incoming)
-}
-const FLOW_TEST_QUEUE: usize = 8;
+// ── pump ──
 
 #[tokio::test]
 async fn pump_drains_buffered_frames_without_another_socket_read() {
@@ -51,21 +60,7 @@ async fn pump_drains_buffered_frames_without_another_socket_read() {
         let key = [7; 16];
         let id = 42;
         let mut sender = Cipher::new(key, id, false);
-        let mut decoder = match camouflage {
-            Camouflage::Ssh => {
-                let mut decoder = framing::Decoder::new_ssh(false);
-                decoder.push(&framing::ssh_server_hello());
-                decoder.push(&framing::ssh_server_tail());
-                decoder
-            }
-            _ => {
-                let mut decoder = framing::Decoder::new(camouflage);
-                if camouflage == Camouflage::Banner {
-                    decoder.push(framing::banner());
-                }
-                decoder
-            }
-        };
+        let mut decoder = server_decoder(camouflage);
         decoder.push(&encode_frame(&mut sender, camouflage, &[]).unwrap());
         decoder.push(&encode_frame(&mut sender, camouflage, b"buffered packet").unwrap());
         let (_send, outgoing) = mpsc::channel(1);
@@ -106,21 +101,7 @@ async fn pump_distinguishes_clean_eof_from_truncated_frames() {
                 .unwrap();
             let (peer, _) = listener.accept().await.unwrap();
             let (key, id) = ([7; 16], 42);
-            let mut decoder = match camouflage {
-                Camouflage::Ssh => {
-                    let mut decoder = framing::Decoder::new_ssh(false);
-                    decoder.push(&framing::ssh_server_hello());
-                    decoder.push(&framing::ssh_server_tail());
-                    decoder
-                }
-                _ => {
-                    let mut decoder = framing::Decoder::new(camouflage);
-                    if camouflage == Camouflage::Banner {
-                        decoder.push(framing::banner());
-                    }
-                    decoder
-                }
-            };
+            let mut decoder = server_decoder(camouflage);
             let frame =
                 encode_frame(&mut Cipher::new(key, id, false), camouflage, b"packet").unwrap();
             decoder.push(&frame[..frame.len() - usize::from(truncated)]);
@@ -156,6 +137,8 @@ async fn pump_distinguishes_clean_eof_from_truncated_frames() {
         }
     }
 }
+
+// ── preflight ──
 
 #[tokio::test]
 async fn preflight_authenticates_both_directions_without_ip_data() {
@@ -256,6 +239,8 @@ async fn preflight_rejects_an_unauthenticated_reply() {
     );
     peer.await.unwrap();
 }
+
+// ── flow binding ──
 
 #[tokio::test]
 async fn binds_by_token_and_transfers_both_directions() {
@@ -421,4 +406,22 @@ async fn wrong_key_fails_authentication() {
         server_events.try_recv().is_err(),
         "unauthenticated binding must not activate a flow"
     );
+}
+
+fn server_decoder(camouflage: Camouflage) -> framing::Decoder {
+    match camouflage {
+        Camouflage::Ssh => {
+            let mut decoder = framing::Decoder::new_ssh(false);
+            decoder.push(&framing::ssh_server_hello());
+            decoder.push(&framing::ssh_server_tail());
+            decoder
+        }
+        _ => {
+            let mut decoder = framing::Decoder::new(camouflage);
+            if camouflage == Camouflage::Banner {
+                decoder.push(framing::banner());
+            }
+            decoder
+        }
+    }
 }

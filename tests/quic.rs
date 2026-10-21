@@ -1,3 +1,5 @@
+//! QUIC relay: datagram codec, connect rejection, relayed exchange, pcap artifact.
+
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use quinn::Endpoint;
@@ -75,6 +77,58 @@ async fn tunneled() -> (Fixture, Tunnel) {
     (fixture, tunnel)
 }
 
+// ── datagram codec ──
+
+#[tokio::test]
+async fn datagram_prefix_codec() {
+    let mut frame = BytesMut::new();
+    frame.extend_from_slice(&DATAGRAM_PREFIX);
+    frame.extend_from_slice(b"udp-payload");
+    let datagram = frame.freeze();
+    assert_eq!(decode_datagram(&datagram).unwrap(), b"udp-payload");
+    // A foreign context id / quarter stream id is rejected outright.
+    for bad in [
+        Bytes::from_static(b"\x00\x01abc"),
+        Bytes::from_static(b"\x01\x00abc"),
+        Bytes::from_static(b"\x00"),
+        Bytes::from_static(b""),
+    ] {
+        assert!(decode_datagram(&bad).is_err(), "{bad:?}");
+    }
+}
+
+// ── connect rejection ──
+
+#[tokio::test]
+async fn wrong_pin_fails_handshake() {
+    let (fixture, _serving) = fixture().await;
+    let wrong = [0u8; 32];
+    let error = connect(fixture.server_addr, SNI, wrong, fixture.target)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("handshake") || error.to_string().contains("pin"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn foreign_target_is_forbidden() {
+    let (fixture, _serving) = fixture().await;
+    let other: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let error = connect(fixture.server_addr, SNI, fixture.pin, other)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("403"),
+        "unexpected error: {error}"
+    );
+}
+
+// ── relayed exchange ──
+
 #[tokio::test]
 async fn full_exchange_with_independent_peer() {
     let (fixture, tunnel) = tunneled().await;
@@ -128,52 +182,6 @@ async fn oversize_datagram_is_rejected_before_send() {
 }
 
 #[tokio::test]
-async fn wrong_pin_fails_handshake() {
-    let (fixture, _serving) = fixture().await;
-    let wrong = [0u8; 32];
-    let error = connect(fixture.server_addr, SNI, wrong, fixture.target)
-        .await
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("handshake") || error.to_string().contains("pin"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn foreign_target_is_forbidden() {
-    let (fixture, _serving) = fixture().await;
-    let other: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let error = connect(fixture.server_addr, SNI, fixture.pin, other)
-        .await
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("403"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn datagram_prefix_codec() {
-    let mut frame = BytesMut::new();
-    frame.extend_from_slice(&DATAGRAM_PREFIX);
-    frame.extend_from_slice(b"udp-payload");
-    let datagram = frame.freeze();
-    assert_eq!(decode_datagram(&datagram).unwrap(), b"udp-payload");
-    // A foreign context id / quarter stream id is rejected outright.
-    for bad in [
-        Bytes::from_static(b"\x00\x01abc"),
-        Bytes::from_static(b"\x01\x00abc"),
-        Bytes::from_static(b"\x00"),
-        Bytes::from_static(b""),
-    ] {
-        assert!(decode_datagram(&bad).is_err(), "{bad:?}");
-    }
-}
-
-#[tokio::test]
 async fn channel_records_flow_through_tunnel() {
     let (fixture, tunnel) = tunneled().await;
     // Full channel cycle: fragmentation → datagrams → echo peer → reassembly.
@@ -210,7 +218,8 @@ async fn channel_records_flow_through_tunnel() {
     fixture.server.close(0u32.into(), b"done");
 }
 
-/// Wire artifact: CONNECT tunnel datagrams in a pcap (UDP wrappers).
+// ── pcap artifact ──
+
 #[tokio::test]
 async fn writes_datagram_pcap_artifact() {
     let (fixture, tunnel) = tunneled().await;

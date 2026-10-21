@@ -1,3 +1,5 @@
+//! TCP framing: length frames, binding, banner and SSH camouflage, SSH wire formats.
+
 use anyhow::Result;
 use svpn::crypto::Cipher;
 use svpn::framing::*;
@@ -11,6 +13,20 @@ fn decode_all(camouflage: Camouflage, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     Ok(payloads)
 }
+
+/// Full client flow under L2: hello, binding, tail, data frames, keepalive.
+fn ssh_client_stream() -> (Vec<u8>, Cipher) {
+    let mut client = Cipher::new([5; 16], 7, true);
+    let sealed = client.seal(b"first").unwrap();
+    let mut stream = ssh_client_hello();
+    stream.extend(ssh_binding_frame(&[9; TOKEN_BYTES], &sealed).unwrap());
+    stream.extend(ssh_client_tail());
+    stream.extend(ssh_frame(&mut client, b"hello").unwrap());
+    stream.extend(ssh_frame(&mut client, &[]).unwrap()); // keepalive
+    (stream, client)
+}
+
+// ── length frames ──
 
 #[test]
 fn frames_round_trip_in_order() {
@@ -36,18 +52,6 @@ fn oversize_payload_and_len_are_rejected() {
 }
 
 #[test]
-fn binding_token_survives_round_trip() {
-    let token = [7u8; TOKEN_BYTES];
-    let packet = vec![9; 24];
-    let stream = frame(&binding_payload(&token, &packet)).unwrap();
-    let payloads = decode_all(Camouflage::None, &stream).unwrap();
-    let (got_token, got_packet) = split_binding(&payloads[0]).unwrap();
-    assert_eq!(got_token, token);
-    assert_eq!(got_packet, packet);
-    assert!(split_binding(&[0u8; TOKEN_BYTES]).is_err());
-}
-
-#[test]
 fn truncated_frame_waits_for_bytes() {
     let stream = frame(&[5; 30]).unwrap();
     let mut decoder = Decoder::new(Camouflage::None);
@@ -59,6 +63,22 @@ fn truncated_frame_waits_for_bytes() {
     assert_eq!(decoder.next(None).unwrap().unwrap(), vec![5; 30]);
     assert!(decoder.next(None).unwrap().is_none());
 }
+
+// ── binding ──
+
+#[test]
+fn binding_token_survives_round_trip() {
+    let token = [7u8; TOKEN_BYTES];
+    let packet = vec![9; 24];
+    let stream = frame(&binding_payload(&token, &packet)).unwrap();
+    let payloads = decode_all(Camouflage::None, &stream).unwrap();
+    let (got_token, got_packet) = split_binding(&payloads[0]).unwrap();
+    assert_eq!(got_token, token);
+    assert_eq!(got_packet, packet);
+    assert!(split_binding(&[0u8; TOKEN_BYTES]).is_err());
+}
+
+// ── banner camouflage ──
 
 #[test]
 fn banner_then_frames_in_one_chunk() {
@@ -112,17 +132,7 @@ fn none_mode_rejects_banner_as_frame() {
     );
 }
 
-/// Full client flow under L2: hello, binding, tail, data frames, keepalive.
-fn ssh_client_stream() -> (Vec<u8>, Cipher) {
-    let mut client = Cipher::new([5; 16], 7, true);
-    let sealed = client.seal(b"first").unwrap();
-    let mut stream = ssh_client_hello();
-    stream.extend(ssh_binding_frame(&[9; TOKEN_BYTES], &sealed).unwrap());
-    stream.extend(ssh_client_tail());
-    stream.extend(ssh_frame(&mut client, b"hello").unwrap());
-    stream.extend(ssh_frame(&mut client, &[]).unwrap()); // keepalive
-    (stream, client)
-}
+// ── ssh camouflage ──
 
 #[test]
 fn ssh_stream_round_trip_server_side() {
@@ -292,6 +302,8 @@ fn ssh_mode_desync_is_rejected() {
         "TCP frame too large"
     );
 }
+
+// ── ssh wire formats ──
 
 #[test]
 fn kexinit_frames_follow_bpp_and_share_lists() {

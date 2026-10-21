@@ -16,4 +16,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 COPY --from=build /svpn /usr/local/bin/svpn
-COPY tests /tests
+COPY e2e /e2e
