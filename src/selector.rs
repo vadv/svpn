@@ -20,6 +20,8 @@
 //! dead code for the bin build.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Instant,
@@ -45,7 +47,7 @@ pub struct ReadyChannel {
 }
 
 impl ReadyChannel {
-    fn new(id: u64, verified: bool) -> Self {
+    pub fn new(id: u64, verified: bool) -> Self {
         Self {
             id,
             self_verified: verified,
@@ -111,6 +113,11 @@ struct FlowSel {
     skip: HashSet<Candidate>,
 }
 
+/// First ban duration; doubles per consecutive failure, capped (EPIC-016).
+const BAN_BACKOFF_START: Duration = Duration::from_secs(600);
+/// Ban backoff never grows past this.
+const BAN_BACKOFF_CAP: Duration = Duration::from_secs(2 * 3600);
+
 /// Auto-selection machine. All methods are pure: time as a parameter, I/O
 /// through the returned actions. One instance per client session.
 pub struct Selector {
@@ -125,6 +132,13 @@ pub struct Selector {
     pub last_good: Option<Candidate>,
     /// Proactive-auto: a preparation failure bans the candidate for the session.
     proactive: bool,
+    /// Expiry of the current ban per candidate (EPIC-016): the candidate is
+    /// eligible again after this moment.
+    ban_until: HashMap<Candidate, Instant>,
+    /// Next ban duration per candidate: doubles per failure, reset on success.
+    ban_backoff: HashMap<Candidate, Duration>,
+    /// Jitter sequence for ban expiry; decorrelates retries without a RNG.
+    ban_seq: u64,
     /// Ban chronicle for the final exhaustion table.
     pub banned: Vec<(Candidate, Reason)>,
     /// `Exhausted` already sent — the stop signal is not repeated.
@@ -155,6 +169,9 @@ impl Selector {
             channels: HashMap::new(),
             preparation: None,
             hold_down: HashMap::new(),
+            ban_until: HashMap::new(),
+            ban_backoff: HashMap::new(),
+            ban_seq: 0,
             last_good: None,
             proactive,
             banned: Vec::new(),
@@ -228,6 +245,9 @@ impl Selector {
         self.exhausted = false;
         self.last_good = Some(candidate);
         self.hold_down.remove(&candidate);
+        // A proven candidate starts with a clean ban backoff (EPIC-016).
+        self.ban_backoff.remove(&candidate);
+        self.ban_until.remove(&candidate);
     }
 
     fn attempt(&mut self) -> u64 {
@@ -510,8 +530,8 @@ impl Selector {
         self.channels.remove(&candidate);
         self.fail_candidate(candidate, reason, now);
         if self.proactive {
-            // Did not come up — never will: banned for the rest of the session (m06456).
-            self.ban(candidate, reason);
+            // Did not come up: banned until the backoff expires (EPIC-016).
+            self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
                 return stop;
             }
@@ -548,7 +568,7 @@ impl Selector {
             actions.extend(self.fail_flow(flow_id, reason));
         }
         if self.proactive && unverified {
-            self.ban(candidate, reason);
+            self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
                 actions.extend(stop);
                 return actions;
@@ -571,8 +591,9 @@ impl Selector {
         }
     }
 
-    /// Proactive ban: the candidate did not come up — excluded for the session.
-    fn ban(&mut self, candidate: Candidate, reason: Reason) {
+    /// Proactive ban: the candidate did not come up. The ban expires after a
+    /// backoff (10 min, doubling to 2 h) so a transient filter is retried.
+    fn ban(&mut self, candidate: Candidate, reason: Reason, now: Instant) {
         self.allowed.retain(|allowed| *allowed != candidate);
         self.hold_down.remove(&candidate);
         if !self.banned.iter().any(|&(banned, _)| banned == candidate) {
@@ -581,6 +602,18 @@ impl Selector {
         if self.last_good == Some(candidate) {
             self.last_good = None;
         }
+        let base = self
+            .ban_backoff
+            .get(&candidate)
+            .copied()
+            .unwrap_or(BAN_BACKOFF_START);
+        self.ban_backoff
+            .insert(candidate, (base * 2).min(BAN_BACKOFF_CAP));
+        // Deterministic jitter in ±20%: decorrelates fleet retries without a RNG.
+        let pct = (self.ban_seq % 41) as i64 - 20;
+        self.ban_seq = self.ban_seq.wrapping_add(1);
+        let jittered = base.mul_f64(1.0 + pct as f64 / 100.0);
+        self.ban_until.insert(candidate, now + jittered);
     }
 
     /// All candidates banned in proactive-auto: one `Exhausted` with the table.
@@ -626,8 +659,8 @@ impl Selector {
         flow.skip.insert(candidate);
         flow.stage = Stage::Pending;
         if self.proactive && candidate == Candidate::Tcp {
-            // A dead TCP path: the first connect failure bans it for the session.
-            self.ban(candidate, reason);
+            // A dead TCP path: the first connect failure bans it.
+            self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
                 return stop;
             }
@@ -738,6 +771,22 @@ impl Selector {
         }
         // Hold-down expired — the entry is removed.
         self.hold_down.retain(|_, until| *until > now);
+        // Ban expiry: the candidate joins the next challenger round again.
+        let expired: Vec<Candidate> = self
+            .ban_until
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(&candidate, _)| candidate)
+            .collect();
+        for candidate in expired {
+            self.ban_until.remove(&candidate);
+            if !self.allowed.contains(&candidate) {
+                self.allowed.push(candidate);
+                self.allowed
+                    .sort_by_key(|c| COLD_ORDER.iter().position(|o| o == c).unwrap_or(usize::MAX));
+            }
+            actions.push(Action::BanExpired { candidate });
+        }
         actions
     }
 
