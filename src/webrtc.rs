@@ -70,6 +70,17 @@ pub struct Peer {
     pub wire: Option<PcapBuilder>,
 }
 
+/// One-time background warmup of the lazily initialized crypto. The first
+/// peer in the process pays tens of milliseconds (up to ~350 ms on a
+/// router) for it, later peers cost microseconds; a round that builds the
+/// first peer synchronously stalls every other candidate behind it. Call
+/// once at startup; the built peer is discarded.
+pub fn prewarm() {
+    std::thread::spawn(|| {
+        let _ = Peer::client(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)));
+    });
+}
+
 impl Peer {
     /// Server side: ICE-lite, DTLS/SCTP passive. `public` is the address
     /// for the client (the socket may listen on 0.0.0.0); None — use the

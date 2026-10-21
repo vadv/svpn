@@ -405,6 +405,11 @@ async fn serve(
     tcp_fallback: Option<u16>,
 ) -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "server requires Linux");
+    if strategies.contains(&Strategy::WebRtc) {
+        // The first webrtc peer pays the one-time crypto init; hide it
+        // behind the client handshake instead of the first ChannelPrepare.
+        webrtc::prewarm();
+    }
     let mut control = Control::new(tokio::io::stdin(), tokio::io::stdout());
     let Message::Hello {
         version,
