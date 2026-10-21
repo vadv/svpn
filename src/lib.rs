@@ -67,6 +67,12 @@ pub use tun::{is_busy_tun, validate_tun_name};
 
 /// Binary entry point: parses CLI, sets up logging and the runtime.
 pub fn main_entry() -> ExitCode {
+    // A panicking thread must kill the process: a silently dead thread once
+    // shipped a broken webrtc warmup to the field (0.5.2). Print, then abort.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("panic: {info}");
+        std::process::abort();
+    }));
     let cli = Cli::parse();
     let level = match &cli.command {
         Mode::Client(args) => args.globals.log_level,
@@ -408,7 +414,7 @@ async fn serve(
     if strategies.contains(&Strategy::WebRtc) {
         // The first webrtc peer pays the one-time crypto init; hide it
         // behind the client handshake instead of the first ChannelPrepare.
-        webrtc::prewarm();
+        drop(webrtc::prewarm());
     }
     let mut control = Control::new(tokio::io::stdin(), tokio::io::stdout());
     let Message::Hello {

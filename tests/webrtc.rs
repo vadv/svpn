@@ -47,6 +47,16 @@ async fn congested_driver() -> (Peer, svpn::drivers::Io, SocketAddr) {
     (server, io, addr)
 }
 
+// ── prewarm ──
+
+#[tokio::test]
+async fn prewarm_builds_a_discarded_peer_with_runtime_context() {
+    // 0.5.2: prewarm ran in a bare std::thread, where UdpSocket::from_std
+    // panics without a reactor and the thread died silently. Awaiting the
+    // JoinHandle locks the runtime-aware implementation.
+    svpn::webrtc::prewarm().await.unwrap();
+}
+
 // ── handshake ──
 
 #[tokio::test]

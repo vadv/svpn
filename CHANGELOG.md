@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.3
+
+Hotfix release.
+
+- Fixed the webrtc warmup panicking in the field: it ran in a bare
+  `std::thread`, where `tokio::net::UdpSocket::from_std` has no reactor
+  (`there is no reactor running` at `src/webrtc.rs`). The warmup now runs
+  in `tokio::task::spawn_blocking`, which carries the runtime context.
+  With the warmup dead, the first webrtc peer again paid the one-time
+  crypto init inside the round and could miss the verdict window on
+  higher-RTT links.
+- Any panic in any thread now aborts the whole process. 0.5.2 showed the
+  alternative: a fire-and-forget thread died silently and the VPN kept
+  running degraded. Fail fast instead.
+
 ## v0.5.2
 
 Honest transport selection and quiet logs release.
