@@ -148,6 +148,13 @@ impl Session {
         if let Some(burst) = &self.burst {
             return burst.wake_at();
         }
+        if let Some(challenge) = &self.challenge {
+            return Some(
+                challenge
+                    .deadline
+                    .min(self.health_at.unwrap_or(challenge.deadline)),
+            );
+        }
         self.health_at
     }
 
@@ -159,6 +166,7 @@ impl Session {
             && self.accepts_packets()
             && matches!(self.plane, Plane::Channels(_))
             && self.burst.is_none()
+            && self.challenge.is_none()
             && self.health_at.is_some_and(|at| now >= at)
     }
 
@@ -166,7 +174,10 @@ impl Session {
     /// out at the deadline. Runs from the health timer arm and the tick.
     pub(crate) async fn poll_burst(&mut self, now: Instant) -> Result<()> {
         if self.health_due(now) {
-            self.start_burst(now).await?;
+            self.maybe_start_challenge().await?;
+            if self.challenge.is_none() {
+                self.start_burst(now).await?;
+            }
         }
         let peer_ip = match &self.io {
             PacketIo::Link(io) => io.peer_ip,
@@ -206,6 +217,7 @@ impl Session {
         if finished {
             self.finish_burst(now).await?;
         }
+        self.challenge_drive(now).await?;
         Ok(())
     }
 
@@ -293,8 +305,17 @@ impl Session {
         let Some(burst) = self.burst.take() else {
             return Ok(());
         };
-        self.health_at = Some(now + HEALTH_INTERVAL);
         let outcome = burst.outcome();
+        if self
+            .challenge
+            .as_ref()
+            .is_some_and(|challenge| challenge.owns(burst.attempt))
+        {
+            // Challenger burst: the challenge records the verdict, the
+            // health timer stays untouched (the incumbent keeps ticking).
+            return self.challenge_burst_done(burst.attempt, outcome).await;
+        }
+        self.health_at = Some(now + HEALTH_INTERVAL);
         let name = match &self.plane {
             Plane::Channels(plane) => plane
                 .channels

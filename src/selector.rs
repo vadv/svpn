@@ -616,6 +616,12 @@ impl Selector {
         self.ban_until.insert(candidate, now + jittered);
     }
 
+    /// Re-ban a candidate from outside the selector's own action flow
+    /// (challenge failures re-ban with the doubled backoff).
+    pub fn ban_candidate(&mut self, candidate: Candidate, reason: Reason, now: Instant) {
+        self.ban(candidate, reason, now);
+    }
+
     /// All candidates banned in proactive-auto: one `Exhausted` with the table.
     fn exhaust_if_empty(&mut self) -> Option<Vec<Action>> {
         if !self.proactive || self.exhausted || !self.allowed.is_empty() {

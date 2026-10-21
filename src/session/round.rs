@@ -109,6 +109,9 @@ impl Session {
 
     /// Arm a fresh TUN round for every allowed candidate, including fixed TCP.
     pub async fn arm_round(&mut self) -> Result<()> {
+        // A fresh round kills the old world; a background challenge in
+        // flight belongs to it and dies here.
+        self.abort_challenge().await?;
         let actions = match &mut self.plane {
             Plane::Channels(plane) => plane
                 .selector

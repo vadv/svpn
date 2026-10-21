@@ -32,6 +32,7 @@ use crate::udp::Incoming;
 use crate::{channel, quic};
 
 pub mod burst;
+pub mod challenge;
 mod control;
 mod event;
 mod flow;
@@ -107,6 +108,7 @@ pub struct Session {
     pub health_at: Option<tokio::time::Instant>,
     /// EPIC-016: in-flight probe burst over the live channel.
     pub burst: Option<burst::Burst>,
+    pub challenge: Option<challenge::Challenge>,
 }
 
 impl Session {
@@ -521,6 +523,7 @@ async fn run_io(
         next_round_attempt: u64::MAX / 2,
         health_at: None,
         burst: None,
+        challenge: None,
         drop_prefix,
     }
     .event_loop()

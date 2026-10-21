@@ -353,6 +353,13 @@ impl Session {
             rc.channel = Some(channel);
             crate::debug!("round: channel_ready bound attempt={attempt} channel={channel}");
             (rc.candidate, rc.peer.take())
+        } else if let Some(challenge) = self.challenge.as_mut()
+            && let Some(challenger) = challenge.attempts.get_mut(&attempt)
+        {
+            if challenger.channel.is_some() {
+                return Ok(());
+            }
+            (challenger.candidate, challenger.peer.take())
         } else {
             let Some((pending_attempt, candidate, pending_channel, peer)) = plane.attempt.as_mut()
             else {
@@ -440,6 +447,14 @@ impl Session {
                 drivers::webrtc_channel(peer)
             }
         };
+        if self
+            .challenge
+            .as_ref()
+            .is_some_and(|challenge| challenge.owns(attempt))
+        {
+            self.challenge_channel_bound(attempt, channel)?;
+            self.challenge_drive(tokio::time::Instant::now()).await?;
+        }
         self.finish_channel_ready(attempt, channel, candidate, io, key, max_wire)
             .await
     }
@@ -469,16 +484,26 @@ impl Session {
                 .attempt
                 .as_ref()
                 .is_some_and(|pending| pending.0 == attempt && pending.2 == Some(channel));
-            if !current_round && !current_selector {
+            let current_challenge = self.challenge.as_ref().is_some_and(|challenge| {
+                challenge
+                    .attempts
+                    .get(&attempt)
+                    .is_some_and(|challenger| challenger.channel == Some(channel))
+            });
+            if !current_round && !current_selector && !current_challenge {
                 return Ok(());
             }
             if current_selector {
                 plane.attempt = None;
             }
-            let Some(selector) = plane.selector.as_mut() else {
-                bail!("finish_channel_ready on server");
-            };
-            selector.channel_ready(candidate, attempt, channel, StdInstant::now())
+            if current_challenge {
+                vec![]
+            } else {
+                let Some(selector) = plane.selector.as_mut() else {
+                    bail!("finish_channel_ready on server");
+                };
+                selector.channel_ready(candidate, attempt, channel, StdInstant::now())
+            }
         };
         self.spawn_channel(channel, candidate, io, key, max_wire, None)?;
         self.execute_actions(actions).await
@@ -495,7 +520,8 @@ impl Session {
                 Plane::Channels(plane) => attempt.and_then(|id| plane.prepared.get(&id).copied()),
                 Plane::Tcp(_) => None,
             })
-            .or_else(|| attempt.and_then(|id| self.round.as_ref()?.pending.get(&id)?.channel));
+            .or_else(|| attempt.and_then(|id| self.round.as_ref()?.pending.get(&id)?.channel))
+            .or_else(|| attempt.and_then(|id| self.challenge.as_ref()?.attempts.get(&id)?.channel));
         if let Some(Readiness::Verified(Some(verified))) = self.readiness {
             ensure!(
                 channel != Some(verified),
@@ -575,6 +601,8 @@ impl Session {
             }
             self.arm_round().await?;
         }
+        self.challenge_channel_failed(attempt, channel, reason)
+            .await?;
         Ok(())
     }
 

@@ -329,8 +329,14 @@ impl Session {
             );
             flow_state.channel = Some(channel);
             // N3 round mode commits directly; the verdict (ICMP reply) ends
-            // the round instead of a selector transition.
-            if self.round.is_some() {
+            // the round instead of a selector transition. Challenge probe
+            // flows follow the same path.
+            if self.round.is_some()
+                || self
+                    .challenge
+                    .as_ref()
+                    .is_some_and(|challenge| challenge.owns(flow_id))
+            {
                 crate::debug!("round: flow_opened preflight channel={channel}, committing");
                 return self
                     .control

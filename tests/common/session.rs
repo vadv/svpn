@@ -76,6 +76,7 @@ pub fn link_session_cap(
             next_round_attempt: u64::MAX / 2,
             health_at: None,
             burst: None,
+            challenge: None,
         },
         returned,
     )
