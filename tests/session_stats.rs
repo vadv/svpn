@@ -104,6 +104,19 @@ fn jitter_stays_inside_bounds_and_converges_to_the_interval() {
 }
 
 #[test]
+fn summary_formats_ewma_and_mad_or_dash() {
+    // The per-tick `paths:` cell: `-` until a sample lands, then `34ms±2`.
+    let mut stats = PathStats::default();
+    assert_eq!(stats.summary(), "-");
+    let t0 = Instant::now();
+    for sample in [30, 34, 31] {
+        stats.push(t0, Some(ms(sample)));
+    }
+    let summary = stats.summary();
+    assert!(summary.contains("ms±"), "unexpected cell format: {summary}");
+}
+
+#[test]
 fn count_eviction_drops_the_oldest_sample() {
     let mut stats = PathStats::default();
     let t0 = Instant::now();

@@ -86,6 +86,15 @@ impl PathStats {
     pub fn is_empty(&self) -> bool {
         self.window.is_empty()
     }
+
+    /// One `34ms±2`-style cell for the per-tick `paths:` log line; a path
+    /// with no successful sample yet logs as `-`.
+    pub fn summary(&self) -> String {
+        match (self.ewma_p90(), self.mad()) {
+            (Some(ewma), Some(mad)) => format!("{}ms±{}", ewma.as_millis(), mad.as_millis()),
+            _ => "-".to_owned(),
+        }
+    }
 }
 
 /// `(den - 1) * prev + sample) / den` without overflow on long durations.

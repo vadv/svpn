@@ -423,7 +423,7 @@ impl Session {
             .map(|rtt| format!("{}ms", rtt.as_millis()))
             .unwrap_or_else(|| "-".to_owned());
         if outcome.lost == 0 {
-            crate::debug!(
+            crate::info!(
                 "{} health: {name} ok p90={p90} ({}/{BURST_LEN} echoes)",
                 prefixed(self.tag(), "channel"),
                 outcome.received
@@ -440,6 +440,39 @@ impl Session {
                 .entry(name.clone())
                 .or_default();
             *entry = entry.saturating_add(outcome.lost as u64);
+        }
+        // The per-tick picture: every measured candidate in one info line,
+        // the incumbent first, the rest in enum order (spec: Logging).
+        if !self.path_stats.is_empty() {
+            let incumbent = match &self.plane {
+                Plane::Channels(plane) => plane
+                    .selector
+                    .as_ref()
+                    .and_then(|selector| selector.last_good),
+                Plane::Tcp(_) => None,
+            };
+            let mut entries: Vec<_> = self.path_stats.iter().collect();
+            entries.sort_by_key(|(candidate, _)| (Some(**candidate) != incumbent, **candidate));
+            let cells: Vec<_> = entries
+                .into_iter()
+                .map(|(candidate, stats)| {
+                    format!(
+                        "{} {}{}",
+                        candidate.as_str(),
+                        stats.summary(),
+                        if Some(*candidate) == incumbent {
+                            " (incumbent)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect();
+            crate::info!(
+                "{} paths: {}",
+                prefixed(self.tag(), "channel"),
+                cells.join(" | ")
+            );
         }
         // EPIC-017 trigger: the incumbent's smoothed path degraded — loss
         // ≥ 3 in this burst, or the EWMA at ≥ 2× the window minimum (slow
