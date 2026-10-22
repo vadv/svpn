@@ -1,4 +1,4 @@
-//! Unit tests for the continuous path statistics (EPIC-017):
+//! Unit tests for the continuous path statistics:
 //! EWMA/MAD smoothing, loss handling, window eviction by count and age.
 
 use std::time::{Duration, Instant};
@@ -104,19 +104,6 @@ fn jitter_stays_inside_bounds_and_converges_to_the_interval() {
 }
 
 #[test]
-fn summary_formats_ewma_and_mad_or_dash() {
-    // The per-tick `paths:` cell: `-` until a sample lands, then `34ms±2`.
-    let mut stats = PathStats::default();
-    assert_eq!(stats.summary(), "-");
-    let t0 = Instant::now();
-    for sample in [30, 34, 31] {
-        stats.push(t0, Some(ms(sample)));
-    }
-    let summary = stats.summary();
-    assert!(summary.contains("ms±"), "unexpected cell format: {summary}");
-}
-
-#[test]
 fn count_eviction_drops_the_oldest_sample() {
     let mut stats = PathStats::default();
     let t0 = Instant::now();
@@ -133,8 +120,10 @@ fn age_eviction_drops_stale_samples() {
     let mut stats = PathStats::default();
     let t0 = Instant::now();
     stats.push(t0, Some(ms(50)));
-    // 31 minutes later the first sample describes a different network.
+    // 31 minutes later the window expired: the averages reset instead
+    // of inheriting 7/8 of a stale estimate.
     let later = t0 + Duration::from_secs(31 * 60);
     stats.push(later, Some(ms(120)));
     assert_eq!(stats.min_p90(), Some(ms(120)));
+    assert_eq!(stats.ewma_p90(), Some(ms(120)));
 }

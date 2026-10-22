@@ -197,12 +197,16 @@ camouflage start simultaneously, the server is pinged through each, and the
 first responder wins. Start with auto. Pin a list only when you know your
 network: `mimic = ['quic', 'mosh']` in TOML or repeated `--mimic` on the CLI.
 
-Auto does not stick to the first winner. About every 10 minutes
-(`remeasure-interval`), and whenever the current channel degrades,
-alternatives are measured in the background. A candidate that beats the
-incumbent's p90 by at least 20% and 5 ms with no more than 1/10 loss, two
-measurements in a row, takes over new connections. Existing connections live
-out their lives on the old channel.
+Auto does not stick to the first winner. Every candidate (the incumbent
+included) is probed about once per `remeasure-interval` (default 60 s,
+jittered ±50%; 0 disables background probing). The verdict reads smoothed
+estimates — EWMA p90 with a deviation band over the last ~10 probes, never
+a single probe: a candidate takes over new connections only if its band
+does not overlap the incumbent's and it is faster by at least 10% (floor
+5 ms). After a switch, a 5-minute cooldown blocks new verdicts — no
+ping-ponging. Slow drift on both sides triggers nothing; a sharp spike or
+≥ 3 lost echoes out of 10 does. Existing connections live out their lives
+on the old channel.
 
 | Value    | Looks like | Choose when |
 |----------|------------|-------------|

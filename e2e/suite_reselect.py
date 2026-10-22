@@ -152,9 +152,8 @@ def ramp_qdisc(port, delay_ms):
 
 
 def test_incumbent_drift_ramp_switches():
-    # EPIC-017 e2e: delay on the incumbent ramped in small steps must still
-    # end in a reselection once the smoothed estimates separate — and the
-    # ramp must not break live traffic on the way there.
+    # A slow ramp on the incumbent must still end in a reselection once
+    # the smoothed estimates separate — without breaking live traffic.
     with session("drift", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
         with socket.create_connection((PEER, 9000), timeout=20) as veteran:
             veteran.sendall(b"before")
@@ -172,8 +171,8 @@ def test_incumbent_drift_ramp_switches():
             strategies, ports = re.search(r"serve: strategies=([\w+]+) udp_ports=([\d,]+)", log).groups()
             port = dict(zip(strategies.split("+"), ports.split(",")))[adopted]
             try:
-                # Three small steps beat one spike: each level must sit in
-                # the EWMA window before the next one lands.
+                # Three small steps beat one spike: each level must sit
+                # in the EWMA window before the next lands.
                 for step in (40, 90, 150):
                     ramp_qdisc(port, step)
                     switched = None
@@ -212,9 +211,8 @@ def test_incumbent_drift_ramp_switches():
 
 
 def test_symmetric_noise_does_not_switch():
-    # EPIC-017 e2e: identical delay with jitter on every strategy port puts
-    # all candidates inside one noise band — no reselection may land while
-    # probes keep running.
+    # Identical delay with jitter on every strategy port puts all
+    # candidates inside one noise band: no reselection may land.
     with session("noise", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
         until(
             lambda: re.search(
@@ -234,8 +232,8 @@ def test_symmetric_noise_does_not_switch():
                     f"tc filter add dev eth0 protocol ip parent 1:0 prio 3"
                     f" u32 match ip sport {port} 0xffff flowid 1:3"
                 )
-            # ~30 probe rounds at the 1 s cadence: every candidate measured
-            # repeatedly under the same noise.
+            # ~30 probe rounds at the 1 s cadence: every candidate
+            # measured repeatedly under the same noise.
             deadline = time.monotonic() + 35
             while time.monotonic() < deadline:
                 assert "reselection:" not in path.read_text(), (

@@ -11,7 +11,7 @@ use crate::link_io::PREFLIGHT_ID;
 use crate::packet::{self, FlowKey};
 use crate::selector::Candidate;
 
-use super::challenge::jittered;
+use super::challenge::{jitter_seed, jittered};
 use super::{Flow, PacketIo, Plane, Session, TaskCommand, prefixed};
 
 /// Health bursts run at most this often; each measures one channel.
@@ -386,9 +386,8 @@ impl Session {
             .await
     }
 
-    /// Burst done: feed the continuous statistics, log the outcome, count
-    /// loss as a transport failure, re-arm the health timer (jittered),
-    /// close the probe flow.
+    /// Burst done: feed the statistics, log, re-arm the health timer
+    /// (jittered), close the probe flow.
     pub(crate) async fn finish_burst(&mut self, now: Instant) -> Result<()> {
         let Some(burst) = self.burst.take() else {
             return Ok(());
@@ -396,7 +395,7 @@ impl Session {
         let outcome = burst.outcome();
         // Health bursts only ever measure the health slot; challenge probes
         // live in `challenge.attempts` and end in `finish_probe`.
-        self.health_at = Some(now + jittered(HEALTH_INTERVAL, burst.attempt));
+        self.health_at = Some(now + jittered(HEALTH_INTERVAL, jitter_seed()?));
         let measured_candidate = match &self.plane {
             Plane::Channels(plane) => plane
                 .channels
@@ -441,44 +440,10 @@ impl Session {
                 .or_default();
             *entry = entry.saturating_add(outcome.lost as u64);
         }
-        // The per-tick picture: every measured candidate in one info line,
-        // the incumbent first, the rest in enum order (spec: Logging).
-        if !self.path_stats.is_empty() {
-            let incumbent = match &self.plane {
-                Plane::Channels(plane) => plane
-                    .selector
-                    .as_ref()
-                    .and_then(|selector| selector.last_good),
-                Plane::Tcp(_) => None,
-            };
-            let mut entries: Vec<_> = self.path_stats.iter().collect();
-            entries.sort_by_key(|(candidate, _)| (Some(**candidate) != incumbent, **candidate));
-            let cells: Vec<_> = entries
-                .into_iter()
-                .map(|(candidate, stats)| {
-                    format!(
-                        "{} {}{}",
-                        candidate.as_str(),
-                        stats.summary(),
-                        if Some(*candidate) == incumbent {
-                            " (incumbent)"
-                        } else {
-                            ""
-                        }
-                    )
-                })
-                .collect();
-            crate::info!(
-                "{} paths: {}",
-                prefixed(self.tag(), "channel"),
-                cells.join(" | ")
-            );
-        }
-        // EPIC-017 trigger: the incumbent's smoothed path degraded — loss
-        // ≥ 3 in this burst, or the EWMA at ≥ 2× the window minimum (slow
-        // drift raises both together and is not degradation; a spike is).
-        // A borrowed channel says nothing about the incumbent's path, so
-        // only the adopted channel counts.
+        // The degradation trigger: loss ≥ 3 in this burst, or the EWMA at
+        // ≥ 2× the window minimum — slow drift raises both together and
+        // is not degradation; a spike is. Only the adopted channel counts
+        // (a borrowed one says nothing about the incumbent's path).
         let degraded = match (&self.plane, measured_candidate) {
             (Plane::Channels(plane), Some(burst_candidate)) => {
                 plane.selector.as_ref().is_some_and(|selector| {
@@ -515,8 +480,8 @@ impl Session {
         Ok(())
     }
 
-    /// One info line with the whole picture: every measured candidate's
-    /// smoothed p90 and variability, the incumbent marked.
+    /// One info line: every measured candidate's smoothed p90 and
+    /// variability, the incumbent marked.
     fn log_paths(&self) {
         let Plane::Channels(plane) = &self.plane else {
             return;
@@ -524,17 +489,21 @@ impl Session {
         let Some(selector) = plane.selector.as_ref() else {
             return;
         };
+        let incumbent = selector.last_good;
         let mut names: Vec<Candidate> = self
             .path_stats
             .keys()
             .copied()
-            .filter(|candidate| *candidate != Candidate::Tcp)
+            // A banned candidate's numbers are history, not the picture.
+            .filter(|candidate| {
+                *candidate != Candidate::Tcp
+                    && (incumbent == Some(*candidate) || selector.allowed.contains(candidate))
+            })
             .collect();
         names.sort();
         if names.is_empty() {
             return;
         }
-        let incumbent = selector.last_good;
         let paths = names
             .iter()
             .filter_map(|&candidate| {

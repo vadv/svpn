@@ -104,8 +104,8 @@ async fn challenge_probes_alternatives_of_udp_incumbent() {
         selector.last_good = Some(Candidate::Mosh);
         selector.allowed.push(Candidate::Quic);
     }
-    // Continuous probing: a healthy UDP incumbent still gets measured
-    // against its alternatives, just less eagerly than a degraded one.
+    // A healthy UDP incumbent is still probed against its alternatives,
+    // just less eagerly than a degraded one.
     session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_some(), "alternatives get probed");
 }
@@ -523,9 +523,12 @@ async fn replaced_incumbent_drains_then_retires() {
             .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
     }
     // Quic at 10 ms separates from the 100 ms incumbent by more than the
-    // noise bands and clears the margin floor: the switch is immediate.
+    // noise bands and clears the margin floor: three samples settle its
+    // estimate past the minimum-sample gate, the switch is immediate.
     seed_stats(&mut session, Candidate::Mosh, 100);
-    seed_stats(&mut session, Candidate::Quic, 10);
+    for _ in 0..3 {
+        seed_stats(&mut session, Candidate::Quic, 10);
+    }
     session.challenge = Some(Challenge {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
@@ -599,6 +602,73 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
 
 // ── separation noise bands ──
 
+// ── verdicts need statistics, not one lucky burst ──
+#[tokio::test]
+async fn single_sample_challenger_waits_for_statistics() {
+    let (mut session, _events) = common::session::link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    {
+        let plane = channels(&mut session);
+        plane.channels.insert(77, dummy_handle());
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(78, quic);
+        plane.flows.insert(
+            PROBE_I,
+            svpn::session::Flow::new(dummy_icmp_key(10), Instant::now()),
+        );
+        plane.flows.insert(
+            PROBE_A,
+            svpn::session::Flow::new(dummy_icmp_key(1), Instant::now()),
+        );
+        let selector = plane.selector.as_mut().unwrap();
+        selector.last_good = Some(Candidate::Mosh);
+        selector
+            .channels
+            .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
+        selector.allowed.push(Candidate::Quic);
+        selector
+            .channels
+            .insert(Candidate::Quic, svpn::selector::ReadyChannel::new(78, true));
+    }
+    let incumbent = session.path_stats.entry(Candidate::Mosh).or_default();
+    for _ in 0..4 {
+        incumbent.push(std::time::Instant::now(), Some(Duration::from_millis(100)));
+    }
+    // One lucky 40 ms burst against a settled 100 ms incumbent.
+    seed_stats(&mut session, Candidate::Quic, 40);
+    let round = |session: &mut svpn::session::Session| {
+        session.challenge = Some(Challenge {
+            incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
+            attempts: HashMap::new(),
+            measured: vec![
+                (Candidate::Mosh, 77, PROBE_I, outcome(100)),
+                (Candidate::Quic, 78, PROBE_A, outcome(40)),
+            ],
+            deadline: Instant::now() + Duration::from_secs(30),
+        });
+    };
+    round(&mut session);
+    session.finish_challenge(false).await.unwrap();
+    assert_eq!(
+        channels(&mut session).selector.as_ref().unwrap().last_good,
+        Some(Candidate::Mosh),
+        "one sample is noise, not a verdict"
+    );
+    // Two more bursts land the statistics — now it is a real win.
+    let challenger = session.path_stats.entry(Candidate::Quic).or_default();
+    for _ in 0..2 {
+        challenger.push(std::time::Instant::now(), Some(Duration::from_millis(40)));
+    }
+    round(&mut session);
+    session.finish_challenge(false).await.unwrap();
+    assert_eq!(
+        channels(&mut session).selector.as_ref().unwrap().last_good,
+        Some(Candidate::Quic),
+        "three samples settle the verdict"
+    );
+}
+
 #[tokio::test]
 async fn overlapping_noise_bands_do_not_switch() {
     let (mut session, _events) = common::session::link_session(false);
@@ -627,9 +697,9 @@ async fn overlapping_noise_bands_do_not_switch() {
             .channels
             .insert(Candidate::Quic, svpn::selector::ReadyChannel::new(78, true));
     }
-    // A flapping incumbent (20/60 ms alternating) settles near 29 ms with a
-    // wide deviation band; a rock-stable 30 ms challenger sits inside that
-    // band. The estimates overlap, so the challenger is not "better".
+    // A flapping incumbent (20/60 ms) settles near 29 ms with a wide
+    // deviation band; a stable 30 ms challenger sits inside it — overlap,
+    // not "better".
     let stats = session.path_stats.entry(Candidate::Mosh).or_default();
     for ms in [20, 60, 20, 60] {
         stats.push(std::time::Instant::now(), Some(Duration::from_millis(ms)));

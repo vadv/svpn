@@ -2,14 +2,14 @@
 
 ## Unreleased
 
-Continuous measurement release (EPIC-017).
+Continuous measurement release.
 
 - Verdicts now read smoothed statistics instead of single bursts: every
   candidate keeps an EWMA of p90 with a deviation band (RFC 9002 alphas,
   window of 10 samples / 30 min). A challenger wins only when its band
   does not overlap the incumbent's and it is faster by 10% (floor 5 ms).
-  The two-round rule is superseded by the smoothing; a 5 min cooldown
-  after a switch stays.
+  One smoothed estimate replaces the two-burst confirmation; a 5 min
+  cooldown after a switch stays.
 - Background probing is continuous: in auto mode every candidate — the
   incumbent included — is probed once per `remeasure-interval` on average
   (default lowered 600 s → 60 s, jittered ±50%, `0` still disables).

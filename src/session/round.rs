@@ -177,7 +177,7 @@ impl Session {
         }
         self.readiness = Some(Readiness::Probing);
         // A fresh round replaces the world: an old cooldown dies with it.
-        self.switch_cooldown_until = StdInstant::now() - std::time::Duration::from_secs(1);
+        self.switch_cooldown_until = StdInstant::now();
         self.round = Some(Round {
             id,
             seq,
@@ -826,10 +826,10 @@ impl Session {
         self.health_at = self
             .client()
             .then_some(now + crate::session::burst::HEALTH_INTERVAL);
+        let challenge_seed = crate::session::challenge::jitter_seed()?;
         self.next_challenge_at = if self.client() {
             self.remeasure.map(|interval| {
-                StdInstant::now()
-                    + crate::session::challenge::jittered(interval, self.next_round_attempt)
+                StdInstant::now() + crate::session::challenge::jittered(interval, challenge_seed)
             })
         } else {
             None

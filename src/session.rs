@@ -547,7 +547,7 @@ async fn run_io(
         burst: None,
         challenge: None,
         path_stats: HashMap::new(),
-        switch_cooldown_until: StdInstant::now() - std::time::Duration::from_secs(1),
+        switch_cooldown_until: StdInstant::now(),
         remeasure: remeasure_interval,
         next_challenge_at: None,
         drop_prefix,

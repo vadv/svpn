@@ -1,9 +1,6 @@
-//! Background re-selection: while the link runs on a TCP
-//! incumbent, expired UDP bans get a challenger round in the background —
-//! traffic keeps flowing, and a healthy UDP challenger takes over. S3: a
-//! degraded incumbent is probed alongside its challengers, a switch needs
-//! the margin (20 % and 5 ms) twice in a row, and the replaced channel
-//! drains instead of dying mid-flow.
+//! Background re-selection: expired UDP bans, the remeasure cadence, and
+//! incumbent degradation start challenger rounds while traffic keeps
+//! flowing; the replaced channel drains instead of dying mid-flow.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -23,15 +20,25 @@ use super::{Flow, PacketIo, Plane, Readiness, Session, candidate_strategy, prefi
 /// A background challenge caps all in-flight challenger work after this.
 const CHALLENGE_CAP: Duration = Duration::from_secs(30);
 
-/// After a landed switch, new verdicts wait this long: a bad switch must
-/// not ping-pong inside one statistics window (spec: 5 min).
+/// After a landed switch, verdicts wait this long: no ping-ponging
+/// inside one statistics window.
 const SWITCH_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// Cadence jitter, ±50 %: fixed timers are themselves a fingerprint, and
-/// the spec spreads probes over half the interval either way.
+/// Successful samples a challenger needs before its estimate may win:
+/// the first sample has zero spread and wins on noise. A TCP incumbent
+/// has no reference — recovery from a blocked UDP path stays immediate.
+const MIN_SAMPLES: usize = 3;
+
+/// Cadence jitter, ±50 %: fixed timers are themselves a fingerprint.
 pub fn jittered(interval: Duration, seed: u64) -> Duration {
     let jitter = (seed % 101) as i64 - 50;
     interval * (100 + jitter) as u32 / 100
+}
+
+/// Seed for `jittered` from real randomness: attempt counters ramp
+/// visibly, which is a pattern, not jitter.
+pub(crate) fn jitter_seed() -> Result<u64> {
+    Ok(u64::from_le_bytes(crypto::random()?))
 }
 
 /// One UDP challenger: prepared channel, then a probe burst over it.
@@ -39,9 +46,8 @@ pub struct Challenger {
     pub candidate: Candidate,
     pub channel: Option<u64>,
     pub peer: Option<webrtc::Peer>,
-    /// Created when the channel binds (immediately for the incumbent
-    /// probe); armed by `committed()`. All challenger bursts run in
-    /// parallel: a shared bottleneck then hits every candidate alike.
+    /// Armed by `committed()`; all challenger bursts run in parallel —
+    /// a shared bottleneck hits every candidate alike.
     /// shortcut: bursts arm at commit, not at a common start gate; prepare
     /// skew (~0.3-2 s) shifts them by less than one burst, revisit if a
     /// challenger ever takes minutes to prepare.
@@ -53,8 +59,7 @@ pub struct Challenge {
     pub attempts: HashMap<u64, Challenger>,
     /// Finished bursts: (candidate, channel, attempt, outcome).
     pub measured: Vec<(Candidate, u64, u64, Outcome)>,
-    /// S3: the probed incumbent (attempt, candidate, channel), if any.
-    /// Never re-banned, never retired — it is serving traffic.
+    /// The probed incumbent (attempt, candidate, channel), if any.
     pub incumbent: Option<(u64, Candidate, u64)>,
     pub deadline: Instant,
 }
@@ -78,12 +83,9 @@ impl Challenge {
 }
 
 impl Session {
-    /// A challenge round at the remeasure cadence: the incumbent (when it
-    /// is UDP) and every eligible alternative are probed in parallel —
-    /// continuous measurement, not a one-shot escape from TCP. Alternatives
-    /// with a live channel reuse it; only unbuilt ones pay a
-    /// `ChannelPrepare`. Runs without pausing admission: the link stays
-    /// Ready and flows keep binding.
+    /// A round at the remeasure cadence: the UDP incumbent and every
+    /// eligible alternative are probed in parallel; live channels are
+    /// reused and the link stays Ready.
     pub async fn maybe_start_challenge(&mut self) -> Result<()> {
         if !self.client()
             || self.readiness != Some(Readiness::Ready)
@@ -93,10 +95,8 @@ impl Session {
         {
             return Ok(());
         }
-        // Background probing runs at most once per remeasure interval
-        // (spec: every candidate is probed once per interval, jittered).
-        // None = fixed strategy or `remeasure-interval = 0`: no background
-        // probing at all, degradation and ban-expiry triggers only.
+        // At most once per remeasure interval (jittered); None = fixed
+        // strategy or `remeasure-interval = 0` — no background probing.
         let Some(interval) = self.remeasure else {
             return Ok(());
         };
@@ -116,8 +116,8 @@ impl Session {
             let Some(incumbent) = selector.last_good else {
                 return Ok(());
             };
-            // The `allowed` field is live eligibility (bans retained out);
-            // the `allowed()` method returns the configured list.
+            // The `allowed` field is live eligibility (bans retained
+            // out); the method returns the configured list.
             let candidates = selector
                 .allowed
                 .iter()
@@ -134,9 +134,8 @@ impl Session {
         if candidates.is_empty() {
             return Ok(());
         }
-        // WebRTC peer creation is CPU-heavy (~300 ms on routers); build it
-        // in the background, like rounds do — and only when the candidate
-        // has no live channel to reuse.
+        // WebRTC peer creation is CPU-heavy (~300 ms on routers): build it
+        // in the background, and only when no live channel exists.
         let webrtc_needs_peer = {
             let Plane::Channels(plane) = &self.plane else {
                 unreachable!()
@@ -156,8 +155,7 @@ impl Session {
         let mut attempts = HashMap::new();
         let mut incumbent_probe = None;
         // The incumbent is probed on its live channel alongside the
-        // challengers: the margin verdict compares like for like. The
-        // channel is long established, so the FlowOpen goes out immediately.
+        // challengers: the margin compares like for like.
         if let Some(channel) = incumbent_channel {
             let attempt = self.next_round_attempt;
             self.next_round_attempt = attempt.checked_add(1).context("probe ID space exhausted")?;
@@ -190,8 +188,7 @@ impl Session {
         let mut names = Vec::new();
         // The challenge exists before the loop: reused channels insert their
         // probes straight into it.
-        self.next_challenge_at =
-            Some(StdInstant::now() + jittered(interval, self.next_round_attempt));
+        self.next_challenge_at = Some(StdInstant::now() + jittered(interval, jitter_seed()?));
         self.challenge = Some(Challenge {
             attempts,
             measured: Vec::new(),
@@ -304,12 +301,9 @@ impl Session {
         Ok(())
     }
 
-    /// A challenger channel bound: build its probe flow and queue the burst.
-    /// Called from `channel_ready` (QUIC: from the handshake task event),
-    /// before the channel task reports `Established`. The probe `FlowOpen`
-    /// goes out on `Established` — announcing earlier races the server's
-    /// channel-task spawn, and the `Established` handler is the single sender
-    /// (a bind-time send duplicates it and draws a `FlowReject`).
+    /// A challenger channel bound: queue the probe burst. The probe
+    /// `FlowOpen` itself waits for `Established` — a bind-time send
+    /// duplicates it and draws a `FlowReject`.
     pub(crate) fn challenge_channel_bound(&mut self, attempt: u64, channel: u64) -> Result<()> {
         let Some(challenge) = self.challenge.as_mut() else {
             return Ok(());
@@ -328,9 +322,8 @@ impl Session {
         Ok(())
     }
 
-    /// Probe flow + burst over an established channel: the ICMP echo id
-    /// avoids every live 5-tuple, and the flow carries the channel for
-    /// `committed()`.
+    /// Probe flow + burst over an established channel; the flow carries
+    /// the channel for `committed()`.
     fn open_probe(&mut self, attempt: u64, channel: u64) -> Result<Burst> {
         let PacketIo::Link(io) = &self.io else {
             bail!("challenge requires a packet port");
@@ -369,16 +362,14 @@ impl Session {
         Ok(Burst::new(channel, attempt, icmp_id, base_seq, payload))
     }
 
-    /// A burst finished: record the outcome in the continuous statistics,
-    /// then let the caller (`finish_probe`) close the probe flow and finish
-    /// the challenge when done.
+    /// A burst finished: record the outcome; the caller closes the probe
+    /// flow and finishes the challenge when done.
     pub(crate) async fn challenge_burst_done(
         &mut self,
         attempt: u64,
         outcome: Outcome,
     ) -> Result<()> {
-        // Remove first, then touch the other fields: one mutable borrow at
-        // a time.
+        // Remove first: one mutable borrow at a time.
         let measured_entry = self
             .challenge
             .as_mut()
@@ -413,12 +404,9 @@ impl Session {
         Ok(())
     }
 
-    /// A challenger failed (prepare rejected or its channel died): re-ban
-    /// the candidate with the doubled backoff and move on. Returns true
-    /// when the attempt/channel belonged to the challenge. The incumbent
-    /// dying is not a challenger failure: the challenge aborts and the
-    /// ordinary dead-incumbent path (already run) decides. Generic channel
-    /// cleanup (stats, channel removal, burst clearing) has already run.
+    /// A challenger failed (prepare rejected or its channel died):
+    /// re-ban with the doubled backoff. True when the attempt belonged to
+    /// the challenge; the incumbent dying is not a challenger failure.
     pub(crate) async fn challenge_channel_failed(
         &mut self,
         attempt: Option<u64>,
@@ -469,13 +457,9 @@ impl Session {
         Ok(true)
     }
 
-    /// Verdict (S3): the incumbent is probed alongside the challengers; a
-    /// challenger must beat it by 20 % and 5 ms (TCP carries its round
-    /// penalty) with loss ≤ 1 to win the round. A winner must repeat in a
-    /// confirming round after at least one health interval before the
-    /// switch lands; until then its channel retires like any loser's. On
-    /// the switch the replaced incumbent's channel drains: no new flows,
-    /// the last bound flow's close tears it down. Every probe flow closes.
+    /// Verdict: a challenger must separate from the incumbent's smoothed
+    /// estimate and clear the margin; losers retire their channels, the
+    /// replaced incumbent drains, every probe flow closes.
     pub async fn finish_challenge(&mut self, expired: bool) -> Result<()> {
         let Some(mut challenge) = self.challenge.take() else {
             return Ok(());
@@ -489,9 +473,9 @@ impl Session {
         let incumbent = challenge.incumbent;
         let incumbent_attempt = incumbent.map(|(attempt, ..)| attempt);
         if expired {
-            // Whatever never answered by the deadline is a failure: re-ban
-            // with the doubled backoff, retire the half-built channel. The
-            // incumbent only lost the measurement race — it keeps serving.
+            // No answer by the deadline: re-ban with the doubled backoff,
+            // retire the channel. The incumbent only lost the measurement
+            // race — it keeps serving.
             let attempts: Vec<u64> = challenge.attempts.keys().copied().collect();
             for attempt in attempts {
                 let Some(challenger) = challenge.attempts.remove(&attempt) else {
@@ -525,14 +509,11 @@ impl Session {
                     .await?;
             }
         }
-        // The verdict (EPIC-017): smoothed statistics, never a single
-        // burst. A challenger must clear both the separation test — the
-        // two EWMA estimates do not overlap inside their own variability,
-        // the cheap form of a t-test — and the margin (10 % and 5 ms).
-        // A TCP incumbent carries no probe history: the first healthy
-        // challenger takes over, as in every release since 0.6.0. An
-        // incumbent whose probe never answered counts as no reference
-        // too — it is dying, and a healthy challenger is right.
+        // The verdict reads smoothed statistics, never a single burst: a
+        // challenger wins when its EWMA band separates from the
+        // incumbent's and it clears the margin (10 %, floor 5 ms). A TCP
+        // incumbent — or one that never answered — carries no reference:
+        // the first healthy challenger takes over.
         let reference = incumbent
             .filter(|(attempt, ..)| {
                 challenge
@@ -551,7 +532,10 @@ impl Session {
             .filter(|(.., outcome)| outcome.lost <= 1)
             .filter_map(|(candidate, channel, _, _)| {
                 let stats = self.path_stats.get(candidate)?;
-                Some((*candidate, *channel, stats.ewma_p90()?, stats.mad()?))
+                let ewma = stats.ewma_p90()?;
+                let mad = stats.mad()?;
+                (reference.is_none() || stats.samples() >= MIN_SAMPLES)
+                    .then_some((*candidate, *channel, ewma, mad))
             })
             .min_by_key(|(_, _, ewma, _)| *ewma);
         let winner = best.filter(|(_, _, ewma, mad)| match reference {
@@ -580,10 +564,8 @@ impl Session {
                 selector.ban_candidate(*candidate, Reason::PathTimeout, StdInstant::now());
             }
         }
-        // Probe flows close; channels retire only when their candidate
-        // failed this round (banned above) — a measured, healthy loser
-        // stays bound: the next interval's probe reuses it without a
-        // rebuild (EPIC-017: probing must not churn channels).
+        // Probe flows close; a measured healthy loser keeps its channel:
+        // the next interval reuses it without a rebuild.
         let incumbent_channel = incumbent.map(|(.., channel)| channel);
         let deciding_channel = deciding.map(|(_, channel, ..)| channel);
         for (candidate, channel, attempt, outcome) in &challenge.measured {
@@ -661,8 +643,8 @@ impl Session {
         Ok(())
     }
 
-    /// The link dropped into a fresh round: the challenge dies with the old
-    /// world. Owned channels retire; the server frees its halves.
+    /// The link dropped into a fresh round: the challenge dies with it;
+    /// owned channels retire.
     pub async fn abort_challenge(&mut self) -> Result<()> {
         let Some(challenge) = self.challenge.take() else {
             return Ok(());

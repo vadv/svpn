@@ -251,8 +251,8 @@ impl Selector {
     }
 
     /// Remember the round winner; TCP has no shared channel to adopt.
-    /// The winner's probe p90 seeds its statistics window (the degradation
-    /// baseline exists from minute zero).
+    /// The winner's probe p90 seeds its statistics window — the
+    /// degradation baseline exists from minute zero.
     pub fn adopt(&mut self, candidate: Candidate, channel_id: Option<u64>) {
         if let Some(id) = channel_id {
             self.channels.insert(candidate, ReadyChannel::new(id, true));
