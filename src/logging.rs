@@ -9,7 +9,7 @@ use std::{
 };
 
 static SINK: OnceLock<mpsc::SyncSender<Record>> = OnceLock::new();
-pub static MAX_LEVEL: AtomicU8 = AtomicU8::new(1);
+pub static MAX_LEVEL: AtomicU8 = AtomicU8::new(2);
 static START: OnceLock<Instant> = OnceLock::new();
 
 /// Log level; the value order defines the filter.
@@ -20,6 +20,7 @@ static START: OnceLock<Instant> = OnceLock::new();
 #[value(rename_all = "lower")]
 pub enum Level {
     Error,
+    Warn,
     Info,
     Debug,
 }
@@ -28,8 +29,9 @@ impl Level {
     pub fn as_u8(self) -> u8 {
         match self {
             Level::Error => 0,
-            Level::Info => 1,
-            Level::Debug => 2,
+            Level::Warn => 1,
+            Level::Info => 2,
+            Level::Debug => 3,
         }
     }
 }
@@ -115,6 +117,10 @@ pub(crate) use log;
 #[macro_export]
 macro_rules! error {
     ($($arg:tt)*) => { $crate::logging::log!(Error, $($arg)*) };
+}
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) => { $crate::logging::log!(Warn, $($arg)*) };
 }
 #[macro_export]
 macro_rules! info {

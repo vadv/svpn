@@ -407,13 +407,13 @@ impl Session {
             .map(|rtt| format!("{}ms", rtt.as_millis()))
             .unwrap_or_else(|| "-".to_owned());
         if outcome.lost == 0 {
-            crate::debug!(
+            crate::info!(
                 "{} health: {name} ok p90={p90} ({}/{BURST_LEN} echoes)",
                 prefixed(self.tag(), "channel"),
                 outcome.received
             );
         } else {
-            crate::info!(
+            crate::warn!(
                 "{} health: {name} degraded p90={p90} ({}/{BURST_LEN} lost)",
                 prefixed(self.tag(), "channel"),
                 outcome.lost
@@ -446,7 +446,7 @@ impl Session {
         };
         self.close_flow(burst.attempt, true).await?;
         if degraded {
-            crate::debug!(
+            crate::warn!(
                 "{} health: {name} degraded past the baseline — challenger round",
                 prefixed(self.tag(), "channel")
             );

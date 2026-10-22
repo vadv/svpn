@@ -32,9 +32,11 @@ fn every_record_ends_with_one_newline() {
 
 #[test]
 fn level_order_filters_output() {
-    assert!(Level::Error < Level::Info && Level::Info < Level::Debug);
+    assert!(Level::Error < Level::Warn && Level::Warn < Level::Info && Level::Info < Level::Debug);
     MAX_LEVEL.store(Level::Error.as_u8(), Ordering::Relaxed);
-    assert!(enabled(Level::Error) && !enabled(Level::Info) && !enabled(Level::Debug));
+    assert!(enabled(Level::Error) && !enabled(Level::Warn) && !enabled(Level::Debug));
+    MAX_LEVEL.store(Level::Warn.as_u8(), Ordering::Relaxed);
+    assert!(enabled(Level::Warn) && !enabled(Level::Info));
     MAX_LEVEL.store(Level::Debug.as_u8(), Ordering::Relaxed);
     assert!(enabled(Level::Error) && enabled(Level::Info) && enabled(Level::Debug));
     MAX_LEVEL.store(Level::Info.as_u8(), Ordering::Relaxed);

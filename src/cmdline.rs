@@ -43,6 +43,7 @@ pub fn serve_command(
         shell_quote(remote_bin),
         match log_level {
             logging::Level::Error => "error",
+            logging::Level::Warn => "warn",
             logging::Level::Info => "info",
             logging::Level::Debug => "debug",
         },
