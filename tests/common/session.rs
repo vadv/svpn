@@ -100,6 +100,9 @@ fn link_session_cap_with(
             burst: None,
             challenge: None,
             switch_pending: None,
+            // Unit tests drive challenges by hand: no cadence gate.
+            remeasure: Some(tokio::time::Duration::ZERO),
+            next_challenge_at: None,
         },
         returned,
     )

@@ -3,12 +3,12 @@
 
 mod common;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use svpn::selector::{Candidate, Reason};
-use svpn::session::burst::{BURST_LEN, Burst, Outcome};
-use svpn::session::challenge::{Challenge, Challenger};
+use svpn::session::burst::{BURST_LEN, Outcome};
+use svpn::session::challenge::Challenge;
 use svpn::session::{ChannelHandle, ChannelReadyParams, Plane, Readiness};
 use tokio::time::Instant;
 
@@ -94,6 +94,37 @@ async fn no_challenge_before_ready() {
     assert!(session.challenge.is_none(), "not Ready yet");
 }
 
+#[tokio::test]
+async fn remeasure_gate_holds_until_due_and_zero_disables() {
+    let (mut session, _events) = common::session::link_session(false);
+    set_tcp_incumbent(&mut session);
+    session.remeasure = Some(Duration::from_secs(600));
+    session.next_challenge_at = Some(std::time::Instant::now() + Duration::from_secs(60));
+    session.maybe_start_challenge(false).await.unwrap();
+    assert!(session.challenge.is_none(), "too early: the gate holds");
+    session.maybe_start_challenge(true).await.unwrap();
+    assert!(
+        session.challenge.is_none(),
+        "the degraded trigger obeys the same gate"
+    );
+    session.next_challenge_at = Some(std::time::Instant::now() - Duration::from_secs(1));
+    session.maybe_start_challenge(false).await.unwrap();
+    assert!(session.challenge.is_some(), "due: the challenge starts");
+    assert!(
+        session.next_challenge_at.unwrap() > std::time::Instant::now(),
+        "the next round is re-armed"
+    );
+
+    let (mut session, _events) = common::session::link_session(false);
+    set_tcp_incumbent(&mut session);
+    session.remeasure = None;
+    session.maybe_start_challenge(false).await.unwrap();
+    assert!(
+        session.challenge.is_none(),
+        "remeasure-interval = 0 disables re-selection"
+    );
+}
+
 // ── failures ──
 
 #[tokio::test]
@@ -131,7 +162,7 @@ async fn failed_prepare_rebans_and_finishes() {
 // ── binding and bursts ──
 
 #[tokio::test]
-async fn bound_challenger_builds_probe_flow_and_queues_burst() {
+async fn bound_challenger_builds_probe_flow_and_burst() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
     session.maybe_start_challenge(false).await.unwrap();
@@ -155,16 +186,11 @@ async fn bound_challenger_builds_probe_flow_and_queues_burst() {
         })
         .await
         .unwrap();
-    // The drive runs right inside channel_ready, so the burst already sits
-    // in the session slot; the commit arms it.
+    // Binding builds the probe flow and the burst inline; the commit arms it.
     let challenge = session.challenge.as_ref().unwrap();
     assert_eq!(challenge.attempts[&attempt].channel, Some(77));
-    assert!(
-        challenge.attempts[&attempt].burst.is_none(),
-        "burst left the queue"
-    );
-    assert!(challenge.queue.is_empty());
-    assert!(session.burst.is_some(), "burst occupies the slot");
+    let burst = challenge.attempts[&attempt].burst.as_ref().unwrap();
+    assert!(burst.armed.is_none(), "armed only at Committed");
     {
         let plane = channels(&mut session);
         assert!(plane.channels.contains_key(&77), "channel task spawned");
@@ -178,7 +204,9 @@ async fn bound_challenger_builds_probe_flow_and_queues_burst() {
         );
     }
     session.committed(attempt).await.unwrap();
-    let burst = session.burst.as_ref().unwrap();
+    let challenge = session.challenge.as_ref().unwrap();
+    let burst = challenge.attempts[&attempt].burst.as_ref().unwrap();
+    assert!(burst.armed.is_some(), "commit armed the burst");
     assert!(!burst.finished(Instant::now()), "armed, in flight");
 }
 
@@ -283,14 +311,13 @@ async fn fastest_challenger_wins_and_losers_retire() {
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
-        queue: VecDeque::new(),
         measured: vec![
             (Candidate::Mosh, 77, PROBE_A, outcome(100)),
             (Candidate::Quic, 78, PROBE_B, outcome(50)),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
-    session.challenge_drive(Instant::now()).await.unwrap();
+    session.finish_challenge(false).await.unwrap();
     assert!(session.challenge.is_none(), "nothing left: verdict");
     // S3: the first win only arms the retry — the incumbent still serves,
     // and the winner's channel retires like any loser's.
@@ -327,11 +354,10 @@ async fn fastest_challenger_wins_and_losers_retire() {
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
-        queue: VecDeque::new(),
         measured: vec![(Candidate::Quic, 79, PROBE_C, outcome(50))],
         deadline: Instant::now() + Duration::from_secs(30),
     });
-    session.challenge_drive(Instant::now()).await.unwrap();
+    session.finish_challenge(false).await.unwrap();
     assert!(session.switch_pending.is_none(), "pending consumed");
     let plane = channels(&mut session);
     let selector = plane.selector.as_ref().unwrap();
@@ -379,14 +405,13 @@ async fn challenger_within_margin_keeps_the_incumbent() {
     session.challenge = Some(Challenge {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
-        queue: VecDeque::new(),
         measured: vec![
             (Candidate::Mosh, 77, PROBE_I, outcome(50)),
             (Candidate::Quic, 78, PROBE_A, outcome(45)),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
-    session.challenge_drive(Instant::now()).await.unwrap();
+    session.finish_challenge(false).await.unwrap();
     assert!(session.switch_pending.is_none(), "no win, no pending");
     let plane = channels(&mut session);
     let selector = plane.selector.as_ref().unwrap();
@@ -450,14 +475,13 @@ async fn replaced_incumbent_drains_then_retires() {
     session.challenge = Some(Challenge {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
-        queue: VecDeque::new(),
         measured: vec![
             (Candidate::Mosh, 77, PROBE_I, outcome(100)),
             (Candidate::Quic, 78, PROBE_A, outcome(10)),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
-    session.challenge_drive(Instant::now()).await.unwrap();
+    session.finish_challenge(false).await.unwrap();
     {
         let plane = channels(&mut session);
         let selector = plane.selector.as_ref().unwrap();
@@ -492,7 +516,6 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
-        queue: VecDeque::new(),
         measured: vec![(
             Candidate::Mosh,
             77,
@@ -505,7 +528,7 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
         )],
         deadline: Instant::now() + Duration::from_secs(30),
     });
-    session.challenge_drive(Instant::now()).await.unwrap();
+    session.finish_challenge(false).await.unwrap();
     let plane = channels(&mut session);
     assert_eq!(
         plane.selector.as_ref().unwrap().last_good,
@@ -531,34 +554,4 @@ async fn fresh_round_aborts_the_challenge() {
     session.arm_round().await.unwrap();
     assert!(session.challenge.is_none(), "round kills the challenge");
     assert!(session.round.is_some(), "round armed");
-}
-
-#[tokio::test]
-async fn drive_skips_challengers_that_failed_before_their_burst() {
-    // Regression: a dead queue entry stalled every challenger queued behind
-    // it until the challenge deadline (drive returned instead of draining).
-    let (mut session, _events) = common::session::link_session(false);
-    set_tcp_incumbent(&mut session);
-    let (dead, live) = (PROBE_A, PROBE_A + 1);
-    session.challenge = Some(Challenge {
-        incumbent: None,
-        attempts: HashMap::from([(
-            live,
-            Challenger {
-                candidate: Candidate::Mosh,
-                channel: Some(71),
-                peer: None,
-                burst: Some(Burst::new(71, live, 9, 100, b"x".to_vec())),
-            },
-        )]),
-        queue: VecDeque::from([dead, live]),
-        measured: Vec::new(),
-        deadline: Instant::now() + Duration::from_secs(30),
-    });
-    session.challenge_drive(Instant::now()).await.unwrap();
-    assert_eq!(
-        session.burst.as_ref().map(|burst| burst.attempt),
-        Some(live),
-        "dead queue entry skipped"
-    );
 }

@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.0
+
+Adaptive transport re-selection release.
+
+- `auto` no longer sticks to the first winner: it re-measures alternatives
+  in the background every `remeasure-interval` (default 10 min, 0 disables,
+  auto mode only) and whenever the live channel degrades (health burst
+  loss ≥ 3/10 or p90 ≥ 2× the baseline taken at adoption).
+- A challenger wins only with margin: its adjusted p90 must beat the
+  incumbent's by at least 10% (floor 5 ms, TCP carries a 50 ms penalty),
+  and the same candidate must win two rounds in a row before anything
+  switches. One-off blips no longer flap the transport.
+- Switching drains instead of killing: new flows open on the new channel,
+  existing TCP flows keep flowing on the old one until they close.
+- Fixed challenge probe flows never arming their bursts (the duplicate
+  FlowOpen race), zombie health bursts blocking the slot forever, and
+  challenge bursts queued behind an early server Committed never arming.
+
 ## v0.5.4
 
 Transport health groundwork release.

@@ -398,6 +398,10 @@ pub(crate) async fn open_link(
             // Without TCP camouflage the server will not send a tcp candidate.
             tcp: if plan.tcp.is_some() { server_tcp } else { None },
             tcp_camouflage: plan.tcp.as_ref().map(|(_, camouflage)| *camouflage),
+            remeasure: match params.remeasure_interval.unwrap_or(600) {
+                0 => None,
+                seconds => Some(std::time::Duration::from_secs(seconds.into())),
+            },
         },
     };
     Ok((control, tail, config, server_ip, addrs))

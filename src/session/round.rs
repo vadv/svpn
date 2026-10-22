@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -813,10 +813,19 @@ impl Session {
         }
         permit.send((io.epoch, link_io::Event::Ready));
         self.readiness = Some(Readiness::Ready);
-        // EPIC-016: health bursts start once the link is Ready.
+        // EPIC-016: health bursts start once the link is Ready; the first
+        // challenger round may run one remeasure interval later.
         self.health_at = self
             .client()
             .then_some(now + crate::session::burst::HEALTH_INTERVAL);
+        self.next_challenge_at = if self.client() {
+            self.remeasure.map(|interval| {
+                StdInstant::now()
+                    + crate::session::challenge::jittered(interval, self.next_round_attempt)
+            })
+        } else {
+            None
+        };
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {

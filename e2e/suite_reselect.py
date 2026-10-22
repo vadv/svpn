@@ -5,11 +5,13 @@ import re
 import socket
 import time
 
-from _lib import PEER, cleanup_verified, recv_exact, session, ssh, tcp_echo, until
+from _lib import CLIENT, PEER, cleanup_verified, recv_exact, session, ssh, tcp_echo, until
 
 # SVPN_TEST_BAN_BACKOFF_SECS (selector.rs ban_backoff_start) shrinks the first
-# ban so the expiry-driven challenge fits the test budget.
+# ban so the expiry-driven challenge fits the test budget. The remeasure
+# cadence gates every challenge (EPIC-016 review); 1 s opens it right away.
 ENV = dict(os.environ, SVPN_TEST_BAN_BACKOFF_SECS="3")
+ARGS = CLIENT + ["--remeasure-interval", "1"]
 
 
 def tcp_flow_ids(log):
@@ -28,7 +30,7 @@ def test_udp_reselect_after_ban_expiry():
     # only arms the retry and the second one lands the reselection.
     ssh("iptables -w -A INPUT -p udp -j DROP")
     try:
-        with session("reselect", args=None, env=ENV, ready_timeout=90) as (process, path):
+        with session("reselect", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
             # One established TCP flow must survive the transport switch; TCP
             # idle teardown is 60 s, so keep it busy while the challenge runs.
             with socket.create_connection((PEER, 9000), timeout=5) as veteran:
@@ -78,7 +80,7 @@ def test_degraded_incumbent_switches_and_drains():
     # S3 criterion: the UDP incumbent degrades -> a challenger beats it by
     # the margin in two consecutive rounds -> reselection; the flow opened
     # before the switch keeps flowing on the draining channel.
-    with session("degrade", args=None, env=ENV, ready_timeout=90) as (process, path):
+    with session("degrade", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
         with socket.create_connection((PEER, 9000), timeout=20) as veteran:
             veteran.sendall(b"before")
             assert recv_exact(veteran, 6) == b"before"

@@ -11,6 +11,7 @@ use crate::link_io::{self, PREFLIGHT_ID, is_probe_flow};
 use crate::packet::{self, FlowKey};
 use crate::selector::{Candidate, Reason};
 
+use super::burst::Burst;
 use super::round::{ROUND_RESEND, unanswered};
 use super::{FLOW_IDLE, Flow, PacketIo, Plane, Readiness, Session, TaskCommand};
 
@@ -407,18 +408,13 @@ impl Session {
         self.control.send(Message::Committed { flow_id }).await
     }
 
-    /// Client: `committed` received — the pre-active queue drains to the channel.
-    /// Arm the burst in the slot and send its first probe echo. Called from
-    /// `committed` (the commit lands while the burst owns the slot) and from
-    /// `challenge_drive` (the commit landed while the burst waited).
-    pub(crate) fn arm_slotted_burst(&mut self, now: tokio::time::Instant) -> Result<()> {
-        let Some(burst) = self.burst.as_mut() else {
-            return Ok(());
-        };
+    /// Arm a probe burst: activate its flow and fire the first echo. The
+    /// remaining echoes leave from `poll_burst` on the burst's schedule.
+    fn arm_burst(plane: &mut Plane, burst: &mut Burst, now: tokio::time::Instant) -> Result<()> {
         if burst.armed.is_some() {
             return Ok(());
         }
-        let Plane::Channels(plane) = &mut self.plane else {
+        let Plane::Channels(plane) = plane else {
             return Ok(());
         };
         let Some(flow) = plane.flows.get_mut(&burst.attempt) else {
@@ -448,6 +444,15 @@ impl Session {
         Ok(())
     }
 
+    /// Client: `committed` received — the pre-active queue drains to the
+    /// channel. Arms the health burst when the probe owns the burst slot.
+    pub(crate) fn arm_slotted_burst(&mut self, now: tokio::time::Instant) -> Result<()> {
+        let Some(burst) = self.burst.as_mut() else {
+            return Ok(());
+        };
+        Self::arm_burst(&mut self.plane, burst, now)
+    }
+
     pub async fn committed(&mut self, flow_id: u64) -> Result<()> {
         if is_probe_flow(flow_id) {
             // EPIC-016: a health burst owns this probe id, not the round.
@@ -458,22 +463,16 @@ impl Session {
             {
                 return self.arm_slotted_burst(tokio::time::Instant::now());
             }
-            // A challenge burst waiting for the slot: the server commits
-            // probes as soon as they echo, long before the burst runs. Do
-            // not drop the commit — activate the flow; challenge_drive arms
-            // the burst when it enters the slot.
-            if self
-                .challenge
-                .as_ref()
-                .is_some_and(|challenge| challenge.owns(flow_id))
+            // A challenge probe committed: arm its burst right away — every
+            // challenger burst runs in parallel with the others.
+            let now = tokio::time::Instant::now();
+            if let Some(challenge) = self.challenge.as_mut()
+                && let Some(challenger) = challenge.attempts.get_mut(&flow_id)
+                && let Some(burst) = challenger.burst.as_mut()
             {
-                if let Plane::Channels(plane) = &mut self.plane
-                    && let Some(flow) = plane.flows.get_mut(&flow_id)
-                {
-                    flow.active = true;
-                }
-                return Ok(());
+                return Self::arm_burst(&mut self.plane, burst, now);
             }
+            // A round probe committed: (re)send the probe and start the clock.
             let Some(rc) = self
                 .round
                 .as_mut()

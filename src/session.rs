@@ -112,6 +112,11 @@ pub struct Session {
     /// EPIC-016 S3: first-round winner awaiting the confirming round
     /// (candidate, first win at). Reset by any round without that winner.
     pub switch_pending: Option<(Candidate, StdInstant)>,
+    /// EPIC-016: remeasure cadence for challenger rounds; None disables
+    /// re-selection (fixed strategy or `remeasure-interval = 0`).
+    pub remeasure: Option<Duration>,
+    /// Next instant a challenge may start; armed on Ready and per challenge.
+    pub next_challenge_at: Option<StdInstant>,
 }
 
 impl Session {
@@ -389,6 +394,7 @@ async fn run_io(
     config: TransportConfig,
 ) -> Result<()> {
     let mut server_listener: Option<tokio::net::TcpListener> = None;
+    let mut remeasure_interval = None;
     let plane = match config {
         TransportConfig::Client {
             strategies,
@@ -396,7 +402,14 @@ async fn run_io(
             pin,
             tcp,
             tcp_camouflage,
+            remeasure,
         } => {
+            remeasure_interval = remeasure;
+            // EPIC-016: re-selection exists only when the selector may move.
+            ensure!(
+                strategies.is_empty() || remeasure.is_none(),
+                "--remeasure-interval requires auto mode (no --mimic)"
+            );
             let mut allowed = Allowed::default();
             let offer: Vec<Strategy> = endpoints.iter().map(|e| e.strategy).collect();
             let wanted: &[Strategy] = if strategies.is_empty() {
@@ -530,6 +543,8 @@ async fn run_io(
         burst: None,
         challenge: None,
         switch_pending: None,
+        remeasure: remeasure_interval,
+        next_challenge_at: None,
         drop_prefix,
     }
     .event_loop()

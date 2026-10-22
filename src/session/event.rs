@@ -34,7 +34,6 @@ impl Session {
                         .is_some_and(|challenge| challenge.owns(attempt))
                     {
                         self.challenge_channel_bound(attempt, channel)?;
-                        self.challenge_drive(tokio::time::Instant::now()).await?;
                     }
                     self.finish_channel_ready(attempt, channel, candidate, io, key, max_wire)
                         .await?

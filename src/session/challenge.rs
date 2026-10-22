@@ -5,7 +5,7 @@
 //! the margin (20 % and 5 ms) twice in a row, and the replaced channel
 //! drains instead of dying mid-flow.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Instant as StdInstant;
 
@@ -24,21 +24,29 @@ use super::{Flow, PacketIo, Plane, Readiness, Session, candidate_strategy, prefi
 /// A background challenge caps all in-flight challenger work after this.
 const CHALLENGE_CAP: Duration = Duration::from_secs(30);
 
+/// Remeasure cadence jitter, ±20 % like the ban backoff (selector.rs).
+pub(crate) fn jittered(interval: Duration, seed: u64) -> Duration {
+    let jitter = (seed % 41) as i64 - 20;
+    interval * (100 + jitter) as u32 / 100
+}
+
 /// One UDP challenger: prepared channel, then a probe burst over it.
 pub struct Challenger {
     pub candidate: Candidate,
     pub channel: Option<u64>,
     pub peer: Option<webrtc::Peer>,
-    /// Created when the channel binds; moved into `session.burst` when the
-    /// burst slot is free (bursts run one at a time).
+    /// Created when the channel binds (immediately for the incumbent
+    /// probe); armed by `committed()`. All challenger bursts run in
+    /// parallel: a shared bottleneck then hits every candidate alike.
+    /// shortcut: bursts arm at commit, not at a common start gate; prepare
+    /// skew (~0.3-2 s) shifts them by less than one burst, revisit if a
+    /// challenger ever takes minutes to prepare.
     pub burst: Option<Burst>,
 }
 
 pub struct Challenge {
     /// Every in-flight challenger by its probe attempt id.
     pub attempts: HashMap<u64, Challenger>,
-    /// Bound attempts waiting for the burst slot.
-    pub queue: VecDeque<u64>,
     /// Finished bursts: (candidate, channel, attempt, outcome).
     pub measured: Vec<(Candidate, u64, u64, Outcome)>,
     /// S3: the probed incumbent (attempt, candidate, channel), if any.
@@ -60,7 +68,7 @@ impl Challenge {
             .map(|(&attempt, _)| attempt)
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.attempts.is_empty()
     }
 }
@@ -78,6 +86,18 @@ impl Session {
             || self.round.is_some()
             || self.challenge.is_some()
             || !matches!(self.plane, Plane::Channels(_))
+        {
+            return Ok(());
+        }
+        // Re-selection runs at most once per remeasure interval (spec:
+        // triggers are checked every interval). None = fixed strategy or
+        // `remeasure-interval = 0`: no challenger rounds at all.
+        let Some(interval) = self.remeasure else {
+            return Ok(());
+        };
+        if self
+            .next_challenge_at
+            .is_some_and(|at| StdInstant::now() < at)
         {
             return Ok(());
         }
@@ -122,11 +142,10 @@ impl Session {
             })
         });
         let mut attempts = HashMap::new();
-        let mut queue = VecDeque::new();
         let mut incumbent_probe = None;
-        // The incumbent is probed on its live channel, first in the queue:
-        // the margin verdict compares like for like. The channel is long
-        // established, so the FlowOpen goes out immediately.
+        // The incumbent is probed on its live channel alongside the
+        // challengers: the margin verdict compares like for like. The
+        // channel is long established, so the FlowOpen goes out immediately.
         if let Some(channel) = incumbent_channel {
             let attempt = self.next_round_attempt;
             self.next_round_attempt = attempt.checked_add(1).context("probe ID space exhausted")?;
@@ -154,7 +173,6 @@ impl Session {
                     burst: Some(burst),
                 },
             );
-            queue.push_back(attempt);
             incumbent_probe = Some((attempt, incumbent, channel));
         }
         let mut names = Vec::new();
@@ -194,9 +212,10 @@ impl Session {
                 },
             );
         }
+        self.next_challenge_at =
+            Some(StdInstant::now() + jittered(interval, self.next_round_attempt));
         self.challenge = Some(Challenge {
             attempts,
-            queue,
             measured: Vec::new(),
             incumbent: incumbent_probe,
             deadline: Instant::now() + CHALLENGE_CAP,
@@ -235,7 +254,6 @@ impl Session {
             .get_mut(&attempt)
             .context("challenger disappeared")?
             .burst = Some(burst);
-        challenge.queue.push_back(attempt);
         Ok(())
     }
 
@@ -280,69 +298,8 @@ impl Session {
         Ok(Burst::new(channel, attempt, icmp_id, base_seq, payload))
     }
 
-    /// The burst slot is free: start the next queued challenger. Finishes
-    /// the challenge when nothing is left or the deadline passed.
-    pub async fn challenge_drive(&mut self, now: Instant) -> Result<()> {
-        let Some(challenge) = self.challenge.as_ref() else {
-            return Ok(());
-        };
-        if now >= challenge.deadline {
-            return self.finish_challenge(true).await;
-        }
-        if self.burst.is_some() || challenge.queue.is_empty() {
-            if challenge.done() && self.burst.is_none() {
-                return self.finish_challenge(false).await;
-            }
-            return Ok(());
-        }
-        let mut attempt = self
-            .challenge
-            .as_mut()
-            .and_then(|challenge| challenge.queue.pop_front());
-        // A challenger that failed between queueing and driving leaves a
-        // dead entry behind: skip it and keep draining the queue, or the
-        // rest waits for the deadline for no reason.
-        let burst = loop {
-            let Some(queued) = attempt else {
-                let done = self
-                    .challenge
-                    .as_ref()
-                    .is_some_and(|challenge| challenge.done());
-                if done && self.burst.is_none() {
-                    return self.finish_challenge(false).await;
-                }
-                return Ok(());
-            };
-            let burst = self
-                .challenge
-                .as_mut()
-                .and_then(|challenge| challenge.attempts.get_mut(&queued))
-                .and_then(|challenger| challenger.burst.take());
-            if burst.is_some() {
-                break burst;
-            }
-            attempt = self
-                .challenge
-                .as_mut()
-                .and_then(|challenge| challenge.queue.pop_front());
-        };
-        self.burst = burst;
-        // The server may have committed the probe while the burst waited for
-        // the slot (committed() activated the flow): arm it now instead of
-        // leaving the burst unarmed until the challenge deadline.
-        let pre_committed = {
-            let Some(burst) = self.burst.as_ref() else {
-                return Ok(());
-            };
-            matches!(&self.plane, Plane::Channels(plane) if plane.flows.get(&burst.attempt).is_some_and(|flow| flow.active))
-        };
-        if pre_committed {
-            self.arm_slotted_burst(now)?;
-        }
-        Ok(())
-    }
-
-    /// A burst finished: record the outcome and drive the next challenger.
+    /// A burst finished: record the outcome. The caller (`finish_probe`)
+    /// closes the probe flow and finishes the challenge when done.
     pub(crate) async fn challenge_burst_done(
         &mut self,
         attempt: u64,
@@ -350,15 +307,13 @@ impl Session {
     ) -> Result<()> {
         if let Some(challenge) = self.challenge.as_mut()
             && let Some(challenger) = challenge.attempts.remove(&attempt)
+            && let Some(channel) = challenger.channel
         {
-            let Some(channel) = challenger.channel else {
-                return Ok(());
-            };
             challenge
                 .measured
                 .push((challenger.candidate, channel, attempt, outcome));
         }
-        self.challenge_drive(Instant::now()).await
+        Ok(())
     }
 
     /// A challenger failed (prepare rejected or its channel died): re-ban
@@ -395,7 +350,6 @@ impl Session {
         let Some(challenger) = challenge.attempts.remove(&attempt) else {
             return Ok(false);
         };
-        challenge.queue.retain(|queued| *queued != attempt);
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {
@@ -408,7 +362,13 @@ impl Session {
             reason_en(reason)
         );
         self.close_flow(attempt, true).await?;
-        self.challenge_drive(Instant::now()).await?;
+        if self
+            .challenge
+            .as_ref()
+            .is_some_and(|challenge| challenge.done())
+        {
+            self.finish_challenge(false).await?;
+        }
         Ok(true)
     }
 
@@ -419,7 +379,7 @@ impl Session {
     /// switch lands; until then its channel retires like any loser's. On
     /// the switch the replaced incumbent's channel drains: no new flows,
     /// the last bound flow's close tears it down. Every probe flow closes.
-    async fn finish_challenge(&mut self, expired: bool) -> Result<()> {
+    pub async fn finish_challenge(&mut self, expired: bool) -> Result<()> {
         let Some(mut challenge) = self.challenge.take() else {
             return Ok(());
         };
@@ -434,19 +394,12 @@ impl Session {
         if expired {
             // Whatever never answered by the deadline is a failure: re-ban
             // with the doubled backoff, retire the half-built channel. The
-            // incumbent only lost the slot race — it keeps serving.
+            // incumbent only lost the measurement race — it keeps serving.
             let attempts: Vec<u64> = challenge.attempts.keys().copied().collect();
             for attempt in attempts {
                 let Some(challenger) = challenge.attempts.remove(&attempt) else {
                     continue;
                 };
-                if self
-                    .burst
-                    .as_ref()
-                    .is_some_and(|burst| burst.attempt == attempt)
-                {
-                    self.burst = None;
-                }
                 self.close_flow(attempt, true).await?;
                 if Some(attempt) == incumbent_attempt {
                     continue;
@@ -499,11 +452,14 @@ impl Session {
             Some(reference) => adjusted_p90(*candidate, *p90) + win_margin(reference) <= reference,
             None => true,
         });
-        // Two consecutive rounds confirm the switch; the first win only
-        // arms the retry and the winner's channel retires like a loser's.
+        // Two consecutive rounds confirm the switch, at least one remeasure
+        // interval apart (challenges start at most once per interval, so the
+        // confirming round simply has to win again); the first win only arms
+        // the retry and the winner's channel retires like a loser's.
+        let gap = self.remeasure.unwrap_or(HEALTH_INTERVAL);
         let deciding = winner.filter(|(candidate, ..)| {
             self.switch_pending.is_some_and(|(pending, armed_at)| {
-                pending == *candidate && armed_at.elapsed() >= HEALTH_INTERVAL
+                pending == *candidate && armed_at.elapsed() >= gap
             })
         });
         self.switch_pending = match (winner, deciding) {
@@ -610,13 +566,6 @@ impl Session {
         let Some(challenge) = self.challenge.take() else {
             return Ok(());
         };
-        if self
-            .burst
-            .as_ref()
-            .is_some_and(|burst| challenge.owns(burst.attempt))
-        {
-            self.burst = None;
-        }
         let incumbent_attempt = challenge.incumbent.map(|(attempt, ..)| attempt);
         for (attempt, challenger) in challenge.attempts {
             self.close_flow(attempt, true).await?;

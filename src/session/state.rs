@@ -122,6 +122,8 @@ pub enum TransportConfig {
         tcp: Option<u16>,
         /// TCP fallback camouflage agreed with the server; None when TCP is off.
         tcp_camouflage: Option<Camouflage>,
+        /// EPIC-016 re-selection cadence; None keeps the first winner (auto only).
+        remeasure: Option<std::time::Duration>,
     },
     /// UDP-channel server: public port of each strategy, bind address
     /// and the shared QUIC endpoint with certificate pin.
