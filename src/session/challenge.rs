@@ -45,6 +45,8 @@ pub(crate) fn jitter_seed() -> Result<u64> {
 pub struct Challenger {
     pub candidate: Candidate,
     pub channel: Option<u64>,
+    /// False for a borrowed channel (a probe on a reused live channel).
+    pub owned: bool,
     pub peer: Option<webrtc::Peer>,
     /// Armed by `committed()`; all challenger bursts run in parallel —
     /// a shared bottleneck hits every candidate alike.
@@ -58,7 +60,7 @@ pub struct Challenge {
     /// Every in-flight challenger by its probe attempt id.
     pub attempts: HashMap<u64, Challenger>,
     /// Finished bursts: (candidate, channel, attempt, outcome).
-    pub measured: Vec<(Candidate, u64, u64, Outcome)>,
+    pub measured: Vec<(Candidate, u64, u64, Outcome, bool)>,
     /// The probed incumbent (attempt, candidate, channel), if any.
     pub incumbent: Option<(u64, Candidate, u64)>,
     pub deadline: Instant,
@@ -179,6 +181,7 @@ impl Session {
                 Challenger {
                     candidate: incumbent,
                     channel: Some(channel),
+                    owned: false,
                     peer: None,
                     burst: Some(burst),
                 },
@@ -243,6 +246,7 @@ impl Session {
                         Challenger {
                             candidate,
                             channel: Some(channel),
+                            owned: false,
                             peer: None,
                             burst: Some(burst),
                         },
@@ -283,6 +287,7 @@ impl Session {
                     Challenger {
                         candidate,
                         channel: None,
+                        owned: true,
                         peer,
                         burst: None,
                     },
@@ -377,9 +382,9 @@ impl Session {
             .and_then(|challenger| {
                 challenger
                     .channel
-                    .map(|channel| (challenger.candidate, channel))
+                    .map(|channel| (challenger.candidate, channel, challenger.owned))
             });
-        if let Some((candidate, channel)) = measured_entry {
+        if let Some((candidate, channel, owned)) = measured_entry {
             self.path_stats
                 .entry(candidate)
                 .or_default()
@@ -398,7 +403,7 @@ impl Session {
             if let Some(challenge) = self.challenge.as_mut() {
                 challenge
                     .measured
-                    .push((candidate, channel, attempt, outcome));
+                    .push((candidate, channel, attempt, outcome, owned));
             }
         }
         Ok(())
@@ -494,16 +499,18 @@ impl Session {
                         StdInstant::now(),
                     );
                 }
-                if let Some(channel) = challenger.channel {
+                if let Some(channel) = challenger.channel
+                    && challenger.owned
+                {
                     self.stop_channel(channel).await;
                     if let Plane::Channels(plane) = &mut self.plane {
-                        plane.channels.remove(&channel);
+                        plane.retire(channel);
                     }
                 }
                 self.control
                     .send(Message::ChannelFailed {
                         attempt: Some(attempt),
-                        channel: challenger.channel,
+                        channel: challenger.owned.then_some(challenger.channel).flatten(),
                         reason: Reason::PathTimeout,
                     })
                     .await?;
@@ -519,7 +526,7 @@ impl Session {
                 challenge
                     .measured
                     .iter()
-                    .any(|(.., measured_attempt, outcome)| {
+                    .any(|(.., measured_attempt, outcome, _)| {
                         *measured_attempt == *attempt && outcome.p90.is_some()
                     })
             })
@@ -528,9 +535,9 @@ impl Session {
         let best = challenge
             .measured
             .iter()
-            .filter(|(.., attempt, _)| Some(*attempt) != incumbent_attempt)
-            .filter(|(.., outcome)| outcome.lost <= 1)
-            .filter_map(|(candidate, channel, _, _)| {
+            .filter(|(.., attempt, _, _)| Some(*attempt) != incumbent_attempt)
+            .filter(|(.., outcome, _)| outcome.lost <= 1)
+            .filter_map(|(candidate, channel, _, _, _)| {
                 let stats = self.path_stats.get(candidate)?;
                 let ewma = stats.ewma_p90()?;
                 let mad = stats.mad()?;
@@ -555,7 +562,7 @@ impl Session {
             );
         }
         // Dead challengers re-ban — a live incumbent never does.
-        for (candidate, _, attempt, outcome) in &challenge.measured {
+        for (candidate, _, attempt, outcome, _) in &challenge.measured {
             if outcome.p90.is_none()
                 && Some(*attempt) != incumbent_attempt
                 && let Plane::Channels(plane) = &mut self.plane
@@ -568,12 +575,13 @@ impl Session {
         // the next interval reuses it without a rebuild.
         let incumbent_channel = incumbent.map(|(.., channel)| channel);
         let deciding_channel = deciding.map(|(_, channel, ..)| channel);
-        for (candidate, channel, attempt, outcome) in &challenge.measured {
+        for (candidate, channel, attempt, outcome, owned) in &challenge.measured {
             // The probe flow served its purpose even for the winner.
             self.close_flow(*attempt, true).await?;
             if outcome.p90.is_some()
                 || Some(*channel) == incumbent_channel
                 || Some(*channel) == deciding_channel
+                || !owned
             {
                 continue;
             }
@@ -584,7 +592,7 @@ impl Session {
             );
             self.stop_channel(*channel).await;
             if let Plane::Channels(plane) = &mut self.plane {
-                plane.channels.remove(channel);
+                plane.retire(*channel);
             }
             self.control
                 .send(Message::ChannelFailed {
@@ -657,16 +665,18 @@ impl Session {
                 // machinery or the dead-incumbent path retires it.
                 continue;
             }
-            if let Some(channel) = challenger.channel {
+            if let Some(channel) = challenger.channel
+                && challenger.owned
+            {
                 self.stop_channel(channel).await;
                 if let Plane::Channels(plane) = &mut self.plane {
-                    plane.channels.remove(&channel);
+                    plane.retire(channel);
                 }
             }
             self.control
                 .send(Message::ChannelFailed {
                     attempt: Some(attempt),
-                    channel: challenger.channel,
+                    channel: challenger.owned.then_some(challenger.channel).flatten(),
                     reason: Reason::ChannelFailed,
                 })
                 .await?;

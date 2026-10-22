@@ -159,11 +159,39 @@ impl Session {
                 .await?;
             return Ok(());
         };
+        let max_wire = strategy_max_wire(strategy);
+        let candidate = candidate_strategy_from(strategy);
+        // Reuse the live channel: its socket already holds the
+        // strategy's fixed port (a second bind would fail with EADDRINUSE).
+        if matches!(strategy, Strategy::Mosh | Strategy::Obfs | Strategy::Plain) {
+            // shortcut: candidate_strategy_from collapses Plain into Mosh, so
+            // a Plain prepare would reuse a Mosh channel's port. Plain is not
+            // reachable today; revisit if it enters DEFAULT_STRATEGIES.
+            let live = plane
+                .channels
+                .iter()
+                .find(|(_, handle)| handle.candidate == candidate && !handle.task.is_finished())
+                .map(|(&id, handle)| (id, handle.key));
+            if let Some((live_id, live_key)) = live {
+                self.control
+                    .send(Message::ChannelReady {
+                        attempt,
+                        channel: live_id,
+                        port,
+                        key: live_key,
+                        max_wire,
+                        hello: None,
+                        relay: None,
+                    })
+                    .await?;
+                // Borrowed: absent from `prepared`, so an attempt-only
+                // ChannelFailed never tears the channel down.
+                return Ok(());
+            }
+        }
         let key = crypto::random().context("channel key generation failed")?;
         let channel_id = plane.next_channel_id;
         plane.next_channel_id += 1;
-        let max_wire = strategy_max_wire(strategy);
-        let candidate = candidate_strategy_from(strategy);
         let mut server_hello = None;
         let mut relay = None;
         let mut relay_task = None;
@@ -318,6 +346,8 @@ impl Session {
             channel_id,
             ChannelHandle {
                 candidate,
+                key,
+                established: false,
                 command: command_tx,
                 cancel: Some(cancel),
                 task,
@@ -347,10 +377,13 @@ impl Session {
         };
         // N3: a round attempt binds its own candidate + peer; selector
         // attempts keep the pre-round path via `plane.attempt`.
+        // Borrowed: the binding keeps the original owner.
+        let existed = plane.channels.contains_key(&channel);
         let (candidate, mut peer) = if let Some(round) = self.round.as_mut()
             && let Some(rc) = round.pending.get_mut(&attempt)
         {
             rc.channel = Some(channel);
+            rc.owned &= !existed;
             crate::debug!("round: channel_ready bound attempt={attempt} channel={channel}");
             (rc.candidate, rc.peer.take())
         } else if let Some(challenge) = self.challenge.as_mut()
@@ -359,6 +392,7 @@ impl Session {
             if challenger.channel.is_some() {
                 return Ok(());
             }
+            challenger.owned &= !existed;
             crate::debug!("challenge: channel_ready bound attempt={attempt} channel={channel}");
             (challenger.candidate, challenger.peer.take())
         } else {
@@ -505,8 +539,84 @@ impl Session {
                 selector.channel_ready(candidate, attempt, channel, StdInstant::now())
             }
         };
-        self.spawn_channel(channel, candidate, io, key, max_wire, None)?;
+        // The channel is gone or its task died: fresh cipher state over
+        // its used key would repeat AES-GCM nonces.
+        let spawn = {
+            let Plane::Channels(plane) = &self.plane else {
+                bail!("finish_channel_ready outside channels mode");
+            };
+            match plane.channels.get(&channel) {
+                Some(handle) if !handle.task.is_finished() => Some((true, handle.established)),
+                _ if plane.retired.contains(&channel) => None,
+                Some(_) => None,
+                None => Some((false, false)),
+            }
+        };
+        let Some((reused, established)) = spawn else {
+            return self
+                .channel_failed(Some(attempt), None, Reason::ChannelFailed)
+                .await;
+        };
+        if !reused {
+            self.spawn_channel(channel, candidate, io, key, max_wire, None)?;
+        } else if established {
+            // A reused channel never re-emits `Established`: open the
+            // probe now.
+            self.probe_flow_open(channel).await?;
+        }
         self.execute_actions(actions).await
+    }
+
+    /// A channel's handshake is complete (the `Established` event, or a
+    /// reused channel that was established long ago): open the probe flow
+    /// bound to the channel, or — for a channel without one — pass the
+    /// selector's probes for it.
+    pub(crate) async fn probe_flow_open(&mut self, channel: u64) -> Result<()> {
+        let probe_id = self
+            .round
+            .as_ref()
+            .and_then(|round| {
+                round
+                    .pending
+                    .iter()
+                    .find(|(_, rc)| rc.channel == Some(channel))
+                    .map(|(&id, _)| id)
+            })
+            .or_else(|| {
+                self.challenge.as_ref().and_then(|challenge| {
+                    challenge
+                        .attempts
+                        .iter()
+                        .find(|(_, challenger)| challenger.channel == Some(channel))
+                        .map(|(&id, _)| id)
+                })
+            });
+        if let Some(flow_id) = probe_id {
+            let Plane::Channels(plane) = &self.plane else {
+                unreachable!()
+            };
+            let Some(flow) = plane.flows.get(&flow_id) else {
+                return Ok(());
+            };
+            return self
+                .control
+                .send(Message::FlowOpen {
+                    flow_id,
+                    flow: flow.key,
+                    channel: Some(channel),
+                })
+                .await;
+        }
+        let Plane::Channels(plane) = &mut self.plane else {
+            bail!("probe_flow_open outside channels mode");
+        };
+        if let Some(selector) = plane.selector.as_mut()
+            && let Some(handle) = plane.channels.get(&channel)
+        {
+            let actions = selector.probes_passed(handle.candidate, channel, StdInstant::now());
+            self.execute_actions(actions).await?;
+        }
+        Ok(())
     }
 
     pub async fn channel_failed(

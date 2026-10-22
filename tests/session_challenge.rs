@@ -42,6 +42,8 @@ fn set_tcp_incumbent(session: &mut svpn::session::Session) {
 fn dummy_handle() -> ChannelHandle {
     ChannelHandle {
         candidate: Candidate::Mosh,
+        key: [7; 16],
+        established: true,
         cancel: None,
         command: tokio::sync::mpsc::channel(8).0,
         task: tokio::spawn(async move {}),
@@ -138,6 +140,7 @@ async fn challenge_burst_records_echo_replies() {
         Challenger {
             candidate: Candidate::Mosh,
             channel: Some(channel),
+            owned: true,
             peer: None,
             burst: Some(burst),
         },
@@ -397,8 +400,8 @@ async fn fastest_challenger_wins_and_losers_stay_bound() {
         incumbent: None,
         attempts: HashMap::new(),
         measured: vec![
-            (Candidate::Mosh, 77, PROBE_A, outcome(100)),
-            (Candidate::Quic, 78, PROBE_B, outcome(50)),
+            (Candidate::Mosh, 77, PROBE_A, outcome(100), true),
+            (Candidate::Quic, 78, PROBE_B, outcome(50), true),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
@@ -464,8 +467,8 @@ async fn challenger_within_margin_keeps_the_incumbent() {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
         measured: vec![
-            (Candidate::Mosh, 77, PROBE_I, outcome(50)),
-            (Candidate::Quic, 78, PROBE_A, outcome(46)),
+            (Candidate::Mosh, 77, PROBE_I, outcome(50), true),
+            (Candidate::Quic, 78, PROBE_A, outcome(46), true),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
@@ -533,8 +536,8 @@ async fn replaced_incumbent_drains_then_retires() {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
         measured: vec![
-            (Candidate::Mosh, 77, PROBE_I, outcome(100)),
-            (Candidate::Quic, 78, PROBE_A, outcome(10)),
+            (Candidate::Mosh, 77, PROBE_I, outcome(100), true),
+            (Candidate::Quic, 78, PROBE_A, outcome(10), true),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
@@ -582,6 +585,7 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
                 received: 0,
                 lost: BURST_LEN,
             },
+            true,
         )],
         deadline: Instant::now() + Duration::from_secs(30),
     });
@@ -642,8 +646,8 @@ async fn single_sample_challenger_waits_for_statistics() {
             incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
             attempts: HashMap::new(),
             measured: vec![
-                (Candidate::Mosh, 77, PROBE_I, outcome(100)),
-                (Candidate::Quic, 78, PROBE_A, outcome(40)),
+                (Candidate::Mosh, 77, PROBE_I, outcome(100), true),
+                (Candidate::Quic, 78, PROBE_A, outcome(40), true),
             ],
             deadline: Instant::now() + Duration::from_secs(30),
         });
@@ -709,8 +713,8 @@ async fn overlapping_noise_bands_do_not_switch() {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
         measured: vec![
-            (Candidate::Mosh, 77, PROBE_I, outcome(29)),
-            (Candidate::Quic, 78, PROBE_A, outcome(30)),
+            (Candidate::Mosh, 77, PROBE_I, outcome(29), true),
+            (Candidate::Quic, 78, PROBE_A, outcome(30), true),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
@@ -766,7 +770,7 @@ async fn switch_cooldown_blocks_back_to_back_switches() {
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
-        measured: vec![(Candidate::Quic, 78, PROBE_B, outcome(50))],
+        measured: vec![(Candidate::Quic, 78, PROBE_B, outcome(50), true)],
         deadline: Instant::now() + Duration::from_secs(30),
     });
     session.finish_challenge(false).await.unwrap();
@@ -780,7 +784,7 @@ async fn switch_cooldown_blocks_back_to_back_switches() {
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
-        measured: vec![(Candidate::WebRtc, 79, PROBE_C, outcome(20))],
+        measured: vec![(Candidate::WebRtc, 79, PROBE_C, outcome(20), true)],
         deadline: Instant::now() + Duration::from_secs(30),
     });
     session.finish_challenge(false).await.unwrap();

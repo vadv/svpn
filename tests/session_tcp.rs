@@ -403,6 +403,8 @@ async fn server_preflight_uses_the_tun_path_and_relays_the_kernel_reply() {
         5,
         ChannelHandle {
             candidate: Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             command,
             task: tokio::spawn(async {}),
             cancel: None,

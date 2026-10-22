@@ -677,6 +677,8 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
             10,
             ChannelHandle {
                 candidate: Candidate::Mosh,
+                key: [7; 16],
+                established: true,
                 command,
                 task: tokio::spawn(std::future::pending()),
                 cancel: None,
@@ -1109,6 +1111,8 @@ async fn parallel_round() -> (
             *channel,
             ChannelHandle {
                 candidate: *candidate,
+                key: [7; 16],
+                established: true,
                 command: mpsc::channel(1).0,
                 cancel: None,
                 task: tokio::spawn(std::future::pending()),
