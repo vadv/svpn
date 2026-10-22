@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.1
+
+Corrective release.
+
+- A challenge attempt on an already-live channel reuses it instead of
+  failing to bind its fixed port (`EADDRINUSE`). Reused channels are
+  borrowed: attempt expiry or cancel no longer stops the shared channel,
+  and a late reuse reply for a retired channel id is rejected instead of
+  re-creating cipher state over its used key.
+
 ## v0.7.0
 
 Continuous measurement release.
