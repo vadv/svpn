@@ -470,6 +470,24 @@ impl Session {
                 && burst.finished(now)
             {
                 self.finish_burst(now).await?;
+            } else {
+                // A challenge burst owns this probe flow: record the echo and
+                // collect the burst right here when it completed.
+                let finished = if let Some(challenge) = self.challenge.as_mut()
+                    && let Some(challenger) = challenge.attempts.get_mut(&incoming.id)
+                    && let Some(burst) = challenger.burst.as_mut()
+                    && incoming.channel == Some(burst.channel)
+                    && let Some(seq) =
+                        packet::icmp_echo_reply_seq(&incoming.packet, burst.icmp_id, &burst.payload)
+                {
+                    burst.record_echo(seq, now);
+                    burst.finished(now)
+                } else {
+                    false
+                };
+                if finished {
+                    self.finish_probe(incoming.id).await?;
+                }
             }
             return Ok(());
         }

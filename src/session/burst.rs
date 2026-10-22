@@ -244,7 +244,7 @@ impl Session {
 
     /// Finish one challenge probe burst: record the outcome, close the probe
     /// flow, close out the challenge when nothing is left in flight.
-    async fn finish_probe(&mut self, attempt: u64) -> Result<()> {
+    pub(crate) async fn finish_probe(&mut self, attempt: u64) -> Result<()> {
         let burst = self
             .challenge
             .as_mut()

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use svpn::selector::{Candidate, Reason};
-use svpn::session::burst::{BURST_LEN, Outcome};
-use svpn::session::challenge::Challenge;
+use svpn::session::burst::{BURST_LEN, Burst, Outcome};
+use svpn::session::challenge::{Challenge, Challenger};
 use svpn::session::{ChannelHandle, ChannelReadyParams, Plane, Readiness};
 use tokio::time::Instant;
 
@@ -92,6 +92,60 @@ async fn no_challenge_before_ready() {
     channels(&mut session).selector.as_mut().unwrap().last_good = Some(Candidate::Tcp);
     session.maybe_start_challenge(false).await.unwrap();
     assert!(session.challenge.is_none(), "not Ready yet");
+}
+
+#[tokio::test]
+async fn challenge_burst_records_echo_replies() {
+    // Regression: parallel bursts moved challenge bursts out of the health
+    // slot; deliver_to_tun checked only the slot and dropped every
+    // challenger echo — no winner could ever emerge.
+    let (mut session, _events) = common::session::link_session(false);
+    set_tcp_incumbent(&mut session);
+    let channel = 7u64;
+    let attempt = PROBE_A;
+    let icmp_id = 4242u16;
+    let payload = vec![9u8; 32];
+    let mut burst = Burst::new(channel, attempt, icmp_id, 100, payload.clone());
+    burst.armed = Some(Instant::now());
+    burst.mark_sent(Instant::now()); // seq 100 (index 0) is in flight
+    let mut attempts = HashMap::new();
+    attempts.insert(
+        attempt,
+        Challenger {
+            candidate: Candidate::Mosh,
+            channel: Some(channel),
+            peer: None,
+            burst: Some(burst),
+        },
+    );
+    session.challenge = Some(Challenge {
+        attempts,
+        measured: Vec::new(),
+        incumbent: None,
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    let key = dummy_icmp_key(icmp_id);
+    let mut flow = svpn::session::Flow::new(key, Instant::now());
+    flow.channel = Some(channel);
+    flow.active = true;
+    channels(&mut session).flows.insert(attempt, flow);
+    let request =
+        svpn::packet::icmp_echo_request(key.source, key.destination, icmp_id, 100, &payload);
+    session
+        .deliver_to_tun(svpn::udp::Incoming {
+            id: attempt,
+            channel: Some(channel),
+            packet: common::echo_reply(&request),
+        })
+        .await
+        .unwrap();
+    let challenge = session.challenge.as_ref().unwrap();
+    let burst = challenge.attempts[&attempt].burst.as_ref().unwrap();
+    assert_eq!(
+        burst.outcome().received,
+        1,
+        "the challenger recorded the echo"
+    );
 }
 
 #[tokio::test]
