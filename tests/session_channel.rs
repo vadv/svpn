@@ -110,7 +110,7 @@ async fn last_channel_loss_signals_checking() {
         .selector
         .as_mut()
         .unwrap()
-        .adopt(Candidate::Mosh, Some(5), None);
+        .adopt(Candidate::Mosh, Some(5));
     plane.channels.insert(
         5,
         ChannelHandle {

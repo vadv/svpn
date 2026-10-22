@@ -662,7 +662,7 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
             tcp: true,
             ..Allowed::default()
         });
-        selector.adopt(Candidate::Mosh, Some(10), None);
+        selector.adopt(Candidate::Mosh, Some(10));
         selector.request(1, key, &bytes, StdInstant::now()).unwrap();
         selector.bind_succeeded(1, StdInstant::now());
         selector.committed(1);

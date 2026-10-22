@@ -139,7 +139,121 @@ def test_degraded_incumbent_switches_and_drains():
     print("PASS degraded_incumbent_switches_and_drains: margin winner takes over, the veteran drains")
 
 
+def ramp_qdisc(port, delay_ms):
+    # Replace the root qdisc wholesale: repeated `change` on a prio+netem
+    # stack is brittle across iproute2 versions.
+    ssh("tc qdisc del dev eth0 root", check=False)
+    ssh(
+        "tc qdisc add dev eth0 root handle 1: prio"
+        f" && tc qdisc add dev eth0 parent 1:3 handle 30: netem delay {delay_ms}ms"
+        f" && tc filter add dev eth0 protocol ip parent 1:0 prio 3"
+        f" u32 match ip sport {port} 0xffff flowid 1:3"
+    )
+
+
+def test_incumbent_drift_ramp_switches():
+    # A slow ramp on the incumbent must still end in a reselection once
+    # the smoothed estimates separate — without breaking live traffic.
+    with session("drift", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
+        with socket.create_connection((PEER, 9000), timeout=20) as veteran:
+            veteran.sendall(b"before")
+            assert recv_exact(veteran, 6) == b"before"
+            until(
+                lambda: re.search(
+                    r"flow_open role=server id=\d+(?: channel=\d+)? "
+                    r"transport=(mosh|quic|webrtc|obfs)",
+                    path.read_text(),
+                ),
+                seconds=30,
+            )
+            log = path.read_text()
+            adopted = re.search(r"transport=(mosh|quic|webrtc|obfs)", log).group(1)
+            strategies, ports = re.search(r"serve: strategies=([\w+]+) udp_ports=([\d,]+)", log).groups()
+            port = dict(zip(strategies.split("+"), ports.split(",")))[adopted]
+            try:
+                # Three small steps beat one spike: each level must sit
+                # in the EWMA window before the next lands.
+                for step in (40, 90, 150):
+                    ramp_qdisc(port, step)
+                    switched = None
+                    deadline = time.monotonic() + 60
+                    while time.monotonic() < deadline:
+                        veteran.sendall(b"keep")
+                        assert recv_exact(veteran, 4) == b"keep"
+                        switched = re.search(r"reselection: (\w+) replaces", path.read_text())
+                        if switched:
+                            break
+                        time.sleep(2)
+                    if switched:
+                        break
+                else:
+                    raise AssertionError(
+                        f"the drift ramp never moved traffic off {adopted}:\n" + path.read_text()[-2000:]
+                    )
+                winner = switched.group(1)
+                assert winner != adopted, "switched onto the same drifting transport"
+                tcp_echo(33)
+                until(
+                    lambda: re.search(
+                        r"flow_open role=server id=\d+(?: channel=\d+)? transport=" + winner,
+                        path.read_text(),
+                    ),
+                    seconds=15,
+                )
+                veteran.sendall(b"after")
+                assert recv_exact(veteran, 5) == b"after"
+                assert "data path lost" not in path.read_text()
+            finally:
+                ssh("tc qdisc del dev eth0 root", check=False)
+        assert process.poll() is None
+    cleanup_verified(process)
+    print("PASS incumbent_drift_ramp_switches: ramped delay ends in reselection")
+
+
+def test_symmetric_noise_does_not_switch():
+    # Identical delay with jitter on every strategy port puts all
+    # candidates inside one noise band: no reselection may land.
+    with session("noise", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
+        until(
+            lambda: re.search(
+                r"flow_open role=server id=\d+(?: channel=\d+)? "
+                r"transport=(mosh|quic|webrtc|obfs)",
+                path.read_text(),
+            ),
+            seconds=30,
+        )
+        try:
+            ssh(
+                "tc qdisc add dev eth0 root handle 1: prio"
+                " && tc qdisc add dev eth0 parent 1:3 handle 30: netem delay 30ms 10ms"
+            )
+            for port in range(60000, 60010):
+                ssh(
+                    f"tc filter add dev eth0 protocol ip parent 1:0 prio 3"
+                    f" u32 match ip sport {port} 0xffff flowid 1:3"
+                )
+            # ~30 probe rounds at the 1 s cadence: every candidate
+            # measured repeatedly under the same noise.
+            deadline = time.monotonic() + 35
+            while time.monotonic() < deadline:
+                assert "reselection:" not in path.read_text(), (
+                    "identical noise switched transports:\n" + path.read_text()[-2000:]
+                )
+                time.sleep(2)
+            rounds = len(re.findall(r"challenge: probing", path.read_text()))
+            assert rounds >= 10, f"only {rounds} probe rounds ran, the case proves nothing"
+            tcp_echo(34)
+            assert "data path lost" not in path.read_text()
+        finally:
+            ssh("tc qdisc del dev eth0 root", check=False)
+        assert process.poll() is None
+    cleanup_verified(process)
+    print("PASS symmetric_noise_does_not_switch: one noise band, no reselection")
+
+
 TESTS = [
     ("test_udp_reselect_after_ban_expiry", test_udp_reselect_after_ban_expiry),
     ("test_degraded_incumbent_switches_and_drains", test_degraded_incumbent_switches_and_drains),
+    ("test_incumbent_drift_ramp_switches", test_incumbent_drift_ramp_switches),
+    ("test_symmetric_noise_does_not_switch", test_symmetric_noise_does_not_switch),
 ]

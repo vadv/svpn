@@ -402,8 +402,10 @@ pub(crate) async fn open_link(
             remeasure: match params.remeasure_interval {
                 // The default cadence applies in auto mode only; a fixed
                 // strategy passes the explicit value through so session
-                // startup can reject the invalid combination.
-                None if auto_mode => Some(std::time::Duration::from_secs(600)),
+                // startup can reject the invalid combination. The value is
+                // the *average* interval between background probes of each
+                // candidate (jittered ±50 %).
+                None if auto_mode => Some(std::time::Duration::from_secs(60)),
                 None => None,
                 Some(0) => None,
                 Some(seconds) => Some(std::time::Duration::from_secs(seconds.into())),

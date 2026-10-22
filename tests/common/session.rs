@@ -99,7 +99,8 @@ fn link_session_cap_with(
             health_at: None,
             burst: None,
             challenge: None,
-            switch_pending: None,
+            path_stats: HashMap::new(),
+            switch_cooldown_until: std::time::Instant::now() - std::time::Duration::from_secs(1),
             // Unit tests drive challenges by hand: no cadence gate.
             remeasure: Some(tokio::time::Duration::ZERO),
             next_challenge_at: None,

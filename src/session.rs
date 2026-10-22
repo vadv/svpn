@@ -39,6 +39,7 @@ mod flow;
 mod pump;
 mod round;
 mod state;
+pub mod stats;
 mod tcp;
 mod tun;
 
@@ -109,9 +110,12 @@ pub struct Session {
     /// in-flight probe burst over the live channel.
     pub burst: Option<burst::Burst>,
     pub challenge: Option<challenge::Challenge>,
-    /// first-round winner awaiting the confirming round
-    /// (candidate, first win at). Reset by any round without that winner.
-    pub switch_pending: Option<(Candidate, StdInstant)>,
+    /// Continuous per-candidate path statistics; verdicts and the
+    /// degradation baseline read them, never a single burst.
+    pub path_stats: HashMap<Candidate, stats::PathStats>,
+    /// A switch just landed: no new verdicts until this instant (a bad
+    /// switch must not ping-pong inside one window).
+    pub switch_cooldown_until: StdInstant,
     /// remeasure cadence for challenger rounds; None disables
     /// re-selection (fixed strategy or `remeasure-interval = 0`).
     pub remeasure: Option<Duration>,
@@ -542,7 +546,8 @@ async fn run_io(
         health_at: None,
         burst: None,
         challenge: None,
-        switch_pending: None,
+        path_stats: HashMap::new(),
+        switch_cooldown_until: StdInstant::now(),
         remeasure: remeasure_interval,
         next_challenge_at: None,
         drop_prefix,

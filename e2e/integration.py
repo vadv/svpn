@@ -30,7 +30,7 @@ _SEQUENCE = (
     + ("lifecycle-pool",) * 2
     + ("udp",)
     + ("lifecycle-pool",) * 4
-    + ("reselect",) * 2
+    + ("reselect",) * 4
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,

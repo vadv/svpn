@@ -56,8 +56,9 @@ pub struct Globals {
     /// exactly one camouflage, here or in --server mimic=VALUE.
     #[arg(long, value_enum)]
     pub mimic: Vec<MimicArg>,
-    /// Re-measure interval in seconds for background re-selection (auto mode
-    /// only); 0 disables re-selection. Unset — 600.
+    /// Average interval in seconds between background probes of each
+    /// candidate (auto mode only, jittered ±50%); 0 disables background
+    /// probing. Unset — 60.
     #[arg(long, value_name = "SECONDS")]
     pub remeasure_interval: Option<u32>,
     /// Server TCP fallback port; 0 — ephemeral (default in auto).

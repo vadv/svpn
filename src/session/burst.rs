@@ -9,7 +9,9 @@ use crate::control::Message;
 use crate::crypto;
 use crate::link_io::PREFLIGHT_ID;
 use crate::packet::{self, FlowKey};
+use crate::selector::Candidate;
 
+use super::challenge::{jitter_seed, jittered};
 use super::{Flow, PacketIo, Plane, Session, TaskCommand, prefixed};
 
 /// Health bursts run at most this often; each measures one channel.
@@ -196,7 +198,7 @@ impl Session {
             self.health_at = Some(now + HEALTH_INTERVAL);
         }
         if self.health_due(now) {
-            self.maybe_start_challenge(false).await?;
+            self.maybe_start_challenge().await?;
             if self.challenge.is_none() {
                 self.start_burst(now).await?;
             }
@@ -384,16 +386,29 @@ impl Session {
             .await
     }
 
-    /// Burst done: log the outcome, count loss as a transport failure,
-    /// re-arm the health timer, close the probe flow.
+    /// Burst done: feed the statistics, log, re-arm the health timer
+    /// (jittered), close the probe flow.
     pub(crate) async fn finish_burst(&mut self, now: Instant) -> Result<()> {
         let Some(burst) = self.burst.take() else {
             return Ok(());
         };
         let outcome = burst.outcome();
         // Health bursts only ever measure the health slot; challenge probes
-        // live in `challenge.active` and end in `finish_probe`.
-        self.health_at = Some(now + HEALTH_INTERVAL);
+        // live in `challenge.attempts` and end in `finish_probe`.
+        self.health_at = Some(now + jittered(HEALTH_INTERVAL, jitter_seed()?));
+        let measured_candidate = match &self.plane {
+            Plane::Channels(plane) => plane
+                .channels
+                .get(&burst.channel)
+                .map(|handle| handle.candidate),
+            Plane::Tcp(_) => None,
+        };
+        if let Some(candidate) = measured_candidate {
+            self.path_stats
+                .entry(candidate)
+                .or_default()
+                .push(std::time::Instant::now(), outcome.p90);
+        }
         let name = match &self.plane {
             Plane::Channels(plane) => plane
                 .channels
@@ -425,33 +440,92 @@ impl Session {
                 .or_default();
             *entry = entry.saturating_add(outcome.lost as u64);
         }
-        // S3 trigger 2: the incumbent's own burst degraded — loss ≥ 3 or
-        // p90 ≥ 2× the adoption baseline. A borrowed channel says nothing
-        // about the incumbent's path, so only the adopted channel counts.
-        let degraded = match &self.plane {
-            Plane::Channels(plane) => plane.selector.as_ref().is_some_and(|selector| {
-                let Some(incumbent) = selector.last_good else {
-                    return false;
-                };
-                if selector.ready_channel(incumbent) != Some(burst.channel) {
-                    return false;
-                }
-                outcome.lost >= 3
-                    || match (outcome.p90, selector.baseline_p90) {
-                        (Some(p90), Some(baseline)) => p90 >= baseline * 2,
-                        _ => false,
+        // The degradation trigger: loss ≥ 3 in this burst, or the EWMA at
+        // ≥ 2× the window minimum — slow drift raises both together and
+        // is not degradation; a spike is. Only the adopted channel counts
+        // (a borrowed one says nothing about the incumbent's path).
+        let degraded = match (&self.plane, measured_candidate) {
+            (Plane::Channels(plane), Some(burst_candidate)) => {
+                plane.selector.as_ref().is_some_and(|selector| {
+                    let Some(incumbent) = selector.last_good else {
+                        return false;
+                    };
+                    if incumbent != burst_candidate
+                        || selector.ready_channel(incumbent) != Some(burst.channel)
+                    {
+                        return false;
                     }
-            }),
-            Plane::Tcp(_) => false,
+                    if outcome.lost >= 3 {
+                        return true;
+                    }
+                    self.path_stats.get(&burst_candidate).is_some_and(|stats| {
+                        stats
+                            .ewma_p90()
+                            .zip(stats.min_p90())
+                            .is_some_and(|(ewma, min)| ewma >= min * 2)
+                    })
+                })
+            }
+            _ => false,
         };
         self.close_flow(burst.attempt, true).await?;
+        self.log_paths();
         if degraded {
             crate::warn!(
-                "{} health: {name} degraded past the baseline — challenger round",
+                "{} health: {name} degraded past the window minimum — challenger round",
                 prefixed(self.tag(), "channel")
             );
-            self.maybe_start_challenge(true).await?;
+            self.maybe_start_challenge().await?;
         }
         Ok(())
+    }
+
+    /// One info line: every measured candidate's smoothed p90 and
+    /// variability, the incumbent marked.
+    fn log_paths(&self) {
+        let Plane::Channels(plane) = &self.plane else {
+            return;
+        };
+        let Some(selector) = plane.selector.as_ref() else {
+            return;
+        };
+        let incumbent = selector.last_good;
+        let mut names: Vec<Candidate> = self
+            .path_stats
+            .keys()
+            .copied()
+            // A banned candidate's numbers are history, not the picture.
+            .filter(|candidate| {
+                *candidate != Candidate::Tcp
+                    && (incumbent == Some(*candidate) || selector.allowed.contains(candidate))
+            })
+            .collect();
+        names.sort();
+        if names.is_empty() {
+            return;
+        }
+        let paths = names
+            .iter()
+            .filter_map(|&candidate| {
+                let stats = self.path_stats.get(&candidate)?;
+                let ewma = stats.ewma_p90()?;
+                let mad = stats.mad()?;
+                Some(format!(
+                    "{} {}ms±{}{}",
+                    candidate.as_str(),
+                    ewma.as_millis(),
+                    mad.as_millis(),
+                    if incumbent == Some(candidate) {
+                        " (incumbent)"
+                    } else {
+                        ""
+                    }
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if !paths.is_empty() {
+            crate::info!("{} paths: {paths}", prefixed(self.tag(), "channel"));
+        }
     }
 }
