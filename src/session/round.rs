@@ -176,8 +176,8 @@ impl Session {
             }
         }
         self.readiness = Some(Readiness::Probing);
-        // A fresh round replaces the world: any pending switch dies with it.
-        self.switch_pending = None;
+        // A fresh round replaces the world: an old cooldown dies with it.
+        self.switch_cooldown_until = StdInstant::now() - std::time::Duration::from_secs(1);
         self.round = Some(Round {
             id,
             seq,
@@ -741,7 +741,15 @@ impl Session {
                 None => Candidate::Tcp,
             };
             if let Some(selector) = plane.selector.as_mut() {
-                selector.adopt(candidate, channel, baseline);
+                selector.adopt(candidate, channel);
+            }
+            // Seed the winner's window with its round RTT: the
+            // degradation baseline exists from minute zero.
+            if let Some(baseline) = baseline {
+                self.path_stats
+                    .entry(candidate)
+                    .or_default()
+                    .push(StdInstant::now(), Some(baseline));
             }
             candidate
         } else {

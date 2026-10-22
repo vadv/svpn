@@ -20,6 +20,13 @@ fn outcome(p90_ms: u64) -> Outcome {
     }
 }
 
+fn seed_stats(session: &mut svpn::session::Session, candidate: Candidate, p90_ms: u64) {
+    session.path_stats.entry(candidate).or_default().push(
+        std::time::Instant::now(),
+        Some(Duration::from_millis(p90_ms)),
+    );
+}
+
 fn channels(session: &mut svpn::session::Session) -> &mut svpn::session::ChannelsPlane {
     let Plane::Channels(plane) = &mut session.plane else {
         panic!("channels plane")
@@ -66,31 +73,48 @@ fn dummy_icmp_key(id: u16) -> svpn::packet::FlowKey {
 async fn challenge_starts_on_tcp_incumbent_with_udp_allowed() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     let challenge = session.challenge.as_ref().expect("challenge started");
     assert_eq!(challenge.attempts.len(), 1, "only mosh is allowed");
     let challenger = challenge.attempts.values().next().unwrap();
     assert_eq!(challenger.candidate, Candidate::Mosh);
     assert_eq!(challenger.channel, None, "not bound yet");
     // A second trigger while one runs is a no-op.
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert_eq!(session.challenge.as_ref().unwrap().attempts.len(), 1);
 }
 
 #[tokio::test]
-async fn no_challenge_on_udp_incumbent() {
+async fn no_challenge_without_alternatives() {
     let (mut session, _events) = common::session::link_session(false);
     session.readiness = Some(Readiness::Ready);
     channels(&mut session).selector.as_mut().unwrap().last_good = Some(Candidate::Mosh);
-    session.maybe_start_challenge(false).await.unwrap();
+    // Allowed holds only the incumbent itself: nothing to probe.
+    session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_none());
+}
+
+#[tokio::test]
+async fn challenge_probes_alternatives_of_udp_incumbent() {
+    let (mut session, _events) = common::session::link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    {
+        let plane = channels(&mut session);
+        let selector = plane.selector.as_mut().unwrap();
+        selector.last_good = Some(Candidate::Mosh);
+        selector.allowed.push(Candidate::Quic);
+    }
+    // Continuous probing: a healthy UDP incumbent still gets measured
+    // against its alternatives, just less eagerly than a degraded one.
+    session.maybe_start_challenge().await.unwrap();
+    assert!(session.challenge.is_some(), "alternatives get probed");
 }
 
 #[tokio::test]
 async fn no_challenge_before_ready() {
     let (mut session, _events) = common::session::link_session(false);
     channels(&mut session).selector.as_mut().unwrap().last_good = Some(Candidate::Tcp);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_none(), "not Ready yet");
 }
 
@@ -154,15 +178,15 @@ async fn remeasure_gate_holds_until_due_and_zero_disables() {
     set_tcp_incumbent(&mut session);
     session.remeasure = Some(Duration::from_secs(600));
     session.next_challenge_at = Some(std::time::Instant::now() + Duration::from_secs(60));
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_none(), "too early: the gate holds");
-    session.maybe_start_challenge(true).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(
         session.challenge.is_none(),
-        "the degraded trigger obeys the same gate"
+        "the periodic trigger obeys the same gate"
     );
     session.next_challenge_at = Some(std::time::Instant::now() - Duration::from_secs(1));
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_some(), "due: the challenge starts");
     assert!(
         session.next_challenge_at.unwrap() > std::time::Instant::now(),
@@ -172,7 +196,7 @@ async fn remeasure_gate_holds_until_due_and_zero_disables() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
     session.remeasure = None;
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(
         session.challenge.is_none(),
         "remeasure-interval = 0 disables re-selection"
@@ -185,7 +209,7 @@ async fn remeasure_gate_holds_until_due_and_zero_disables() {
 async fn failed_prepare_rebans_and_finishes() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -219,7 +243,7 @@ async fn failed_prepare_rebans_and_finishes() {
 async fn bound_challenger_builds_probe_flow_and_burst() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -272,7 +296,7 @@ async fn bound_challenger_sends_flow_open_on_the_wire() {
     let control = svpn::control::Control::new(tokio::io::empty(), client_half);
     let (mut session, _events) = common::session::link_session_with(false, control);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     let attempt = *session
         .challenge
         .as_ref()
@@ -344,7 +368,7 @@ async fn bound_challenger_sends_flow_open_on_the_wire() {
 }
 
 #[tokio::test]
-async fn fastest_challenger_wins_and_losers_retire() {
+async fn fastest_challenger_wins_and_losers_stay_bound() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
     {
@@ -353,6 +377,11 @@ async fn fastest_challenger_wins_and_losers_retire() {
         let mut quic = dummy_handle();
         quic.candidate = Candidate::Quic;
         plane.channels.insert(78, quic);
+        let selector = plane.selector.as_mut().unwrap();
+        selector.allowed.push(Candidate::Quic);
+        selector
+            .channels
+            .insert(Candidate::Quic, svpn::selector::ReadyChannel::new(78, true));
         plane.flows.insert(
             PROBE_A,
             svpn::session::Flow::new(dummy_icmp_key(1), Instant::now()),
@@ -362,6 +391,8 @@ async fn fastest_challenger_wins_and_losers_retire() {
             svpn::session::Flow::new(dummy_icmp_key(2), Instant::now()),
         );
     }
+    seed_stats(&mut session, Candidate::Mosh, 100);
+    seed_stats(&mut session, Candidate::Quic, 50);
     session.challenge = Some(Challenge {
         incumbent: None,
         attempts: HashMap::new(),
@@ -372,60 +403,32 @@ async fn fastest_challenger_wins_and_losers_retire() {
         deadline: Instant::now() + Duration::from_secs(30),
     });
     session.finish_challenge(false).await.unwrap();
-    assert!(session.challenge.is_none(), "nothing left: verdict");
-    // S3: the first win only arms the retry — the incumbent still serves,
-    // and the winner's channel retires like any loser's.
-    let pending = session.switch_pending.map(|(candidate, _)| candidate);
+    assert!(session.challenge.is_none(), "verdict reached");
     {
         let plane = channels(&mut session);
         let selector = plane.selector.as_ref().unwrap();
-        assert_eq!(selector.last_good, Some(Candidate::Tcp), "no switch yet");
-        assert_eq!(pending, Some(Candidate::Quic), "quic won the round");
+        assert_eq!(
+            selector.last_good,
+            Some(Candidate::Quic),
+            "one round lands the switch: no incumbent to defer to"
+        );
         assert!(
-            !plane.channels.contains_key(&77) && !plane.channels.contains_key(&78),
-            "every challenger channel retires, the winner's included"
+            plane.channels.contains_key(&78),
+            "the winner keeps its measured channel"
+        );
+        assert!(
+            plane.channels.contains_key(&77),
+            "a live loser stays bound for the next round"
         );
         assert!(
             !plane.flows.contains_key(&PROBE_A) && !plane.flows.contains_key(&PROBE_B),
             "every probe flow closes"
         );
     }
-    // The confirming round (at least one health interval later) lands it.
-    session.switch_pending = Some((
-        Candidate::Quic,
-        std::time::Instant::now() - Duration::from_secs(31),
-    ));
-    {
-        let plane = channels(&mut session);
-        let mut quic = dummy_handle();
-        quic.candidate = Candidate::Quic;
-        plane.channels.insert(79, quic);
-        plane.flows.insert(
-            PROBE_C,
-            svpn::session::Flow::new(dummy_icmp_key(3), Instant::now()),
-        );
-    }
-    session.challenge = Some(Challenge {
-        incumbent: None,
-        attempts: HashMap::new(),
-        measured: vec![(Candidate::Quic, 79, PROBE_C, outcome(50))],
-        deadline: Instant::now() + Duration::from_secs(30),
-    });
-    session.finish_challenge(false).await.unwrap();
-    assert!(session.switch_pending.is_none(), "pending consumed");
-    let plane = channels(&mut session);
-    let selector = plane.selector.as_ref().unwrap();
-    assert_eq!(
-        selector.last_good,
-        Some(Candidate::Quic),
-        "confirmed: switch"
+    assert!(
+        session.switch_cooldown_until > std::time::Instant::now(),
+        "the switch arms the cooldown"
     );
-    assert_eq!(
-        selector.baseline_p90,
-        Some(Duration::from_millis(50)),
-        "the baseline is the winner's raw p90"
-    );
-    assert!(plane.channels.contains_key(&79), "winner channel stays");
 }
 
 #[tokio::test]
@@ -451,22 +454,22 @@ async fn challenger_within_margin_keeps_the_incumbent() {
         selector
             .channels
             .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
-        selector.baseline_p90 = Some(Duration::from_millis(50));
         selector.allowed.push(Candidate::Quic);
     }
-    // Incumbent p90 50 ms: the margin is max(50/5, 5) = 10 ms, so 45 ms
-    // does not win (45 + 10 > 50).
+    // Incumbent ewma 50 ms: the margin floor is max(5% × 50, 5 ms) = 5 ms,
+    // so a 46 ms challenger does not win (46 + 5 > 50).
+    seed_stats(&mut session, Candidate::Mosh, 50);
+    seed_stats(&mut session, Candidate::Quic, 46);
     session.challenge = Some(Challenge {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
         measured: vec![
             (Candidate::Mosh, 77, PROBE_I, outcome(50)),
-            (Candidate::Quic, 78, PROBE_A, outcome(45)),
+            (Candidate::Quic, 78, PROBE_A, outcome(46)),
         ],
         deadline: Instant::now() + Duration::from_secs(30),
     });
     session.finish_challenge(false).await.unwrap();
-    assert!(session.switch_pending.is_none(), "no win, no pending");
     let plane = channels(&mut session);
     let selector = plane.selector.as_ref().unwrap();
     assert_eq!(
@@ -475,7 +478,7 @@ async fn challenger_within_margin_keeps_the_incumbent() {
         "margin not met: the incumbent holds"
     );
     assert!(plane.channels.contains_key(&77), "incumbent keeps serving");
-    assert!(!plane.channels.contains_key(&78), "challenger retired");
+    assert!(plane.channels.contains_key(&78), "the loser stays bound");
     assert!(
         selector.allowed.contains(&Candidate::Quic),
         "slower, not dead: stays eligible"
@@ -518,14 +521,11 @@ async fn replaced_incumbent_drains_then_retires() {
         selector
             .channels
             .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
-        selector.baseline_p90 = Some(Duration::from_millis(100));
     }
-    // Quic at 10 ms beats the 100 ms incumbent by the margin; the
-    // confirming round is aged past the interval.
-    session.switch_pending = Some((
-        Candidate::Quic,
-        std::time::Instant::now() - Duration::from_secs(31),
-    ));
+    // Quic at 10 ms separates from the 100 ms incumbent by more than the
+    // noise bands and clears the margin floor: the switch is immediate.
+    seed_stats(&mut session, Candidate::Mosh, 100);
+    seed_stats(&mut session, Candidate::Quic, 10);
     session.challenge = Some(Challenge {
         incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
         attempts: HashMap::new(),
@@ -597,13 +597,144 @@ async fn all_lost_challenge_keeps_tcp_incumbent() {
     );
 }
 
+// ── separation noise bands ──
+
+#[tokio::test]
+async fn overlapping_noise_bands_do_not_switch() {
+    let (mut session, _events) = common::session::link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    {
+        let plane = channels(&mut session);
+        plane.channels.insert(77, dummy_handle());
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(78, quic);
+        plane.flows.insert(
+            PROBE_I,
+            svpn::session::Flow::new(dummy_icmp_key(10), Instant::now()),
+        );
+        plane.flows.insert(
+            PROBE_A,
+            svpn::session::Flow::new(dummy_icmp_key(1), Instant::now()),
+        );
+        let selector = plane.selector.as_mut().unwrap();
+        selector.last_good = Some(Candidate::Mosh);
+        selector
+            .channels
+            .insert(Candidate::Mosh, svpn::selector::ReadyChannel::new(77, true));
+        selector.allowed.push(Candidate::Quic);
+        selector
+            .channels
+            .insert(Candidate::Quic, svpn::selector::ReadyChannel::new(78, true));
+    }
+    // A flapping incumbent (20/60 ms alternating) settles near 29 ms with a
+    // wide deviation band; a rock-stable 30 ms challenger sits inside that
+    // band. The estimates overlap, so the challenger is not "better".
+    let stats = session.path_stats.entry(Candidate::Mosh).or_default();
+    for ms in [20, 60, 20, 60] {
+        stats.push(std::time::Instant::now(), Some(Duration::from_millis(ms)));
+    }
+    seed_stats(&mut session, Candidate::Quic, 30);
+    session.challenge = Some(Challenge {
+        incumbent: Some((PROBE_I, Candidate::Mosh, 77)),
+        attempts: HashMap::new(),
+        measured: vec![
+            (Candidate::Mosh, 77, PROBE_I, outcome(29)),
+            (Candidate::Quic, 78, PROBE_A, outcome(30)),
+        ],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.finish_challenge(false).await.unwrap();
+    let plane = channels(&mut session);
+    let selector = plane.selector.as_ref().unwrap();
+    assert_eq!(
+        selector.last_good,
+        Some(Candidate::Mosh),
+        "overlapping bands: no switch"
+    );
+    assert!(
+        plane.channels.contains_key(&78),
+        "the challenger stays bound"
+    );
+    assert!(
+        selector.allowed.contains(&Candidate::Quic),
+        "not dead: stays eligible"
+    );
+}
+
+#[tokio::test]
+async fn switch_cooldown_blocks_back_to_back_switches() {
+    let (mut session, _events) = common::session::link_session(false);
+    set_tcp_incumbent(&mut session);
+    {
+        let plane = channels(&mut session);
+        let mut quic = dummy_handle();
+        quic.candidate = Candidate::Quic;
+        plane.channels.insert(78, quic);
+        let mut webrtc = dummy_handle();
+        webrtc.candidate = Candidate::WebRtc;
+        plane.channels.insert(79, webrtc);
+        let selector = plane.selector.as_mut().unwrap();
+        selector.allowed.push(Candidate::Quic);
+        selector.allowed.push(Candidate::WebRtc);
+        selector
+            .channels
+            .insert(Candidate::Quic, svpn::selector::ReadyChannel::new(78, true));
+        selector.channels.insert(
+            Candidate::WebRtc,
+            svpn::selector::ReadyChannel::new(79, true),
+        );
+        for id in [PROBE_B, PROBE_C] {
+            plane.flows.insert(
+                id,
+                svpn::session::Flow::new(dummy_icmp_key(2), Instant::now()),
+            );
+        }
+    }
+    // Round 1: quic (50 ms) replaces the TCP incumbent outright.
+    seed_stats(&mut session, Candidate::Quic, 50);
+    session.challenge = Some(Challenge {
+        incumbent: None,
+        attempts: HashMap::new(),
+        measured: vec![(Candidate::Quic, 78, PROBE_B, outcome(50))],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.finish_challenge(false).await.unwrap();
+    assert_eq!(
+        channels(&mut session).selector.as_ref().unwrap().last_good,
+        Some(Candidate::Quic)
+    );
+    // Round 2 seconds later: webrtc (20 ms) is clearly better, but the
+    // cooldown from round 1 has not elapsed — the switch waits.
+    seed_stats(&mut session, Candidate::WebRtc, 20);
+    session.challenge = Some(Challenge {
+        incumbent: None,
+        attempts: HashMap::new(),
+        measured: vec![(Candidate::WebRtc, 79, PROBE_C, outcome(20))],
+        deadline: Instant::now() + Duration::from_secs(30),
+    });
+    session.finish_challenge(false).await.unwrap();
+    let plane = channels(&mut session);
+    let selector = plane.selector.as_ref().unwrap();
+    assert_eq!(
+        selector.last_good,
+        Some(Candidate::Quic),
+        "the cooldown holds the fresh winner back"
+    );
+    assert!(plane.channels.contains_key(&79), "webrtc stays bound");
+    assert!(
+        !plane.flows.contains_key(&PROBE_C),
+        "its probe flow still closes"
+    );
+}
+
 // ── abort ──
 
 #[tokio::test]
 async fn fresh_round_aborts_the_challenge() {
     let (mut session, _events) = common::session::link_session(false);
     set_tcp_incumbent(&mut session);
-    session.maybe_start_challenge(false).await.unwrap();
+    session.maybe_start_challenge().await.unwrap();
     assert!(session.challenge.is_some());
     session.arm_round().await.unwrap();
     assert!(session.challenge.is_none(), "round kills the challenge");

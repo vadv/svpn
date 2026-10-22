@@ -325,7 +325,7 @@ impl Session {
                         prefixed(self.tag(), "channel"),
                         format!("{:?}", candidate_strategy(candidate)).to_lowercase()
                     );
-                    self.maybe_start_challenge(false).await?;
+                    self.maybe_start_challenge().await?;
                 }
                 Action::Exhausted { reasons } => {
                     // Proactive-auto: nothing could be raised — bail out.
