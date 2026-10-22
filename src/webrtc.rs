@@ -1,4 +1,4 @@
-//! WebRTC strategy (EPIC-005 I06): ICE/DTLS/SCTP data channel (RFC 8831).
+//! WebRTC strategy: ICE/DTLS/SCTP data channel (RFC 8831).
 //!
 //! A real WebRTC stack (str0m, sans-I/O): channel hardening with ICE, a
 //! DTLS 1.2 handshake with fingerprint verification, an SCTP association
@@ -8,7 +8,7 @@
 //!
 //! Signaling without SDP or third-party servers: `Hello` (ICE credentials,
 //! DTLS fingerprint, host candidate) travels over the SSH control channel
-//! (wired up in I07/I08). The server is ICE-lite with a public address, the
+//! The server is ICE-lite with a public address, the
 //! client is controlling; str0m handles Nomination and consent freshness as
 //! long as the `recv`/`wait_ready` pump keeps running.
 //!

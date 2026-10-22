@@ -57,7 +57,7 @@ pub struct Globals {
     #[arg(long, value_enum)]
     pub mimic: Vec<MimicArg>,
     /// Re-measure interval in seconds for background re-selection (auto mode
-    /// only, EPIC-016); 0 disables re-selection. Unset — 600.
+    /// only); 0 disables re-selection. Unset — 600.
     #[arg(long, value_name = "SECONDS")]
     pub remeasure_interval: Option<u32>,
     /// Server TCP fallback port; 0 — ephemeral (default in auto).
@@ -114,7 +114,7 @@ pub struct LinkParams {
     pub log_level: logging::Level,
     pub udp_port_range: (u16, u16),
     pub mimic: Vec<MimicArg>,
-    /// EPIC-016 re-selection cadence; 0/None disables it. Auto mode only.
+    /// Re-selection cadence; 0/None disables it. Auto mode only.
     pub remeasure_interval: Option<u32>,
     pub tcp_port: Option<u16>,
     pub tun_addr: Ipv4Addr,

@@ -813,7 +813,7 @@ impl Session {
         }
         permit.send((io.epoch, link_io::Event::Ready));
         self.readiness = Some(Readiness::Ready);
-        // EPIC-016: health bursts start once the link is Ready; the first
+        // health bursts start once the link is Ready; the first
         // challenger round may run one remeasure interval later.
         self.health_at = self
             .client()

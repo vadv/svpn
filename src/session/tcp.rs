@@ -1,5 +1,5 @@
-//! EPIC-003 TCP mode (per-flow connections) and the TCP candidate of the
-//! channel mode (I09).
+//! TCP mode (per-flow connections) and the TCP candidate of the
+//! channel mode.
 
 use std::{collections::VecDeque, net::SocketAddr};
 

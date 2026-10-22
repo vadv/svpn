@@ -201,7 +201,7 @@ pub fn tcp_reset_for(packet: &Packet) -> Option<[u8; 40]> {
 }
 
 /// Best-effort RST toward the client for a retired flow, seeded with the
-/// last ACK the client kernel sent (EPIC-010 §5.3).
+/// last ACK the client kernel sent.
 pub fn tcp_reset_seq(flow: FlowKey, seq: u32) -> [u8; 40] {
     tcp_segment(reverse(flow), 0x04, seq, 0)
 }
@@ -272,7 +272,7 @@ pub fn internet_checksum(bytes: &[u8]) -> u16 {
 }
 
 /// ICMP echo request toward the server's TUN address — the liveness probe
-/// (docs/SERVER-LIVENESS.md): caller supplies a random payload and round-unique
+///: caller supplies a random payload and round-unique
 /// id/seq; the server answers with the matching echo reply.
 pub fn icmp_echo_request(
     source: Ipv4Addr,

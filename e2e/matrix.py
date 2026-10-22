@@ -1,8 +1,8 @@
-"""Strategy matrix I11 (EPIC-005): every fixed strategy and auto,
+"""Strategy matrix: every fixed strategy and auto,
 both traffic directions (echo = upload+download), full-MTU, idle survival.
 Run: `docker compose run --rm --no-deps -v "$(pwd)/e2e:/e2e-ro:ro" \
         -v /tmp/loadlogs:/testlogs client python3 -u /e2e-ro/matrix.py`.
-The field (real networks/filter) is out of scope here — see columns in docs/FIELD_MATRIX.md.
+The field (real networks/filter) is out of scope here.
 """
 
 import argparse

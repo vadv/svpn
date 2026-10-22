@@ -106,7 +106,7 @@ fn report_labels_rates_interval_counters_and_totals() {
     );
 }
 
-// ── transport failures (EPIC-016) ──
+// ── transport failures ──
 
 #[test]
 fn difference_and_add_carry_per_transport_failures() {

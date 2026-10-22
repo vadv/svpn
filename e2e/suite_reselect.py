@@ -1,4 +1,4 @@
-"""EPIC-016 re-selection: ban expiry moves new flows back to UDP while TCP flows survive."""
+"""Re-selection: ban expiry moves new flows back to UDP while TCP flows survive."""
 
 import os
 import re
@@ -9,7 +9,7 @@ from _lib import CLIENT, PEER, cleanup_verified, recv_exact, session, ssh, tcp_e
 
 # SVPN_TEST_BAN_BACKOFF_SECS (selector.rs ban_backoff_start) shrinks the first
 # ban so the expiry-driven challenge fits the test budget. The remeasure
-# cadence gates every challenge (EPIC-016 review); 1 s opens it right away.
+# cadence gates every challenge; 1 s opens it right away.
 ENV = dict(os.environ, SVPN_TEST_BAN_BACKOFF_SECS="3")
 ARGS = CLIENT + ["--remeasure-interval", "1"]
 

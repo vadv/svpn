@@ -9,7 +9,7 @@ pub const MAX_PACKETS: u64 = 1 << 32;
 pub const MAX_BLOCKS: u64 = 1 << 32;
 const DIRECTION: u64 = 1 << 63;
 /// A 4096-record window: the shared v2 channel tolerates more reordering
-/// than the per-flow window of 128 from the first version (docs/WIRE.md §4).
+/// than the per-flow window of 128 from the first version.
 pub const WINDOW: u64 = 4096;
 
 pub struct Cipher {
@@ -36,7 +36,7 @@ impl Cipher {
         Self::with_aad(key, aad, client)
     }
 
-    /// UDP v2: one key per channel epoch, the AAD binds records to the channel (docs/WIRE.md).
+    /// UDP v2: one key per channel epoch, the AAD binds records to the channel.
     pub fn new_channel(key: [u8; 16], channel_id: u64, client: bool) -> Self {
         let mut aad = *b"SVPNUDP2\0\0\0\0\0\0\0\0";
         aad[8..].copy_from_slice(&channel_id.to_be_bytes());

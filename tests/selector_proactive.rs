@@ -189,7 +189,7 @@ fn proactive_channel_lost_is_not_banned() {
     ));
 }
 
-// ── ban expiry (EPIC-016) ──
+// ── ban expiry ──
 
 #[test]
 fn ban_expires_after_backoff_and_restores_cold_order_position() {
@@ -267,7 +267,7 @@ fn repeated_bans_double_the_backoff_and_success_resets_it() {
     );
 }
 
-// ── e2e hook (EPIC-016) ──
+// ── e2e hook ──
 
 #[test]
 fn ban_backoff_hook_only_shortens_the_first_ban() {

@@ -1,4 +1,4 @@
-"""I10 measurements (EPIC-005): time-to-ready, throughput/CPU/RAM/FD,
+"""Measurements: time-to-ready, throughput/CPU/RAM/FD,
 wire overhead, behavior under loss. Run:
 `docker compose run --rm --no-deps client python3 -u /e2e/load.py`.
 """

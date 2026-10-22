@@ -76,7 +76,7 @@ impl Pool {
     }
 
     /// Ready or Checking with a live epoch: a link that keeps serving its
-    /// existing owner flows (docs/SERVER-LIVENESS.md).
+    /// existing owner flows.
     pub fn is_serving(&self, epoch: Epoch) -> bool {
         self.slots
             .get(epoch.link)
@@ -133,8 +133,7 @@ impl Pool {
 
     /// A checking round finished with no winner (the session itself stays
     /// alive and will retry after backoff). The VPN stops only when no slot
-    /// can still produce a Ready: none is Ready, Connecting or mid-round —
-    /// docs/SERVER-LIVENESS.md, pool FSM.
+    /// can still produce a Ready: none is Ready, Connecting or mid-round.
     pub fn round_failed(&mut self, epoch: Epoch) -> Result<bool> {
         let Some(slot) = self.slots.get_mut(epoch.link).filter(|s| {
             s.epoch == epoch && s.round && matches!(s.state, State::Connecting | State::Checking)

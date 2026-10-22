@@ -1,11 +1,11 @@
-//! Strategy auto-selector (EPIC-005 I07): a pure client state machine.
+//! Strategy auto-selector: a pure client state machine.
 //!
 //! Decides which candidate (`quic → webrtc → obfs → mosh → tcp`) to try for
 //! a new flow, when a strategy channel is ready, when to commit, and when
 //! to fail honestly. No sockets or timers: time arrives as the `now`
 //! parameter, I/O is performed by session per the returned [`Action`]s.
 //!
-//! Invariants (EPIC-005 §6–8 + PROACTIVE_AUTO m06456):
+//! Invariants:
 //! - one selection process: parallel flows wait for one channel preparation;
 //! - `last_good` first, erased only by that candidate's own failure;
 //! - after `Commit` there is no fallback — only closing on timeout;
@@ -16,8 +16,7 @@
 //!   the candidate for the rest of the session; exhausting them all — one `Exhausted`, stop.
 //!
 //! Layout: `types` holds the wire vocabulary (candidates, reasons, actions),
-//! this file the selection machine. Consumed by session in I08 — until then
-//! dead code for the bin build.
+//! this file the selection machine.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -113,7 +112,7 @@ struct FlowSel {
     skip: HashSet<Candidate>,
 }
 
-/// First ban duration; doubles per consecutive failure, capped (EPIC-016).
+/// First ban duration; doubles per consecutive failure, capped.
 const BAN_BACKOFF_START: Duration = Duration::from_secs(600);
 
 /// e2e hook: `SVPN_TEST_BAN_BACKOFF_SECS` shrinks the first ban (and, while
@@ -152,7 +151,7 @@ pub struct Selector {
     pub baseline_p90: Option<Duration>,
     /// Proactive-auto: a preparation failure bans the candidate for the session.
     proactive: bool,
-    /// Expiry of the current ban per candidate (EPIC-016): the candidate is
+    /// Expiry of the current ban per candidate: the candidate is
     /// eligible again after this moment.
     ban_until: HashMap<Candidate, Instant>,
     /// Next ban duration per candidate: doubles per failure, reset on success.
@@ -273,7 +272,7 @@ impl Selector {
         self.last_good = Some(candidate);
         self.baseline_p90 = baseline;
         self.hold_down.remove(&candidate);
-        // A proven candidate starts with a clean ban backoff (EPIC-016).
+        // A proven candidate starts with a clean ban backoff.
         self.ban_backoff.remove(&candidate);
         self.ban_until.remove(&candidate);
     }
@@ -558,7 +557,7 @@ impl Selector {
         self.channels.remove(&candidate);
         self.fail_candidate(candidate, reason, now);
         if self.proactive {
-            // Did not come up: banned until the backoff expires (EPIC-016).
+            // Did not come up: banned until the backoff expires.
             self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
                 return stop;

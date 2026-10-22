@@ -1,5 +1,5 @@
 //! Flow lifecycle: admission and binding, the commit barrier, teardown, and
-//! link-loss retirement (EPIC-010 §5.3).
+//! link-loss retirement.
 
 use std::{collections::VecDeque, time::Instant as StdInstant};
 
@@ -455,7 +455,7 @@ impl Session {
 
     pub async fn committed(&mut self, flow_id: u64) -> Result<()> {
         if is_probe_flow(flow_id) {
-            // EPIC-016: a health burst owns this probe id, not the round.
+            // a health burst owns this probe id, not the round.
             if self
                 .burst
                 .as_ref()
@@ -561,7 +561,7 @@ impl Session {
         Ok(())
     }
 
-    /// Link lost (EPIC-010 §5.3): retire every flow of this session's
+    /// Link lost: retire every flow of this session's
     /// link. Each TCP flow with a known last client ACK yields a best-effort
     /// RST plus one keepalive probe (id, bytes) toward the client TUN;
     /// flows without an ACK rely on respond-on-arrival; UDP/ICMP flows
@@ -694,7 +694,7 @@ impl Session {
         Ok(())
     }
 
-    /// Draining channel (EPIC-016 S3): the replaced incumbent serves its
+    /// Draining channel: the replaced incumbent serves its
     /// remaining flows; once the last one closes, retire the channel.
     pub(crate) async fn maybe_drain(&mut self, channel: u64) -> Result<()> {
         {

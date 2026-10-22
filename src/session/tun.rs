@@ -102,7 +102,7 @@ impl Session {
             return Ok(());
         };
         let is_client = self.client();
-        // A retired flow never re-enters admission (EPIC-010 §5.3): answer
+        // A retired flow never re-enters admission: answer
         // as a CLOSED endpoint, rate-limited; a client RST is just dropped.
         // Device sessions never tombstone, so there is no local write path.
         if is_client && self.tombstones.active(&packet.flow, StdInstant::now()) {
@@ -128,7 +128,7 @@ impl Session {
                 .count_drop(&self.drop_prefix, "flow closed (tombstone)");
             return Ok(());
         }
-        // Newest client ACK per TCP flow seeds the link-loss reset (§5.3).
+        // Newest client ACK per TCP flow seeds the link-loss reset.
         if is_client
             && let Some(ack) = packet
                 .tcp

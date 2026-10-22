@@ -1,4 +1,4 @@
-//! Background re-selection (EPIC-016): while the link runs on a TCP
+//! Background re-selection: while the link runs on a TCP
 //! incumbent, expired UDP bans get a challenger round in the background —
 //! traffic keeps flowing, and a healthy UDP challenger takes over. S3: a
 //! degraded incumbent is probed alongside its challengers, a switch needs
@@ -454,7 +454,7 @@ impl Session {
         });
         // Two consecutive rounds confirm the switch, at least one remeasure
         // interval apart (challenges start at most once per interval, so the
-        // confirming round simply has to win again); the first win only arms
+        // confirming round only needs to win again); the first win just arms
         // the retry and the winner's channel retires like a loser's.
         let gap = self.remeasure.unwrap_or(HEALTH_INTERVAL);
         let deciding = winner.filter(|(candidate, ..)| {

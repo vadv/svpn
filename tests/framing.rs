@@ -329,7 +329,7 @@ fn kexinit_frames_follow_bpp_and_share_lists() {
         }
         assert_eq!(offset, payload_end - 5);
     }
-    // Both sides' lists are checked against KEX_LISTS above — the intersection is non-empty (T02 §2).
+    // Both sides' lists are checked against KEX_LISTS above — the intersection is non-empty.
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn ssh_control_frames_follow_bpp() {
     assert_eq!(&binding[22..86], &[2; 64]);
     let reply = kex_reply();
     assert_eq!(reply[5], 31);
-    assert!(reply.len() >= 100, "kex-reply implausible size"); // T02 §3
+    assert!(reply.len() >= 100, "kex-reply implausible size");
     let keys = newkeys();
     assert_eq!(keys.len(), 16); // minimal BPP frame
     assert_eq!(keys[5], 21); // SSH2_MSG_NEWKEYS

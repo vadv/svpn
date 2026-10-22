@@ -351,7 +351,7 @@ impl Hub {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
                     let reason = result.err().map_or_else(|| "session ended".to_string(), |e| format!("{e:#}"));
                     let link = &self.links[epoch.link];
-                    // EPIC-016: name the transport that was live when the link died.
+                    // name the transport that was live when the link died.
                     let transport = link
                         .latest
                         .as_ref()

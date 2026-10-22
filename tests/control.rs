@@ -82,7 +82,7 @@ async fn opened_token_round_trip() {
 
 #[tokio::test]
 async fn v2_messages_round_trip_with_wire_names() {
-    // Exact JSON names from WIRE.md: one line, no unknown fields.
+    // Exact JSON names: one line, no unknown fields.
     let cases: Vec<(Message, &str)> = vec![
         (
             Message::Endpoints {

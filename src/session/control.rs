@@ -96,7 +96,7 @@ impl Session {
                     self.close_flow(flow_id, false).await?;
                 }
             }
-            // ── EPIC-003 TCP mode ──
+            // ── TCP mode ──
             Message::Open { id, flow } if matches!(self.plane, Plane::Tcp(_)) => {
                 self.tcp_open_server(id, flow).await?
             }
@@ -119,7 +119,7 @@ impl Session {
                     self.tcp_close(id).await?;
                 }
             }
-            // ── TCP candidate in channel mode (I09) ──
+            // ── TCP candidate in channel mode ──
             Message::Open { id, flow } if matches!(self.plane, Plane::Channels(_)) => {
                 self.channels_tcp_open(id, flow).await?
             }
@@ -551,7 +551,7 @@ impl Session {
         let Plane::Channels(plane) = &mut self.plane else {
             bail!("channel_failed outside channels mode");
         };
-        // EPIC-016: count the failure under the channel's transport. A burst
+        // count the failure under the channel's transport. A burst
         // riding this channel dies with it; the timer waits for the next Ready.
         if let Some(id) = channel {
             if let Some(handle) = plane.channels.get(&id) {

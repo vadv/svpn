@@ -328,7 +328,7 @@ impl Session {
                     self.maybe_start_challenge(false).await?;
                 }
                 Action::Exhausted { reasons } => {
-                    // Proactive-auto: nothing could be raised — bail out (m06456).
+                    // Proactive-auto: nothing could be raised — bail out.
                     let table = reasons
                         .iter()
                         .map(|(candidate, reason)| {

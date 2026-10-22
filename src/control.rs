@@ -15,7 +15,7 @@ pub const VERSION: u32 = 2;
 pub const MAX_LINE: usize = 4096;
 pub const QUEUE: usize = 256;
 
-/// UDP channel strategy; the strings match WIRE.md (`plain` is a
+/// UDP channel strategy; the strings are the wire names (`plain` is a
 /// diagnostic-only L0, not an auto candidate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -41,7 +41,7 @@ pub struct Stats {
     /// Last winning transport candidate on the client; server leaves it None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_candidate: Option<String>,
-    /// Packet-level failure counters per transport since start (EPIC-016).
+    /// Packet-level failure counters per transport since start.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub transport_failures: std::collections::BTreeMap<String, u64>,
 }
@@ -136,19 +136,19 @@ pub enum Message {
     Close {
         id: u64,
     },
-    // ─── Control v2 (WIRE.md, EPIC-005 I01); used by session starting from I08 ───
+    // ─── Control v2 protocol messages ───
     /// The server's actual endpoints, before TUN creation.
     Endpoints {
         udp: Vec<Endpoint>,
         tcp: Option<u16>,
-        /// QUIC: SHA-256 fingerprint of the server certificate (I08 extension).
+        /// QUIC: SHA-256 fingerprint of the server certificate.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pin: Option<[u8; 32]>,
     },
     ChannelPrepare {
         attempt: u64,
         strategy: Strategy,
-        /// WebRTC: the client's JSON hello for ICE/DTLS (I08 extension).
+        /// WebRTC: the client's JSON hello for ICE/DTLS.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hello: Option<String>,
     },
@@ -158,10 +158,10 @@ pub enum Message {
         port: u16,
         key: [u8; 16],
         max_wire: u16,
-        /// WebRTC: the server's JSON hello for ICE/DTLS (I08 extension).
+        /// WebRTC: the server's JSON hello for ICE/DTLS.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hello: Option<String>,
-        /// QUIC: the channel's loopback relay port on the server (I08 extension).
+        /// QUIC: the channel's loopback relay port on the server.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay: Option<u16>,
     },

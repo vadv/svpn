@@ -1,4 +1,4 @@
-//! Probe bursts (EPIC-016): pacing, echo accounting, deadlines, p90, timer wiring.
+//! Probe bursts: pacing, echo accounting, deadlines, p90, timer wiring.
 
 mod common;
 

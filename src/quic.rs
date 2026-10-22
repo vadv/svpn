@@ -1,4 +1,4 @@
-//! QUIC/H3 strategy (EPIC-005 I05): a MASQUE-like tunnel per RFC 9298.
+//! QUIC/H3 strategy: a MASQUE-like tunnel per RFC 9298.
 //!
 //! Real QUIC/TLS 1.3 (quinn, ALPN `h3`) + HTTP/3 extended CONNECT
 //! (`:protocol connect-udp`, RFC 9298) as the controlling stream; channel
@@ -21,7 +21,6 @@
 //!
 //! shortcut: no capsule framing or REGISTER_CAPSULE, revisit when
 //! integrating with third-party MASQUE clients (outside the current epic).
-//! Consumed by session in I07/I08 — dead code for the bin build until then.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;

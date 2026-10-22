@@ -1,5 +1,5 @@
-//! UDP v2: the shared strategy channel (EPIC-005 I02). Records, fragment reassembly
-//! and channel key encryption follow the frozen spec docs/WIRE.md.
+//! UDP v2: the shared strategy channel. Records, fragment reassembly
+//! and channel key encryption follow the frozen wire spec.
 //! Orchestration (auto, probes over control) lives in session; this is the core only.
 //! The socket helpers are exercised by integration tests — dead code for the bin build.
 #![allow(dead_code)]
@@ -29,7 +29,7 @@ pub const MIN_PACKET: usize = 28;
 pub const MAX_PACKET: usize = 1400;
 /// 1401 (MAX_PLAINTEXT) minus the DATA header: kind 1 + flow 8 + packet 8 + off 2 + total 2.
 pub const MAX_FRAGMENT: usize = MAX_PLAINTEXT - 21;
-/// Per-channel reassembly limits: incomplete packets, bytes and TTL (WIRE.md §5).
+/// Per-channel reassembly limits: incomplete packets, bytes and TTL.
 pub const MAX_PENDING_PACKETS: usize = 64;
 pub const MAX_PENDING_BYTES: usize = 1024 * 1024;
 pub const PENDING_TTL: Duration = Duration::from_secs(1);
@@ -395,7 +395,7 @@ pub fn fragment_packet(
     Ok(records)
 }
 
-/// A fresh 128-bit challenge for channel/flow probes (WIRE.md §3).
+/// A fresh 128-bit challenge for channel/flow probes.
 pub fn challenge() -> Result<[u8; CHALLENGE]> {
     crypto::random()
 }

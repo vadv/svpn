@@ -1,4 +1,4 @@
-//! Probe bursts (EPIC-016): ten ICMP echoes over one live channel, spaced
+//! Probe bursts: ten ICMP echoes over one live channel, spaced
 //! 100 ms apart, measuring p90 RTT and loss while traffic keeps flowing.
 //! The session owns the plumbing; the burst only accounts.
 

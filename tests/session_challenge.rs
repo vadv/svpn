@@ -1,4 +1,4 @@
-//! Background re-selection (EPIC-016 S2): trigger conditions, re-ban on
+//! Background re-selection: trigger conditions, re-ban on
 //! challenger failure, burst queueing, the verdict, and the round abort.
 
 mod common;
@@ -318,7 +318,7 @@ async fn bound_challenger_sends_flow_open_on_the_wire() {
         .await
         .unwrap();
     // Without the FlowOpen on the wire the server never registers the
-    // probe flow and drops every burst echo reply (review finding 1).
+    // probe flow and drops every burst echo reply.
     let mut opened = None;
     for _ in 0..4 {
         line.clear();
