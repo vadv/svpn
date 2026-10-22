@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.1
+
+Health-check visibility release.
+
+- Periodic health bursts (every 30 s per server) now log their result:
+  `ok` lines at `info` with p90 and echo count, degraded bursts and the
+  re-selection trigger at `warn`.
+- New `warn` log level between `error` and `info`: `--log-level warn` on
+  the CLI, `log-level = "warn"` in TOML; the default stays `info`.
+
 ## v0.6.0
 
 Adaptive transport re-selection release.
