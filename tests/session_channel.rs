@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use std::time::Instant as StdInstant;
 
-use common::session::{link_session, test_key, test_plane};
+use common::session::{link_session, link_session_with, test_key, test_plane};
 use svpn::control::{Control, Message, Strategy};
 use svpn::link_io;
 use svpn::selector::{Action, Allowed, Candidate, Reason, Selector};
@@ -115,6 +115,8 @@ async fn last_channel_loss_signals_checking() {
         5,
         ChannelHandle {
             candidate: svpn::selector::Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             cancel: None,
             command,
             task,
@@ -160,6 +162,8 @@ async fn peer_channel_failure_unblocks_tcp_fallback() {
         10,
         ChannelHandle {
             candidate: Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             command,
             task,
             cancel: None,
@@ -239,6 +243,8 @@ async fn server_channel_failure_closes_only_its_flows() {
         10,
         ChannelHandle {
             candidate: Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             command,
             task,
             cancel: None,
@@ -268,6 +274,8 @@ async fn channel_removal_aborts_its_relay() {
         1,
         ChannelHandle {
             candidate: Candidate::Quic,
+            key: [7; 16],
+            established: true,
             cancel: None,
             command: mpsc::channel(1).0,
             task,
@@ -307,6 +315,8 @@ async fn session_drop_aborts_flow_channel_and_handshake_tasks() {
                     1,
                     ChannelHandle {
                         candidate: Candidate::Mosh,
+                        key: [7; 16],
+                        established: true,
                         command: mpsc::channel(1).0,
                         task,
                         cancel: None,
@@ -434,4 +444,363 @@ async fn occupied_candidate_port_reports_failure_without_ending_session() {
         assert_eq!(plane.channels.len(), 1);
         assert!(plane.prepared.contains_key(&8));
     }
+}
+
+#[tokio::test]
+async fn channel_prepare_reuses_a_live_datagram_channel() {
+    let (client_half, mut wire) = tokio::io::duplex(4096);
+    let control = Control::new(tokio::io::empty(), client_half);
+    let (mut session, _events) = link_session_with(false, control);
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.selector = None;
+    plane.bind = Ipv4Addr::UNSPECIFIED;
+    plane.ports.insert(Strategy::Mosh, 60002);
+    plane.next_channel_id = 5;
+    let (command, _commands) = mpsc::channel(1);
+    let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async { std::future::pending::<()>().await });
+    plane.channels.insert(
+        5,
+        ChannelHandle {
+            candidate: Candidate::Mosh,
+            key: [9; 16],
+            established: true,
+            command,
+            cancel: Some(cancel),
+            task,
+            relay: None,
+        },
+    );
+    session
+        .channel_prepare(99, Strategy::Mosh, None)
+        .await
+        .unwrap();
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(&mut wire);
+    let mut line = String::new();
+    lines.read_line(&mut line).await.unwrap();
+    let ready: Message = serde_json::from_str(line.trim()).unwrap();
+    let Message::ChannelReady {
+        attempt,
+        channel,
+        port,
+        key,
+        ..
+    } = ready
+    else {
+        panic!("expected ChannelReady");
+    };
+    assert_eq!((attempt, channel, port), (99, 5, 60002));
+    assert_eq!(key, [9; 16]);
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    // Borrowed, not owned: an attempt-only ChannelFailed must not resolve
+    // to the live channel, so the attempt is absent from `prepared`.
+    assert!(!plane.prepared.contains_key(&99));
+    assert_eq!(
+        plane.next_channel_id, 5,
+        "reuse must not allocate a channel id"
+    );
+    assert_eq!(
+        plane.channels.len(),
+        1,
+        "no fresh channel bound on top of the live one"
+    );
+}
+
+#[tokio::test]
+async fn channel_ready_reuses_a_live_channel_without_clobbering_it() {
+    let (mut session, _events) = link_session(false);
+    // A live channel id=5 already exists (e.g. draining after a switch).
+    let (command, _commands) = mpsc::channel(1);
+    let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async { std::future::pending::<()>().await });
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.channels.insert(
+        5,
+        ChannelHandle {
+            candidate: Candidate::Mosh,
+            key: [9; 16],
+            established: true,
+            command,
+            cancel: Some(cancel),
+            task,
+            relay: None,
+        },
+    );
+    // A challenge probe targets the same strategy; the server reuses id 5.
+    session.challenge = Some(challenge::Challenge {
+        attempts: std::collections::HashMap::from([(
+            99,
+            challenge::Challenger {
+                candidate: Candidate::Mosh,
+                channel: None,
+                owned: true,
+                peer: None,
+                burst: None,
+            },
+        )]),
+        measured: Vec::new(),
+        incumbent: None,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+    });
+    session
+        .channel_ready(ChannelReadyParams {
+            attempt: 99,
+            channel: 5,
+            port: 60002,
+            key: [8; 16],
+            max_wire: 1200,
+            hello: None,
+            relay: None,
+        })
+        .await
+        .unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    assert_eq!(
+        plane.channels.len(),
+        1,
+        "reuse must not spawn a fresh channel"
+    );
+    let handle = plane.channels.get(&5).unwrap();
+    assert_eq!(
+        handle.key, [9; 16],
+        "the live handle must survive unchanged (no clobber)"
+    );
+    assert!(
+        !handle.task.is_finished(),
+        "the live channel task was aborted"
+    );
+}
+
+// ── borrowed channels: reuse must never resurrect cipher state ──
+
+#[tokio::test]
+async fn late_reuse_reply_after_retirement_fails_the_attempt() {
+    let (mut session, _events) = link_session(false);
+    let (command, _commands) = mpsc::channel(1);
+    let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async { std::future::pending::<()>().await });
+    {
+        let Plane::Channels(plane) = &mut session.plane else {
+            unreachable!()
+        };
+        plane.channels.insert(
+            5,
+            ChannelHandle {
+                candidate: Candidate::Mosh,
+                key: [9; 16],
+                established: true,
+                command,
+                cancel: Some(cancel),
+                task,
+                relay: None,
+            },
+        );
+        // The channel dies and retires before the reuse reply arrives.
+        plane.retire(5);
+    }
+    session.challenge = Some(challenge::Challenge {
+        attempts: std::collections::HashMap::from([(
+            99,
+            challenge::Challenger {
+                candidate: Candidate::Mosh,
+                channel: None,
+                owned: true,
+                peer: None,
+                burst: None,
+            },
+        )]),
+        measured: Vec::new(),
+        incumbent: None,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+    });
+    session
+        .channel_ready(ChannelReadyParams {
+            attempt: 99,
+            channel: 5,
+            port: 60002,
+            key: [9; 16],
+            max_wire: 1200,
+            hello: None,
+            relay: None,
+        })
+        .await
+        .unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    assert!(
+        plane.channels.is_empty(),
+        "a retired id must not be resurrected with fresh cipher state"
+    );
+    assert!(
+        session
+            .challenge
+            .as_ref()
+            .is_none_or(|challenge| !challenge.attempts.contains_key(&99)),
+        "the attempt fails instead of waiting forever"
+    );
+}
+
+#[tokio::test]
+async fn reused_established_channel_opens_probe_and_expiry_spares_it() {
+    let (client_half, mut wire) = tokio::io::duplex(4096);
+    let control = Control::new(tokio::io::empty(), client_half);
+    let (mut session, _events) = link_session_with(false, control);
+    let (command, _commands) = mpsc::channel(1);
+    let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async { std::future::pending::<()>().await });
+    {
+        let Plane::Channels(plane) = &mut session.plane else {
+            unreachable!()
+        };
+        plane.channels.insert(
+            5,
+            ChannelHandle {
+                candidate: Candidate::Mosh,
+                key: [9; 16],
+                established: true,
+                command,
+                cancel: Some(cancel),
+                task,
+                relay: None,
+            },
+        );
+    }
+    session.challenge = Some(challenge::Challenge {
+        attempts: std::collections::HashMap::from([(
+            99,
+            challenge::Challenger {
+                candidate: Candidate::Mosh,
+                channel: None,
+                owned: true,
+                peer: None,
+                burst: None,
+            },
+        )]),
+        measured: Vec::new(),
+        incumbent: None,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+    });
+    session
+        .channel_ready(ChannelReadyParams {
+            attempt: 99,
+            channel: 5,
+            port: 60002,
+            key: [9; 16],
+            max_wire: 1200,
+            hello: None,
+            relay: None,
+        })
+        .await
+        .unwrap();
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(&mut wire);
+    let mut line = String::new();
+    lines.read_line(&mut line).await.unwrap();
+    let open: Message = serde_json::from_str(line.trim()).unwrap();
+    let Message::FlowOpen {
+        flow_id, channel, ..
+    } = open
+    else {
+        panic!("expected FlowOpen for the reused channel");
+    };
+    assert_eq!((flow_id, channel), (99, Some(5)));
+    // The probe never answers: expiry must fail the attempt without
+    // stopping the borrowed channel.
+    session.finish_challenge(true).await.unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    let handle = plane.channels.get(&5).unwrap();
+    assert!(
+        !handle.task.is_finished(),
+        "the borrowed channel outlives the attempt"
+    );
+    let mut line = String::new();
+    lines.read_line(&mut line).await.unwrap();
+    let closed: Message = serde_json::from_str(line.trim()).unwrap();
+    assert!(
+        matches!(closed, Message::FlowClose { .. }),
+        "the expired probe flow is closed"
+    );
+    let mut line = String::new();
+    lines.read_line(&mut line).await.unwrap();
+    let failed: Message = serde_json::from_str(line.trim()).unwrap();
+    let Message::ChannelFailed {
+        attempt, channel, ..
+    } = failed
+    else {
+        panic!("expected ChannelFailed");
+    };
+    assert_eq!(
+        (attempt, channel),
+        (Some(99), None),
+        "a borrowed channel is never reported as the attempt's own failure"
+    );
+}
+
+#[tokio::test]
+async fn borrowed_attempt_cancellation_spares_the_server_channel() {
+    let (client_half, mut wire) = tokio::io::duplex(4096);
+    let control = Control::new(tokio::io::empty(), client_half);
+    let (mut session, _events) = link_session_with(false, control);
+    {
+        let Plane::Channels(plane) = &mut session.plane else {
+            unreachable!()
+        };
+        plane.selector = None;
+        plane.bind = Ipv4Addr::UNSPECIFIED;
+        plane.ports.insert(Strategy::Mosh, 60002);
+        plane.next_channel_id = 5;
+    }
+    let (command, _commands) = mpsc::channel(1);
+    let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async { std::future::pending::<()>().await });
+    {
+        let Plane::Channels(plane) = &mut session.plane else {
+            unreachable!()
+        };
+        plane.channels.insert(
+            5,
+            ChannelHandle {
+                candidate: Candidate::Mosh,
+                key: [9; 16],
+                established: true,
+                command,
+                cancel: Some(cancel),
+                task,
+                relay: None,
+            },
+        );
+    }
+    session
+        .channel_prepare(99, Strategy::Mosh, None)
+        .await
+        .unwrap();
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(&mut wire);
+    let mut line = String::new();
+    lines.read_line(&mut line).await.unwrap();
+    // The client cancels the attempt: the borrowed channel must stay.
+    session
+        .channel_failed(Some(99), None, Reason::ChannelFailed)
+        .await
+        .unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    let handle = plane.channels.get(&5).unwrap();
+    assert!(
+        !handle.task.is_finished(),
+        "the server channel survives the borrowed attempt's cancellation"
+    );
 }

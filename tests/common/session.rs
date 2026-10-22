@@ -165,6 +165,7 @@ pub fn test_plane(selector: Option<Selector>) -> ChannelsPlane {
         quic: None,
         channels: HashMap::new(),
         draining: HashSet::new(),
+        retired: HashSet::new(),
         next_channel_id: 0,
         attempt: None,
         flows: HashMap::new(),

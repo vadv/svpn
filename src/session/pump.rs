@@ -46,6 +46,11 @@ pub enum TaskCommand {
 
 pub struct ChannelHandle {
     pub candidate: Candidate,
+    /// Kept so a reused channel answers a fresh `ChannelPrepare`
+    /// with its real key.
+    pub key: [u8; 16],
+    /// Handshake done; a reused channel never re-emits `Established`.
+    pub established: bool,
     pub cancel: Option<oneshot::Sender<()>>,
     pub command: mpsc::Sender<TaskCommand>,
     pub task: tokio::task::JoinHandle<()>,

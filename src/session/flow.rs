@@ -714,7 +714,7 @@ impl Session {
         self.stop_channel(channel).await;
         if let Plane::Channels(plane) = &mut self.plane {
             plane.draining.remove(&channel);
-            plane.channels.remove(&channel);
+            plane.retire(channel);
         }
         self.control
             .send(Message::ChannelFailed {

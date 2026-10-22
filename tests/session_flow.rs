@@ -241,6 +241,8 @@ async fn client_rst_reaches_transport_before_retiring_flow() {
                             5,
                             ChannelHandle {
                                 candidate: Candidate::Mosh,
+                                key: [7; 16],
+                                established: true,
                                 command,
                                 task: tokio::spawn(async {}),
                                 cancel: None,
@@ -490,6 +492,8 @@ async fn committed_packets_are_counted_once_on_both_sides_and_transports() {
                     10,
                     ChannelHandle {
                         candidate: Candidate::Mosh,
+                        key: [7; 16],
+                        established: true,
                         command,
                         task: tokio::spawn(std::future::pending()),
                         cancel: None,
@@ -547,6 +551,8 @@ async fn flow_probe_overload_closes_only_the_opening_flow() {
             10,
             ChannelHandle {
                 candidate: Candidate::Mosh,
+                key: [7; 16],
+                established: true,
                 command,
                 task: tokio::spawn(std::future::pending()),
                 cancel: None,
@@ -594,6 +600,8 @@ async fn udp_commit_does_not_wait_for_a_full_shared_command_queue() {
         10,
         ChannelHandle {
             candidate: Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             command,
             task: tokio::spawn(std::future::pending()),
             cancel: None,

@@ -226,6 +226,9 @@ pub struct ChannelsPlane {
     /// Channels of a replaced incumbent: no new flows, not
     /// probed; torn down once the last bound flow closes.
     pub draining: HashSet<u64>,
+    /// Channel ids this side no longer holds; a late reuse reply
+    /// naming one is rejected (its cipher key is used up).
+    pub retired: HashSet<u64>,
     pub prepared: HashMap<u64, u64>,
     pub next_channel_id: u64,
     /// Client: preparation in flight (attempt, candidate, channel, webrtc peer).
@@ -247,7 +250,7 @@ impl ChannelsPlane {
         let channel = channel.or_else(|| attempt.and_then(|id| self.prepared.get(&id).copied()));
         if let Some(channel_id) = channel {
             self.prepared.retain(|_, id| *id != channel_id);
-            if let Some(handle) = self.channels.remove(&channel_id) {
+            if let Some(handle) = self.retire(channel_id) {
                 if let Some(selector) = self.selector.as_mut() {
                     // Remove the channel from the selector too: otherwise it
                     // waits for its probes forever.
@@ -274,6 +277,13 @@ impl ChannelsPlane {
             return selector.attempt_failed(candidate, pending_attempt, reason, now);
         }
         Vec::new()
+    }
+
+    /// Remove a channel and remember its id: reuse replies naming it
+    /// are rejected.
+    pub fn retire(&mut self, id: u64) -> Option<ChannelHandle> {
+        self.retired.insert(id);
+        self.channels.remove(&id)
     }
 }
 

@@ -425,7 +425,7 @@ impl Session {
             if let Some(channel) = rc.channel {
                 self.stop_channel(channel).await;
                 if let Plane::Channels(plane) = &mut self.plane {
-                    plane.channels.remove(&channel);
+                    plane.retire(channel);
                 }
             }
             self.control
@@ -474,7 +474,7 @@ impl Session {
                     if let Some(channel) = rc.channel {
                         self.stop_channel(channel).await;
                         if let Plane::Channels(plane) = &mut self.plane {
-                            plane.channels.remove(&channel);
+                            plane.retire(channel);
                         }
                     }
                     self.control
@@ -715,7 +715,7 @@ impl Session {
             if let Some(id) = rc.channel {
                 self.stop_channel(id).await;
                 if let Plane::Channels(plane) = &mut self.plane {
-                    plane.channels.remove(&id);
+                    plane.retire(id);
                 }
             }
             self.control

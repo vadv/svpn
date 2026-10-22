@@ -151,6 +151,8 @@ async fn committed_arms_burst_and_sends_first_echo() {
         channel,
         ChannelHandle {
             candidate: Candidate::Mosh,
+            key: [7; 16],
+            established: true,
             cancel: None,
             command,
             task,

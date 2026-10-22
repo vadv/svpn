@@ -82,56 +82,19 @@ impl Session {
                     return Ok(());
                 }
                 crate::debug!("channel_established id={channel}");
+                {
+                    let Plane::Channels(plane) = &mut self.plane else {
+                        bail!("task event outside channels mode");
+                    };
+                    // A reused channel never re-emits `Established`.
+                    if let Some(handle) = plane.channels.get_mut(&channel) {
+                        handle.established = true;
+                    }
+                }
                 self.control
                     .send(Message::ChannelVerified { channel })
                     .await?;
-                // N3: a round winner binds the PREFLIGHT flow to the channel
-                // directly; the selector learns it through `adopt` at the verdict.
-                let probe_id = self
-                    .round
-                    .as_ref()
-                    .and_then(|round| {
-                        round
-                            .pending
-                            .iter()
-                            .find(|(_, rc)| rc.channel == Some(channel))
-                            .map(|(&id, _)| id)
-                    })
-                    .or_else(|| {
-                        self.challenge.as_ref().and_then(|challenge| {
-                            challenge
-                                .attempts
-                                .iter()
-                                .find(|(_, challenger)| challenger.channel == Some(channel))
-                                .map(|(&id, _)| id)
-                        })
-                    });
-                if let Some(flow_id) = probe_id {
-                    let Plane::Channels(plane) = &self.plane else {
-                        unreachable!()
-                    };
-                    let Some(flow) = plane.flows.get(&flow_id) else {
-                        return Ok(());
-                    };
-                    return self
-                        .control
-                        .send(Message::FlowOpen {
-                            flow_id,
-                            flow: flow.key,
-                            channel: Some(channel),
-                        })
-                        .await;
-                }
-                let Plane::Channels(plane) = &mut self.plane else {
-                    bail!("task event outside channels mode");
-                };
-                if let Some(selector) = plane.selector.as_mut()
-                    && let Some(handle) = plane.channels.get(&channel)
-                {
-                    let actions =
-                        selector.probes_passed(handle.candidate, channel, StdInstant::now());
-                    self.execute_actions(actions).await?;
-                }
+                self.probe_flow_open(channel).await?
             }
             TaskEvent::Failed { channel, reason } => {
                 // The client drives attempts: a strategy failure is a
@@ -250,7 +213,7 @@ impl Session {
                     {
                         self.stop_channel(channel_id).await;
                         if let Plane::Channels(plane) = &mut self.plane {
-                            plane.channels.remove(&channel_id);
+                            plane.retire(channel_id);
                         }
                     }
                     self.control
