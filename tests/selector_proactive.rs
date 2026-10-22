@@ -189,7 +189,7 @@ fn proactive_channel_lost_is_not_banned() {
     ));
 }
 
-// ── ban expiry (EPIC-016) ──
+// ── ban expiry ──
 
 #[test]
 fn ban_expires_after_backoff_and_restores_cold_order_position() {
@@ -255,7 +255,7 @@ fn repeated_bans_double_the_backoff_and_success_resets_it() {
     );
 
     // Success resets the backoff: the next ban is ~10 minutes again.
-    selector.adopt(Candidate::Quic, Some(10));
+    selector.adopt(Candidate::Quic, Some(10), None);
     selector
         .channels
         .insert(Candidate::Quic, ReadyChannel::new(11, false));
@@ -265,4 +265,18 @@ fn repeated_bans_double_the_backoff_and_success_resets_it() {
         selector.allowed.contains(&Candidate::Quic),
         "reset backoff expires at 12m"
     );
+}
+
+// ── e2e hook ──
+
+#[test]
+fn ban_backoff_hook_only_shortens_the_first_ban() {
+    use std::time::Duration;
+    use svpn::selector::ban_backoff_from;
+    let start = Duration::from_secs(600);
+    assert_eq!(ban_backoff_from(None), start, "unset keeps the default");
+    assert_eq!(ban_backoff_from(Some("garbage")), start);
+    assert_eq!(ban_backoff_from(Some("0")), start, "zero is not a shrink");
+    assert_eq!(ban_backoff_from(Some("3")), Duration::from_secs(3));
+    assert_eq!(ban_backoff_from(Some("999999")), start, "never lengthens");
 }

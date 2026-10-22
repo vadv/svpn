@@ -1,4 +1,4 @@
-//! UDP channel transport tasks (EPIC-005 I08). Every strategy gives the
+//! UDP channel transport tasks. Every strategy gives the
 //! session the same interface: a command channel + an event stream.
 //! `Event::Wire` carries the channel sealed record ([seq 8][ct][tag 16])
 //! AFTER removing the strategy camouflage; the sender applies it. The AEAD
@@ -7,7 +7,6 @@
 //! Datagram strategies (plain/mosh/obfs) and the server-side QUIC relay run
 //! on tokio; WebRTC drives str0m by UDP readiness, commands, and
 //! ICE/DTLS/SCTP timers without blocking waits between outbound records.
-//! Consumed by session in I10+; until then dead code for the bin build.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;

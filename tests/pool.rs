@@ -102,7 +102,7 @@ fn checking_then_session_death_stops_only_without_other_ready() {
 #[test]
 fn losing_last_ready_waits_for_another_connecting_round() {
     // superseded: stop-immediately variant — the accepted pool FSM waits
-    // for in-flight rounds of Connecting/Checking servers (m12466).
+    // for in-flight rounds of Connecting/Checking servers.
     let now = Instant::now();
     let mut pool = Pool::new([1, 1]);
     pool.ready(epoch(0), now);

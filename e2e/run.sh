@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 usage() {
-    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|udp|tcp-auto]"
+    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|udp|tcp-auto|reselect]"
     echo "Matrix groups: all, udp, tcp-auto. Run groups sequentially on a local Docker host."
 }
 matrix=0
@@ -17,7 +17,7 @@ export SVPN_TEST_GROUP=${1-all}
 case "$SVPN_TEST_GROUP" in
     -h|--help) usage; exit 0 ;;
     all|udp|tcp-auto) ;;
-    bootstrap|lifecycle-pool)
+    bootstrap|lifecycle-pool|reselect)
         if (( matrix )); then usage >&2; exit 2; fi ;;
     *) usage >&2; exit 2 ;;
 esac

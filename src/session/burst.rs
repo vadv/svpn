@@ -1,4 +1,4 @@
-//! Probe bursts (EPIC-016): ten ICMP echoes over one live channel, spaced
+//! Probe bursts: ten ICMP echoes over one live channel, spaced
 //! 100 ms apart, measuring p90 RTT and loss while traffic keeps flowing.
 //! The session owns the plumbing; the burst only accounts.
 
@@ -31,7 +31,7 @@ pub struct Burst {
     base_seq: u16,
     pub payload: Vec<u8>,
     /// None until the probe flow commits: sends and the deadline start then.
-    armed: Option<Instant>,
+    pub armed: Option<Instant>,
     sent: [Option<Instant>; BURST_LEN],
     rtts: [Option<Duration>; BURST_LEN],
     next: usize,
@@ -145,10 +145,20 @@ impl Session {
         if !self.client() || !self.accepts_packets() || !matches!(self.plane, Plane::Channels(_)) {
             return None;
         }
-        if let Some(burst) = &self.burst {
-            return burst.wake_at();
+        let burst_wake = self.burst.as_ref().and_then(Burst::wake_at);
+        if let Some(challenge) = &self.challenge {
+            let active = challenge
+                .attempts
+                .values()
+                .filter_map(|challenger| challenger.burst.as_ref())
+                .filter_map(Burst::wake_at)
+                .min();
+            return [Some(challenge.deadline), self.health_at, active, burst_wake]
+                .into_iter()
+                .flatten()
+                .min();
         }
-        self.health_at
+        burst_wake.or(self.health_at)
     }
 
     /// Whether a new burst may start now. `health_at` is armed by
@@ -159,54 +169,138 @@ impl Session {
             && self.accepts_packets()
             && matches!(self.plane, Plane::Channels(_))
             && self.burst.is_none()
+            && self.challenge.is_none()
             && self.health_at.is_some_and(|at| now >= at)
     }
 
     /// Drive the burst: start when due, send the echoes that are due, close
     /// out at the deadline. Runs from the health timer arm and the tick.
     pub(crate) async fn poll_burst(&mut self, now: Instant) -> Result<()> {
+        // The challenge cap fires here: every wake that could finish a
+        // burst already routes through poll_burst.
+        if self
+            .challenge
+            .as_ref()
+            .is_some_and(|challenge| now >= challenge.deadline)
+        {
+            self.finish_challenge(true).await?;
+            return Ok(());
+        }
+        // A probe flow reaped underneath an unarmed health burst would stall
+        // health forever: drop the dead burst and re-arm the interval.
+        // Challenge bursts die via `challenge_channel_failed` / flow_close.
+        let zombie = matches!(&self.burst, Some(burst) if burst.armed.is_none()
+            && matches!(&self.plane, Plane::Channels(plane) if !plane.flows.contains_key(&burst.attempt)));
+        if zombie {
+            self.burst = None;
+            self.health_at = Some(now + HEALTH_INTERVAL);
+        }
         if self.health_due(now) {
-            self.start_burst(now).await?;
+            self.maybe_start_challenge(false).await?;
+            if self.challenge.is_none() {
+                self.start_burst(now).await?;
+            }
         }
         let peer_ip = match &self.io {
             PacketIo::Link(io) => io.peer_ip,
             PacketIo::Device(_) => return Ok(()),
         };
         let tag = self.tag().to_owned();
-        let mut finished = false;
-        if let Some(burst) = self.burst.as_mut() {
-            while let Some(index) = burst.due(now) {
-                let seq = burst.seq(index);
-                let request = packet::icmp_echo_request(
-                    self.client_ip,
-                    peer_ip,
-                    burst.icmp_id,
-                    seq,
-                    &burst.payload,
-                );
-                let Plane::Channels(plane) = &mut self.plane else {
-                    return Ok(());
+        // Drive every probe burst: the health burst in the slot and, during a
+        // challenge, all armed bursts in parallel. A finished health burst is
+        // reported inline; finished challenge bursts go through
+        // `challenge_burst_done` after the loop.
+        let mut finished_challenge: Vec<u64> = Vec::new();
+        // Take the challenge out for the loop: sending borrows the plane,
+        // and the borrow checker cannot split self across a field borrow.
+        // Nothing in the send loop observes `self.challenge`.
+        if let Some(mut challenge) = self.challenge.take() {
+            for (attempt, challenger) in &mut challenge.attempts {
+                let Some(burst) = challenger.burst.as_mut() else {
+                    continue;
                 };
-                let sent = plane.channels.get(&burst.channel).is_some_and(|handle| {
-                    handle
-                        .command
-                        .try_send(TaskCommand::Data(burst.attempt, request))
-                        .is_ok()
-                });
-                if !sent {
-                    crate::debug!(
-                        "{} health: echo {seq} not sent (queue full or channel gone)",
-                        prefixed(&tag, "channel")
-                    );
+                self.send_due_echoes(*attempt, burst, peer_ip, &tag, now);
+                if burst.finished(now) {
+                    finished_challenge.push(*attempt);
                 }
-                burst.mark_sent(now);
             }
-            finished = burst.finished(now);
+            self.challenge = Some(challenge);
         }
-        if finished {
+        let mut health_done = false;
+        if let Some(mut burst) = self.burst.take() {
+            let attempt = burst.attempt;
+            self.send_due_echoes(attempt, &mut burst, peer_ip, &tag, now);
+            health_done = burst.finished(now);
+            self.burst = Some(burst);
+        }
+        for attempt in finished_challenge {
+            self.finish_probe(attempt).await?;
+        }
+        if health_done {
             self.finish_burst(now).await?;
         }
         Ok(())
+    }
+
+    /// Finish one challenge probe burst: record the outcome, close the probe
+    /// flow, close out the challenge when nothing is left in flight.
+    pub(crate) async fn finish_probe(&mut self, attempt: u64) -> Result<()> {
+        let burst = self
+            .challenge
+            .as_mut()
+            .and_then(|challenge| challenge.attempts.get_mut(&attempt))
+            .and_then(|challenger| challenger.burst.take());
+        let Some(burst) = burst else {
+            return Ok(());
+        };
+        self.challenge_burst_done(attempt, burst.outcome()).await?;
+        self.close_flow(attempt, true).await?;
+        let done = self
+            .challenge
+            .as_ref()
+            .is_some_and(|challenge| challenge.done());
+        if done {
+            self.finish_challenge(false).await?;
+        }
+        Ok(())
+    }
+
+    /// Send every echo of `burst` that is due at `now`. Split out of
+    /// `poll_burst`: challenge drives several bursts in parallel.
+    fn send_due_echoes(
+        &mut self,
+        attempt: u64,
+        burst: &mut Burst,
+        peer_ip: std::net::Ipv4Addr,
+        tag: &str,
+        now: Instant,
+    ) {
+        while let Some(index) = burst.due(now) {
+            let seq = burst.seq(index);
+            let request = packet::icmp_echo_request(
+                self.client_ip,
+                peer_ip,
+                burst.icmp_id,
+                seq,
+                &burst.payload,
+            );
+            let Plane::Channels(plane) = &mut self.plane else {
+                return;
+            };
+            let sent = plane.channels.get(&burst.channel).is_some_and(|handle| {
+                handle
+                    .command
+                    .try_send(TaskCommand::Data(attempt, request))
+                    .is_ok()
+            });
+            if !sent {
+                crate::debug!(
+                    "{} health: echo {seq} not sent (queue full or channel gone)",
+                    prefixed(tag, "channel")
+                );
+            }
+            burst.mark_sent(now);
+        }
     }
 
     /// Open one probe flow over the live channel: the adopted one, or any
@@ -272,7 +366,10 @@ impl Session {
         let Plane::Channels(plane) = &mut self.plane else {
             unreachable!()
         };
-        plane.flows.insert(attempt, Flow::new(key, now));
+        // The committed probe requires the bound channel on the flow.
+        let mut probe = Flow::new(key, now);
+        probe.channel = Some(channel);
+        plane.flows.insert(attempt, probe);
         crate::debug!(
             "{} health: burst attempt={attempt} channel={channel} icmp_id={icmp_id} borrowed={borrowed}",
             prefixed(self.tag(), "channel")
@@ -293,8 +390,10 @@ impl Session {
         let Some(burst) = self.burst.take() else {
             return Ok(());
         };
-        self.health_at = Some(now + HEALTH_INTERVAL);
         let outcome = burst.outcome();
+        // Health bursts only ever measure the health slot; challenge probes
+        // live in `challenge.active` and end in `finish_probe`.
+        self.health_at = Some(now + HEALTH_INTERVAL);
         let name = match &self.plane {
             Plane::Channels(plane) => plane
                 .channels
@@ -319,9 +418,40 @@ impl Session {
                 prefixed(self.tag(), "channel"),
                 outcome.lost
             );
-            let entry = self.stats.transport_failures.entry(name).or_default();
+            let entry = self
+                .stats
+                .transport_failures
+                .entry(name.clone())
+                .or_default();
             *entry = entry.saturating_add(outcome.lost as u64);
         }
-        self.close_flow(burst.attempt, true).await
+        // S3 trigger 2: the incumbent's own burst degraded — loss ≥ 3 or
+        // p90 ≥ 2× the adoption baseline. A borrowed channel says nothing
+        // about the incumbent's path, so only the adopted channel counts.
+        let degraded = match &self.plane {
+            Plane::Channels(plane) => plane.selector.as_ref().is_some_and(|selector| {
+                let Some(incumbent) = selector.last_good else {
+                    return false;
+                };
+                if selector.ready_channel(incumbent) != Some(burst.channel) {
+                    return false;
+                }
+                outcome.lost >= 3
+                    || match (outcome.p90, selector.baseline_p90) {
+                        (Some(p90), Some(baseline)) => p90 >= baseline * 2,
+                        _ => false,
+                    }
+            }),
+            Plane::Tcp(_) => false,
+        };
+        self.close_flow(burst.attempt, true).await?;
+        if degraded {
+            crate::debug!(
+                "{} health: {name} degraded past the baseline — challenger round",
+                prefixed(self.tag(), "channel")
+            );
+            self.maybe_start_challenge(true).await?;
+        }
+        Ok(())
     }
 }

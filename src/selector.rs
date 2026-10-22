@@ -1,11 +1,11 @@
-//! Strategy auto-selector (EPIC-005 I07): a pure client state machine.
+//! Strategy auto-selector: a pure client state machine.
 //!
 //! Decides which candidate (`quic → webrtc → obfs → mosh → tcp`) to try for
 //! a new flow, when a strategy channel is ready, when to commit, and when
 //! to fail honestly. No sockets or timers: time arrives as the `now`
 //! parameter, I/O is performed by session per the returned [`Action`]s.
 //!
-//! Invariants (EPIC-005 §6–8 + PROACTIVE_AUTO m06456):
+//! Invariants:
 //! - one selection process: parallel flows wait for one channel preparation;
 //! - `last_good` first, erased only by that candidate's own failure;
 //! - after `Commit` there is no fallback — only closing on timeout;
@@ -16,8 +16,7 @@
 //!   the candidate for the rest of the session; exhausting them all — one `Exhausted`, stop.
 //!
 //! Layout: `types` holds the wire vocabulary (candidates, reasons, actions),
-//! this file the selection machine. Consumed by session in I08 — until then
-//! dead code for the bin build.
+//! this file the selection machine.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -113,8 +112,25 @@ struct FlowSel {
     skip: HashSet<Candidate>,
 }
 
-/// First ban duration; doubles per consecutive failure, capped (EPIC-016).
+/// First ban duration; doubles per consecutive failure, capped.
 const BAN_BACKOFF_START: Duration = Duration::from_secs(600);
+
+/// e2e hook: `SVPN_TEST_BAN_BACKOFF_SECS` shrinks the first ban (and, while
+/// set, pins every re-ban to the same value) so ban-expiry recovery fits
+/// test budgets. Unset in production; a malformed value keeps the default.
+/// Can only shorten bans, never lengthen them.
+fn ban_backoff_start() -> Duration {
+    ban_backoff_from(std::env::var("SVPN_TEST_BAN_BACKOFF_SECS").ok().as_deref())
+}
+
+/// Pure parse behind the e2e hook: tested directly in tests/selector_proactive.rs.
+pub fn ban_backoff_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(BAN_BACKOFF_START, |secs| {
+            BAN_BACKOFF_START.min(Duration::from_secs(secs))
+        })
+}
 /// Ban backoff never grows past this.
 const BAN_BACKOFF_CAP: Duration = Duration::from_secs(2 * 3600);
 
@@ -130,9 +146,12 @@ pub struct Selector {
     hold_down: HashMap<Candidate, Instant>,
     /// RAM hint for this SSH session; stores no keys/ports.
     pub last_good: Option<Candidate>,
+    /// Incumbent's p90 recorded at adoption (raw, no TCP penalty): the
+    /// degradation baseline — a health burst at ≥ 2× starts a challenge.
+    pub baseline_p90: Option<Duration>,
     /// Proactive-auto: a preparation failure bans the candidate for the session.
     proactive: bool,
-    /// Expiry of the current ban per candidate (EPIC-016): the candidate is
+    /// Expiry of the current ban per candidate: the candidate is
     /// eligible again after this moment.
     ban_until: HashMap<Candidate, Instant>,
     /// Next ban duration per candidate: doubles per failure, reset on success.
@@ -173,6 +192,7 @@ impl Selector {
             ban_backoff: HashMap::new(),
             ban_seq: 0,
             last_good: None,
+            baseline_p90: None,
             proactive,
             banned: Vec::new(),
             exhausted: false,
@@ -235,7 +255,13 @@ impl Selector {
     }
 
     /// Remember the round winner; TCP has no shared channel to adopt.
-    pub fn adopt(&mut self, candidate: Candidate, channel_id: Option<u64>) {
+    /// `baseline` is the winner's raw p90 — the degradation reference.
+    pub fn adopt(
+        &mut self,
+        candidate: Candidate,
+        channel_id: Option<u64>,
+        baseline: Option<Duration>,
+    ) {
         if let Some(id) = channel_id {
             self.channels.insert(candidate, ReadyChannel::new(id, true));
         }
@@ -244,8 +270,9 @@ impl Selector {
         }
         self.exhausted = false;
         self.last_good = Some(candidate);
+        self.baseline_p90 = baseline;
         self.hold_down.remove(&candidate);
-        // A proven candidate starts with a clean ban backoff (EPIC-016).
+        // A proven candidate starts with a clean ban backoff.
         self.ban_backoff.remove(&candidate);
         self.ban_until.remove(&candidate);
     }
@@ -530,7 +557,7 @@ impl Selector {
         self.channels.remove(&candidate);
         self.fail_candidate(candidate, reason, now);
         if self.proactive {
-            // Did not come up: banned until the backoff expires (EPIC-016).
+            // Did not come up: banned until the backoff expires.
             self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
                 return stop;
@@ -584,6 +611,7 @@ impl Selector {
         self.hold_down.insert(candidate, now + HOLD_DOWN);
         if self.last_good == Some(candidate) {
             self.last_good = None;
+            self.baseline_p90 = None;
         }
         if matches!(reason, Reason::Unsupported | Reason::EndpointUnavailable) {
             // Exclude the candidate for the rest of the session: it will not "cool down" into anything useful.
@@ -601,19 +629,32 @@ impl Selector {
         }
         if self.last_good == Some(candidate) {
             self.last_good = None;
+            self.baseline_p90 = None;
         }
         let base = self
             .ban_backoff
             .get(&candidate)
             .copied()
-            .unwrap_or(BAN_BACKOFF_START);
-        self.ban_backoff
-            .insert(candidate, (base * 2).min(BAN_BACKOFF_CAP));
+            .unwrap_or_else(ban_backoff_start);
+        // With the e2e hook active every re-ban stays pinned to it: the
+        // doubling would push ban-expiry recovery past any test budget.
+        let next = if ban_backoff_start() < BAN_BACKOFF_START {
+            ban_backoff_start()
+        } else {
+            (base * 2).min(BAN_BACKOFF_CAP)
+        };
+        self.ban_backoff.insert(candidate, next);
         // Deterministic jitter in ±20%: decorrelates fleet retries without a RNG.
         let pct = (self.ban_seq % 41) as i64 - 20;
         self.ban_seq = self.ban_seq.wrapping_add(1);
         let jittered = base.mul_f64(1.0 + pct as f64 / 100.0);
         self.ban_until.insert(candidate, now + jittered);
+    }
+
+    /// Re-ban a candidate from outside the selector's own action flow
+    /// (challenge failures re-ban with the doubled backoff).
+    pub fn ban_candidate(&mut self, candidate: Candidate, reason: Reason, now: Instant) {
+        self.ban(candidate, reason, now);
     }
 
     /// All candidates banned in proactive-auto: one `Exhausted` with the table.

@@ -1,6 +1,6 @@
 //! Wire vocabulary of the auto-selector: candidates, failure reasons, the
 //! actions session must perform, and admission rejections.
-//! String values match WIRE.md.
+//! String values are the wire protocol vocabulary.
 
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ pub const PENDING_FLOWS: usize = 64;
 /// Pre-active queue: total size of waiting packets.
 pub const PREACTIVE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Auto candidates in cold order (EPIC-005 §7).
+/// Auto candidates in cold order.
 pub const COLD_ORDER: [Candidate; 5] = [
     Candidate::Quic,
     Candidate::WebRtc,
@@ -30,7 +30,7 @@ pub const COLD_ORDER: [Candidate; 5] = [
     Candidate::Tcp,
 ];
 
-/// Strategy candidate. String values match WIRE.md.
+/// Strategy candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Candidate {
     Quic,
@@ -58,7 +58,7 @@ impl std::fmt::Display for Candidate {
     }
 }
 
-/// Failure reasons; strings match WIRE.md `reason`.
+/// Failure reasons (wire `reason` strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -122,7 +122,7 @@ pub enum Action {
     CloseFlow { flow_id: u64 },
     /// Proactive-auto: no candidates left — the session stops.
     Exhausted { reasons: Vec<(Candidate, Reason)> },
-    /// EPIC-016: the backoff ban expired; the candidate is eligible again.
+    /// the backoff ban expired; the candidate is eligible again.
     BanExpired { candidate: Candidate },
 }
 

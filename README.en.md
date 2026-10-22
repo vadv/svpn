@@ -24,8 +24,9 @@ UDP is blocked, like SSH over TCP.
   itself (1→2→4…→60 s). The VPN stops only when no server is left alive.
 - **Camouflage picked for your network.** `auto` tries transports from fast
   to survivable — QUIC → WebRTC → obfs → mosh → SSH/TCP — and sticks with the
-  first one that actually works. The transport does not change for the rest
-  of the session.
+  first one that actually works. The choice does not freeze: about every
+  10 minutes a background probe compares transports by latency and loss, and
+  a clearly faster one takes over new connections.
 
 ```text
 ┌─────────────────┐        ┌──────────┐
@@ -196,6 +197,13 @@ camouflage start simultaneously, the server is pinged through each, and the
 first responder wins. Start with auto. Pin a list only when you know your
 network: `mimic = ['quic', 'mosh']` in TOML or repeated `--mimic` on the CLI.
 
+Auto does not stick to the first winner. About every 10 minutes
+(`remeasure-interval`), and whenever the current channel degrades,
+alternatives are measured in the background. A candidate that beats the
+incumbent's p90 by at least 20% and 5 ms with no more than 1/10 loss, two
+measurements in a row, takes over new connections. Existing connections live
+out their lives on the old channel.
+
 | Value    | Looks like | Choose when |
 |----------|------------|-------------|
 | `quic`   | HTTP/3 (real QUIC/TLS 1.3, CONNECT-UDP) | everyday choice |
@@ -215,12 +223,6 @@ not moved to the new channel: TCP gets a RST and applications reconnect.
 
 Camouflage reproduces the protocol format on the wire but does not guarantee
 passing a particular filter — measure with `svpn perf`.
-
-The server counts per-transport failure causes in its heartbeat stats:
-udp-refused, tcp-refused, no-server-answer, address-taken, udp-garbage,
-tcp-garbage. Garbage means datagrams that passed the outer protocol but
-broke the inner framing — the signature of a content filter mangling
-packets. Stats lines appear in the client log every stats-interval.
 
 ## Server firewall without hooks
 

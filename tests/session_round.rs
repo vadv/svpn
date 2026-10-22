@@ -387,7 +387,7 @@ async fn tcp_round_winner_is_first_for_new_user_flows() {
         .round_attempt_failed(attempt, Reason::PathTimeout)
         .await
         .unwrap();
-    session.round_won(None).await.unwrap();
+    session.round_won(None, None).await.unwrap();
     assert!(
         session
             .announce_ready(Some(tokio::time::Instant::now()), None)
@@ -432,7 +432,7 @@ async fn late_round_failure_cannot_restart_a_successful_tcp_round() {
         .round_attempt_failed(attempt, Reason::PathTimeout)
         .await
         .unwrap();
-    session.round_won(None).await.unwrap();
+    session.round_won(None, None).await.unwrap();
     session
         .channel_failed(Some(attempt), None, Reason::PathTimeout)
         .await
@@ -662,7 +662,7 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
             tcp: true,
             ..Allowed::default()
         });
-        selector.adopt(Candidate::Mosh, Some(10));
+        selector.adopt(Candidate::Mosh, Some(10), None);
         selector.request(1, key, &bytes, StdInstant::now()).unwrap();
         selector.bind_succeeded(1, StdInstant::now());
         selector.committed(1);
@@ -710,7 +710,7 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
                 .unwrap();
             assert!(events.try_recv().is_err());
         }
-        session.round_won(None).await.unwrap();
+        session.round_won(None, None).await.unwrap();
         assert_eq!(session.readiness, Some(Readiness::Verified(None)));
         assert_eq!(session.has_flow(1), !transport_failed);
         let Plane::Channels(plane) = &session.plane else {

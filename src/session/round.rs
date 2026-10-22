@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -39,7 +39,7 @@ const ESTABLISHED_RTTS: u32 = 6;
 /// TCP counts as this much slower in the verdict. A TCP tunnel stalls on
 /// packet loss in a way one echo cannot show, so UDP wins unless TCP is
 /// faster by more than this.
-const TCP_PENALTY: Duration = Duration::from_millis(50);
+pub(crate) const TCP_PENALTY: Duration = Duration::from_millis(50);
 /// A datagram request can vanish anywhere (driver burst drops, UDP loss):
 /// re-send until the verdict or the round deadline; replies are idempotent.
 pub(crate) const ROUND_RESEND: Duration = Duration::from_secs(2);
@@ -109,6 +109,9 @@ impl Session {
 
     /// Arm a fresh TUN round for every allowed candidate, including fixed TCP.
     pub async fn arm_round(&mut self) -> Result<()> {
+        // A fresh round kills the old world; a background challenge in
+        // flight belongs to it and dies here.
+        self.abort_challenge().await?;
         let actions = match &mut self.plane {
             Plane::Channels(plane) => plane
                 .selector
@@ -173,6 +176,8 @@ impl Session {
             }
         }
         self.readiness = Some(Readiness::Probing);
+        // A fresh round replaces the world: any pending switch dies with it.
+        self.switch_pending = None;
         self.round = Some(Round {
             id,
             seq,
@@ -688,11 +693,16 @@ impl Session {
             candidate.as_str(),
             if silent.is_empty() { "none" } else { &silent },
         );
-        self.round_won(channel).await
+        self.round_won(channel, Some(rtt)).await
     }
 
     /// The first matching echo wins; retire only this round's losers.
-    pub async fn round_won(&mut self, channel: Option<u64>) -> Result<()> {
+    /// `baseline` is the winner's raw RTT — the degradation reference.
+    pub async fn round_won(
+        &mut self,
+        channel: Option<u64>,
+        baseline: Option<Duration>,
+    ) -> Result<()> {
         let Some(round) = self.round.take() else {
             return Ok(());
         };
@@ -731,7 +741,7 @@ impl Session {
                 None => Candidate::Tcp,
             };
             if let Some(selector) = plane.selector.as_mut() {
-                selector.adopt(candidate, channel);
+                selector.adopt(candidate, channel, baseline);
             }
             candidate
         } else {
@@ -803,10 +813,19 @@ impl Session {
         }
         permit.send((io.epoch, link_io::Event::Ready));
         self.readiness = Some(Readiness::Ready);
-        // EPIC-016: health bursts start once the link is Ready.
+        // health bursts start once the link is Ready; the first
+        // challenger round may run one remeasure interval later.
         self.health_at = self
             .client()
             .then_some(now + crate::session::burst::HEALTH_INTERVAL);
+        self.next_challenge_at = if self.client() {
+            self.remeasure.map(|interval| {
+                StdInstant::now()
+                    + crate::session::challenge::jittered(interval, self.next_round_attempt)
+            })
+        } else {
+            None
+        };
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {

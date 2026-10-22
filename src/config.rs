@@ -41,6 +41,7 @@ struct FileConfig {
     #[serde(default, deserialize_with = "port_range")]
     udp_port_range: Option<(u16, u16)>,
     mimic: Option<Vec<MimicArg>>,
+    remeasure_interval: Option<u32>,
     tcp_port: Option<u16>,
     stats_interval: Option<u32>,
     up_script: Option<PathBuf>,
@@ -148,6 +149,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         log_level: file.log_level.unwrap_or(logging::Level::Info),
         udp_port_range: file.udp_port_range.unwrap_or((60000, 60009)),
         mimic: file.mimic.unwrap_or_default(),
+        remeasure_interval: file.remeasure_interval,
         tcp_port: file.tcp_port,
         server_up: file.server_up,
         server_down: file.server_down,

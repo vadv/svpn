@@ -1,6 +1,6 @@
-//! VPN session v2 (EPIC-005 I08). Data plane — shared UDP channels
-//! (mosh/webrtc/quic/obfs) driven by the candidate selector; the EPIC-003
-//! TCP mode is kept unchanged (`TransportConfig::Tcp`).
+//! VPN session v2. Data plane — shared UDP channels
+//! (mosh/webrtc/quic/obfs) driven by the candidate selector; the TCP
+//! fallback mode is kept unchanged (`TransportConfig::Tcp`).
 //!
 //! One channel per strategy: the server opens the strategy socket on
 //! `channel_prepare`, the client connects and verifies the channel with
@@ -13,10 +13,10 @@
 //! Layout: `state` holds the planes and flow records, `pump` the channel
 //! task, `round` the N3 liveness rounds, `control` the control dispatch and
 //! channel handshake, `flow` the flow lifecycle, `event` task events and
-//! selector actions, `tun` the packet path, `tcp` the EPIC-003 mode.
+//! selector actions, `tun` the packet path, `tcp` the TCP fallback mode.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::Ipv4Addr,
     time::{Duration, Instant as StdInstant},
 };
@@ -32,6 +32,7 @@ use crate::udp::Incoming;
 use crate::{channel, quic};
 
 pub mod burst;
+pub mod challenge;
 mod control;
 mod event;
 mod flow;
@@ -65,7 +66,7 @@ pub const FIN_DWELL: Duration = Duration::from_secs(15);
 /// Per-channel outgoing IP-packet queue and binding wait.
 pub const CHANNEL_QUEUE: usize = 1024;
 /// How long a lost link's tuples stay refused before normal admission
-/// resumes: a new-ISN SYN then becomes a new flow (EPIC-010 §5.3).
+/// resumes: a new-ISN SYN then becomes a new flow.
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(30);
 /// Maximum remembered tombstones; the oldest entry is evicted on overflow.
 pub const TOMBSTONE_CAP: usize = 4096;
@@ -94,7 +95,7 @@ pub struct Session {
         mpsc::Sender<crate::tcp::Event>,
         mpsc::Receiver<crate::tcp::Event>,
     ),
-    /// Retired flows of lost links (EPIC-010 §5.3).
+    /// Retired flows of lost links.
     pub tombstones: Tombstones,
     /// N3 liveness round; None once the link is Ready.
     pub round: Option<Round>,
@@ -103,10 +104,19 @@ pub struct Session {
     pub stats: Stats,
     /// Precomputed `drop[host]:` prefix — every loss logs its reason (#124).
     pub drop_prefix: String,
-    /// EPIC-016: next health burst at; armed on Ready, re-armed per burst.
+    /// next health burst at; armed on Ready, re-armed per burst.
     pub health_at: Option<tokio::time::Instant>,
-    /// EPIC-016: in-flight probe burst over the live channel.
+    /// in-flight probe burst over the live channel.
     pub burst: Option<burst::Burst>,
+    pub challenge: Option<challenge::Challenge>,
+    /// first-round winner awaiting the confirming round
+    /// (candidate, first win at). Reset by any round without that winner.
+    pub switch_pending: Option<(Candidate, StdInstant)>,
+    /// remeasure cadence for challenger rounds; None disables
+    /// re-selection (fixed strategy or `remeasure-interval = 0`).
+    pub remeasure: Option<Duration>,
+    /// Next instant a challenge may start; armed on Ready and per challenge.
+    pub next_challenge_at: Option<StdInstant>,
 }
 
 impl Session {
@@ -240,7 +250,7 @@ impl Session {
                         self.poll_round(tokio::time::Instant::now()).await?;
                     }
                     _ = tokio::time::sleep_until(health_wake.unwrap_or(deadline)), if health_wake.is_some() => {
-                        // Health burst due or in flight (EPIC-016).
+                        // Health burst due or in flight.
                         self.poll_burst(tokio::time::Instant::now()).await?;
                     }
                     _ = tick.tick() => {
@@ -294,7 +304,7 @@ impl Session {
                 Ok(true) => startup_deadline = None,
                 Ok(false) => {}
                 Err(error) => {
-                    // Link loss (EPIC-010 §5.3): reset the link's client TCP
+                    // Link loss: reset the link's client TCP
                     // flows toward the client kernel before the error unwinds.
                     self.emit_retired_resets();
                     return Err(error);
@@ -384,6 +394,7 @@ async fn run_io(
     config: TransportConfig,
 ) -> Result<()> {
     let mut server_listener: Option<tokio::net::TcpListener> = None;
+    let mut remeasure_interval = None;
     let plane = match config {
         TransportConfig::Client {
             strategies,
@@ -391,7 +402,14 @@ async fn run_io(
             pin,
             tcp,
             tcp_camouflage,
+            remeasure,
         } => {
+            remeasure_interval = remeasure;
+            // re-selection exists only when the selector may move.
+            ensure!(
+                strategies.is_empty() || remeasure.is_none(),
+                "--remeasure-interval requires auto mode (no --mimic)"
+            );
             let mut allowed = Allowed::default();
             let offer: Vec<Strategy> = endpoints.iter().map(|e| e.strategy).collect();
             let wanted: &[Strategy] = if strategies.is_empty() {
@@ -424,7 +442,7 @@ async fn run_io(
                 "no available strategy: server offered {offer:?}, client allows {strategies:?}"
             );
             // auto (empty strategies) runs proactively: a candidate failure
-            // bans it for the rest of the session; exhaustion stops the client (m06456).
+            // bans it for the rest of the session; exhaustion stops the client.
             let selector = if strategies.is_empty() {
                 Selector::new_proactive(allowed)
             } else {
@@ -442,6 +460,7 @@ async fn run_io(
                 bind: Ipv4Addr::UNSPECIFIED,
                 quic: None,
                 channels: HashMap::new(),
+                draining: HashSet::new(),
                 next_channel_id: 0,
                 attempt: None,
                 flows: HashMap::new(),
@@ -469,6 +488,7 @@ async fn run_io(
                 bind,
                 quic,
                 channels: HashMap::new(),
+                draining: HashSet::new(),
                 next_channel_id: 0,
                 attempt: None,
                 flows: HashMap::new(),
@@ -521,6 +541,10 @@ async fn run_io(
         next_round_attempt: u64::MAX / 2,
         health_at: None,
         burst: None,
+        challenge: None,
+        switch_pending: None,
+        remeasure: remeasure_interval,
+        next_challenge_at: None,
         drop_prefix,
     }
     .event_loop()

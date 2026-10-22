@@ -16,6 +16,7 @@ import integration
 import matrix
 import suite_bootstrap
 import suite_pool
+import suite_reselect
 import suite_tcp_auto
 import suite_udp
 from test_artifacts import check
@@ -35,6 +36,9 @@ test_readiness_requires_kernel_reply test_checking_recovers_without_ssh_restart
 test_checking_preserves_active_tcp_flows test_perf
 test_auto_assignment_and_restart test_auto_two_clients_one_server test_auto_explicit_pair_lock
 test_auto_pool_shared_pair
+""".split()
+RESELECT_BASELINE = """
+test_udp_reselect_after_ban_expiry test_degraded_incumbent_switches_and_drains
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -67,11 +71,12 @@ def integration_groups():
         "lifecycle-pool": suite_pool,
         "udp": suite_udp,
         "tcp-auto": suite_tcp_auto,
+        "reselect": suite_reselect,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    assert [by_fn[test][1] for test in tests] == BASELINE, "must preserve the original runner order"
+    assert [by_fn[test][1] for test in tests] == BASELINE + RESELECT_BASELINE, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
     assert len(tests) == len(set(tests)) == len(by_fn), "a test is assigned twice or dropped"
     for group, suite in suites.items():
@@ -87,6 +92,7 @@ def integration_groups():
         "lifecycle-pool": 18,
         "udp": 5,
         "tcp-auto": 10,
+        "reselect": 2,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -104,7 +110,7 @@ def integration_groups():
             ):
                 integration.main()
             assert called == expected, (group, args)
-    print("PASS integration: 45 cases assigned once, CLI/env selection and original order")
+    print("PASS integration: 46 cases assigned once, CLI/env selection and original order")
 
 
 def matrix_groups():

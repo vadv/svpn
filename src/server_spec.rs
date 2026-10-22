@@ -56,6 +56,10 @@ pub struct Globals {
     /// exactly one camouflage, here or in --server mimic=VALUE.
     #[arg(long, value_enum)]
     pub mimic: Vec<MimicArg>,
+    /// Re-measure interval in seconds for background re-selection (auto mode
+    /// only); 0 disables re-selection. Unset — 600.
+    #[arg(long, value_name = "SECONDS")]
+    pub remeasure_interval: Option<u32>,
     /// Server TCP fallback port; 0 — ephemeral (default in auto).
     #[arg(long)]
     pub tcp_port: Option<u16>,
@@ -110,6 +114,8 @@ pub struct LinkParams {
     pub log_level: logging::Level,
     pub udp_port_range: (u16, u16),
     pub mimic: Vec<MimicArg>,
+    /// Re-selection cadence; 0/None disables it. Auto mode only.
+    pub remeasure_interval: Option<u32>,
     pub tcp_port: Option<u16>,
     pub tun_addr: Ipv4Addr,
     pub peer_addr: Ipv4Addr,
@@ -234,6 +240,7 @@ impl ServerSpec {
             log_level: globals.log_level,
             udp_port_range: self.udp_port_range.unwrap_or(globals.udp_port_range),
             mimic: self.mimic.as_ref().unwrap_or(&globals.mimic).clone(),
+            remeasure_interval: globals.remeasure_interval,
             tcp_port: self.tcp_port.or(globals.tcp_port),
             tun_addr,
             peer_addr,

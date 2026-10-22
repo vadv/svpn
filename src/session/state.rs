@@ -2,7 +2,7 @@
 //! tombstone table of retired flows.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::Ipv4Addr,
     time::{Duration, Instant as StdInstant},
 };
@@ -122,6 +122,8 @@ pub enum TransportConfig {
         tcp: Option<u16>,
         /// TCP fallback camouflage agreed with the server; None when TCP is off.
         tcp_camouflage: Option<Camouflage>,
+        /// Re-selection cadence; None keeps the first winner (auto only).
+        remeasure: Option<std::time::Duration>,
     },
     /// UDP-channel server: public port of each strategy, bind address
     /// and the shared QUIC endpoint with certificate pin.
@@ -132,7 +134,7 @@ pub enum TransportConfig {
         /// TCP candidate: listener and actual port.
         tcp: Option<(tokio::net::TcpListener, u16)>,
     },
-    /// EPIC-003 TCP mode: per-flow connections; the server passes its bound
+    /// TCP mode: per-flow connections; the server passes its bound
     /// listener so Endpoints/Opened carry the actual (possibly ephemeral) port.
     Tcp {
         mode: crate::tcp::Mode,
@@ -179,7 +181,7 @@ pub struct Flow {
     /// Server saw FIN from the target: close the flow if no data for 15s
     /// (half-close keeps sending data and resets the timer).
     pub fin_dwell: Option<tokio::time::Instant>,
-    /// Newest client ACK (TCP flows): seeds the link-loss reset (§5.3).
+    /// Newest client ACK (TCP flows): seeds the link-loss reset.
     pub last_ack: Option<u32>,
     /// Last packet time (idle timeout) and creation time (budget).
     pub last_seen: tokio::time::Instant,
@@ -221,6 +223,9 @@ pub struct ChannelsPlane {
     pub bind: Ipv4Addr,
     pub quic: Option<(quinn::Endpoint, [u8; 32])>,
     pub channels: HashMap<u64, ChannelHandle>,
+    /// Channels of a replaced incumbent: no new flows, not
+    /// probed; torn down once the last bound flow closes.
+    pub draining: HashSet<u64>,
     pub prepared: HashMap<u64, u64>,
     pub next_channel_id: u64,
     /// Client: preparation in flight (attempt, candidate, channel, webrtc peer).
@@ -272,7 +277,7 @@ impl ChannelsPlane {
     }
 }
 
-/// EPIC-003 TCP mode: per-flow connections with binding tokens.
+/// TCP mode: per-flow connections with binding tokens.
 pub struct TcpFlow {
     pub key: FlowKey,
     pub active: bool,
@@ -284,7 +289,7 @@ pub struct TcpFlow {
     pub tcp_receiver: Option<mpsc::Receiver<Vec<u8>>>,
     pub task: Option<tokio::task::JoinHandle<()>>,
     pub fin_dwell: Option<tokio::time::Instant>,
-    /// Newest client ACK: seeds the link-loss reset (§5.3).
+    /// Newest client ACK: seeds the link-loss reset.
     pub last_ack: Option<u32>,
     pub last_seen: tokio::time::Instant,
     pub created: tokio::time::Instant,

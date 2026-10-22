@@ -1,5 +1,5 @@
 //! TCP-mode framing: layers L0/L1 (`[u32 BE len][payload]`, optional banner)
-//! and L2 `Ssh` — the appearance of a plausible SSH session (EPIC-003 T06).
+//! and L2 `Ssh` — the appearance of a plausible SSH session.
 //! The payload is a UDP-mode cipher packet (`crypto::Cipher::seal`);
 //! the binding frame carries the token before the first packet.
 
@@ -13,19 +13,19 @@ use crate::crypto::Cipher;
 /// Maximum frame payload: token 16 + seq 8 + packet ≤1401 + tag 16.
 pub const MAX_PAYLOAD: usize = 16 + 8 + crate::crypto::MAX_PLAINTEXT + 16;
 pub const TOKEN_BYTES: usize = 16;
-/// Banner for layers L1/L2: a current OpenSSH version, family pattern (T02).
+/// Banner for layers L1/L2: a current OpenSSH version, family pattern.
 const BANNER: &[u8] = b"SSH-2.0-OpenSSH_9.9p2\r\n";
 const MAX_BANNER: usize = 255 + 2;
 
-// ==== L2: Camouflage::Ssh (EPIC-003 T06; requirements — the "Research T02" section) ====
+// ==== L2: Camouflage::Ssh ====
 // Appearance for the observer, not compatibility: a real SSH peer will not
 // accept our kex. Before NEWKEYS the frames are plaintext BPP (RFC 4253),
 // after — opaque blocks with no visible lengths, like OpenSSH AEAD ciphers
-// (T02 §4). Each side's flow:
+// Each side's flow:
 //   server: banner, KEXINIT | kex-reply(31), NEWKEYS, auth frames, data
 //   client: banner, KEXINIT | binding(30),   NEWKEYS, auth frames, data
 
-/// KEXINIT algorithm lists shared by both sides: the negotiation stays non-empty (T02 §2).
+/// KEXINIT algorithm lists shared by both sides: the negotiation stays non-empty.
 pub const KEX_LISTS: [&str; 10] = [
     "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256",
     "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
@@ -331,7 +331,7 @@ pub fn kexinit(cookie_seed: u8) -> Vec<u8> {
     bpp(&payload)
 }
 
-/// Kex-reply (msg 31) of plausible size: Q_S 32 B + signature 64 B (T02 §3).
+/// Kex-reply (msg 31) of plausible size: Q_S 32 B + signature 64 B.
 pub fn kex_reply() -> Vec<u8> {
     let mut payload = vec![31, 0, 0, 0, 32];
     payload.extend(noise(32, 41));
@@ -344,7 +344,7 @@ pub fn newkeys() -> Vec<u8> {
     bpp(&[21])
 }
 
-/// Small opaque frames after NEWKEYS — the auth exchange appearance (T02 §5):
+/// Small opaque frames after NEWKEYS — the auth exchange appearance:
 /// the server's lengths 60 and 44 preserve the relation `len + 16 == service_accept_size`
 /// by which Zeek detects USERAUTH_SUCCESS; the blocks cannot be parsed.
 pub fn auth_frames(large_seed: u8, small_seed: u8, large: usize) -> Vec<u8> {
@@ -353,7 +353,7 @@ pub fn auth_frames(large_seed: u8, small_seed: u8, large: usize) -> Vec<u8> {
     bytes
 }
 
-/// Server flow on accept: banner + KEXINIT (T02 §1–2).
+/// Server flow on accept: banner + KEXINIT.
 pub fn ssh_server_hello() -> Vec<u8> {
     let mut bytes = BANNER.to_vec();
     bytes.extend(kexinit(SERVER_COOKIE_SEED));
@@ -394,7 +394,7 @@ pub fn ssh_binding_frame(token: &[u8; TOKEN_BYTES], sealed: &[u8]) -> Result<Vec
     Ok(bpp(&payload))
 }
 
-/// L2 data frame — AEAD appearance (T02 §4): [seal(u32 block length)][sealed
+/// L2 data frame — AEAD appearance: [seal(u32 block length)][sealed
 /// packet]. Fixed-size header; the receiver opens it with the same flow
 /// cipher; no new crypto primitives.
 pub fn ssh_frame(cipher: &mut Cipher, payload: &[u8]) -> Result<Vec<u8>> {
@@ -406,7 +406,7 @@ pub fn ssh_frame(cipher: &mut Cipher, payload: &[u8]) -> Result<Vec<u8>> {
 
 /// Deterministic pseudonoise: cookie, padding, and kex/auth appearance bytes.
 /// shortcut: appearance bytes repeat from session to session — an observer with
-/// session history will notice the match; randomize if the T07 field check catches it.
+/// session history will notice the match; randomize when a detector catches it.
 fn noise(len: usize, seed: u8) -> Vec<u8> {
     let mut state = u16::from(seed);
     (0..len)

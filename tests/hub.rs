@@ -31,6 +31,7 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
         log_level: svpn::logging::Level::Info,
         udp_port_range: (0, 0),
         mimic: Vec::new(),
+        remeasure_interval: None,
         tcp_port: None,
         tun_addr: Ipv4Addr::new(10, 77, 0, 2),
         peer_addr: Ipv4Addr::new(10, 77, 0, 1),

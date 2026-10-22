@@ -1,6 +1,6 @@
-//! UDP wire-shape profiles (EPIC-005 I03/I04): the wire representation of
+//! UDP wire-shape profiles: the wire representation of
 //! the channel sealed record `[seq 8][ct][tag 16]`. Orchestration and
-//! strategy selection belong to session (I07+).
+//! strategy selection belong to session.
 //!
 //! `Plain` — diagnostic U-L0: the record equals the UDP payload.
 //! `Mosh` — mosh-like prefix: u64 little-endian (seq + direction bit in the
@@ -13,7 +13,6 @@
 //! length field (a detectable structure) or brute-forcing the sealed
 //! boundary; smearing lengths by ±15 B achieves the same goal without
 //! structure.
-//! Consumed by session in I07/I08 — dead code for the bin build until then.
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, ensure};

@@ -74,7 +74,7 @@ fn replay_window_accepts_reordering_not_duplicates_or_old_packets() {
 
 #[test]
 fn replay_window_boundary_is_4096() {
-    // Age 4095 is still allowed, 4096 is not (docs/WIRE.md §4).
+    // Age 4095 is still allowed, 4096 is not.
     let mut client = Cipher::new_channel([7; 16], 1, true);
     let packets: Vec<_> = (0..=4096)
         .map(|_| client.seal(b"packet").unwrap())

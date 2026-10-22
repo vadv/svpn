@@ -1,9 +1,8 @@
-//! UDP channel establishment (EPIC-005 I08): protected challenge/response
+//! UDP channel establishment: protected challenge/response
 //! A → echo-A+B → echo-B and a size probe up to the wire cap inside the
-//! AEAD channel (WIRE.md §3, §6). Each call verifies only a data-plane fact
+//! AEAD channel. Each call verifies only a data-plane fact
 //! it checked itself; peer reports travel as session control messages.
 //! `flow_id=0` is reserved: channel service records.
-//! Consumed by session in I10; dead code for the bin build until then.
 #![allow(dead_code)]
 
 use anyhow::{Result, bail, ensure};

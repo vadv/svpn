@@ -35,7 +35,7 @@ pub enum Event {
     /// Confirmed data-path loss with the control channel still alive.
     Checking,
     /// A liveness round finished with every candidate failing; the server
-    /// stays in Checking and retries after backoff (docs/SERVER-LIVENESS.md).
+    /// stays in Checking and retries after backoff.
     RoundFailed,
     Packet(Packet),
     Closed {

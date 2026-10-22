@@ -102,7 +102,7 @@ impl Session {
             return Ok(());
         };
         let is_client = self.client();
-        // A retired flow never re-enters admission (EPIC-010 §5.3): answer
+        // A retired flow never re-enters admission: answer
         // as a CLOSED endpoint, rate-limited; a client RST is just dropped.
         // Device sessions never tombstone, so there is no local write path.
         if is_client && self.tombstones.active(&packet.flow, StdInstant::now()) {
@@ -128,7 +128,7 @@ impl Session {
                 .count_drop(&self.drop_prefix, "flow closed (tombstone)");
             return Ok(());
         }
-        // Newest client ACK per TCP flow seeds the link-loss reset (§5.3).
+        // Newest client ACK per TCP flow seeds the link-loss reset.
         if is_client
             && let Some(ack) = packet
                 .tcp
@@ -470,6 +470,24 @@ impl Session {
                 && burst.finished(now)
             {
                 self.finish_burst(now).await?;
+            } else {
+                // A challenge burst owns this probe flow: record the echo and
+                // collect the burst right here when it completed.
+                let finished = if let Some(challenge) = self.challenge.as_mut()
+                    && let Some(challenger) = challenge.attempts.get_mut(&incoming.id)
+                    && let Some(burst) = challenger.burst.as_mut()
+                    && incoming.channel == Some(burst.channel)
+                    && let Some(seq) =
+                        packet::icmp_echo_reply_seq(&incoming.packet, burst.icmp_id, &burst.payload)
+                {
+                    burst.record_echo(seq, now);
+                    burst.finished(now)
+                } else {
+                    false
+                };
+                if finished {
+                    self.finish_probe(incoming.id).await?;
+                }
             }
             return Ok(());
         }

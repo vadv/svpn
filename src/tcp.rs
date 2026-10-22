@@ -1,4 +1,4 @@
-//! TCP flow transport (EPIC-003): one listening port per session, every
+//! TCP flow transport: one listening port per session, every
 //! connection is initiated by the client. The binding token correlates a
 //! connection with a flow, then `framing` frames (including the Ssh layer)
 //! carry packets sealed by `Cipher::seal`.
@@ -19,7 +19,7 @@ use crate::udp::Incoming;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 4096;
-/// Periodic small L2 frame while the flow is idle (T02, requirement 6).
+/// Periodic small L2 frame while the flow is idle.
 const SSH_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// TCP mode configuration of the session (one port for all flows).
@@ -269,7 +269,7 @@ pub async fn pump(
                 write_frame(&mut write_half, cipher, camouflage, &packet).await?;
             }
             _ = tokio::time::sleep(SSH_KEEPALIVE), if matches!(camouflage, Camouflage::Ssh) => {
-                // Small frame while idle (T02 §6); empty payload is a keepalive.
+                // Small frame while idle; empty payload is a keepalive.
                 write_frame(&mut write_half, cipher, camouflage, &[]).await?;
             }
             read = read_half.read(&mut chunk) => {

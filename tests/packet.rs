@@ -418,7 +418,7 @@ fn segment_meta(bytes: &[u8]) -> (u8, u32, u32) {
     )
 }
 
-// ── burst echo matching (EPIC-016) ──
+// ── burst echo matching ──
 
 #[test]
 fn echo_reply_seq_matches_id_and_payload_without_seq() {

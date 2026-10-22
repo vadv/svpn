@@ -26,6 +26,15 @@ impl Session {
                 io,
             } => match io {
                 Some(io) => {
+                    // QUIC: the handshake ran in a detached task, so the
+                    // challenge binding skipped `channel_ready` — bind now.
+                    if self
+                        .challenge
+                        .as_ref()
+                        .is_some_and(|challenge| challenge.owns(attempt))
+                    {
+                        self.challenge_channel_bound(attempt, channel)?;
+                    }
                     self.finish_channel_ready(attempt, channel, candidate, io, key, max_wire)
                         .await?
                 }
@@ -78,13 +87,25 @@ impl Session {
                     .await?;
                 // N3: a round winner binds the PREFLIGHT flow to the channel
                 // directly; the selector learns it through `adopt` at the verdict.
-                let probe_id = self.round.as_ref().and_then(|round| {
-                    round
-                        .pending
-                        .iter()
-                        .find(|(_, rc)| rc.channel == Some(channel))
-                        .map(|(&id, _)| id)
-                });
+                let probe_id = self
+                    .round
+                    .as_ref()
+                    .and_then(|round| {
+                        round
+                            .pending
+                            .iter()
+                            .find(|(_, rc)| rc.channel == Some(channel))
+                            .map(|(&id, _)| id)
+                    })
+                    .or_else(|| {
+                        self.challenge.as_ref().and_then(|challenge| {
+                            challenge
+                                .attempts
+                                .iter()
+                                .find(|(_, challenger)| challenger.channel == Some(channel))
+                                .map(|(&id, _)| id)
+                        })
+                    });
                 if let Some(flow_id) = probe_id {
                     let Plane::Channels(plane) = &self.plane else {
                         unreachable!()
@@ -304,9 +325,10 @@ impl Session {
                         prefixed(self.tag(), "channel"),
                         format!("{:?}", candidate_strategy(candidate)).to_lowercase()
                     );
+                    self.maybe_start_challenge(false).await?;
                 }
                 Action::Exhausted { reasons } => {
-                    // Proactive-auto: nothing could be raised — bail out (m06456).
+                    // Proactive-auto: nothing could be raised — bail out.
                     let table = reasons
                         .iter()
                         .map(|(candidate, reason)| {
