@@ -386,6 +386,7 @@ pub(crate) async fn open_link(
     }
     // Ready to exchange transport probes, not to route user IP packets yet.
     control.send(Message::TunReady).await?;
+    let auto_mode = plan.strategies.is_empty();
     let config = match tcp {
         Some(mode) => session::TransportConfig::Tcp {
             mode,
@@ -398,9 +399,14 @@ pub(crate) async fn open_link(
             // Without TCP camouflage the server will not send a tcp candidate.
             tcp: if plan.tcp.is_some() { server_tcp } else { None },
             tcp_camouflage: plan.tcp.as_ref().map(|(_, camouflage)| *camouflage),
-            remeasure: match params.remeasure_interval.unwrap_or(600) {
-                0 => None,
-                seconds => Some(std::time::Duration::from_secs(seconds.into())),
+            remeasure: match params.remeasure_interval {
+                // The default cadence applies in auto mode only; a fixed
+                // strategy passes the explicit value through so session
+                // startup can reject the invalid combination.
+                None if auto_mode => Some(std::time::Duration::from_secs(600)),
+                None => None,
+                Some(0) => None,
+                Some(seconds) => Some(std::time::Duration::from_secs(seconds.into())),
             },
         },
     };
