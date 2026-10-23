@@ -64,6 +64,47 @@ fn default_single_and_multi_have_separate_cardinality_and_weight_rules() {
     }
 }
 
+#[test]
+fn sticky_asn_is_multi_only() {
+    for args in [
+        vec![
+            "--server",
+            "203.0.113.1",
+            "--exit-policy",
+            "sticky-asn",
+            "--geo-db",
+            "asn.csv",
+        ],
+        vec![
+            "client",
+            "--server",
+            "203.0.113.1",
+            "--exit-policy",
+            "sticky-asn",
+            "--geo-db",
+            "asn.csv",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(["svpn"].into_iter().chain(args)).is_err(),
+            "single mode must reject sticky-asn"
+        );
+    }
+    // Multi accepts the flags; the geo-db requirement is enforced at runtime.
+    let multi = client(&[
+        "multi",
+        "--server",
+        "203.0.113.1",
+        "--server",
+        "203.0.113.2",
+        "--exit-policy",
+        "sticky-asn",
+        "--geo-db",
+        "asn.csv",
+    ]);
+    assert_eq!(multi.exit_policy, ExitPolicy::StickyAsn);
+}
+
 // ── config exclusivity ──
 
 #[test]

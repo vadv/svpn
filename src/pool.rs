@@ -68,6 +68,28 @@ impl Pool {
             .count()
     }
 
+    /// The live epoch of a Ready link, for sticky exit selection.
+    pub fn ready_epoch(&self, link: usize) -> Option<Epoch> {
+        let slot = self.slots.get(link)?;
+        (slot.state == State::Ready).then_some(slot.epoch)
+    }
+
+    /// The link has never been Ready in this run: a saved owner still in its
+    /// startup grace window.
+    pub fn is_connecting(&self, link: usize) -> bool {
+        self.slots
+            .get(link)
+            .is_some_and(|s| s.state == State::Connecting)
+    }
+
+    /// The link is mid health-check: live flows continue, owner groups wait
+    /// for the verdict instead of migrating.
+    pub fn link_checking(&self, link: usize) -> bool {
+        self.slots
+            .get(link)
+            .is_some_and(|s| s.state == State::Checking)
+    }
+
     pub fn checking_count(&self) -> usize {
         self.slots
             .iter()

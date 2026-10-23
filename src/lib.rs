@@ -18,7 +18,9 @@ pub mod config;
 pub mod control;
 pub mod crypto;
 pub mod drivers;
+pub mod exit_state;
 pub mod framing;
+pub mod geo;
 pub mod hooks;
 pub mod hub;
 pub mod limits;
@@ -121,6 +123,41 @@ pub fn main_entry() -> ExitCode {
     }
 }
 
+fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_state::ExitState>)> {
+    match (args.exit_policy, &args.geo_db) {
+        (cli::ExitPolicy::Balance, None) => Ok((None, None)),
+        (cli::ExitPolicy::Balance, Some(_)) => {
+            crate::warn!("geo-db set without exit-policy sticky-asn — ignoring");
+            Ok((None, None))
+        }
+        (cli::ExitPolicy::StickyAsn, None) => {
+            anyhow::bail!("exit-policy sticky-asn requires geo-db")
+        }
+        (cli::ExitPolicy::StickyAsn, Some(path)) => match geo::Geo::load(path) {
+            Ok(geo) => {
+                crate::info!(
+                    "geo database {}: {} IPv4 ranges",
+                    path.display(),
+                    geo.rows()
+                );
+                let state_path = args
+                    .exit_state
+                    .clone()
+                    .unwrap_or_else(|| path.with_extension("state.json"));
+                Ok((
+                    Some(geo),
+                    Some(exit_state::ExitState::load(Some(state_path))),
+                ))
+            }
+            // Graceful degradation: a missing/broken database must not stop the VPN.
+            Err(error) => {
+                crate::error!("{error:#} — falling back to balance");
+                Ok((None, None))
+            }
+        },
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Mode::Serve {
@@ -153,6 +190,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Mode::Client(args) => {
+            let (geo, exit_state) = load_geo(&args)?;
             let hooks = args.hooks.resolve()?;
             let servers = resolve_servers(&args.server, &args.globals)?;
             let mut interrupt =
@@ -162,7 +200,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("install SIGTERM handler")?;
             let (stop, shutdown) = tokio::sync::watch::channel(false);
-            let client = hub::run(servers, None, args.stats_interval, hooks, shutdown);
+            let client = hub::run(
+                servers,
+                None,
+                args.stats_interval,
+                hooks,
+                shutdown,
+                geo,
+                exit_state,
+            );
             tokio::pin!(client);
             tokio::select! {
                 result = &mut client => result,
@@ -213,7 +259,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, None, None) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),

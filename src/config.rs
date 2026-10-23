@@ -44,6 +44,9 @@ struct FileConfig {
     remeasure_interval: Option<u32>,
     tcp_port: Option<u16>,
     stats_interval: Option<u32>,
+    exit_policy: Option<crate::cli::ExitPolicy>,
+    geo_db: Option<PathBuf>,
+    exit_state: Option<PathBuf>,
     up_script: Option<PathBuf>,
     down_script: Option<PathBuf>,
     up_command: Option<String>,
@@ -198,6 +201,9 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         server: servers,
         globals,
         stats_interval: file.stats_interval.unwrap_or(30),
+        exit_policy: file.exit_policy.unwrap_or_default(),
+        geo_db: file.geo_db.map(|path| base.join(path)),
+        exit_state: file.exit_state.map(|path| base.join(path)),
         hooks,
     })
 }

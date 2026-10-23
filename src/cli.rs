@@ -7,6 +7,16 @@ use clap::{
 };
 use std::{ffi::OsString, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitPolicy {
+    /// Weighted round-robin per new flow (default).
+    #[default]
+    Balance,
+    /// Pin destination groups (destination ASN) to servers.
+    StickyAsn,
+}
+
 #[derive(clap::Args)]
 pub struct ClientArgs {
     /// Read all client settings from one TOML file instead of CLI options.
@@ -20,6 +30,15 @@ pub struct ClientArgs {
     /// Client statistics interval in seconds; 0 disables periodic reports.
     #[arg(long, default_value_t = 30, value_name = "SECONDS")]
     pub stats_interval: u32,
+    /// Exit selection: balance (default) or sticky-asn (stable exit per destination ASN).
+    #[arg(long, value_enum, default_value_t = ExitPolicy::Balance)]
+    pub exit_policy: ExitPolicy,
+    /// DB-IP ASN Lite CSV database for sticky-asn.
+    #[arg(long, value_name = "FILE")]
+    pub geo_db: Option<PathBuf>,
+    /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.
+    #[arg(long, value_name = "FILE")]
+    pub exit_state: Option<PathBuf>,
     #[command(flatten)]
     pub hooks: hooks::Args,
     #[command(flatten)]
@@ -180,6 +199,12 @@ impl Cli {
                         ));
                     }
                     client.server[0].without_weight("single").map_err(invalid)?;
+                    if client.exit_policy != ExitPolicy::Balance {
+                        return Err(clap::Error::raw(
+                            ErrorKind::ValueValidation,
+                            "exit-policy sticky-asn is multi-only",
+                        ));
+                    }
                 }
                 // Validate every server before the runtime can open the first SSH session.
                 if !from_file {

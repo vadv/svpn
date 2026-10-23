@@ -35,6 +35,10 @@ pub use routes::{Owner, Routes};
 // with resident packets only. 1024 absorbs CPU/Wi-Fi jitter without unbounded growth.
 pub const QUEUE: usize = 1024;
 
+/// Startup grace for restored sticky owners: two connect budgets
+/// (selector::ATTEMPT_BUDGET is 5 s each).
+pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
 pub struct Link {
     pub params: LinkParams,
     pub outgoing: Option<mpsc::Sender<Packet>>,
@@ -47,9 +51,30 @@ pub struct Link {
     pub assigned: Arc<std::sync::OnceLock<(Ipv4Addr, Ipv4Addr)>>,
 }
 
+/// Sticky exit counters, surfaced in the periodic stats report.
+#[derive(Default)]
+pub struct StickyStats {
+    pub lookup_hit: u64,
+    pub lookup_miss: u64,
+    pub failover_moves: u64,
+}
+
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
+    /// Sticky exit: destination grouping; None = weighted balance.
+    pub geo: Option<crate::geo::Geo>,
+    /// Stable node ids (configured `server` strings) and weights, for rendezvous.
+    pub nodes: Vec<(String, u32)>,
+    /// Sticky owners: group key → link index. An alive owner keeps its group
+    /// (no snap-back); reassigned only when the owner cannot serve new flows.
+    pub exit_owners: std::collections::HashMap<u64, usize>,
+    /// Failover persistence; None in balance mode.
+    pub exit_state: Option<crate::exit_state::ExitState>,
+    /// Sticky exit counters, surfaced in the periodic stats report.
+    pub sticky: StickyStats,
+    /// Restored owners keep their groups while connecting until this instant.
+    pub grace_until: Option<StdInstant>,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
     pub events: mpsc::Sender<(Epoch, Event)>,
     pub incoming: mpsc::Receiver<(Epoch, Event)>,
@@ -142,6 +167,12 @@ impl Hub {
         if self.links.len() > 1 {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
+        }
+        if self.geo.is_some() {
+            report.push_str(&format!(
+                "\nsticky: lookup hit {} / miss {} | failover moves {}",
+                self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
+            ));
         }
         for line in per_link {
             report.push('\n');
@@ -300,9 +331,72 @@ impl Hub {
         });
     }
 
-    /// The flow key is available here for a future destination-stickiness policy.
-    fn pick(&mut self, _key: &FlowKey) -> Option<Epoch> {
-        self.pool.pick()
+    pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
+        let Some(geo) = &self.geo else {
+            return self.pool.pick();
+        };
+        // Retry throttled persistence even when no failover follows.
+        if let Some(state) = &mut self.exit_state {
+            state.flush_due(StdInstant::now());
+        }
+        let Some(asn) = geo.lookup(key.destination) else {
+            // Uncovered /32: deterministic stateless rendezvous, never
+            // recorded in exit_owners or persisted (spec: no /32 overrides).
+            self.sticky.lookup_miss += 1;
+            return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
+                .into_iter()
+                .find_map(|link| self.pool.ready_epoch(link));
+        };
+        let group = crate::geo::asn_key(asn);
+        if let Some(&owner) = self.exit_owners.get(&group) {
+            if let Some(epoch) = self.pool.ready_epoch(owner) {
+                self.sticky.lookup_hit += 1;
+                return Some(epoch);
+            }
+            // Checking owner keeps its group: serve new flows from a reserve
+            // without migrating (spec: no migration on Checking).
+            if self.pool.link_checking(owner) {
+                self.sticky.lookup_hit += 1;
+                return crate::geo::rendezvous(group, &self.nodes)
+                    .into_iter()
+                    .filter(|&link| link != owner)
+                    .find_map(|link| self.pool.ready_epoch(link));
+            }
+            // Startup grace: a restored owner still connecting keeps its
+            // groups until the deadline; afterwards it fails over.
+            if self.pool.is_connecting(owner)
+                && self
+                    .grace_until
+                    .is_some_and(|until| StdInstant::now() < until)
+            {
+                return None;
+            }
+        }
+        self.sticky.lookup_miss += 1;
+        let previous = self.exit_owners.get(&group).copied();
+        let order = crate::geo::rendezvous(group, &self.nodes);
+        let next = order
+            .iter()
+            .find_map(|&link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
+        let (link, epoch) = next?;
+        if previous != Some(link) {
+            self.exit_owners.insert(group, link);
+            // Baseline — first node of the rendezvous order — reproduces
+            // itself and needs no disk. Deviations (a failover transition or
+            // a first assignment that skipped an unavailable primary) do not,
+            // so they are persisted; a restart must not snap back (spec).
+            let deviation = order.first() != Some(&link);
+            if previous.is_some() {
+                self.sticky.failover_moves += 1;
+            }
+            if (previous.is_some() || deviation)
+                && let Some(state) = &mut self.exit_state
+            {
+                // Batched: dirty here, flushed by flush_due / clean stop.
+                state.assign(group, &self.nodes[link].0);
+            }
+        }
+        Some(epoch)
     }
 
     async fn relay(
@@ -493,11 +587,35 @@ pub async fn run(
     stats_interval: u32,
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
+    geo: Option<crate::geo::Geo>,
+    exit_state: Option<crate::exit_state::ExitState>,
 ) -> Result<()> {
     ensure!(!servers.is_empty(), "no servers configured");
     let pool = Pool::new(servers.iter().map(|s| s.weight));
+    // Stable node identity is host:port (spec): a port change is a new node.
+    let nodes: Vec<(String, u32)> = servers
+        .iter()
+        .map(|s| (format!("{}:{}", s.server, s.ssh_port), s.weight))
+        .collect();
+    let mut exit_state = exit_state;
+    let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+    let exit_owners = match &mut exit_state {
+        Some(state) => {
+            state.retain_nodes(&ids);
+            state.owner_indices(&ids)
+        }
+        None => std::collections::HashMap::new(),
+    };
+    // Startup grace covers exactly the restored owners: two connect budgets.
+    let grace_until = (!exit_owners.is_empty()).then(|| StdInstant::now() + STARTUP_GRACE);
     let (events, incoming) = mpsc::channel(QUEUE);
     let mut hub = Hub {
+        geo,
+        nodes,
+        exit_owners,
+        exit_state,
+        sticky: StickyStats::default(),
+        grace_until,
         links: servers
             .into_iter()
             .map(|params| Link {
@@ -530,6 +648,9 @@ pub async fn run(
     let result = hub
         .relay(started, stats_interval, &mut tun, &mut hooks, &mut shutdown)
         .await;
+    if let Some(state) = &mut hub.exit_state {
+        state.flush();
+    }
     let canceled = hooks.cancel_up().await;
     hub.tasks.shutdown().await;
     let cleanup = match canceled {

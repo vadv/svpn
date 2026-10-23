@@ -95487,3 +95487,15 @@ Debian Bookworm runtime / musl.version
 Package: musl
 Version: 1.2.3-1
 
+
+========================================================================
+DB-IP ASN Lite (data, not linked into binaries)
+Downloaded by the operator via scripts/update-asn-db.sh for
+exit-policy sticky-asn; not redistributed with SVPN, used unmodified.
+Source: https://download.db-ip.com/free/
+Declared license: CC BY 4.0
+Repository: https://db-ip.com/
+
+--- LICENSE-CC-BY-4.0 ---
+Attribution: (c) DB-IP.com — Geolocation data under CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/
