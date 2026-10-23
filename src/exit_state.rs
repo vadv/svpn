@@ -117,11 +117,14 @@ impl ExitState {
         let written = fs::File::open(&tmp)?;
         written.sync_all().context("fsync exit state")?;
         fs::rename(&tmp, path).with_context(|| format!("{}", path.display()))?;
-        if let Some(dir) = path.parent()
-            && let Ok(dir) = fs::File::open(dir)
-        {
-            let _ = dir.sync_all();
-        }
+        // A bare relative path has an empty parent: it means the cwd.
+        let dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("fsync dir {}", dir.display()))?;
         Ok(())
     }
 

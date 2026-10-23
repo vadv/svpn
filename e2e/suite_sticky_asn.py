@@ -87,6 +87,13 @@ def sticky_counters(path):
     return tuple(int(value) for value in found[-1])
 
 
+def sticky_counters_now(path, expected):
+    """Non-raising predicate for until(): the periodic sticky report lags the flow
+    heartbeat, so poll until the counters converge instead of trusting a snapshot."""
+    found = re.findall(r"sticky: lookup hit (\d+) / miss (\d+) \| failover moves (\d+)", path.read_text())
+    return bool(found) and tuple(int(value) for value in found[-1]) == expected
+
+
 def pinned_owner(path, baseline, count):
     """The server that owns every one of `count` new flows, once counters converge."""
     counts = delta(path, baseline)
@@ -121,6 +128,7 @@ def test_sticky_dst():
         for index in range(10):
             tcp_echo(index)
         until(lambda: pinned_owner(path, baseline, 10), seconds=15)
+        until(lambda: sticky_counters_now(path, (9, 1, 0)), seconds=15)
         hit, miss, moves = sticky_counters(path)
         assert (hit, miss, moves) == (9, 1, 0), (hit, miss, moves)
     cleanup_verified(process, server_hosts=HOSTS)
@@ -172,6 +180,7 @@ def test_failover_move():
         for index in range(10, 16):
             tcp_echo(index)
         until(lambda: opened(path)[spare] - settled == 6 and opened(path)[owner] == 0, seconds=20)
+        until(lambda: sticky_counters_now(path, (14, 2, 1)), seconds=15)
         assert sticky_counters(path)[2] == 1, "exactly one failover move expected"
     cleanup_verified(process, server_hosts=HOSTS)
     print("PASS sticky failover: killed owner's group moves to the next exit and stays after rejoin")

@@ -199,6 +199,12 @@ impl Cli {
                         ));
                     }
                     client.server[0].without_weight("single").map_err(invalid)?;
+                    if client.exit_policy != ExitPolicy::Balance {
+                        return Err(clap::Error::raw(
+                            ErrorKind::ValueValidation,
+                            "exit-policy sticky-asn is multi-only",
+                        ));
+                    }
                 }
                 // Validate every server before the runtime can open the first SSH session.
                 if !from_file {

@@ -374,21 +374,26 @@ impl Hub {
         }
         self.sticky.lookup_miss += 1;
         let previous = self.exit_owners.get(&group).copied();
-        let next = crate::geo::rendezvous(group, &self.nodes)
-            .into_iter()
-            .find_map(|link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
+        let order = crate::geo::rendezvous(group, &self.nodes);
+        let next = order
+            .iter()
+            .find_map(|&link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
         let (link, epoch) = next?;
         if previous != Some(link) {
             self.exit_owners.insert(group, link);
-            // Persist only genuine failover transitions; baseline rendezvous
-            // assignments reproduce themselves (spec: failover-only state).
+            // Baseline — first node of the rendezvous order — reproduces
+            // itself and needs no disk. Deviations (a failover transition or
+            // a first assignment that skipped an unavailable primary) do not,
+            // so they are persisted; a restart must not snap back (spec).
+            let deviation = order.first() != Some(&link);
             if previous.is_some() {
                 self.sticky.failover_moves += 1;
-                if let Some(state) = &mut self.exit_state {
-                    // Write-ahead: before the first flow uses the new exit.
-                    state.assign(group, &self.nodes[link].0);
-                    state.flush();
-                }
+            }
+            if (previous.is_some() || deviation)
+                && let Some(state) = &mut self.exit_state
+            {
+                // Batched: dirty here, flushed by flush_due / clean stop.
+                state.assign(group, &self.nodes[link].0);
             }
         }
         Some(epoch)

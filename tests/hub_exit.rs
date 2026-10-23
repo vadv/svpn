@@ -375,9 +375,49 @@ fn normal_assignment_is_not_persisted() {
     assert_eq!(
         hub.exit_state.as_ref().unwrap().owner(group),
         Some(&id),
-        "a failover transition is persisted"
+        "a failover transition is recorded"
     );
-    assert!(path.exists(), "failover persistence is write-ahead");
+    // Persistence is batched (spec): pick marks dirty, flush_due / clean stop write.
+    assert!(!path.exists(), "batched: no sync write inside pick");
+    hub.exit_state.as_mut().unwrap().flush();
+    assert!(path.exists(), "flush persists the failover transition");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn first_assignment_skipping_unavailable_primary_is_persisted() {
+    // The first rendezvous node stays unavailable; with only the reserve
+    // Ready the first assignment deviates from the baseline and must be
+    // persisted, otherwise a restart with the primary back would snap the
+    // group back (review P0).
+    let mut hub = connecting_hub(&[1, 1]);
+    let group = svpn::geo::asn_key(100);
+    let order = svpn::geo::rendezvous(group, &hub.nodes);
+    let reserve = order[1];
+    assert!(hub.pool.ready(
+        Epoch {
+            link: reserve,
+            generation: 1
+        },
+        Instant::now()
+    ));
+    let dir = temp_dir("deviation");
+    let path = dir.join("exit-state.json");
+    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
+
+    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
+    assert_eq!(pick_link(&mut hub, key).link, reserve);
+    assert_eq!(
+        hub.sticky.failover_moves, 0,
+        "a first assignment is not a failover"
+    );
+    assert_eq!(
+        hub.exit_state.as_ref().unwrap().owner(group),
+        Some(&hub.nodes[reserve].0),
+        "a first assignment that skipped the unavailable primary is recorded"
+    );
+    hub.exit_state.as_mut().unwrap().flush();
+    assert!(path.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 

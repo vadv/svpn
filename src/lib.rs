@@ -127,7 +127,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_sta
     match (args.exit_policy, &args.geo_db) {
         (cli::ExitPolicy::Balance, None) => Ok((None, None)),
         (cli::ExitPolicy::Balance, Some(_)) => {
-            crate::info!("geo-db set without exit-policy sticky-asn — ignoring");
+            crate::warn!("geo-db set without exit-policy sticky-asn — ignoring");
             Ok((None, None))
         }
         (cli::ExitPolicy::StickyAsn, None) => {
