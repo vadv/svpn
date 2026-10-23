@@ -8,13 +8,14 @@ import suite_bootstrap
 import suite_pool
 import suite_recovery
 import suite_reselect
+import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
 
 # diag_dwell129.py imports PEER, session, ssh, command and until from this module.
 from _lib import SERVER, command, ssh
 
-GROUPS = ("bootstrap", "lifecycle-pool", "udp", "tcp-auto", "reselect", "recovery")
+GROUPS = ("bootstrap", "lifecycle-pool", "udp", "tcp-auto", "reselect", "recovery", "sticky-asn")
 
 # The pre-split registry interleaved the groups; keep the exact overall sequence.
 _SEQUENCE = (
@@ -33,6 +34,7 @@ _SEQUENCE = (
     + ("lifecycle-pool",) * 4
     + ("reselect",) * 4
     + ("recovery",) * 3
+    + ("sticky-asn",) * 4
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,
@@ -41,6 +43,7 @@ _SUITES = {
     "tcp-auto": suite_tcp_auto,
     "reselect": suite_reselect,
     "recovery": suite_recovery,
+    "sticky-asn": suite_sticky_asn,
 }
 _PENDING = {group: iter(suite.TESTS) for group, suite in _SUITES.items()}
 TESTS = []

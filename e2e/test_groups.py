@@ -18,6 +18,7 @@ import suite_bootstrap
 import suite_pool
 import suite_recovery
 import suite_reselect
+import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
 from test_artifacts import check
@@ -46,6 +47,9 @@ RECOVERY_BASELINE = """
 test_recovery_restores_tcp_without_second_accept
 test_recovery_does_not_retransmit_uncertain_udp
 test_recovery_without_alternative_closes_within_budget
+""".split()
+STICKY_BASELINE = """
+test_sticky_dst test_balance_diff test_failover_move test_restart_restore
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -80,11 +84,12 @@ def integration_groups():
         "tcp-auto": suite_tcp_auto,
         "reselect": suite_reselect,
         "recovery": suite_recovery,
+        "sticky-asn": suite_sticky_asn,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE
+    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE + STICKY_BASELINE
     assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
     assert len(tests) == len(set(tests)) == len(by_fn), "a test is assigned twice or dropped"
@@ -103,6 +108,7 @@ def integration_groups():
         "tcp-auto": 10,
         "reselect": 4,
         "recovery": 3,
+        "sticky-asn": 4,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
