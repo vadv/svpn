@@ -149,7 +149,7 @@ fn parse_v4(text: &str) -> Option<u32> {
                 }
                 digits = true;
             }
-            b'.' if digits => {
+            b'.' if digits && octets < 3 => {
                 value = (value << 8) | octet;
                 octet = 0;
                 digits = false;

@@ -57,6 +57,12 @@ fn skips_garbage_v6_and_bad_asn_rows() {
         "\"2607:6bc0::\",\"2607:6bc0::ffff\",399358,\"v6 skipped\"".to_string(),
         "\"1.2.3.4\",\"1.2.3.4\",\"not-a-number\",\"bad asn skipped\"".to_string(),
         "\"300.1.1.1\",\"300.1.1.2\",7,\"bad ip skipped\"".to_string(),
+        // More than three separators: must be skipped, not wrap the octet
+        // counter (regression: u8 overflow panicked debug / wrapped release).
+        format!(
+            "\"{}1.2.3.4\",\"1.2.3.5\",7,\"overflow skipped\"",
+            "0.".repeat(256)
+        ),
     ];
     let csv = Csv::of(&full_rows(&extra));
     let geo = Geo::load(csv.0.as_path()).unwrap();

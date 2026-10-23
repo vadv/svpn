@@ -107,3 +107,30 @@ fn retain_nodes_drops_departed() {
     assert_eq!(reloaded.owner(43), None);
     let _ = std::fs::remove_file(path);
 }
+
+// ── write errors ──
+
+#[test]
+fn failed_write_stays_pending_and_recovers() {
+    // Parent directory does not exist: the write fails.
+    let path = state_path("enoent").with_file_name(format!(
+        "svpn-exit-state-enoent-{}/state.json",
+        std::process::id()
+    ));
+    let mut state = ExitState::load(Some(path.clone()));
+    state.assign(42, "node-a");
+    state.flush();
+    assert!(!path.exists(), "the failed write produced no file");
+
+    // After the directory appears, the next flush must persist: a failed
+    // write keeps the pending state instead of discarding it.
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    state.flush();
+    let reloaded = ExitState::load(Some(path.clone()));
+    assert_eq!(
+        reloaded.owner(42).map(String::as_str),
+        Some("node-a"),
+        "a failed write must not lose the pending transition"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

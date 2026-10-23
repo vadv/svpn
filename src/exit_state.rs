@@ -89,11 +89,13 @@ impl ExitState {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
         self.last_flush = Instant::now();
-        if let Err(error) = self.write() {
-            // Sticky keeps working in RAM; the loss window is documented.
-            crate::error!("exit state: {error:#} — failover transitions are not persisted");
+        match self.write() {
+            Ok(()) => self.dirty = false,
+            // Keep dirty: flush_due retries after FLUSH_EVERY.
+            Err(error) => {
+                crate::error!("exit state: {error:#} — failover transitions are not persisted")
+            }
         }
     }
 

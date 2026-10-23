@@ -99,6 +99,7 @@ fn sticky_hub_state(weights: &[u32], ready: bool) -> Hub {
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
         sticky: StickyStats::default(),
+        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,
@@ -120,6 +121,12 @@ fn flow(destination: Ipv4Addr, source_port: u16) -> packet::FlowKey {
 
 fn pick_link(hub: &mut Hub, key: packet::FlowKey) -> Epoch {
     hub.pick(&key).expect("a Ready link exists")
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("svpn-hub-exit-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 // ── sticky pick ──
@@ -226,8 +233,30 @@ fn checking_owner_gets_no_new_flows() {
 }
 
 #[test]
+fn sticky_counters_track_lookup_and_failover() {
+    let mut hub = sticky_hub(&[1, 1]);
+    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
+    let primary = pick_link(&mut hub, key);
+    assert_eq!(
+        (hub.sticky.lookup_miss, hub.sticky.lookup_hit),
+        (1, 0),
+        "the first pick of a group is a rendezvous miss"
+    );
+    pick_link(&mut hub, key);
+    assert_eq!(hub.sticky.lookup_hit, 1, "a served owner is a hit");
+
+    hub.pool.failed(primary, Instant::now(), "test").unwrap();
+    pick_link(&mut hub, key);
+    assert_eq!(
+        hub.sticky.failover_moves, 1,
+        "a dead owner moves the group once"
+    );
+}
+
+#[test]
 fn connecting_owner_keeps_group_in_grace() {
     let mut hub = connecting_hub(&[1, 1]);
+    hub.grace_until = Some(std::time::Instant::now() + svpn::hub::STARTUP_GRACE);
     let group = svpn::geo::asn_key(100);
     hub.exit_owners.insert(group, 0);
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
@@ -261,24 +290,115 @@ fn connecting_owner_keeps_group_in_grace() {
 }
 
 #[test]
-fn sticky_counters_track_lookup_and_failover() {
+fn grace_deadline_expired_fails_over() {
+    // Owner 0 restored from state but still Connecting; link 1 is Ready.
+    let mut hub = sticky_hub(&[1, 1]);
+    let now = Instant::now();
+    hub.pool
+        .failed(
+            Epoch {
+                link: 0,
+                generation: 1,
+            },
+            now,
+            "startup connect failed",
+        )
+        .unwrap();
+    // A failed startup round leaves the slot Connecting again after retry.
+    let retries = hub
+        .pool
+        .retry_due(now + std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(retries.len(), 1);
+    assert!(hub.pool.is_connecting(0));
+
+    let group = svpn::geo::asn_key(100);
+    hub.exit_owners.insert(group, 0);
+    // The grace deadline has passed: the group must not starve behind a
+    // connecting owner while a healthy reserve exists.
+    hub.grace_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
+    let moved = pick_link(&mut hub, key);
+    assert_eq!(moved.link, 1, "expired grace must fail over to the reserve");
+    assert_eq!(hub.exit_owners.get(&group), Some(&1));
+    assert_eq!(hub.sticky.failover_moves, 1);
+}
+
+#[test]
+fn checking_owner_falls_back_without_migration() {
     let mut hub = sticky_hub(&[1, 1]);
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let primary = pick_link(&mut hub, key);
+    assert!(hub.pool.checking(primary));
+
+    let reserve = pick_link(&mut hub, key);
+    assert_ne!(reserve, primary, "Checking is excluded from new picks");
+    let group = svpn::geo::asn_key(100);
     assert_eq!(
-        (hub.sticky.lookup_miss, hub.sticky.lookup_hit),
-        (1, 0),
-        "the first pick of a group is a rendezvous miss"
+        hub.exit_owners.get(&group),
+        Some(&primary.link),
+        "a Checking owner keeps the group — no migration"
     );
-    pick_link(&mut hub, key);
-    assert_eq!(hub.sticky.lookup_hit, 1, "a served owner is a hit");
+    assert_eq!(hub.sticky.failover_moves, 0, "Checking is not a failover");
+
+    // The verdict arrives: owner is Ready again and serves its group.
+    assert!(hub.pool.ready(primary, Instant::now()));
+    assert_eq!(
+        pick_link(&mut hub, key),
+        primary,
+        "a recovered Checking owner resumes serving"
+    );
+}
+
+#[test]
+fn normal_assignment_is_not_persisted() {
+    let mut hub = sticky_hub(&[1, 1]);
+    let dir = temp_dir("normal-assign");
+    let path = dir.join("exit-state.json");
+    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
+    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
+    let primary = pick_link(&mut hub, key);
+    let group = svpn::geo::asn_key(100);
+    assert_eq!(
+        hub.exit_state.as_ref().unwrap().owner(group),
+        None,
+        "a baseline rendezvous assignment reproduces itself — nothing to persist"
+    );
+    assert!(
+        !path.exists(),
+        "no state file may be written before a failover"
+    );
 
     hub.pool.failed(primary, Instant::now(), "test").unwrap();
-    pick_link(&mut hub, key);
+    let reserve = pick_link(&mut hub, key);
+    let id = hub.nodes[reserve.link].0.clone();
     assert_eq!(
-        hub.sticky.failover_moves, 1,
-        "a dead owner moves the group once"
+        hub.exit_state.as_ref().unwrap().owner(group),
+        Some(&id),
+        "a failover transition is persisted"
     );
+    assert!(path.exists(), "failover persistence is write-ahead");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn uncovered_ip_is_stateless() {
+    let mut hub = sticky_hub(&[1, 1]);
+    let dir = temp_dir("uncovered");
+    let path = dir.join("exit-state.json");
+    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
+    let first = pick_link(&mut hub, flow(Ipv4Addr::new(9, 9, 9, 9), 1000));
+    assert!(
+        hub.exit_owners.is_empty(),
+        "an uncovered /32 is never recorded in exit_owners"
+    );
+    assert!(!path.exists(), "an uncovered /32 is never persisted");
+    // Deterministic rendezvous: the same address maps to the same exit.
+    assert_eq!(
+        pick_link(&mut hub, flow(Ipv4Addr::new(9, 9, 9, 9), 1001)),
+        first
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

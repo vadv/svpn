@@ -82,6 +82,14 @@ impl Pool {
             .is_some_and(|s| s.state == State::Connecting)
     }
 
+    /// The link is mid health-check: live flows continue, owner groups wait
+    /// for the verdict instead of migrating.
+    pub fn link_checking(&self, link: usize) -> bool {
+        self.slots
+            .get(link)
+            .is_some_and(|s| s.state == State::Checking)
+    }
+
     pub fn checking_count(&self) -> usize {
         self.slots
             .iter()
