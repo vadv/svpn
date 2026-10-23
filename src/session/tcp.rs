@@ -291,6 +291,13 @@ impl Session {
         }
         .context("client requires server address")?;
         let remote = SocketAddr::from((ip, port));
+        // e2e greps this token to tell TCP-transport flows from UDP channels.
+        if !is_probe_flow(binding.0) {
+            crate::debug!(
+                "flow_connect role=client id={} tcp_remote={remote}",
+                binding.0
+            );
+        }
         let events = self.tcp_events.0.clone();
         let failure = events.clone();
         let tag = self.tag().to_owned();

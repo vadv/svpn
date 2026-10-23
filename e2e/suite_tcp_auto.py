@@ -87,7 +87,9 @@ def test_idle_tcp_survival():
                         assert recv_exact(target, 6) == b"resume"
                         assert target.recv(1) == b""
                         # Both directions remain usable after 20 s in half-close.
-                        assert recv_exact(client, 6) == b"resume"
+                        # 35 s > idle_tcp's 20 s dwell plus relay latency: a
+                        # 20 s budget here races the sender's own sleep(20).
+                        assert recv_exact(client, 6, seconds=35) == b"resume"
                         assert client.recv(1) == b""
                         target.sendall(b"after")
                         target.shutdown(socket.SHUT_WR)
