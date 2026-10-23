@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.0
+
+Flow recovery release.
+
+- Live flows survive transport loss: when a session's channel dies, the
+  server keeps the session and its flow queues while the client rebinds
+  to a replacement channel; TCP streams continue byte-exact over the new
+  channel and UDP flows keep their flow id and sequence numbers.
+- Recovery is proven by delivery, not intent: a flow counts as restored
+  only after an observed peer packet (or a challenge round-trip for
+  quiet flows); an abandoned recovery is logged with a reason.
+- A failed fresh challenge channel no longer announces a lost data path
+  while the verified incumbent keeps serving.
+- Server-side TCP lifetime: half-closed and idle flows retire
+  predictably; a dying session's flows get a best-effort RST toward the
+  client TUN instead of hanging sockets.
+- e2e: recovery suite (UDP continuation, byte-exact TCP continuation,
+  silent retirement). Runbook: `recovery.md`.
+
 ## v0.7.1
 
 Corrective release.
