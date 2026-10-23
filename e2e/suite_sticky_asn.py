@@ -199,7 +199,8 @@ def test_restart_restore():
     # Clean stop: the client flushes the failover transition to /var/lib/svpn.
     cleanup_verified(process, server_hosts=HOSTS)
     persisted = json.loads(STATE.read_text())
-    assert persisted == {"version": 1, "owners": {str(asn): spare}}, persisted
+    # Persisted identity is host:port (spec); the default ssh port is 22.
+    assert persisted == {"version": 1, "owners": {str(asn): f"{spare}:22"}}, persisted
     with session("sticky-restart-2", args=sticky_args(), server_hosts=HOSTS, ready_timeout=20) as (
         process,
         path,
