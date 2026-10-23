@@ -160,6 +160,7 @@ async fn challenge_burst_records_echo_replies() {
         svpn::packet::icmp_echo_request(key.source, key.destination, icmp_id, 100, &payload);
     session
         .deliver_to_tun(svpn::udp::Incoming {
+            generation: 1,
             id: attempt,
             channel: Some(channel),
             packet: common::echo_reply(&request),
@@ -284,7 +285,7 @@ async fn bound_challenger_builds_probe_flow_and_burst() {
             "bound at open — committed() insists on it"
         );
     }
-    session.committed(attempt).await.unwrap();
+    session.committed(attempt, 1).await.unwrap();
     let challenge = session.challenge.as_ref().unwrap();
     let burst = challenge.attempts[&attempt].burst.as_ref().unwrap();
     assert!(burst.armed.is_some(), "commit armed the burst");
@@ -350,14 +351,21 @@ async fn bound_challenger_sends_flow_open_on_the_wire() {
     for _ in 0..4 {
         line.clear();
         lines.read_line(&mut line).await.unwrap();
-        if let Ok(message @ svpn::control::Message::FlowOpen { .. }) =
-            serde_json::from_str::<svpn::control::Message>(line.trim())
+        if let Ok(
+            message @ svpn::control::Message::FlowOpen {
+                generation: 1,
+                resume: false,
+                ..
+            },
+        ) = serde_json::from_str::<svpn::control::Message>(line.trim())
         {
             opened = Some(message);
             break;
         }
     }
     let Some(svpn::control::Message::FlowOpen {
+        generation: 1,
+        resume: false,
         flow_id,
         flow,
         channel,

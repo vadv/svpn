@@ -1,8 +1,4 @@
-//! UDP v2: the shared strategy channel. Records, fragment reassembly
-//! and channel key encryption follow the frozen wire spec.
-//! Orchestration (auto, probes over control) lives in session; this is the core only.
-//! The socket helpers are exercised by integration tests — dead code for the bin build.
-#![allow(dead_code)]
+//! Shared datagram records, authenticated channels and bounded reassembly.
 
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -27,8 +23,8 @@ pub const KIND_SIZE_PROBE: u8 = 0x08;
 /// the maximum is the channel limit.
 pub const MIN_PACKET: usize = 28;
 pub const MAX_PACKET: usize = 1400;
-/// 1401 (MAX_PLAINTEXT) minus the DATA header: kind 1 + flow 8 + packet 8 + off 2 + total 2.
-pub const MAX_FRAGMENT: usize = MAX_PLAINTEXT - 21;
+pub const DATA_HEADER: usize = 29;
+pub const MAX_FRAGMENT: usize = MAX_PLAINTEXT - DATA_HEADER;
 /// Per-channel reassembly limits: incomplete packets, bytes and TTL.
 pub const MAX_PENDING_PACKETS: usize = 64;
 pub const MAX_PENDING_BYTES: usize = 1024 * 1024;
@@ -36,11 +32,12 @@ pub const PENDING_TTL: Duration = Duration::from_secs(1);
 
 const CHALLENGE: usize = 16;
 
-/// UDP v2 record (plaintext before `Cipher::seal`). Channel kinds use `flow_id = 0`.
+/// Plaintext record. Channel-wide kinds use `flow_id = 0`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     Data {
         flow_id: u64,
+        generation: u64,
         packet_id: u64,
         offset: u16,
         total_len: u16,
@@ -58,10 +55,12 @@ pub enum Record {
     },
     FlowProbe {
         flow_id: u64,
+        generation: u64,
         challenge: [u8; CHALLENGE],
     },
     FlowEcho {
         flow_id: u64,
+        generation: u64,
         echo: [u8; CHALLENGE],
     },
     Keepalive,
@@ -72,10 +71,11 @@ pub enum Record {
 
 impl Record {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut plain = Vec::with_capacity(21 + MAX_FRAGMENT);
+        let mut plain = Vec::with_capacity(MAX_PLAINTEXT);
         match self {
             Record::Data {
                 flow_id,
+                generation,
                 packet_id,
                 offset,
                 total_len,
@@ -91,8 +91,10 @@ impl Record {
                     (1..=MAX_PACKET).contains(&(*total_len as usize)),
                     "total_len out of range"
                 );
+                ensure!(*generation != 0, "zero binding generation");
                 plain.push(KIND_DATA);
                 plain.extend_from_slice(&flow_id.to_be_bytes());
+                plain.extend_from_slice(&generation.to_be_bytes());
                 plain.extend_from_slice(&packet_id.to_be_bytes());
                 plain.extend_from_slice(&offset.to_be_bytes());
                 plain.extend_from_slice(&total_len.to_be_bytes());
@@ -114,14 +116,26 @@ impl Record {
                 plain.extend_from_slice(&[0; 8]);
                 plain.extend_from_slice(echo);
             }
-            Record::FlowProbe { flow_id, challenge } => {
+            Record::FlowProbe {
+                flow_id,
+                generation,
+                challenge,
+            } => {
+                ensure!(*generation != 0, "zero binding generation");
                 plain.push(KIND_FLOW_PROBE);
                 plain.extend_from_slice(&flow_id.to_be_bytes());
+                plain.extend_from_slice(&generation.to_be_bytes());
                 plain.extend_from_slice(challenge);
             }
-            Record::FlowEcho { flow_id, echo } => {
+            Record::FlowEcho {
+                flow_id,
+                generation,
+                echo,
+            } => {
+                ensure!(*generation != 0, "zero binding generation");
                 plain.push(KIND_FLOW_ECHO);
                 plain.extend_from_slice(&flow_id.to_be_bytes());
+                plain.extend_from_slice(&generation.to_be_bytes());
                 plain.extend_from_slice(echo);
             }
             Record::Keepalive => {
@@ -163,6 +177,15 @@ impl Record {
             flow_id != 0 || kind != KIND_DATA && kind != KIND_FLOW_PROBE && kind != KIND_FLOW_ECHO,
             "flow record must use nonzero flow_id"
         );
+        let (generation, body) = if matches!(kind, KIND_DATA | KIND_FLOW_PROBE | KIND_FLOW_ECHO) {
+            ensure!(body.len() >= 8, "short binding generation");
+            let (generation, body) = body.split_at(8);
+            let generation = u64::from_be_bytes(generation.try_into()?);
+            ensure!(generation != 0, "zero binding generation");
+            (generation, body)
+        } else {
+            (0, body)
+        };
         let record = match kind {
             KIND_DATA => {
                 ensure!(body.len() >= 13, "short DATA record");
@@ -171,6 +194,7 @@ impl Record {
                 let (total_len, fragment) = tail.split_at(2);
                 let record = Record::Data {
                     flow_id,
+                    generation,
                     packet_id: u64::from_be_bytes(packet_id.try_into()?),
                     offset: u16::from_be_bytes(offset.try_into()?),
                     total_len: u16::from_be_bytes(total_len.try_into()?),
@@ -196,10 +220,12 @@ impl Record {
             },
             KIND_FLOW_PROBE => Record::FlowProbe {
                 flow_id,
+                generation,
                 challenge: body.try_into()?,
             },
             KIND_FLOW_ECHO => Record::FlowEcho {
                 flow_id,
+                generation,
                 echo: body.try_into()?,
             },
             KIND_KEEPALIVE if body.is_empty() => Record::Keepalive,
@@ -212,11 +238,10 @@ impl Record {
     }
 }
 
-/// Fragment reassembly for one direction of a channel. The key is `(flow_id, packet_id)`:
-/// origin is separated by the sequence direction bit of the other side's `Cipher`.
+/// Fragments from different bindings must never assemble into the same packet.
 #[derive(Default)]
 pub struct Reassembly {
-    packets: HashMap<(u64, u64), Partial>,
+    packets: HashMap<(u64, u64, u64), Partial>,
     bytes: usize,
 }
 
@@ -235,6 +260,7 @@ impl Reassembly {
     pub fn insert(&mut self, record: &Record, now: Instant) -> Result<Option<Vec<u8>>> {
         let Record::Data {
             flow_id,
+            generation,
             packet_id,
             offset,
             total_len,
@@ -243,7 +269,7 @@ impl Reassembly {
         else {
             bail!("reassembly accepts only DATA records");
         };
-        let key = (*flow_id, *packet_id);
+        let key = (*flow_id, *generation, *packet_id);
         let at_limit = self.packets.len() >= MAX_PENDING_PACKETS || self.bytes >= MAX_PENDING_BYTES;
         let packet = match self.packets.entry(key) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -266,7 +292,7 @@ impl Reassembly {
         // Conflicting data drops the whole packet but does not take down the channel:
         // a hostile fragment must not break reassembly of neighboring flows.
         if packet.total_len != *total_len || end > packet.total_len as usize {
-            self.packets.remove(&key);
+            self.discard(key);
             return Ok(None);
         }
         let position = packet.parts.partition_point(|(at, _)| *at < *offset);
@@ -276,18 +302,18 @@ impl Reassembly {
                 if *bytes == *fragment {
                     return Ok(None); // exact duplicate
                 }
-                self.packets.remove(&key);
+                self.discard(key);
                 return Ok(None); // offset conflict
             }
             if at < end {
-                self.packets.remove(&key);
+                self.discard(key);
                 return Ok(None); // forward overlap
             }
         }
         if position > 0 {
             let (at, prev) = &packet.parts[position - 1];
             if *at as usize + prev.len() > start {
-                self.packets.remove(&key);
+                self.discard(key);
                 return Ok(None); // backward overlap
             }
         }
@@ -298,7 +324,7 @@ impl Reassembly {
         let total_len = packet.total_len;
         if packet.have < usize::from(total_len) {
             if self.bytes > MAX_PENDING_BYTES {
-                self.packets.remove(&key);
+                self.discard(key);
             }
             return Ok(None);
         }
@@ -312,6 +338,12 @@ impl Reassembly {
         self.packets.remove(&key);
         ensure!(assembled.len() == total_len as usize, "coverage gap");
         Ok(Some(assembled))
+    }
+
+    fn discard(&mut self, key: (u64, u64, u64)) {
+        if let Some(packet) = self.packets.remove(&key) {
+            self.bytes -= 9 + packet.have;
+        }
     }
 
     /// Removes expired incomplete packets; called while processing records.
@@ -354,7 +386,11 @@ impl Channel {
     }
 
     pub fn open(&mut self, wire: &[u8], now: Instant) -> Result<Option<Record>> {
-        let plain = self.cipher.open(wire)?;
+        let plain = match self.cipher.open(wire) {
+            Ok(plain) => plain,
+            Err(error) if error.is::<crypto::InvalidPacket>() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.reassembly.expire(now);
         Ok(Some(Record::decode(&plain)?))
     }
@@ -372,6 +408,7 @@ impl Channel {
 /// Splits an inner IP packet into DATA records with the fragment size cap `chunk_cap`.
 pub fn fragment_packet(
     flow_id: u64,
+    generation: u64,
     packet_id: u64,
     packet: &[u8],
     chunk_cap: usize,
@@ -386,6 +423,7 @@ pub fn fragment_packet(
     for (index, chunk) in packet.chunks(cap).enumerate() {
         records.push(Record::Data {
             flow_id,
+            generation,
             packet_id,
             offset: (index * cap) as u16,
             total_len: packet.len() as u16,
@@ -419,9 +457,10 @@ pub async fn recv_record(
     now: Instant,
 ) -> Result<(SocketAddr, Record)> {
     let mut buffer = vec![0u8; MAX_PLAINTEXT + 24];
-    let (size, peer) = socket.recv_from(&mut buffer).await?;
-    let record = channel
-        .open(&buffer[..size], now)?
-        .expect("open always yields a record");
-    Ok((peer, record))
+    loop {
+        let (size, peer) = socket.recv_from(&mut buffer).await?;
+        if let Some(record) = channel.open(&buffer[..size], now)? {
+            return Ok((peer, record));
+        }
+    }
 }

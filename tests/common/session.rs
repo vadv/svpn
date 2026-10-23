@@ -97,6 +97,7 @@ fn link_session_cap_with(
             round: None,
             next_round_attempt: u64::MAX / 2,
             health_at: None,
+            flush_at: None,
             burst: None,
             challenge: None,
             path_stats: HashMap::new(),

@@ -25,18 +25,21 @@ async fn reads_split_and_coalesced_messages() {
         write.write_all(b"{\"type\":\"rea").await.unwrap();
         tokio::task::yield_now().await;
         write
-            .write_all(b"dy\",\"version\":1}\n{\"type\":\"close\",\"id\":2}\n")
+            .write_all(b"dy\",\"version\":3}\n{\"type\":\"close\",\"id\":2,\"generation\":1}\n")
             .await
             .unwrap();
     });
     let mut reader = BufReader::new(read);
     assert!(matches!(
         read_message(&mut reader).await.unwrap(),
-        Message::Ready { version: 1 }
+        Message::Ready { version: VERSION }
     ));
     assert!(matches!(
         read_message(&mut reader).await.unwrap(),
-        Message::Close { id: 2 }
+        Message::Close {
+            id: 2,
+            generation: 1
+        }
     ));
     assert!(read_message(&mut reader).await.is_err());
     task.await.unwrap();
@@ -46,9 +49,9 @@ async fn reads_split_and_coalesced_messages() {
 async fn rejects_oversized_incomplete_and_invalid_messages() {
     for input in [
         vec![b'x'; MAX_LINE + 1],
-        b"{\"type\":\"ready\",\"version\":1}".to_vec(),
+        b"{\"type\":\"ready\",\"version\":3}".to_vec(),
         b"not JSON\n".to_vec(),
-        b"{\"type\":\"ready\",\"version\":1,\"unknown\":true}\n".to_vec(),
+        b"{\"type\":\"ready\",\"version\":3,\"unknown\":true}\n".to_vec(),
     ] {
         let mut reader = BufReader::new(input.as_slice());
         assert!(read_message(&mut reader).await.is_err());
@@ -61,6 +64,7 @@ async fn rejects_oversized_incomplete_and_invalid_messages() {
 async fn opened_token_round_trip() {
     let value = Message::Opened {
         id: 5,
+        generation: 1,
         port: 41000,
         key: [7; 16],
         token: Some([9; 16]),
@@ -72,6 +76,7 @@ async fn opened_token_round_trip() {
     ));
     let udp_value = Message::Opened {
         id: 5,
+        generation: 1,
         port: 41000,
         key: [7; 16],
         token: None,
@@ -81,7 +86,7 @@ async fn opened_token_round_trip() {
 }
 
 #[tokio::test]
-async fn v2_messages_round_trip_with_wire_names() {
+async fn v3_messages_round_trip_with_wire_names() {
     // Exact JSON names: one line, no unknown fields.
     let cases: Vec<(Message, &str)> = vec![
         (
@@ -130,6 +135,7 @@ async fn v2_messages_round_trip_with_wire_names() {
         (
             Message::FlowOpen {
                 flow_id: 9,
+                generation: 1,
                 flow: FlowKey {
                     protocol: 6,
                     source: "10.77.0.2".parse().unwrap(),
@@ -138,30 +144,38 @@ async fn v2_messages_round_trip_with_wire_names() {
                     destination_port: 80,
                 },
                 channel: Some(3),
+                resume: false,
             },
-            "{\"type\":\"flow_open\",\"flow_id\":9,\"flow\":{\"protocol\":6,\"source\":\"10.77.0.2\",\"destination\":\"10.77.0.1\",\"source_port\":5,\"destination_port\":80},\"channel\":3}",
+            "{\"type\":\"flow_open\",\"flow_id\":9,\"generation\":1,\"flow\":{\"protocol\":6,\"source\":\"10.77.0.2\",\"destination\":\"10.77.0.1\",\"source_port\":5,\"destination_port\":80},\"channel\":3,\"resume\":false}",
         ),
         (
             Message::Commit {
                 flow_id: 9,
-                attempt: 11,
+                generation: 1,
             },
-            "{\"type\":\"commit\",\"flow_id\":9,\"attempt\":11}",
+            "{\"type\":\"commit\",\"flow_id\":9,\"generation\":1}",
         ),
         (
-            Message::Committed { flow_id: 9 },
-            "{\"type\":\"committed\",\"flow_id\":9}",
+            Message::Committed {
+                flow_id: 9,
+                generation: 1,
+            },
+            "{\"type\":\"committed\",\"flow_id\":9,\"generation\":1}",
         ),
         (
-            Message::FlowClose { flow_id: 9 },
-            "{\"type\":\"flow_close\",\"flow_id\":9}",
+            Message::FlowClose {
+                flow_id: 9,
+                generation: 1,
+            },
+            "{\"type\":\"flow_close\",\"flow_id\":9,\"generation\":1}",
         ),
         (
             Message::FlowReject {
                 flow_id: 9,
+                generation: 1,
                 reason: Reason::EndpointUnavailable,
             },
-            "{\"type\":\"flow_reject\",\"flow_id\":9,\"reason\":\"endpoint_unavailable\"}",
+            "{\"type\":\"flow_reject\",\"flow_id\":9,\"generation\":1,\"reason\":\"endpoint_unavailable\"}",
         ),
     ];
     for (message, json) in cases {
@@ -175,14 +189,97 @@ async fn v2_messages_round_trip_with_wire_names() {
 }
 
 #[tokio::test]
-async fn v2_rejects_unknown_strategy_reason_and_fields() {
+async fn v3_rejects_unknown_strategy_reason_and_fields() {
     for bad in [
+        "{\"type\":\"commit\",\"flow_id\":1,\"generation\":1,\"attempt\":1}",
         "{\"type\":\"channel_prepare\",\"attempt\":1,\"strategy\":\"tcp\"}",
         "{\"type\":\"channel_prepare\",\"attempt\":1,\"strategy\":\"wireguard\"}",
         "{\"type\":\"channel_failed\",\"attempt\":null,\"channel\":null,\"reason\":\"dpi\"}",
-        "{\"type\":\"committed\",\"flow_id\":1,\"extra\":true}",
+        "{\"type\":\"committed\",\"flow_id\":1,\"generation\":1,\"extra\":true}",
     ] {
         assert!(serde_json::from_str::<Message>(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn flow_messages_require_generation_and_resume() {
+    assert_eq!(VERSION, 3);
+    let flow = FlowKey {
+        protocol: 6,
+        source: "10.77.0.2".parse().unwrap(),
+        source_port: 5,
+        destination: "10.77.0.1".parse().unwrap(),
+        destination_port: 80,
+    };
+    for message in [
+        Message::Open {
+            id: 9,
+            generation: 1,
+            flow,
+        },
+        Message::Opened {
+            id: 9,
+            generation: 1,
+            port: 41000,
+            key: [7; 16],
+            token: None,
+        },
+        Message::Close {
+            id: 9,
+            generation: 1,
+        },
+        Message::FlowOpen {
+            flow_id: 9,
+            generation: 1,
+            flow,
+            channel: Some(3),
+            resume: false,
+        },
+        Message::FlowChannel {
+            flow_id: 9,
+            generation: 1,
+            channel: 3,
+        },
+        Message::FlowReject {
+            flow_id: 9,
+            generation: 1,
+            reason: Reason::EndpointUnavailable,
+        },
+        Message::FlowOpened {
+            flow_id: 9,
+            generation: 1,
+            flow,
+            channel: 3,
+        },
+        Message::Commit {
+            flow_id: 9,
+            generation: 1,
+        },
+        Message::Committed {
+            flow_id: 9,
+            generation: 1,
+        },
+        Message::FlowClose {
+            flow_id: 9,
+            generation: 1,
+        },
+    ] {
+        let mut json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["generation"], 1);
+        let decoded: Message = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        json.as_object_mut().unwrap().remove("generation");
+        assert!(serde_json::from_value::<Message>(json.clone()).is_err());
+        json["generation"] = u64::MAX.into();
+        let decoded: Message = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        if json.get("resume").is_some() {
+            json["resume"] = true.into();
+            let decoded: Message = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+            json.as_object_mut().unwrap().remove("resume");
+            assert!(serde_json::from_value::<Message>(json).is_err());
+        }
     }
 }
 
@@ -267,7 +364,9 @@ async fn close_burst_waits_for_writer_then_delivers_heartbeat() {
         let (read, write) = tokio::io::split(right);
         let mut peer = Control::new(read, write);
         for expected in 0..=QUEUE as u64 {
-            assert!(matches!(peer.recv().await.unwrap(), Message::Close { id } if id == expected));
+            assert!(
+                matches!(peer.recv().await.unwrap(), Message::Close { id, generation: 1 } if id == expected)
+            );
         }
         assert!(matches!(
             peer.recv().await.unwrap(),
@@ -276,7 +375,10 @@ async fn close_burst_waits_for_writer_then_delivers_heartbeat() {
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         for id in 0..=QUEUE as u64 {
-            control.send(Message::Close { id }).await.unwrap();
+            control
+                .send(Message::Close { id, generation: 1 })
+                .await
+                .unwrap();
         }
         control
             .send(Message::Heartbeat {
@@ -297,10 +399,19 @@ async fn control_round_trip() {
     let (rr, rw) = tokio::io::split(right);
     let mut client = Control::new(lr, lw);
     let mut server = Control::new(rr, rw);
-    client.send(Message::Close { id: 7 }).await.unwrap();
+    client
+        .send(Message::Close {
+            id: 7,
+            generation: 1,
+        })
+        .await
+        .unwrap();
     assert!(matches!(
         server.recv().await.unwrap(),
-        Message::Close { id: 7 }
+        Message::Close {
+            id: 7,
+            generation: 1
+        }
     ));
     server
         .send(Message::Ready { version: VERSION })
@@ -325,7 +436,7 @@ fn address_assignment_messages_round_trip() {
                 mtu: 1400,
                 addr_auto: true,
             },
-            "{\"type\":\"hello\",\"version\":2,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400,\"addr_auto\":true}",
+            "{\"type\":\"hello\",\"version\":3,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400,\"addr_auto\":true}",
         ),
         (
             Message::Assigned {
@@ -345,7 +456,7 @@ fn address_assignment_messages_round_trip() {
     // A Hello without addr_auto (a pre-#181 client) must fail to parse.
     assert!(
         serde_json::from_str::<Message>(
-            "{\"type\":\"hello\",\"version\":2,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400}"
+            "{\"type\":\"hello\",\"version\":3,\"client_ip\":\"10.77.3.2\",\"server_ip\":\"10.77.3.1\",\"mtu\":1400}"
         )
         .is_err()
     );

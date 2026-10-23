@@ -37,6 +37,7 @@ mod control;
 mod event;
 mod flow;
 mod pump;
+mod recovery;
 mod round;
 mod state;
 pub mod stats;
@@ -47,8 +48,8 @@ pub use pump::{ChannelCtx, ChannelHandle, ChannelReadyParams, TaskCommand, TaskE
 pub use round::{Round, RoundCandidate, pick_verified, unanswered};
 
 pub use state::{
-    ChannelsPlane, Flow, FlowTcp, PacketIo, Plane, Readiness, TcpFlow, TcpPlane, Tombstone,
-    Tombstones, TransportConfig,
+    ChannelsPlane, Flow, FlowTcp, PacketIo, Plane, Readiness, Recovery, TcpClose, TcpFlow,
+    TcpPlane, Tombstone, Tombstones, TransportConfig,
 };
 
 // ────────────────────────── Timeouts and budgets ──────────────────────────
@@ -60,10 +61,14 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Data-plane channel keepalive and silence budget (consent freshness).
 pub const KEEPALIVE: Duration = Duration::from_secs(1);
 pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(5);
-/// An active flow without traffic is closed (idle timeout).
+/// UDP/ICMP idle and legacy TCP opening budget.
 pub const FLOW_IDLE: Duration = Duration::from_secs(60);
-/// FIN from the target with no data for this long — the server closes the flow (server decides).
-pub const FIN_DWELL: Duration = Duration::from_secs(15);
+/// TCP idle floor from RFC 5382; silence alone is not a failed connection.
+pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60 + 4 * 60);
+/// Retain both-FIN flows for retransmissions (RFC 5382 transitory timeout).
+pub const FIN_DWELL: Duration = Duration::from_secs(4 * 60);
+pub const FLOW_CAP: usize = 4096;
+pub const PROBE_FLOW_RESERVE: usize = 16;
 /// Per-channel outgoing IP-packet queue and binding wait.
 pub const CHANNEL_QUEUE: usize = 1024;
 /// How long a lost link's tuples stay refused before normal admission
@@ -107,6 +112,7 @@ pub struct Session {
     pub drop_prefix: String,
     /// next health burst at; armed on Ready, re-armed per burst.
     pub health_at: Option<tokio::time::Instant>,
+    pub flush_at: Option<tokio::time::Instant>,
     /// in-flight probe burst over the live channel.
     pub burst: Option<burst::Burst>,
     pub challenge: Option<challenge::Challenge>,
@@ -184,6 +190,7 @@ impl Session {
             }
             let round_wake = self.round.as_ref().and_then(|round| round.decide_at);
             let health_wake = self.health_wake();
+            let flush_wake = self.flush_at;
             let result = with_heartbeat_deadline(deadline, async {
                 tokio::select! {
                     message = self.control.recv() => {
@@ -210,9 +217,9 @@ impl Session {
                                 crate::tcp::Event::Packet(incoming) => {
                                     self.deliver_to_tun(incoming).await?;
                                 }
-                                crate::tcp::Event::Connected { id } => self.tcp_connected(id).await?,
-                                crate::tcp::Event::Failed { id } => self.tcp_failed(id).await?,
-                                crate::tcp::Event::Closed { id } => self.tcp_closed(id).await?,
+                                crate::tcp::Event::Connected { id, generation } => self.tcp_connected(id, generation).await?,
+                                crate::tcp::Event::Failed { id, generation } => self.tcp_failed(id, generation).await?,
+                                crate::tcp::Event::Closed { id, generation } => self.tcp_closed(id, generation).await?,
                                 crate::tcp::Event::Bound { token, conn } => {
                                     conn.send(self.resolve_binding(&token)).ok();
                                 }
@@ -257,9 +264,13 @@ impl Session {
                         // Health burst due or in flight.
                         self.poll_burst(tokio::time::Instant::now()).await?;
                     }
+                    _ = tokio::time::sleep_until(flush_wake.unwrap_or(deadline)), if flush_wake.is_some() => {
+                        self.flush_pending().await?;
+                    }
                     _ = tick.tick() => {
                         let now = tokio::time::Instant::now();
                         self.expire_flows(now).await?;
+                        self.poll_recovery(now).await?;
                         self.stats.active_flows = self.flow_count();
                         self.stats.active_candidate = self.active_candidate();
                         if let PacketIo::Link(io) = &self.io {
@@ -546,6 +557,7 @@ async fn run_io(
         round: None,
         next_round_attempt: u64::MAX / 2,
         health_at: None,
+        flush_at: None,
         burst: None,
         challenge: None,
         path_stats: HashMap::new(),
@@ -570,7 +582,7 @@ pub fn probe_payload_len(mtu: u16, sample: u16) -> Result<usize> {
 pub fn strategy_max_wire(strategy: Strategy) -> u16 {
     match strategy {
         Strategy::Quic => quic::FRAGMENT_BUDGET as u16,
-        Strategy::WebRtc => (channel::MAX_PACKET + 45) as u16,
+        Strategy::WebRtc => (channel::MAX_PACKET + channel::DATA_HEADER + 24) as u16,
         Strategy::Mosh | Strategy::Plain => crate::profile::MAX_WIRE as u16,
         Strategy::Obfs => (crate::profile::MAX_WIRE - 32) as u16,
     }

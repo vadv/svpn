@@ -8,9 +8,9 @@
 //! Invariants:
 //! - one selection process: parallel flows wait for one channel preparation;
 //! - `last_good` first, erased only by that candidate's own failure;
-//! - after `Commit` there is no fallback — only closing on timeout;
+//! - binding generations reject events from an abandoned attempt;
 //! - a bind failure affects one flow, a channel failure affects all its flows;
-//! - the 30 s hold-down is not extended by packets; everyone in cooldown — immediate failure;
+//! - packets and repeated failures never extend an admission/recovery deadline;
 //! - the pre-active queue is bounded (64 packets/flow, 64 flows, 2 MiB);
 //! - proactive-auto: a preparation failure (including the first TCP connect) bans
 //!   the candidate for the rest of the session; exhausting them all — one `Exhausted`, stop.
@@ -32,7 +32,7 @@ mod types;
 
 pub use types::{
     ATTEMPT_BUDGET, Action, Allowed, COLD_ORDER, Candidate, FLOW_BUDGET, HOLD_DOWN, PENDING_FLOWS,
-    PREACTIVE_BYTES, PREACTIVE_PACKETS, Reason, Reject,
+    PREACTIVE_BYTES, PREACTIVE_PACKETS, RECOVERY_BUDGET, Reason, Reject,
 };
 
 /// A ready strategy channel (after `channel_ready`).
@@ -72,14 +72,14 @@ pub struct Preparation {
 enum Stage {
     /// Waiting for a candidate choice and a ready channel.
     Pending,
-    /// `flow_open` sent, waiting for `flow_opened` (including FLOW_PROBE/ECHO).
     Binding {
         candidate: Candidate,
-        attempt: u64,
         deadline: Instant,
     },
-    /// `commit` sent — fallback is forbidden until the very end of the flow.
-    Committing { candidate: Candidate, attempt: u64 },
+    Committing {
+        candidate: Candidate,
+        deadline: Instant,
+    },
     /// `committed` received: DATA allowed, last_good updated.
     Active { candidate: Candidate },
 }
@@ -102,6 +102,9 @@ impl Stage {
 
 struct FlowSel {
     flow: FlowKey,
+    generation: u64,
+    recovering: bool,
+    retry_at: Option<Instant>,
     /// Overall flow deadline (admission + FLOW_BUDGET).
     deadline: Instant,
     stage: Stage,
@@ -211,8 +214,42 @@ impl Selector {
         self.queued_bytes
     }
 
+    /// Flows holding memory the selector has not admitted yet — pre-active,
+    /// recovering, or active with a still-undrained queue. Bounded by
+    /// `PENDING_FLOWS`: a deliberate admission cap, so a backed-up flow
+    /// consumes a slot a new flow would need.
     pub fn pre_active_count(&self) -> usize {
-        self.flows.values().filter(|f| !f.stage.is_active()).count()
+        self.flows
+            .values()
+            .filter(|flow| (!flow.stage.is_active() && !flow.recovering) || !flow.queue.is_empty())
+            .count()
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.flows.values().any(|flow| !flow.stage.is_active())
+    }
+
+    pub fn binding_active(&self, flow_id: u64, generation: u64) -> bool {
+        self.flows
+            .get(&flow_id)
+            .is_some_and(|flow| flow.generation == generation && flow.stage.is_active())
+    }
+
+    pub fn has_queued(&self, flow_id: u64) -> bool {
+        self.flows
+            .get(&flow_id)
+            .is_some_and(|flow| !flow.queue.is_empty())
+    }
+
+    pub fn pop_packet(&mut self, flow_id: u64) -> Option<Vec<u8>> {
+        let flow = self.flows.get_mut(&flow_id)?;
+        if !flow.stage.is_active() {
+            return None;
+        }
+        let packet = flow.queue.pop_front()?;
+        flow.queue_bytes -= packet.len();
+        self.queued_bytes -= packet.len();
+        Some(packet)
     }
 
     pub fn ready_channel(&self, candidate: Candidate) -> Option<u64> {
@@ -222,8 +259,8 @@ impl Selector {
             .map(|channel| channel.id)
     }
 
-    /// Cancel unfinished selection without changing healthy active flows.
-    pub fn enter_checking(&mut self) -> Vec<Action> {
+    /// Pause selection while preserving queues and their original deadlines.
+    pub fn enter_checking(&mut self, now: Instant) -> Vec<Action> {
         self.suspended = true;
         let mut actions = Vec::new();
         if let Some(preparation) = self.preparation.take() {
@@ -236,18 +273,20 @@ impl Selector {
         let unfinished: Vec<_> = self
             .flows
             .iter()
-            .filter(|(_, flow)| !flow.stage.is_active())
-            .map(|(&id, _)| id)
+            .filter(|(_, flow)| {
+                matches!(flow.stage, Stage::Binding { .. } | Stage::Committing { .. })
+            })
+            .map(|(&id, flow)| (id, flow.generation, flow.recovering))
             .collect();
-        for id in unfinished {
-            self.finished(id);
-            actions.push(Action::CloseFlow { flow_id: id });
+        for (id, generation, recovering) in unfinished {
+            actions.extend(self.retry(id, generation, recovering, Reason::ChannelFailed, now));
         }
         actions
     }
 
-    pub fn resume(&mut self) {
+    pub fn resume(&mut self, now: Instant) -> Vec<Action> {
         self.suspended = false;
+        self.advance(now)
     }
 
     /// Remember the round winner; TCP has no shared channel to adopt.
@@ -266,6 +305,13 @@ impl Selector {
         // A proven candidate starts with a clean ban backoff.
         self.ban_backoff.remove(&candidate);
         self.ban_until.remove(&candidate);
+        for flow in self
+            .flows
+            .values_mut()
+            .filter(|flow| matches!(flow.stage, Stage::Pending))
+        {
+            flow.skip.remove(&candidate);
+        }
     }
 
     fn attempt(&mut self) -> u64 {
@@ -306,7 +352,9 @@ impl Selector {
         }
         self.order()
             .into_iter()
-            .filter(|candidate| !flow.skip.contains(candidate))
+            .filter(|candidate| {
+                !flow.skip.contains(candidate) && (!flow.recovering || *candidate != Candidate::Tcp)
+            })
             .find(|candidate| self.available(*candidate, now))
     }
 
@@ -326,21 +374,23 @@ impl Selector {
             .map(|(&id, _)| id)
             .collect();
         for flow_id in pending {
+            if let Some(flow) = self.flows.get_mut(&flow_id)
+                && flow.retry_at.is_some_and(|at| now >= at)
+            {
+                flow.skip.clear();
+                flow.retry_at = None;
+            }
             let Some(candidate) = self.next_for_flow(&flow_id, now) else {
-                // All candidates in hold-down/excluded — an honest failure;
-                // proactive-auto with empty allowed — the session stop signal.
-                if let Some(stop) = self.exhaust_if_empty() {
-                    actions.extend(stop);
-                    continue;
-                }
-                actions.extend(self.fail_flow(flow_id, Reason::PathTimeout));
+                // The shared round may still supply a verified channel before the deadline.
                 continue;
             };
             match candidate {
                 Candidate::Tcp => {
-                    let attempt = self.attempt();
-                    self.set_binding(flow_id, candidate, attempt, now);
-                    actions.push(Action::TryTcp { flow_id, attempt });
+                    self.set_binding(flow_id, candidate, now);
+                    actions.push(Action::TryTcp {
+                        flow_id,
+                        generation: self.flows[&flow_id].generation,
+                    });
                 }
                 udp => {
                     let channel = self
@@ -349,10 +399,10 @@ impl Selector {
                         .map(|channel| (channel.id, channel.verified()));
                     match channel {
                         Some((channel_id, true)) => {
-                            let attempt = self.attempt();
-                            self.set_binding(flow_id, udp, attempt, now);
+                            self.set_binding(flow_id, udp, now);
                             actions.push(Action::OpenFlow {
                                 flow_id,
+                                generation: self.flows[&flow_id].generation,
                                 candidate: udp,
                                 channel: channel_id,
                             });
@@ -383,12 +433,11 @@ impl Selector {
         actions
     }
 
-    fn set_binding(&mut self, flow_id: u64, candidate: Candidate, attempt: u64, now: Instant) {
+    fn set_binding(&mut self, flow_id: u64, candidate: Candidate, now: Instant) {
         if let Some(flow) = self.flows.get_mut(&flow_id) {
             flow.stage = Stage::Binding {
                 candidate,
-                attempt,
-                deadline: now + ATTEMPT_BUDGET,
+                deadline: (now + ATTEMPT_BUDGET).min(flow.deadline),
             };
         }
     }
@@ -407,14 +456,9 @@ impl Selector {
         if !self.used_ids.insert(flow_id) {
             return Err(Reject::Duplicate);
         }
-        // The cap protects the pre-active backlog; Active flows live until
-        // the idle sweep and must not eat the budget of new attempts.
-        let pre_active = self
-            .flows
-            .values()
-            .filter(|flow| !flow.stage.is_active())
-            .count();
-        if pre_active >= PENDING_FLOWS {
+        if self.pre_active_count() >= PENDING_FLOWS
+            || self.queued_bytes + first_packet.len() > PREACTIVE_BYTES
+        {
             return Err(Reject::PendingFull);
         }
         let queue = VecDeque::from([first_packet.to_vec()]);
@@ -423,6 +467,9 @@ impl Selector {
             flow_id,
             FlowSel {
                 flow,
+                generation: 1,
+                recovering: false,
+                retry_at: None,
                 deadline: now + FLOW_BUDGET,
                 stage: Stage::Pending,
                 queue,
@@ -504,6 +551,9 @@ impl Selector {
 
     /// Channel verified on both sides: waiting flows go to bind.
     fn verified(&mut self, candidate: Candidate, now: Instant) -> Vec<Action> {
+        if self.suspended {
+            return Vec::new();
+        }
         let Some(channel) = self.channels.get(&candidate) else {
             return Vec::new();
         };
@@ -521,10 +571,10 @@ impl Selector {
             .map(|(&id, _)| id)
             .collect();
         for flow_id in pending {
-            let attempt = self.attempt();
-            self.set_binding(flow_id, candidate, attempt, now);
+            self.set_binding(flow_id, candidate, now);
             actions.push(Action::OpenFlow {
                 flow_id,
+                generation: self.flows[&flow_id].generation,
                 candidate,
                 channel: channel_id,
             });
@@ -557,8 +607,7 @@ impl Selector {
         self.advance(now)
     }
 
-    /// Channel loss: close its flows without migration. A verified channel gets
-    /// hold-down; one that failed probes in auto — a session-long ban.
+    /// Invalidate this channel only. Session selects affected flows by their actual channel ID.
     pub fn channel_lost(
         &mut self,
         candidate: Candidate,
@@ -575,16 +624,7 @@ impl Selector {
         };
         let unverified = !channel.verified();
         self.channels.remove(&candidate);
-        let doomed: Vec<u64> = self
-            .flows
-            .iter()
-            .filter(|(_, flow)| flow.stage.candidate() == Some(candidate))
-            .map(|(&id, _)| id)
-            .collect();
         let mut actions = Vec::new();
-        for flow_id in doomed {
-            actions.extend(self.fail_flow(flow_id, reason));
-        }
         if self.proactive && unverified {
             self.ban(candidate, reason, now);
             if let Some(stop) = self.exhaust_if_empty() {
@@ -648,7 +688,7 @@ impl Selector {
 
     /// All candidates banned in proactive-auto: one `Exhausted` with the table.
     fn exhaust_if_empty(&mut self) -> Option<Vec<Action>> {
-        if !self.proactive || self.exhausted || !self.allowed.is_empty() {
+        if !self.proactive || self.exhausted || !self.allowed.is_empty() || !self.flows.is_empty() {
             return None;
         }
         self.exhausted = true;
@@ -657,57 +697,122 @@ impl Selector {
         }])
     }
 
-    /// `flow_opened` (UDP) or a successful TCP connect+probe: go to commit.
-    pub fn bind_succeeded(&mut self, flow_id: u64, _now: Instant) -> Vec<Action> {
-        // The commit inherits the deadline from the flow (FLOW_BUDGET).
-        let Some(flow) = self.flows.get_mut(&flow_id) else {
-            return Vec::new();
-        };
-        let Stage::Binding {
-            candidate, attempt, ..
-        } = flow.stage
+    pub fn bind_succeeded(&mut self, flow_id: u64, generation: u64, now: Instant) -> Vec<Action> {
+        let Some(flow) = self
+            .flows
+            .get_mut(&flow_id)
+            .filter(|flow| flow.generation == generation)
         else {
-            return Vec::new();
-        };
-        flow.stage = Stage::Committing { candidate, attempt };
-        vec![Action::Commit {
-            flow_id,
-            candidate,
-            attempt,
-        }]
-    }
-
-    /// Bind failure of one flow (FLOW_PROBE/TCP connect): the channel is intact,
-    /// exclude the candidate for this flow and try the next one.
-    pub fn bind_failed(&mut self, flow_id: u64, reason: Reason, now: Instant) -> Vec<Action> {
-        let Some(flow) = self.flows.get_mut(&flow_id) else {
             return Vec::new();
         };
         let Stage::Binding { candidate, .. } = flow.stage else {
             return Vec::new();
         };
-        flow.skip.insert(candidate);
-        flow.stage = Stage::Pending;
-        if self.proactive && candidate == Candidate::Tcp {
-            // A dead TCP path: the first connect failure bans it.
-            self.ban(candidate, reason, now);
-            if let Some(stop) = self.exhaust_if_empty() {
-                return stop;
-            }
-        }
-        self.advance(now)
+        flow.stage = Stage::Committing {
+            candidate,
+            deadline: (now + ATTEMPT_BUDGET).min(flow.deadline),
+        };
+        vec![Action::Commit {
+            flow_id,
+            candidate,
+            generation,
+        }]
     }
 
-    /// `committed`: the flow is active, the candidate is the RAM hint for the next flows.
-    pub fn committed(&mut self, flow_id: u64) -> Vec<Action> {
-        let Some(flow) = self.flows.get_mut(&flow_id) else {
+    /// Session calls this only while user data has not entered a transport.
+    pub fn bind_failed(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        reason: Reason,
+        now: Instant,
+    ) -> Vec<Action> {
+        if self.proactive
+            && self.flows.get(&flow_id).is_some_and(|flow| {
+                flow.generation == generation
+                    && matches!(
+                        flow.stage,
+                        Stage::Binding {
+                            candidate: Candidate::Tcp,
+                            ..
+                        }
+                    )
+            })
+        {
+            self.ban(Candidate::Tcp, reason, now);
+        }
+        self.retry(flow_id, generation, false, reason, now)
+    }
+
+    pub fn recover(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        reason: Reason,
+        now: Instant,
+    ) -> Vec<Action> {
+        self.retry(flow_id, generation, true, reason, now)
+    }
+
+    fn retry(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        recovering: bool,
+        reason: Reason,
+        now: Instant,
+    ) -> Vec<Action> {
+        let Some(flow) = self
+            .flows
+            .get_mut(&flow_id)
+            .filter(|flow| flow.generation == generation)
+        else {
+            return Vec::new();
+        };
+        if matches!(flow.stage, Stage::Pending) {
+            return Vec::new();
+        }
+        if recovering && flow.stage.is_active() {
+            flow.deadline = now + RECOVERY_BUDGET;
+            flow.skip.clear();
+        }
+        if now >= flow.deadline {
+            return self.fail_flow(flow_id, reason);
+        }
+        let Some(generation) = generation.checked_add(1) else {
+            return self.fail_flow(flow_id, Reason::ResourceExhausted);
+        };
+        let from = flow.stage.candidate();
+        if let Some(candidate) = from {
+            flow.skip.insert(candidate);
+        }
+        flow.generation = generation;
+        flow.retry_at = Some(now + ATTEMPT_BUDGET);
+        flow.recovering |= recovering;
+        flow.stage = Stage::Pending;
+        let mut actions = vec![Action::ResetBinding {
+            flow_id,
+            generation,
+            from,
+            reason,
+        }];
+        actions.extend(self.advance(now));
+        actions
+    }
+
+    pub fn committed(&mut self, flow_id: u64, generation: u64) -> Vec<Action> {
+        let Some(flow) = self
+            .flows
+            .get_mut(&flow_id)
+            .filter(|flow| flow.generation == generation)
+        else {
             return Vec::new();
         };
         if let Stage::Committing { candidate, .. } = flow.stage {
             flow.stage = Stage::Active { candidate };
+            flow.recovering = false;
             self.last_good = Some(candidate);
         }
-        // The packet queue is handed over by session on reaching Active.
         Vec::new()
     }
 
@@ -720,26 +825,9 @@ impl Selector {
         Vec::new()
     }
 
-    /// Flow closed before commit (FlowClose from the server, budget): for the
-    /// selector this is a bind failure — in proactive-auto a candidate ban
-    /// and possibly Exhausted. After commit — plain queue release.
-    pub fn closed(&mut self, flow_id: u64, reason: Reason, now: Instant) -> Vec<Action> {
-        let binding = self
-            .flows
-            .get(&flow_id)
-            .is_some_and(|flow| matches!(flow.stage, Stage::Binding { .. }));
-        if !binding {
-            return self.finished(flow_id);
-        }
-        let actions = self.bind_failed(flow_id, reason, now);
-        // bind_failed returned the flow to Pending — finish it like finished().
-        if let Some(flow) = self.flows.remove(&flow_id) {
-            self.queued_bytes -= flow.queue_bytes;
-        }
-        actions
-    }
-
     /// Pre-active packet queue of an active flow (after committed).
+    /// Test inspection and channel handover only; production drains via
+    /// `pop_packet` inside the session's flush loop.
     pub fn take_queue(&mut self, flow_id: u64) -> Option<VecDeque<Vec<u8>>> {
         let flow = self.flows.get_mut(&flow_id)?;
         if !flow.stage.is_active() {
@@ -776,16 +864,20 @@ impl Selector {
                 now,
             ));
         }
-        let expired_binds: Vec<u64> = self
+        let expired_binds: Vec<_> = self
             .flows
             .iter()
             .filter(|(_, flow)| {
-                matches!(&flow.stage, Stage::Binding { deadline, .. } if now >= *deadline)
+                matches!(&flow.stage, Stage::Binding { deadline, .. } | Stage::Committing { deadline, .. } if now >= *deadline)
             })
-            .map(|(&id, _)| id)
+            .map(|(&id, flow)| (id, flow.generation, flow.recovering))
             .collect();
-        for flow_id in expired_binds {
-            actions.extend(self.bind_failed(flow_id, Reason::PathTimeout, now));
+        for (flow_id, generation, recovering) in expired_binds {
+            actions.extend(if recovering {
+                self.recover(flow_id, generation, Reason::PathTimeout, now)
+            } else {
+                self.bind_failed(flow_id, generation, Reason::PathTimeout, now)
+            });
         }
         let expired_flows: Vec<u64> = self
             .flows
@@ -796,7 +888,6 @@ impl Selector {
             .map(|(&id, _)| id)
             .collect();
         for flow_id in expired_flows {
-            // Committing without committed by this point — closure without fallback.
             actions.extend(self.fail_flow(flow_id, Reason::PathTimeout));
         }
         // Hold-down expired — the entry is removed.
@@ -816,6 +907,10 @@ impl Selector {
                     .sort_by_key(|c| COLD_ORDER.iter().position(|o| o == c).unwrap_or(usize::MAX));
             }
             actions.push(Action::BanExpired { candidate });
+        }
+        actions.extend(self.advance(now));
+        if let Some(stop) = self.exhaust_if_empty() {
+            actions.extend(stop);
         }
         actions
     }

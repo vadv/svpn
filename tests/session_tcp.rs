@@ -10,10 +10,54 @@ use common::session::{assert_closed, link_session, link_session_cap, tcp_packet}
 use svpn::control::{Control, Message};
 use svpn::link_io::{self, PREFLIGHT_ID};
 use svpn::packet;
-use svpn::selector::{Allowed, Candidate, Selector};
+use svpn::selector::{Allowed, Candidate, Reason, Selector};
 use svpn::session::*;
 use svpn::udp::Incoming;
 use tokio::sync::mpsc;
+
+// ── opening fallback ──
+
+#[tokio::test]
+async fn failed_tcp_binding_keeps_owner_and_queue_on_a_verified_datagram_path() {
+    let (mut session, mut events) = link_session_cap(false, 8);
+    session.readiness = Some(Readiness::Ready);
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    let mut selector = Selector::new_proactive(Allowed {
+        quic: true,
+        tcp: true,
+        ..Allowed::default()
+    });
+    selector.adopt(Candidate::Quic, Some(10));
+    selector.adopt(Candidate::Tcp, None);
+    plane.selector = Some(selector);
+    let bytes = common::udp_packet(false);
+    let key = packet::parse(&bytes, true).unwrap().flow;
+    session.handle_tun_packet(&bytes, Some(41)).await.unwrap();
+    session.tcp_failed(41, 1).await.unwrap();
+    session.tcp_failed(41, 1).await.unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    let flow = &plane.flows[&41];
+    assert_eq!(flow.generation, 2);
+    assert_eq!(flow.channel, Some(10));
+    assert!(!flow.active);
+    assert!(!flow.data_started);
+    assert_eq!(plane.by_key[&key], 41);
+    let selector = plane.selector.as_ref().unwrap();
+    assert_eq!(
+        selector.banned,
+        vec![(Candidate::Tcp, Reason::ChannelFailed)]
+    );
+    assert!(selector.has_queued(41));
+    assert_eq!(selector.queued_bytes(), bytes.len());
+    assert_eq!(session.stats.open_failed_flows, 0);
+    assert_eq!(session.readiness, Some(Readiness::Ready));
+    assert!(session.round.is_none());
+    assert!(events.try_recv().is_err(), "retry released the Hub owner");
+}
 
 // ── EOF/FIN behavior ──
 
@@ -26,13 +70,24 @@ async fn idle_tcp_eof_does_not_check_or_retire_other_flows() {
         second[20..22].copy_from_slice(&4321u16.to_be_bytes());
         session.handle_tun_packet(&first, Some(41)).await.unwrap();
         session.handle_tun_packet(&second, Some(42)).await.unwrap();
-        let idle = tokio::time::Instant::now() - FLOW_IDLE;
+        let idle = tokio::time::Instant::now() - TCP_IDLE;
         match &mut session.plane {
-            Plane::Channels(plane) => plane.flows.get_mut(&41).unwrap().last_seen = idle,
-            Plane::Tcp(plane) => plane.flows.get_mut(&41).unwrap().last_seen = idle,
+            Plane::Channels(plane) => {
+                let flow = plane.flows.get_mut(&41).unwrap();
+                flow.active = true;
+                flow.data_started = true;
+                flow.last_seen = idle;
+            }
+            Plane::Tcp(plane) => {
+                let flow = plane.flows.get_mut(&41).unwrap();
+                flow.active = true;
+                flow.data_started = true;
+                flow.binding_deadline = None;
+                flow.last_seen = idle;
+            }
         }
         session.readiness = Some(Readiness::Ready);
-        session.tcp_closed(41).await.unwrap();
+        session.tcp_closed(41, 1).await.unwrap();
         assert!(!session.has_flow(41));
         assert!(session.has_flow(42));
         assert!(matches!(
@@ -45,7 +100,7 @@ async fn idle_tcp_eof_does_not_check_or_retire_other_flows() {
             "idle EOF started Checking"
         );
         assert!(session.round.is_none());
-        session.tcp_closed(41).await.unwrap();
+        session.tcp_closed(41, 1).await.unwrap();
         assert!(events.try_recv().is_err());
     }
 }
@@ -67,20 +122,37 @@ async fn fin_then_eof_keeps_ready_but_reset_or_unexplained_eof_checks() {
                 second[20..22].copy_from_slice(&4321u16.to_be_bytes());
                 session.handle_tun_packet(&syn, Some(41)).await.unwrap();
                 session.handle_tun_packet(&second, Some(42)).await.unwrap();
+                let mut outgoing = Vec::new();
                 match &mut session.plane {
                     Plane::Channels(plane) => {
                         let selector = plane.selector.as_mut().unwrap();
                         for (&id, flow) in &mut plane.flows {
-                            selector.bind_succeeded(id, StdInstant::now());
-                            selector.committed(id);
+                            selector.bind_succeeded(id, 1, StdInstant::now());
+                            selector.committed(id, 1);
                             selector.take_queue(id);
                             flow.active = true;
+                            flow.data_started = true;
+                            let (send, receive) = mpsc::channel(8);
+                            outgoing.push(receive);
+                            flow.tcp = Some(FlowTcp {
+                                key: [1; 16],
+                                token: None,
+                                out: Some(send),
+                                receiver: None,
+                                task: None,
+                                cancel: None,
+                            });
                         }
                     }
                     Plane::Tcp(plane) => {
                         for flow in plane.flows.values_mut() {
                             flow.active = true;
-                            flow.outgoing = Some(mpsc::channel(1).0);
+                            flow.data_started = true;
+                            flow.pending.clear();
+                            flow.binding_deadline = None;
+                            let (send, receive) = mpsc::channel(8);
+                            outgoing.push(receive);
+                            flow.outgoing = Some(send);
                         }
                     }
                 }
@@ -93,6 +165,7 @@ async fn fin_then_eof_keeps_ready_but_reset_or_unexplained_eof_checks() {
                 if finish {
                     session
                         .deliver_to_tun(Incoming {
+                            generation: 1,
                             id: 41,
                             channel: None,
                             packet: reply.clone(),
@@ -103,16 +176,40 @@ async fn fin_then_eof_keeps_ready_but_reset_or_unexplained_eof_checks() {
                         events.try_recv().unwrap().1,
                         link_io::Event::Packet(_)
                     ));
-                    // The final ACK must not erase the FIN-dwell state.
                     session
-                        .handle_tun_packet(&tcp_packet(0x10), Some(41))
+                        .handle_tun_packet(&tcp_packet(0x11), Some(41))
                         .await
                         .unwrap();
+                    let fin_end = packet::parse(&syn, true)
+                        .unwrap()
+                        .tcp
+                        .unwrap()
+                        .seq
+                        .wrapping_add(1);
+                    let mut ack = tcp_packet(0x10);
+                    ack[28..32].copy_from_slice(&fin_end.to_be_bytes());
+                    session.handle_tun_packet(&ack, Some(41)).await.unwrap();
+                    let mut ack = reply.clone();
+                    ack[33] = 0x10;
+                    ack[28..32].copy_from_slice(&fin_end.to_be_bytes());
+                    session
+                        .deliver_to_tun(Incoming {
+                            generation: 1,
+                            id: 41,
+                            channel: None,
+                            packet: ack,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        events.try_recv().unwrap().1,
+                        link_io::Event::Packet(_)
+                    ));
                 }
                 if reset {
-                    session.tcp_failed(41).await.unwrap();
+                    session.tcp_failed(41, 1).await.unwrap();
                 } else {
-                    session.tcp_closed(41).await.unwrap();
+                    session.tcp_closed(41, 1).await.unwrap();
                 }
                 assert!(!session.has_flow(41));
                 assert!(session.has_flow(42));
@@ -128,6 +225,7 @@ async fn fin_then_eof_keeps_ready_but_reset_or_unexplained_eof_checks() {
                     reply[22..24].copy_from_slice(&4321u16.to_be_bytes());
                     session
                         .deliver_to_tun(Incoming {
+                            generation: 1,
                             id: 42,
                             channel: None,
                             packet: reply,
@@ -160,7 +258,12 @@ async fn failed_fixed_tcp_flow_starts_checking_without_retiring_other_flows() {
     second[20..22].copy_from_slice(&4321u16.to_be_bytes());
     session.handle_tun_packet(&first, Some(41)).await.unwrap();
     session.handle_tun_packet(&second, Some(42)).await.unwrap();
-    session.tcp_failed(41).await.unwrap();
+    let Plane::Tcp(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&41).unwrap().active = true;
+    plane.flows.get_mut(&41).unwrap().data_started = true;
+    session.tcp_failed(41, 1).await.unwrap();
     assert!(!session.has_flow(41));
     assert!(session.has_flow(42));
     assert!(matches!(
@@ -238,13 +341,25 @@ async fn legacy_tcp_failure_closes_and_notifies_both_owners() {
     session.handle_tun_packet(&bytes, Some(11)).await.unwrap();
     assert!(matches!(
         peer.recv().await.unwrap(),
-        Message::Open { id: 11, .. }
+        Message::Open {
+            generation: 1,
+            id: 11,
+            ..
+        }
     ));
-    session.tcp_failed(11).await.unwrap();
+    let Plane::Tcp(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.flows.get_mut(&11).unwrap().active = true;
+    plane.flows.get_mut(&11).unwrap().data_started = true;
+    session.tcp_failed(11, 1).await.unwrap();
     assert_closed(events.recv().await.unwrap(), 11, key);
     assert!(matches!(
         peer.recv().await.unwrap(),
-        Message::Close { id: 11 }
+        Message::Close {
+            generation: 1,
+            id: 11
+        }
     ));
     assert_eq!(session.flow_count(), 0);
 }
@@ -290,12 +405,12 @@ async fn session_drop_closes_real_tcp_flow_connections() {
             .unwrap();
         if legacy {
             session
-                .tcp_opened_client(1, port, [1; 16], Some([2; 16]))
+                .tcp_opened_client(1, 1, port, [1; 16], Some([2; 16]))
                 .await
                 .unwrap();
         } else {
             session
-                .channels_tcp_opened(1, port, [1; 16], Some([2; 16]))
+                .channels_tcp_opened(1, 1, port, [1; 16], Some([2; 16]))
                 .await
                 .unwrap();
         }
@@ -333,13 +448,16 @@ async fn server_tcp_preflight_uses_the_tun_only_after_authenticated_binding() {
         );
         let key = packet::parse(&request, true).unwrap().flow;
         let token = if legacy {
-            session.tcp_open_server(PREFLIGHT_ID, key).await.unwrap();
+            session.tcp_open_server(PREFLIGHT_ID, 1, key).await.unwrap();
             let Plane::Tcp(plane) = &session.plane else {
                 unreachable!()
             };
             plane.flows[&PREFLIGHT_ID].tcp_token.unwrap()
         } else {
-            session.channels_tcp_open(PREFLIGHT_ID, key).await.unwrap();
+            session
+                .channels_tcp_open(PREFLIGHT_ID, 1, key)
+                .await
+                .unwrap();
             let Plane::Channels(plane) = &session.plane else {
                 unreachable!()
             };
@@ -352,6 +470,7 @@ async fn server_tcp_preflight_uses_the_tun_only_after_authenticated_binding() {
         };
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: PREFLIGHT_ID,
                 channel: None,
                 packet: request.clone(),
@@ -362,6 +481,7 @@ async fn server_tcp_preflight_uses_the_tun_only_after_authenticated_binding() {
         let mut bound = session.resolve_binding(&token).unwrap();
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: PREFLIGHT_ID,
                 channel: None,
                 packet: request.clone(),
@@ -372,9 +492,10 @@ async fn server_tcp_preflight_uses_the_tun_only_after_authenticated_binding() {
             events.try_recv().is_err(),
             "unauthenticated TCP probe reached TUN"
         );
-        session.tcp_connected(PREFLIGHT_ID).await.unwrap();
+        session.tcp_connected(PREFLIGHT_ID, 1).await.unwrap();
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: PREFLIGHT_ID,
                 channel: None,
                 packet: request.clone(),
@@ -420,7 +541,10 @@ async fn server_preflight_uses_the_tun_path_and_relays_the_kernel_reply() {
         &[0xa5; 16],
     );
     let key = packet::parse(&request, true).unwrap().flow;
-    session.flow_open(PREFLIGHT_ID, key, Some(5)).await.unwrap();
+    session
+        .flow_open(PREFLIGHT_ID, 1, key, Some(5), false)
+        .await
+        .unwrap();
     // Model the completed FlowEcho/Commit exchange.
     let Plane::Channels(plane) = &mut session.plane else {
         unreachable!()
@@ -430,6 +554,7 @@ async fn server_preflight_uses_the_tun_path_and_relays_the_kernel_reply() {
 
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: PREFLIGHT_ID,
             channel: Some(5),
             packet: request.clone(),
@@ -450,7 +575,7 @@ async fn server_preflight_uses_the_tun_path_and_relays_the_kernel_reply() {
     session.handle_tun_packet(&reply, None).await.unwrap();
     assert!(matches!(
         commands.try_recv(),
-        Ok(TaskCommand::Data(id, bytes)) if id == PREFLIGHT_ID && bytes == reply
+        Ok(TaskCommand::Data { flow_id: id, generation: 1, packet: bytes }) if id == PREFLIGHT_ID && bytes == reply
     ));
     assert!(packet::icmp_echo_reply_matches(
         &reply,

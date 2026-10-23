@@ -34,12 +34,12 @@ pub enum Event {
     /// A decrypted IP packet of a flow.
     Packet(Incoming),
     /// Client: binding sent (preflight also verified a reply). Server: binding authenticated.
-    Connected { id: u64 },
+    Connected { id: u64, generation: u64 },
     /// Connect/binding failed: the selector must learn about the refusal
     /// (auto mode bans the TCP candidate and decides whether the list is exhausted).
-    Failed { id: u64 },
+    Failed { id: u64, generation: u64 },
     /// Clean stream EOF; the session classifies it using the inner flow state.
-    Closed { id: u64 },
+    Closed { id: u64, generation: u64 },
     /// An incoming connection presented a binding token; the session matches
     /// the token to a flow.
     Bound {
@@ -51,8 +51,10 @@ pub enum Event {
 /// Session reply to `Event::Bound`: flow parameters and the outgoing packet channel.
 pub struct Bound {
     pub id: u64,
+    pub generation: u64,
     pub key: [u8; 16],
     pub outgoing: mpsc::Receiver<Vec<u8>>,
+    pub cancel: Option<oneshot::Receiver<()>>,
 }
 
 /// Binds the mimic TCP listener. SO_REUSEADDR: a session restart must
@@ -121,9 +123,34 @@ pub async fn serve(
         .send(Event::Bound { token, conn: reply })
         .await
         .context("session stopped while binding TCP connection")?;
-    let bound = resolve
+    let mut bound = resolve
         .await
         .context("session dropped TCP binding resolver")??;
+    let (id, generation) = (bound.id, bound.generation);
+    let cancel = bound.cancel.take();
+    let result = tokio::select! {
+        result = serve_bound(stream, camouflage, decoder, first, bound, events.clone()) => result,
+        _ = async {
+            match cancel {
+                Some(cancel) => { let _ = cancel.await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => return Ok(()),
+    };
+    if result.is_err() {
+        let _ = events.send(Event::Failed { id, generation }).await;
+    }
+    result
+}
+
+async fn serve_bound(
+    mut stream: TcpStream,
+    camouflage: Camouflage,
+    decoder: framing::Decoder,
+    first: &[u8],
+    bound: Bound,
+    events: mpsc::Sender<Event>,
+) -> Result<()> {
     let mut cipher = Cipher::new(bound.key, bound.id, false);
     let packet = cipher
         .open(first)
@@ -139,11 +166,17 @@ pub async fn serve(
         stream.write_all(&response).await?;
         return Ok(());
     }
-    events.send(Event::Connected { id: bound.id }).await?;
+    events
+        .send(Event::Connected {
+            id: bound.id,
+            generation: bound.generation,
+        })
+        .await?;
     if !packet.is_empty() {
         events
             .send(Event::Packet(Incoming {
                 id: bound.id,
+                generation: bound.generation,
                 channel: None,
                 packet,
             }))
@@ -152,7 +185,7 @@ pub async fn serve(
     pump(
         stream,
         &mut cipher,
-        bound.id,
+        (bound.id, bound.generation),
         bound.outgoing,
         decoder,
         camouflage,
@@ -165,7 +198,7 @@ pub async fn serve(
 pub async fn connect(
     remote: SocketAddr,
     camouflage: Camouflage,
-    id: u64,
+    (id, generation): (u64, u64),
     key: [u8; 16],
     token: [u8; TOKEN_BYTES],
     mut outgoing: mpsc::Receiver<Vec<u8>>,
@@ -179,18 +212,18 @@ pub async fn connect(
         // Plain-TCP plane: an empty binding — the handshake itself is the probe.
         preflight(remote, camouflage, id, key, token).await?;
         events
-            .send(Event::Connected { id })
+            .send(Event::Connected { id, generation })
             .await
             .context("session stopped during TCP preflight")?;
         return Ok(());
     }
     let (stream, mut cipher, decoder) =
         connect_bound(remote, camouflage, id, key, token, &first).await?;
-    events.send(Event::Connected { id }).await.ok();
+    events.send(Event::Connected { id, generation }).await.ok();
     pump(
         stream,
         &mut cipher,
-        id,
+        (id, generation),
         outgoing,
         decoder,
         camouflage,
@@ -239,7 +272,7 @@ pub async fn preflight(
 pub async fn pump(
     stream: TcpStream,
     cipher: &mut Cipher,
-    id: u64,
+    (id, generation): (u64, u64),
     mut outgoing: mpsc::Receiver<Vec<u8>>,
     mut decoder: framing::Decoder,
     camouflage: Camouflage,
@@ -257,6 +290,7 @@ pub async fn pump(
                 events
                     .send(Event::Packet(Incoming {
                         id,
+                        generation,
                         channel: None,
                         packet,
                     }))
@@ -276,7 +310,7 @@ pub async fn pump(
                 let read = read.context("read TCP flow stream")?;
                 if read == 0 {
                     decoder.finish()?;
-                    events.send(Event::Closed { id }).await?;
+                    events.send(Event::Closed { id, generation }).await?;
                     return Ok(());
                 }
                 decoder.push(&chunk[..read]);

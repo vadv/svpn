@@ -2,7 +2,7 @@
 //! complete ICMP round-trip through the server TUN wins the round.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     time::{Duration, Instant as StdInstant},
 };
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::control::Message;
 use crate::link_io::{self, PREFLIGHT_ID};
 use crate::packet::{self, FlowKey};
-use crate::selector::{Candidate, Reason, Selector};
+use crate::selector::{Candidate, Reason};
 use crate::{crypto, webrtc};
 
 use super::{
@@ -116,7 +116,7 @@ impl Session {
             Plane::Channels(plane) => plane
                 .selector
                 .as_mut()
-                .map(Selector::enter_checking)
+                .map(|selector| selector.enter_checking(StdInstant::now()))
                 .unwrap_or_default(),
             Plane::Tcp(_) => Vec::new(),
         };
@@ -155,24 +155,7 @@ impl Session {
                 plane.flows.insert(PREFLIGHT_ID, Flow::new(key, now));
             }
             Plane::Tcp(plane) => {
-                plane.flows.insert(
-                    PREFLIGHT_ID,
-                    TcpFlow {
-                        key,
-                        active: false,
-                        reset_requested: false,
-                        outgoing: None,
-                        pending: VecDeque::new(),
-                        tcp_key: None,
-                        tcp_token: None,
-                        tcp_receiver: None,
-                        task: None,
-                        fin_dwell: None,
-                        last_ack: None,
-                        last_seen: now,
-                        created: now,
-                    },
-                );
+                plane.flows.insert(PREFLIGHT_ID, TcpFlow::new(key, now));
             }
         }
         self.readiness = Some(Readiness::Probing);
@@ -314,6 +297,8 @@ impl Session {
                 self.control
                     .send(Message::FlowOpen {
                         flow_id: attempt,
+                        generation: 1,
+                        resume: false,
                         flow: key,
                         channel: Some(channel),
                     })
@@ -376,24 +361,9 @@ impl Session {
                     .get(&PREFLIGHT_ID)
                     .context("preflight flow disappeared")?
                     .key;
-                plane.flows.insert(
-                    id,
-                    TcpFlow {
-                        key,
-                        active: false,
-                        reset_requested: false,
-                        outgoing: None,
-                        pending: VecDeque::from([round.request.clone()]),
-                        tcp_key: None,
-                        tcp_token: None,
-                        tcp_receiver: None,
-                        task: None,
-                        fin_dwell: None,
-                        last_ack: None,
-                        last_seen: now,
-                        created: now,
-                    },
-                );
+                let mut flow = TcpFlow::new(key, now);
+                flow.pending.push_back(round.request.clone());
+                plane.flows.insert(id, flow);
                 key
             }
         };
@@ -403,7 +373,13 @@ impl Session {
             "{} round: probing tcp (attempt {id})",
             prefixed(self.tag(), "channel")
         );
-        self.control.send(Message::Open { id, flow: key }).await
+        self.control
+            .send(Message::Open {
+                id,
+                generation: 1,
+                flow: key,
+            })
+            .await
     }
 
     /// N3: one round candidate died — free both halves, maybe tail to TCP.
@@ -578,7 +554,11 @@ impl Session {
                 .is_some_and(|handle| {
                     handle
                         .command
-                        .try_send(TaskCommand::Data(id, rc.request.clone()))
+                        .try_send(TaskCommand::Data {
+                            flow_id: id,
+                            generation: 1,
+                            packet: rc.request.clone(),
+                        })
                         .is_ok()
                 })
             {
@@ -837,7 +817,8 @@ impl Session {
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {
-            selector.resume();
+            let actions = selector.resume(StdInstant::now());
+            self.execute_actions(actions).await?;
         }
         Ok(true)
     }

@@ -53,7 +53,7 @@ fn cold_order_with_fallback_to_tcp() {
         actions,
         vec![Action::TryTcp {
             flow_id: 1,
-            attempt: 5
+            generation: 1
         }]
     );
 }
@@ -92,44 +92,40 @@ fn hold_down_blocks_new_flows_until_expiry() {
     selector.attempt_failed(Candidate::WebRtc, 2, Reason::PathTimeout, start);
     selector.attempt_failed(Candidate::Obfs, 3, Reason::PathTimeout, start);
     let actions = selector.attempt_failed(Candidate::Mosh, 4, Reason::PathTimeout, start);
-    // The last UDP candidate failed, TCP is forbidden: the flow is closed.
-    assert_eq!(
-        actions,
-        vec![
-            Action::FailFlow {
-                flow_id: 1,
-                flow: key(1),
-                reason: Reason::PathTimeout
-            },
-            Action::CloseFlow { flow_id: 1 }
-        ]
-    );
-    // Everyone in hold-down: a new flow gets an immediate failure.
+    // No candidate is available now; admitted queues retain their original budget.
+    assert!(actions.is_empty());
+    assert!(selector.has_queued(1));
     let actions = selector
         .request(2, key(2), b"x", start + Duration::from_secs(1))
         .expect("admission");
-    assert_eq!(
-        actions,
-        vec![
-            Action::FailFlow {
-                flow_id: 2,
-                flow: key(2),
-                reason: Reason::PathTimeout
-            },
-            Action::CloseFlow { flow_id: 2 }
-        ]
+    assert!(actions.is_empty());
+    assert!(
+        selector
+            .poll(start + HOLD_DOWN - Duration::from_secs(1))
+            .is_empty()
     );
-    // After the hold-down expires, a new flow tries quic again.
-    let actions = selector
-        .request(3, key(3), b"x", start + HOLD_DOWN + Duration::from_secs(1))
-        .expect("admission");
+    assert!(selector.preparation.is_none());
+    let actions = selector.poll(start + FLOW_BUDGET);
+    assert!(actions.contains(&Action::CloseFlow { flow_id: 1 }));
+    assert!(!actions.contains(&Action::CloseFlow { flow_id: 2 }));
+    assert!(selector.has_queued(2));
     assert_eq!(
-        actions,
-        vec![Action::PrepareChannel {
+        actions
+            .iter()
+            .filter(|action| matches!(action, Action::PrepareChannel { .. }))
+            .collect::<Vec<_>>(),
+        vec![&Action::PrepareChannel {
             candidate: Candidate::Quic,
             attempt: 5
         }]
     );
+    selector.finished(2);
+    // A later admission shares the preparation started at hold-down expiry.
+    let actions = selector
+        .request(3, key(3), b"x", start + HOLD_DOWN + Duration::from_secs(1))
+        .expect("admission");
+    assert!(actions.is_empty());
+    assert_eq!(selector.preparation_candidate(), Some(Candidate::Quic));
 }
 
 #[test]
@@ -142,11 +138,8 @@ fn fixed_unverified_channel_loss_keeps_hold_down() {
     selector.request(1, key(1), b"syn", now).unwrap();
     selector.channel_ready(Candidate::Mosh, 1, 10, now);
     let actions = selector.channel_lost(Candidate::Mosh, 10, Reason::ChannelFailed, now);
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, Action::CloseFlow { flow_id: 1 }))
-    );
+    assert!(actions.is_empty());
+    assert!(selector.has_queued(1));
     assert!(selector.banned.is_empty());
     let later = now + HOLD_DOWN + Duration::from_secs(1);
     assert!(matches!(
@@ -174,6 +167,7 @@ fn last_good_goes_first_and_is_dropped_after_its_failure() {
     assert!(matches!(
         actions.as_slice(),
         [Action::OpenFlow {
+            generation: 1,
             flow_id: 2,
             candidate: Candidate::Quic,
             channel: 100
@@ -183,11 +177,8 @@ fn last_good_goes_first_and_is_dropped_after_its_failure() {
     let now = Instant::now();
     let actions = selector.channel_lost(Candidate::Quic, 100, Reason::ChannelFailed, now);
     assert_eq!(selector.last_good, None);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::CloseFlow { flow_id: 2 }))
-    );
+    assert!(actions.is_empty());
+    assert!(selector.has_queued(2));
     // quic is in hold-down: the next flow starts with webrtc.
     let actions = request(&mut selector, 3);
     assert!(matches!(
@@ -215,7 +206,7 @@ fn channel_loss_erases_hint_and_restarts_cold() {
         actions,
         vec![Action::PrepareChannel {
             candidate: Candidate::WebRtc,
-            attempt: 3
+            attempt: 2
         }]
     );
 }
@@ -239,13 +230,18 @@ fn unsupported_candidate_is_excluded_for_session() {
 }
 
 #[test]
-fn empty_allowed_rejects_immediately() {
+fn empty_allowed_waits_until_original_flow_budget() {
     let mut selector = Selector::new(Allowed::default());
-    let actions = selector
-        .request(1, key(1), b"x", Instant::now())
-        .expect("admission");
+    let now = Instant::now();
+    let actions = selector.request(1, key(1), b"x", now).expect("admission");
+    assert!(actions.is_empty());
+    assert!(
+        selector
+            .poll(now + FLOW_BUDGET - Duration::from_nanos(1))
+            .is_empty()
+    );
     assert_eq!(
-        actions,
+        selector.poll(now + FLOW_BUDGET),
         vec![
             Action::FailFlow {
                 flow_id: 1,

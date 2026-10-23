@@ -10,7 +10,7 @@ use svpn::tcp::*;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 const FLOW_TEST_QUEUE: usize = 8;
@@ -69,7 +69,7 @@ async fn pump_drains_buffered_frames_without_another_socket_read() {
             pump(
                 stream,
                 &mut Cipher::new(key, id, true),
-                id,
+                (id, 1),
                 outgoing,
                 decoder,
                 camouflage,
@@ -86,7 +86,7 @@ async fn pump_drains_buffered_frames_without_another_socket_read() {
         else {
             panic!("expected buffered packet");
         };
-        assert_eq!(packet.id, id);
+        assert_eq!((packet.id, packet.generation), (id, 1));
         assert_eq!(packet.packet, b"buffered packet");
     }
 }
@@ -113,7 +113,7 @@ async fn pump_distinguishes_clean_eof_from_truncated_frames() {
                 pump(
                     stream,
                     &mut Cipher::new(key, id, true),
-                    id,
+                    (id, 1),
                     outgoing,
                     decoder,
                     camouflage,
@@ -130,7 +130,10 @@ async fn pump_distinguishes_clean_eof_from_truncated_frames() {
                 assert!(matches!(incoming.recv().await, Some(Event::Packet(_))));
                 assert!(matches!(
                     incoming.recv().await,
-                    Some(Event::Closed { id: 42 })
+                    Some(Event::Closed {
+                        id: 42,
+                        generation: 1
+                    })
                 ));
                 assert!(incoming.recv().await.is_none());
             }
@@ -151,7 +154,7 @@ async fn preflight_authenticates_both_directions_without_ip_data() {
         let probe = tokio::spawn(connect(
             address,
             camouflage,
-            PREFLIGHT_ID,
+            (PREFLIGHT_ID, 1),
             key,
             [8; TOKEN_BYTES],
             outgoing,
@@ -164,8 +167,10 @@ async fn preflight_authenticates_both_directions_without_ip_data() {
         let (_send, outgoing) = mpsc::channel(1);
         conn.send(Ok(Bound {
             id: PREFLIGHT_ID,
+            generation: 1,
             key,
             outgoing,
+            cancel: None,
         }))
         .ok();
         timeout(Duration::from_secs(3), probe)
@@ -175,7 +180,10 @@ async fn preflight_authenticates_both_directions_without_ip_data() {
             .unwrap();
         assert!(matches!(
             received.recv().await,
-            Some(Event::Connected { id: PREFLIGHT_ID })
+            Some(Event::Connected {
+                id: PREFLIGHT_ID,
+                generation: 1
+            })
         ));
         assert!(
             received.recv().await.is_none(),
@@ -251,7 +259,7 @@ async fn binds_by_token_and_transfers_both_directions() {
     let client = tokio::spawn(connect(
         address,
         Camouflage::Banner,
-        1,
+        (1, 1),
         key,
         [9u8; TOKEN_BYTES],
         client_outgoing,
@@ -278,22 +286,30 @@ async fn binds_by_token_and_transfers_both_directions() {
     let (server_send, server_outgoing) = mpsc::channel(FLOW_TEST_QUEUE);
     let _ = conn.send(Ok(Bound {
         id: 1,
+        generation: 1,
         key,
         outgoing: server_outgoing,
+        cancel: None,
     }));
     assert!(matches!(
         timeout(Duration::from_secs(3), server_events.recv())
             .await
             .unwrap()
             .unwrap(),
-        Event::Connected { id: 1 }
+        Event::Connected {
+            id: 1,
+            generation: 1
+        }
     ));
     let event = timeout(Duration::from_secs(3), server_events.recv())
         .await
         .unwrap()
         .unwrap();
     match event {
-        Event::Packet(packet) => assert_eq!(packet.packet, vec![1, 2, 3]),
+        Event::Packet(packet) => {
+            assert_eq!((packet.id, packet.generation), (1, 1));
+            assert_eq!(packet.packet, vec![1, 2, 3]);
+        }
         Event::Bound { .. }
         | Event::Connected { .. }
         | Event::Failed { .. }
@@ -314,12 +330,103 @@ async fn binds_by_token_and_transfers_both_directions() {
         }
     };
     match event {
-        Event::Packet(packet) => assert_eq!(packet.packet, vec![7, 7]),
+        Event::Packet(packet) => {
+            assert_eq!((packet.id, packet.generation), (1, 1));
+            assert_eq!(packet.packet, vec![7, 7]);
+        }
         Event::Bound { .. } => panic!("client must not receive bindings"),
         Event::Connected { .. } => unreachable!(),
         Event::Failed { .. } | Event::Closed { .. } => unreachable!(),
     }
     client.abort();
+}
+
+#[tokio::test]
+async fn bound_cancellation_preserves_generation_on_peer_eof() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server_events, mut server_incoming) = mpsc::channel(8);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        serve(stream, Camouflage::None, server_events).await
+    });
+    let (client_send, client_outgoing) = mpsc::channel(1);
+    let (client_events, mut client_incoming) = mpsc::channel(8);
+    let client = tokio::spawn(connect(
+        address,
+        Camouflage::None,
+        (42, 7),
+        [1; 16],
+        [9; TOKEN_BYTES],
+        client_outgoing,
+        client_events,
+    ));
+    client_send.send(vec![1, 2, 3]).await.unwrap();
+    let Event::Bound { conn, .. } = timeout(Duration::from_secs(3), server_incoming.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected binding");
+    };
+    let (server_send, outgoing) = mpsc::channel(1);
+    let (cancel, cancelled) = oneshot::channel();
+    assert!(
+        conn.send(Ok(Bound {
+            id: 42,
+            generation: 7,
+            key: [1; 16],
+            outgoing,
+            cancel: Some(cancelled),
+        }))
+        .is_ok()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(3), server_incoming.recv())
+            .await
+            .unwrap(),
+        Some(Event::Connected {
+            id: 42,
+            generation: 7
+        })
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(3), server_incoming.recv()).await.unwrap(),
+        Some(Event::Packet(packet))
+            if (packet.id, packet.generation) == (42, 7) && packet.packet == [1, 2, 3]
+    ));
+    cancel.send(()).unwrap();
+    timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(3), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(server_send.is_closed());
+    assert!(client_send.is_closed());
+    assert!(
+        server_incoming.recv().await.is_none(),
+        "cancellation is not a transport failure"
+    );
+    assert!(matches!(
+        client_incoming.recv().await,
+        Some(Event::Connected {
+            id: 42,
+            generation: 7
+        })
+    ));
+    assert!(matches!(
+        client_incoming.recv().await,
+        Some(Event::Closed {
+            id: 42,
+            generation: 7
+        })
+    ));
+    assert!(client_incoming.recv().await.is_none());
 }
 
 #[tokio::test]
@@ -330,7 +437,7 @@ async fn unknown_token_closes_connection() {
     let client = tokio::spawn(connect(
         address,
         Camouflage::None,
-        1,
+        (1, 1),
         random().unwrap(),
         [9u8; TOKEN_BYTES],
         outgoing,
@@ -353,8 +460,14 @@ async fn unknown_token_closes_connection() {
     let mut closed = result.is_err();
     while let Some(event) = incoming.recv().await {
         match event {
-            Event::Closed { id: 1 } => closed = true,
-            Event::Connected { id: 1 } => {}
+            Event::Closed {
+                id: 1,
+                generation: 1,
+            } => closed = true,
+            Event::Connected {
+                id: 1,
+                generation: 1,
+            } => {}
             _ => panic!("rejected binding delivered data or another flow event"),
         }
     }
@@ -369,7 +482,7 @@ async fn wrong_key_fails_authentication() {
     let client = tokio::spawn(connect(
         address,
         Camouflage::None,
-        1,
+        (1, 1),
         [1u8; 16],
         [9u8; TOKEN_BYTES],
         outgoing,
@@ -384,8 +497,10 @@ async fn wrong_key_fails_authentication() {
         let (_, server_outgoing) = mpsc::channel(FLOW_TEST_QUEUE);
         let _ = conn.send(Ok(Bound {
             id: 1,
+            generation: 1,
             key: [2u8; 16],
             outgoing: server_outgoing,
+            cancel: None,
         }));
     }
     // The server rejects authentication; EOF/reset must not deliver data.
@@ -396,16 +511,28 @@ async fn wrong_key_fails_authentication() {
     let mut closed = result.is_err();
     while let Some(event) = incoming.recv().await {
         match event {
-            Event::Closed { id: 1 } => closed = true,
-            Event::Connected { id: 1 } => {}
+            Event::Closed {
+                id: 1,
+                generation: 1,
+            } => closed = true,
+            Event::Connected {
+                id: 1,
+                generation: 1,
+            } => {}
             _ => panic!("rejected key delivered data or another flow event"),
         }
     }
     assert!(closed);
-    assert!(
-        server_events.try_recv().is_err(),
-        "unauthenticated binding must not activate a flow"
-    );
+    assert!(matches!(
+        timeout(Duration::from_secs(3), server_events.recv())
+            .await
+            .unwrap(),
+        Some(Event::Failed {
+            id: 1,
+            generation: 1
+        })
+    ));
+    assert!(server_events.recv().await.is_none());
 }
 
 fn server_decoder(camouflage: Camouflage) -> framing::Decoder {

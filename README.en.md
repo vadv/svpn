@@ -259,6 +259,11 @@ started by hand — the client launches it over SSH.
 - The server's SSH key is remembered on first connect. Pin it explicitly with
   `ssh-host-key = "SHA256:…"`.
 - `svpn serve` refuses to run outside an SSH session.
+- TCP idle timeout is 2 h 4 min; UDP/ICMP idle timeout is 60 s. One FIN
+  does not close a flow. After both FINs are acknowledged, state survives
+  another 4 quiet minutes. A delivered client RST closes the flow.
+- Each session holds up to 4096 flow records plus 16 reserved for probes.
+  At capacity, new opens are refused; existing flows are not evicted.
 
 ## Running the client without root (Linux)
 

@@ -94,7 +94,19 @@ impl Session {
                 self.control
                     .send(Message::ChannelVerified { channel })
                     .await?;
-                self.probe_flow_open(channel).await?
+                self.probe_flow_open(channel).await?;
+                let pending: Vec<_> = match &self.plane {
+                    Plane::Channels(plane) => plane
+                        .flows
+                        .iter()
+                        .filter(|(_, flow)| flow.channel == Some(channel) && flow.commit_pending)
+                        .map(|(&id, flow)| (id, flow.generation))
+                        .collect(),
+                    Plane::Tcp(_) => unreachable!(),
+                };
+                for (id, generation) in pending {
+                    self.commit(id, generation).await?;
+                }
             }
             TaskEvent::Failed { channel, reason } => {
                 // The client drives attempts: a strategy failure is a
@@ -132,6 +144,7 @@ impl Session {
             TaskEvent::FlowEcho {
                 channel,
                 flow_id,
+                generation,
                 echo,
             } => {
                 let Plane::Channels(plane) = &mut self.plane else {
@@ -140,6 +153,9 @@ impl Session {
                 let Some(flow_state) = plane.flows.get_mut(&flow_id) else {
                     return Ok(());
                 };
+                if flow_state.generation != generation {
+                    return Ok(());
+                }
                 if flow_state.channel != Some(channel) || flow_state.echo_pending != Some(echo) {
                     if flow_id != PREFLIGHT_ID {
                         crate::error!(
@@ -155,12 +171,35 @@ impl Session {
                     self.control
                         .send(Message::FlowOpened {
                             flow_id,
+                            generation,
                             flow: flow_state.key,
                             channel,
                         })
                         .await?;
+                } else if flow_state.recovery.is_some() {
+                    // A quiet rebound flow has no data to show yet: the probe
+                    // round-trip on the new binding is its delivery evidence.
+                    self.recovery_delivered(flow_id, "probe");
                 } else {
                     crate::debug!("flow_echo_ok id={flow_id}");
+                }
+            }
+            TaskEvent::ProbeSeen {
+                channel,
+                flow_id,
+                generation,
+            } => {
+                // The peer's probe crossed this binding in flight; for a
+                // quiet rebound flow that is the receiving peer's evidence.
+                let Plane::Channels(plane) = &mut self.plane else {
+                    return Ok(());
+                };
+                if plane.flows.get(&flow_id).is_some_and(|flow| {
+                    flow.generation == generation
+                        && flow.channel == Some(channel)
+                        && flow.recovery.is_some()
+                }) {
+                    self.recovery_delivered(flow_id, "probe");
                 }
             }
         }
@@ -224,8 +263,15 @@ impl Session {
                         })
                         .await?;
                 }
+                Action::ResetBinding {
+                    flow_id,
+                    generation,
+                    from,
+                    reason,
+                } => self.reset_binding(flow_id, generation, from, reason),
                 Action::OpenFlow {
                     flow_id,
+                    generation,
                     candidate: _,
                     channel,
                 } => {
@@ -235,19 +281,24 @@ impl Session {
                     let Some(flow_state) = plane.flows.get_mut(&flow_id) else {
                         continue;
                     };
+                    if flow_state.generation != generation {
+                        continue;
+                    }
                     flow_state.channel = Some(channel);
                     let flow = flow_state.key;
                     self.control
                         .send(Message::FlowOpen {
                             flow_id,
+                            generation,
                             flow,
+                            resume: flow_state.data_started,
                             channel: Some(channel),
                         })
                         .await?;
                 }
                 Action::TryTcp {
                     flow_id,
-                    attempt: _,
+                    generation,
                 } => {
                     let Plane::Channels(plane) = &mut self.plane else {
                         bail!("TryTcp outside channels mode");
@@ -255,17 +306,29 @@ impl Session {
                     let Some(flow_state) = plane.flows.get_mut(&flow_id) else {
                         continue;
                     };
+                    if flow_state.generation != generation {
+                        continue;
+                    }
                     flow_state.channel = None;
                     let flow = flow_state.key;
                     self.control
-                        .send(Message::Open { id: flow_id, flow })
+                        .send(Message::Open {
+                            id: flow_id,
+                            generation,
+                            flow,
+                        })
                         .await?;
                 }
                 Action::Commit {
-                    flow_id, attempt, ..
+                    flow_id,
+                    generation,
+                    ..
                 } => {
                     self.control
-                        .send(Message::Commit { flow_id, attempt })
+                        .send(Message::Commit {
+                            flow_id,
+                            generation,
+                        })
                         .await?;
                 }
                 Action::FailFlow {
@@ -274,13 +337,19 @@ impl Session {
                     reason,
                 } => {
                     let _ = flow;
+                    let Some(generation) = self.flow_generation(flow_id) else {
+                        continue;
+                    };
                     self.control
-                        .send(Message::FlowReject { flow_id, reason })
+                        .send(Message::FlowReject {
+                            flow_id,
+                            generation,
+                            reason,
+                        })
                         .await?;
-                    self.close_flow(flow_id, false).await?;
                 }
                 Action::CloseFlow { flow_id } => {
-                    self.close_flow(flow_id, false).await?;
+                    self.close_flow(flow_id, true).await?;
                 }
                 Action::BanExpired { candidate } => {
                     crate::info!(

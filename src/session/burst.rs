@@ -292,7 +292,11 @@ impl Session {
             let sent = plane.channels.get(&burst.channel).is_some_and(|handle| {
                 handle
                     .command
-                    .try_send(TaskCommand::Data(attempt, request))
+                    .try_send(TaskCommand::Data {
+                        flow_id: attempt,
+                        generation: 1,
+                        packet: request,
+                    })
                     .is_ok()
             });
             if !sent {
@@ -380,6 +384,8 @@ impl Session {
         self.control
             .send(Message::FlowOpen {
                 flow_id: attempt,
+                generation: 1,
+                resume: false,
                 flow: key,
                 channel: Some(channel),
             })

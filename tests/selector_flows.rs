@@ -32,7 +32,7 @@ fn duplicate_flow_id_rejected() {
         Err(Reject::Duplicate)
     );
     // A closed flow_id does not resurrect either.
-    selector.closed(1, Reason::ChannelFailed, Instant::now());
+    selector.finished(1);
     assert_eq!(
         selector.request(1, key(1), b"x", Instant::now()),
         Err(Reject::Duplicate)
@@ -86,9 +86,9 @@ fn preactive_queue_bounds() {
     selector.channel_ready(Candidate::Quic, 1, 100, now);
     selector.probes_passed(Candidate::Quic, 100, now);
     selector.peer_verified(Candidate::Quic, 100, now);
-    selector.bind_succeeded(1, now);
+    selector.bind_succeeded(1, 1, now);
     assert!(selector.take_queue(1).is_none()); // still Committing
-    selector.committed(1);
+    selector.committed(1, 1);
     let queue = selector.take_queue(1).expect("active queue");
     assert_eq!(queue.len(), 64);
     assert_eq!(queue[0], b"first".to_vec());
@@ -120,10 +120,10 @@ fn tcp_binding_retains_the_queue_until_commit() {
     assert!(selector.tcp_binding(1));
     assert!(!selector.tcp_binding(2));
     assert!(selector.take_queue(1).is_none());
-    selector.bind_succeeded(1, Instant::now());
+    selector.bind_succeeded(1, 1, Instant::now());
     assert!(!selector.tcp_binding(1));
     assert!(selector.take_queue(1).is_none());
-    selector.committed(1);
+    selector.committed(1, 1);
     assert_eq!(
         selector.take_queue(1).expect("active queue"),
         VecDeque::from([b"first".to_vec()])
@@ -151,7 +151,11 @@ fn many_flows_share_one_preparation() {
     let mut opened: Vec<u64> = actions
         .iter()
         .map(|action| match action {
-            Action::OpenFlow { flow_id, .. } => *flow_id,
+            Action::OpenFlow {
+                generation: 1,
+                flow_id,
+                ..
+            } => *flow_id,
             other => panic!("expected open, got {other:?}"),
         })
         .collect();
@@ -171,28 +175,45 @@ fn bind_failure_is_scoped_to_flow() {
     assert_eq!(opened.len(), 2);
     // The first flow's bind failed: the channel is ready, the second continues.
     // quic is excluded only for flow 1: the next candidate is webrtc.
-    let actions = selector.bind_failed(1, Reason::OneWay, now);
+    let actions = selector.bind_failed(1, 1, Reason::OneWay, now);
     assert!(matches!(
         actions.as_slice(),
-        [Action::PrepareChannel {
-            candidate: Candidate::WebRtc,
-            ..
-        }]
+        [
+            Action::ResetBinding {
+                flow_id: 1,
+                generation: 2,
+                from: Some(Candidate::Quic),
+                reason: Reason::OneWay
+            },
+            Action::PrepareChannel {
+                candidate: Candidate::WebRtc,
+                ..
+            }
+        ]
     ));
     assert!(matches!(
-        selector.bind_succeeded(2, now).as_slice(),
+        selector.bind_succeeded(2, 1, now).as_slice(),
         [Action::Commit {
             flow_id: 2,
             candidate: Candidate::Quic,
             ..
         }]
     ));
-    // The quic channel stays ready: quic is not in hold-down.
+    // Both queues survive; only the failed flow waits for a new binding.
+    assert_eq!(selector.queued_bytes(), 2);
+    assert!(selector.take_queue(1).is_none());
+    selector.committed(2, 1);
+    assert_eq!(
+        selector.take_queue(2).unwrap(),
+        VecDeque::from([b"b".to_vec()])
+    );
+    assert_eq!(selector.queued_bytes(), 1);
+    assert!(selector.has_queued(1));
     assert!(selector.channels.contains_key(&Candidate::Quic));
 }
 
 #[test]
-fn channel_lost_closes_all_its_flows_without_fallback() {
+fn channel_lost_invalidates_cache_without_retiring_bindings() {
     let mut selector = Selector::new(all());
     let now = Instant::now();
     selector.request(1, key(1), b"a", now).expect("admission");
@@ -201,22 +222,29 @@ fn channel_lost_closes_all_its_flows_without_fallback() {
     selector.probes_passed(Candidate::Quic, 100, now);
     selector.peer_verified(Candidate::Quic, 100, now);
     assert!(matches!(
-        selector.bind_succeeded(1, now).as_slice(),
+        selector.bind_succeeded(1, 1, now).as_slice(),
         [Action::Commit {
             flow_id: 1,
             candidate: Candidate::Quic,
             ..
         }]
     ));
-    selector.bind_succeeded(2, Instant::now());
-    selector.committed(1);
+    selector.bind_succeeded(2, 1, Instant::now());
+    selector.committed(1, 1);
     let actions =
         selector.channel_lost(Candidate::Quic, 100, Reason::ChannelFailed, Instant::now());
-    // Both flows closed (FailFlow+CloseFlow each), quic in hold-down,
-    // last_good erased; no new waiting flows — no preparation starts.
-    assert!(actions.contains(&Action::CloseFlow { flow_id: 1 }));
-    assert!(actions.contains(&Action::CloseFlow { flow_id: 2 }));
-    assert_eq!(actions.len(), 4);
+    // Session resolves actual channel ownership; selector only invalidates the cache.
+    assert!(actions.is_empty());
+    assert_eq!(selector.last_good, None);
+    assert_eq!(
+        selector.take_queue(1).unwrap(),
+        VecDeque::from([b"a".to_vec()])
+    );
+    selector.committed(2, 1);
+    assert_eq!(
+        selector.take_queue(2).unwrap(),
+        VecDeque::from([b"b".to_vec()])
+    );
     assert!(!selector.channels.contains_key(&Candidate::Quic));
 }
 
@@ -233,7 +261,7 @@ fn tcp_only_mode_uses_tcp_for_every_flow() {
         actions,
         vec![Action::TryTcp {
             flow_id: 1,
-            attempt: 1
+            generation: 1
         }]
     );
     // TCP does not block the second flow: each gets its own connect.
@@ -242,7 +270,7 @@ fn tcp_only_mode_uses_tcp_for_every_flow() {
         actions,
         vec![Action::TryTcp {
             flow_id: 2,
-            attempt: 2
+            generation: 1
         }]
     );
 }

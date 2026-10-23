@@ -37,7 +37,7 @@ try:
 
     hello = {
         "type": "hello",
-        "version": 2,
+        "version": 3,
         "client_ip": "10.77.0.2",
         "server_ip": "10.77.0.1",
         "mtu": 1280,

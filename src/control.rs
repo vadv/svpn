@@ -11,7 +11,7 @@ use tokio::{
 use crate::packet::FlowKey;
 use crate::selector::Reason;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_LINE: usize = 4096;
 pub const QUEUE: usize = 256;
 
@@ -122,10 +122,12 @@ pub enum Message {
     },
     Open {
         id: u64,
+        generation: u64,
         flow: FlowKey,
     },
     Opened {
         id: u64,
+        generation: u64,
         /// UDP: the server flow socket's port; TCP: the TCP transport's listening port.
         port: u16,
         key: [u8; 16],
@@ -135,8 +137,8 @@ pub enum Message {
     },
     Close {
         id: u64,
+        generation: u64,
     },
-    // ─── Control v2 protocol messages ───
     /// The server's actual endpoints, before TUN creation.
     Endpoints {
         udp: Vec<Endpoint>,
@@ -177,31 +179,38 @@ pub enum Message {
     /// client picks the channel; the reply arrives as `flow_channel`.
     FlowOpen {
         flow_id: u64,
+        generation: u64,
         flow: FlowKey,
         channel: Option<u64>,
+        resume: bool,
     },
     FlowChannel {
         flow_id: u64,
+        generation: u64,
         channel: u64,
     },
     FlowReject {
         flow_id: u64,
+        generation: u64,
         reason: Reason,
     },
     FlowOpened {
         flow_id: u64,
+        generation: u64,
         flow: FlowKey,
         channel: u64,
     },
     Commit {
         flow_id: u64,
-        attempt: u64,
+        generation: u64,
     },
     Committed {
         flow_id: u64,
+        generation: u64,
     },
     FlowClose {
         flow_id: u64,
+        generation: u64,
     },
     Heartbeat {
         stats: Stats,

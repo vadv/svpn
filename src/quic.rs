@@ -307,11 +307,10 @@ pub fn decode_datagram(datagram: &Bytes) -> Result<&[u8]> {
     Ok(&datagram[DATAGRAM_PREFIX.len()..])
 }
 
-/// Negotiated DATA fragment budget for the QUIC transport:
-/// the wire limit minus the record header (21 B) and the GCM overhead (24 B).
+/// Negotiated fragment budget after record and encryption overhead.
 pub fn fragment_budget(tunnel: &Tunnel) -> Result<usize> {
     let limit = tunnel.max_payload().context("datagrams off")?;
-    Ok((limit.min(FRAGMENT_BUDGET)).saturating_sub(21 + 24))
+    Ok((limit.min(FRAGMENT_BUDGET)).saturating_sub(crate::channel::DATA_HEADER + 24))
 }
 
 fn datagram_transport() -> quinn::TransportConfig {

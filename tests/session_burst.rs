@@ -175,14 +175,18 @@ async fn committed_arms_burst_and_sends_first_echo() {
     plane.flows.insert(attempt, flow);
     session.burst = Some(probe);
 
-    session.committed(attempt).await.unwrap();
+    session.committed(attempt, 1).await.unwrap();
 
     let burst = session.burst.as_ref().unwrap();
     assert!(burst.finished(now + BURST_TAIL + BURST_SPACING * 10));
     let outcome = burst.outcome();
     assert_eq!((outcome.received, outcome.lost), (0, BURST_LEN));
     match commands.try_recv() {
-        Ok(TaskCommand::Data(id, packet)) => {
+        Ok(TaskCommand::Data {
+            flow_id: id,
+            generation: 1,
+            packet,
+        }) => {
             assert_eq!(id, attempt);
             assert_eq!(
                 svpn::packet::icmp_echo_reply_seq(&packet, 4242, &[9; 32]),
@@ -225,6 +229,7 @@ async fn health_probe_flow_opened_commits_on_the_wire() {
 
     session
         .dispatch_control(svpn::control::Message::FlowOpened {
+            generation: 1,
             flow_id: attempt,
             flow: key,
             channel,
@@ -241,7 +246,7 @@ async fn health_probe_flow_opened_commits_on_the_wire() {
         .unwrap();
     let message: svpn::control::Message = serde_json::from_str(line.trim()).unwrap();
     assert!(
-        matches!(message, svpn::control::Message::Commit { flow_id, .. } if flow_id == attempt),
+        matches!(message, svpn::control::Message::Commit { generation: 1, flow_id, .. } if flow_id == attempt),
         "health probe commits: {line}"
     );
 }

@@ -36,12 +36,11 @@ pub enum Profile {
 }
 
 impl Profile {
-    /// Maximum DATA fragment of this profile: wire budget minus overhead
-    /// (record header 21 B + GCM 24 B + the profile's shape).
+    /// Maximum DATA fragment after record, encryption and profile overhead.
     pub fn max_fragment(&self) -> usize {
         match self {
             Profile::Plain | Profile::Mosh => crate::channel::MAX_FRAGMENT,
-            Profile::Obfs => MAX_WIRE - OBF_HEADER - OBF_EXTRA - 21 - 24,
+            Profile::Obfs => MAX_WIRE - OBF_HEADER - OBF_EXTRA - crate::channel::DATA_HEADER - 24,
         }
     }
 
