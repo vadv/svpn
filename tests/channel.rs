@@ -9,6 +9,7 @@ use svpn::crypto;
 fn sample_data() -> Record {
     Record::Data {
         flow_id: 9,
+        generation: 1,
         packet_id: 1,
         offset: 0,
         total_len: 4,
@@ -19,11 +20,11 @@ fn sample_data() -> Record {
 // ── records ──
 
 #[test]
-fn golden_vectors_match_wire_md() {
-    // V1/V2: record plaintexts.
+fn golden_vectors_match_independent_aes_gcm() {
+    // AES-128-GCM vectors derived with Node crypto, AAD SVPNUDP2 + channel ID.
     assert_eq!(
         hex(&sample_data().encode().unwrap()),
-        "0100000000000000090000000000000001000000045356504e"
+        "01000000000000000900000000000000010000000000000001000000045356504e"
     );
     assert_eq!(
         hex(&Record::ProbeA {
@@ -37,13 +38,13 @@ fn golden_vectors_match_wire_md() {
     let mut client = Channel::new([0x07; 16], 1, true);
     assert_eq!(
         hex(&client.seal(&sample_data()).unwrap()),
-        "0000000000000000fd9f18a2b2cf5882b0d3c1468cf7396c076adeef46652d65b960713f2adc0e5e28e6ab1c18a7d1f31d"
+        "0000000000000000fd9f18a2b2cf5882b0d3c1468cf7396c076adeef42367b35f6aa2c83b98b9c1e8f8079dbf09b694ec4d009e88869adcf16"
     );
     // V5: same plaintext, channel 2 — the AAD is channel-dependent, only the tag differs.
     let mut other = Channel::new([0x07; 16], 2, true);
     assert_eq!(
         hex(&other.seal(&sample_data()).unwrap()),
-        "0000000000000000fd9f18a2b2cf5882b0d3c1468cf7396c076adeef46652d65b95f670053124a93d787082a8b988eca7a"
+        "0000000000000000fd9f18a2b2cf5882b0d3c1468cf7396c076adeef42367b35f6aa2c83b98b9c1e8f8ff11d5da424248aa95664f2e74cc301"
     );
     // V4: server direction, seq 2^63+5.
     let mut server = Channel::new([0x07; 16], 1, false);
@@ -51,7 +52,10 @@ fn golden_vectors_match_wire_md() {
         server.seal(&Record::Keepalive).unwrap();
     }
     let sealed = server.seal(&sample_data()).unwrap();
-    assert!(sealed.starts_with(&[0x80, 0, 0, 0, 0, 0, 0, 5]));
+    assert_eq!(
+        hex(&sealed),
+        "80000000000000058858085f53a8180a5f8986b2ea37ac47c000f1b37a032f7cd979763204048ecf76b20ef312798d27911045d2bd68ff3af7"
+    );
     // V6: keepalive plaintext and seal at seq 1.
     assert_eq!(
         hex(&Record::Keepalive.encode().unwrap()),
@@ -77,10 +81,12 @@ fn round_trip_all_kinds() {
         Record::ProbeB { echo: [4; 16] },
         Record::FlowProbe {
             flow_id: 7,
+            generation: 1,
             challenge: [5; 16],
         },
         Record::FlowEcho {
             flow_id: 7,
+            generation: 1,
             echo: [6; 16],
         },
         Record::Keepalive,
@@ -96,33 +102,90 @@ fn round_trip_all_kinds() {
 
 #[test]
 fn decode_rejects_malformed_records() {
-    // Unknown kind.
     assert!(Record::decode(&[0x09, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
-    // DATA with flow_id 0 (reserved) and a channel kind with flow_id ≠ 0.
-    assert!(Record::decode(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]).is_err());
+    let valid = sample_data().encode().unwrap();
+    // Reserved flow ID, invalid total length, and offset beyond the packet.
+    for (range, bytes) in [
+        (1..9, 0u64.to_be_bytes().to_vec()),
+        (27..29, 0u16.to_be_bytes().to_vec()),
+        (27..29, 1401u16.to_be_bytes().to_vec()),
+        (25..27, 1u16.to_be_bytes().to_vec()),
+    ] {
+        let mut bad = valid.clone();
+        bad[range].copy_from_slice(&bytes);
+        assert!(Record::decode(&bad).is_err());
+    }
     assert!(Record::decode(&[0x02, 0, 0, 0, 0, 0, 0, 0, 7, 1]).is_err());
-    // total_len outside [1,1400] and offset+len > total_len.
-    for (total, size) in [(0u16, 0usize), (1401, 1400)] {
+    assert!(Record::decode(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]).is_err());
+    for (total_len, offset, size) in [
+        (0, 0, 1),
+        (1401, 0, 1),
+        (1400, 1399, 42),
+        (1400, 0, 0),
+        (1400, 0, MAX_FRAGMENT + 1),
+    ] {
         let record = Record::Data {
             flow_id: 1,
+            generation: 1,
             packet_id: 1,
-            offset: 0,
-            total_len: total,
+            offset,
+            total_len,
             fragment: vec![0; size],
         };
         assert!(record.encode().is_err());
     }
-    let record = Record::Data {
-        flow_id: 1,
-        packet_id: 1,
-        offset: 1399,
-        total_len: 1400,
-        fragment: vec![0; 42],
-    };
-    assert!(record.encode().is_err());
-    // Truncated bodies.
-    assert!(Record::decode(&[0x01, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
-    assert!(Record::decode(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]).is_err());
+}
+
+#[test]
+fn flow_generations_round_trip_and_reject_zero_or_truncation() {
+    for mut record in [
+        sample_data(),
+        Record::FlowProbe {
+            flow_id: 7,
+            generation: 1,
+            challenge: [5; 16],
+        },
+        Record::FlowEcho {
+            flow_id: 7,
+            generation: 1,
+            echo: [6; 16],
+        },
+    ] {
+        for generation in [1, 0x0102_0304_0506_0708, u64::MAX, 0] {
+            match &mut record {
+                Record::Data {
+                    generation: value, ..
+                }
+                | Record::FlowProbe {
+                    generation: value, ..
+                }
+                | Record::FlowEcho {
+                    generation: value, ..
+                } => *value = generation,
+                _ => unreachable!(),
+            }
+            if generation == 0 {
+                assert!(record.encode().is_err());
+                continue;
+            }
+            let mut plain = record.encode().unwrap();
+            assert_eq!(&plain[9..17], &generation.to_be_bytes());
+            assert_eq!(Record::decode(&plain).unwrap(), record);
+            let minimum = if matches!(record, Record::Data { .. }) {
+                DATA_HEADER + 1
+            } else {
+                plain.len()
+            };
+            for len in 0..minimum {
+                assert!(
+                    Record::decode(&plain[..len]).is_err(),
+                    "accepted length {len}"
+                );
+            }
+            plain[9..17].fill(0);
+            assert!(Record::decode(&plain).is_err());
+        }
+    }
 }
 
 // ── authentication ──
@@ -137,26 +200,51 @@ fn tampered_wire_fails_authentication() {
     for index in 0..wire.len() {
         let mut bad = wire.clone();
         bad[index] ^= 1;
-        assert!(server.open(&bad, now).is_err(), "byte {index} accepted");
+        assert!(
+            server.open(&bad, now).unwrap().is_none(),
+            "byte {index} accepted"
+        );
     }
     // A foreign channel cannot read the record.
-    assert!(Channel::new([0x07; 16], 2, false).open(&wire, now).is_err());
-    server.open(&wire, now).unwrap();
+    assert!(
+        Channel::new([0x07; 16], 2, false)
+            .open(&wire, now)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(server.open(&wire, now).unwrap(), Some(sample_data()));
+    assert!(server.open(&wire, now).unwrap().is_none());
+}
+
+#[test]
+fn rejected_datagrams_do_not_hide_authenticated_protocol_errors() {
+    let mut sender = svpn::crypto::Cipher::new_channel([7; 16], 1, true);
+    let mut channel = Channel::new([7; 16], 1, false);
+    let now = Instant::now();
+    assert!(channel.open(&[0], now).unwrap().is_none());
+    let unknown_kind = sender.seal(&[9, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    assert!(channel.open(&unknown_kind, now).is_err());
 }
 
 // ── reassembly ──
 
 #[test]
 fn fragments_of_1400_bytes_assemble() {
-    // V7: the 1380 cap yields offsets 0..1380 and 1380..1400.
+    assert_eq!(DATA_HEADER, 29);
+    assert_eq!(MAX_FRAGMENT, 1372);
     let packet = vec![0xAB; 1400];
-    let records = fragment_packet(5, 77, &packet, MAX_FRAGMENT).unwrap();
+    let records = fragment_packet(5, 1, 77, &packet, MAX_FRAGMENT).unwrap();
     assert_eq!(records.len(), 2);
+    let mut plain = records[0].encode().unwrap();
+    assert_eq!(plain.len(), crypto::MAX_PLAINTEXT);
+    assert_eq!(Record::decode(&plain).unwrap(), records[0]);
+    plain.push(0);
+    assert!(Record::decode(&plain).is_err());
     let mut reassembly = Reassembly::default();
     let now = Instant::now();
     assert!(reassembly.insert(&records[0], now).unwrap().is_none());
     match &records[1] {
-        Record::Data { offset, .. } => assert_eq!(*offset, 1380),
+        Record::Data { offset, .. } => assert_eq!(*offset, 1372),
         _ => panic!("not a DATA record"),
     }
     assert_eq!(reassembly.insert(&records[1], now).unwrap(), Some(packet));
@@ -165,7 +253,7 @@ fn fragments_of_1400_bytes_assemble() {
 
 #[test]
 fn duplicate_fragment_ignored_conflict_drops_packet() {
-    let records = fragment_packet(5, 1, &vec![7; 1400], 700).unwrap();
+    let records = fragment_packet(5, 1, 1, &vec![7; 1400], 700).unwrap();
     assert_eq!(records.len(), 2);
     let mut reassembly = Reassembly::default();
     let now = Instant::now();
@@ -177,6 +265,7 @@ fn duplicate_fragment_ignored_conflict_drops_packet() {
     // An offset conflict drops the whole packet, not the neighboring ones.
     let conflict = Record::Data {
         flow_id: 5,
+        generation: 1,
         packet_id: 1,
         offset: 0,
         total_len: 1400,
@@ -187,12 +276,63 @@ fn duplicate_fragment_ignored_conflict_drops_packet() {
 }
 
 #[test]
+fn fragments_from_different_generations_never_combine() {
+    let old_packet = vec![7; 1400];
+    let new_packet = vec![8; 1400];
+    let old = fragment_packet(5, 1, 9, &old_packet, 700).unwrap();
+    let new = fragment_packet(5, 2, 9, &new_packet, 700).unwrap();
+    let mut reassembly = Reassembly::default();
+    let now = Instant::now();
+    assert!(reassembly.insert(&old[0], now).unwrap().is_none());
+    assert!(reassembly.insert(&new[1], now).unwrap().is_none());
+    assert_eq!(reassembly.pending(), 2);
+    assert_eq!(reassembly.insert(&new[0], now).unwrap(), Some(new_packet));
+    assert_eq!(reassembly.insert(&old[1], now).unwrap(), Some(old_packet));
+    assert_eq!(reassembly.pending(), 0);
+}
+
+#[test]
+fn repeated_conflicts_release_reassembly_byte_budget() {
+    let data = |offset, total_len, byte| Record::Data {
+        flow_id: 5,
+        generation: 1,
+        packet_id: 9,
+        offset,
+        total_len,
+        fragment: vec![byte; 700],
+    };
+    for (first, conflict) in [
+        (data(0, 1400, 7), data(0, 1399, 7)),
+        (data(0, 1400, 7), data(0, 1400, 8)),
+        (data(350, 1400, 7), data(0, 1400, 7)),
+        (data(0, 1400, 7), data(350, 1400, 7)),
+    ] {
+        let mut reassembly = Reassembly::default();
+        let now = Instant::now();
+        // Without releasing bytes, these discarded packets exhaust the channel budget.
+        for _ in 0..=MAX_PENDING_BYTES / 700 {
+            assert!(reassembly.insert(&first, now).unwrap().is_none());
+            assert_eq!(reassembly.pending(), 1);
+            assert!(reassembly.insert(&conflict, now).unwrap().is_none());
+            assert_eq!(reassembly.pending(), 0);
+        }
+        assert!(reassembly.insert(&data(0, 1400, 7), now).unwrap().is_none());
+        assert_eq!(
+            reassembly.insert(&data(700, 1400, 7), now).unwrap(),
+            Some(vec![7; 1400])
+        );
+        assert_eq!(reassembly.pending(), 0);
+    }
+}
+
+#[test]
 fn pending_limits_drop_new_packets_not_channel() {
     let mut reassembly = Reassembly::default();
     let now = Instant::now();
     for packet_id in 0..MAX_PENDING_PACKETS as u64 {
         let record = Record::Data {
             flow_id: 1,
+            generation: 1,
             packet_id,
             offset: 0,
             total_len: 100,
@@ -203,6 +343,7 @@ fn pending_limits_drop_new_packets_not_channel() {
     assert_eq!(reassembly.pending(), MAX_PENDING_PACKETS);
     let extra = Record::Data {
         flow_id: 1,
+        generation: 1,
         packet_id: 999,
         offset: 0,
         total_len: 100,
@@ -304,6 +445,7 @@ async fn plain_channel_socket_dance() {
         &mut client,
         &Record::FlowProbe {
             flow_id: 3,
+            generation: 1,
             challenge: flow_challenge,
         },
     )
@@ -314,6 +456,7 @@ async fn plain_channel_socket_dance() {
         .unwrap();
     let Record::FlowProbe {
         flow_id,
+        generation,
         challenge: echoed,
     } = record
     else {
@@ -325,6 +468,7 @@ async fn plain_channel_socket_dance() {
         &mut server,
         &Record::FlowEcho {
             flow_id,
+            generation,
             echo: echoed,
         },
     )
@@ -337,13 +481,14 @@ async fn plain_channel_socket_dance() {
         record,
         Record::FlowEcho {
             flow_id: 3,
+            generation: 1,
             echo: flow_challenge
         }
     );
 
     // 1400 bytes of data as two fragments + keepalive.
     let inner = vec![0x5A; 1400];
-    for record in fragment_packet(3, 1, &inner, MAX_FRAGMENT).unwrap() {
+    for record in fragment_packet(3, 1, 1, &inner, MAX_FRAGMENT).unwrap() {
         send_record(&client_socket, server_addr, &mut client, &record)
             .await
             .unwrap();

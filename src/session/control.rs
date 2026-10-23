@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::control::{Message, Strategy};
 use crate::link_io;
-use crate::selector::{Candidate, Reason, Selector};
+use crate::selector::{Candidate, Reason};
 use crate::{channel, crypto, drivers, quic, webrtc};
 
 use super::pump::channel_task;
@@ -71,65 +71,106 @@ impl Session {
             Message::ChannelVerified { channel } => self.channel_verified(channel).await?,
             Message::FlowOpen {
                 flow_id,
+                generation,
                 flow,
                 channel,
+                resume,
             } => {
-                self.flow_open(flow_id, flow, channel).await?;
+                self.flow_open(flow_id, generation, flow, channel, resume)
+                    .await?;
             }
-            Message::FlowChannel { flow_id, channel } => {
-                self.flow_channel(flow_id, channel).await?;
+            Message::FlowChannel {
+                flow_id,
+                generation,
+                channel,
+            } => {
+                self.flow_channel(flow_id, generation, channel).await?;
             }
             Message::FlowOpened {
-                flow_id, channel, ..
-            } => self.flow_opened(flow_id, channel).await?,
-            Message::FlowReject { flow_id, reason } => self.flow_rejected(flow_id, reason).await?,
-            Message::Commit { flow_id, .. } => self.commit(flow_id).await?,
-            Message::Committed { flow_id } => self.committed(flow_id).await?,
-            Message::FlowClose { flow_id } => {
+                flow_id,
+                generation,
+                channel,
+                ..
+            } => self.flow_opened(flow_id, generation, channel).await?,
+            Message::FlowReject {
+                flow_id,
+                generation,
+                reason,
+            } => self.flow_rejected(flow_id, generation, reason).await?,
+            Message::Commit {
+                flow_id,
+                generation,
+            } => self.commit(flow_id, generation).await?,
+            Message::Committed {
+                flow_id,
+                generation,
+            } => self.committed(flow_id, generation).await?,
+            Message::FlowClose {
+                flow_id,
+                generation,
+            } => {
+                if !self.binding_current(flow_id, generation) {
+                    return Ok(());
+                }
                 if self
                     .round
                     .as_ref()
                     .is_some_and(|round| round.tcp_id == Some(flow_id))
                 {
-                    self.tcp_failed(flow_id).await?;
+                    self.tcp_failed(flow_id, generation).await?;
                 } else {
                     self.close_flow(flow_id, false).await?;
                 }
             }
             // ── TCP mode ──
-            Message::Open { id, flow } if matches!(self.plane, Plane::Tcp(_)) => {
-                self.tcp_open_server(id, flow).await?
+            Message::Open {
+                id,
+                generation,
+                flow,
+            } if matches!(self.plane, Plane::Tcp(_)) => {
+                self.tcp_open_server(id, generation, flow).await?
             }
             Message::Opened {
                 id,
+                generation,
                 port,
                 key,
                 token,
             } if matches!(self.plane, Plane::Tcp(_)) => {
-                self.tcp_opened_client(id, port, key, token).await?
+                self.tcp_opened_client(id, generation, port, key, token)
+                    .await?
             }
-            Message::Close { id } if matches!(self.plane, Plane::Tcp(_)) => {
+            Message::Close { id, generation } if matches!(self.plane, Plane::Tcp(_)) => {
+                if !self.binding_current(id, generation) {
+                    return Ok(());
+                }
                 if self
                     .round
                     .as_ref()
                     .is_some_and(|round| round.tcp_id == Some(id))
                 {
-                    self.tcp_failed(id).await?;
+                    self.tcp_failed(id, generation).await?;
                 } else {
                     self.tcp_close(id).await?;
                 }
             }
             // ── TCP candidate in channel mode ──
-            Message::Open { id, flow } if matches!(self.plane, Plane::Channels(_)) => {
-                self.channels_tcp_open(id, flow).await?
+            Message::Open {
+                id,
+                generation,
+                flow,
+            } if matches!(self.plane, Plane::Channels(_)) => {
+                self.channels_tcp_open(id, generation, flow).await?
             }
             Message::Opened {
                 id,
+                generation,
                 port,
                 key,
                 token,
             } if matches!(self.plane, Plane::Channels(_)) => {
-                self.channels_tcp_opened(id, port, key, token).await?
+                self.channels_tcp_opened(id, generation, port, key, token)
+                    .await?
             }
             other => {
                 let _ = other;
@@ -603,6 +644,8 @@ impl Session {
                 .send(Message::FlowOpen {
                     flow_id,
                     flow: flow.key,
+                    generation: flow.generation,
+                    resume: false,
                     channel: Some(channel),
                 })
                 .await;
@@ -677,23 +720,13 @@ impl Session {
                 self.health_at = None;
             }
         }
-        let recheck = self.readiness == Some(Readiness::Ready)
-            && self.round.is_none()
-            && channel.is_some_and(|id| {
-                plane.channels.get(&id).is_some_and(|handle| {
-                    plane.selector.as_ref().is_some_and(|selector| {
-                        selector.ready_channel(handle.candidate) == Some(id)
-                    })
-                })
-            });
-        if recheck {
-            let actions = plane
-                .selector
-                .as_mut()
-                .map(Selector::enter_checking)
-                .unwrap_or_default();
-            self.execute_actions(actions).await?;
-        }
+        let affected: Vec<_> = plane
+            .flows
+            .iter()
+            .filter(|(_, flow)| channel.is_some() && flow.channel == channel)
+            .map(|(&id, flow)| (id, flow.generation))
+            .collect();
+        let was_live = channel.is_some_and(|id| plane.channels.contains_key(&id));
         if let Some(id) = channel {
             self.stop_channel(id).await;
         }
@@ -702,6 +735,15 @@ impl Session {
         };
         let actions = plane.channel_failed(attempt, channel, reason, StdInstant::now());
         self.execute_actions(actions).await?;
+        for (id, generation) in affected {
+            if !self.retry_flow(id, generation, reason).await? {
+                self.close_flow(id, true).await?;
+            }
+        }
+        let recheck = was_live
+            && self.readiness == Some(Readiness::Ready)
+            && self.round.is_none()
+            && matches!(&self.plane, Plane::Channels(plane) if plane.selector.as_ref().is_some_and(|s| !s.channels.keys().any(|c| s.ready_channel(*c).is_some())));
         if recheck {
             if let PacketIo::Link(io) = &self.io {
                 io.events

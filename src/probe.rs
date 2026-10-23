@@ -108,16 +108,19 @@ async fn exchange(io: &mut Io, channel: &mut Channel, record: &Record) -> Result
 
 /// Next channel record: event → AEAD-open. The deadline covers the whole attempt.
 async fn next_record(io: &mut Io, channel: &mut Channel, deadline: Instant) -> Result<Record> {
-    let now = Instant::now();
-    ensure!(now < deadline, "probe deadline exceeded");
-    let event = tokio::time::timeout_at(deadline, io.events.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("probe deadline exceeded"))?
-        .ok_or_else(|| anyhow::anyhow!("transport task closed"))?;
-    match event {
-        Event::Wire(bytes) => channel
-            .open(&bytes, StdInstant::now())?
-            .ok_or_else(|| anyhow::anyhow!("replayed channel record")),
-        Event::Failed(reason) => bail!("transport failed: {reason}"),
+    loop {
+        ensure!(Instant::now() < deadline, "probe deadline exceeded");
+        let event = tokio::time::timeout_at(deadline, io.events.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("probe deadline exceeded"))?
+            .ok_or_else(|| anyhow::anyhow!("transport task closed"))?;
+        match event {
+            Event::Wire(bytes) => {
+                if let Some(record) = channel.open(&bytes, StdInstant::now())? {
+                    return Ok(record);
+                }
+            }
+            Event::Failed(reason) => bail!("transport failed: {reason}"),
+        }
     }
 }

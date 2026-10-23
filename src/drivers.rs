@@ -97,14 +97,8 @@ pub fn datagram(socket: UdpSocket, profile: Profile, dest: Option<SocketAddr>) -
                         // is not allocated. Other profiles check the same
                         // inside unwrap_in_place.
                         if !(profile::MIN_WIRE..=profile::MAX_WIRE).contains(&len) {
-                            if peer.is_none() {
-                                continue;
-                            }
-                            break format!(
-                                "unwrap: length {len} outside {}..={}",
-                                profile::MIN_WIRE,
-                                profile::MAX_WIRE
-                            );
+                            dropped += 1;
+                            continue;
                         }
                         let mut bytes = wire[..len].to_vec();
                         match profile.unwrap_in_place(&mut bytes) {
@@ -118,10 +112,7 @@ pub fn datagram(socket: UdpSocket, profile: Profile, dest: Option<SocketAddr>) -
                                     dropped += 1;
                                 }
                             }
-                            // Junk before the first valid packet (port scan):
-                            // drop it, the peer address is not taken and the channel lives.
-                            Err(_) if peer.is_none() => {}
-                            Err(e) => break format!("unwrap: {e}"),
+                            Err(_) => dropped += 1,
                         }
                     }
                     Err(e) => break format!("recv: {e}"),

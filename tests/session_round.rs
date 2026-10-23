@@ -52,6 +52,7 @@ async fn parallel_candidates_have_independent_tun_verdicts() {
     // A reply from the faster handshake cannot prove another candidate's TUN path.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[1].0,
             channel: Some(101),
             packet: echo_reply_for(&probes[0].4),
@@ -62,6 +63,7 @@ async fn parallel_candidates_have_independent_tun_verdicts() {
     // Even matching ICMP bytes cannot prove B when delivered by channel A.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[1].0,
             channel: Some(100),
             packet: echo_reply_for(&probes[1].4),
@@ -75,6 +77,7 @@ async fn parallel_candidates_have_independent_tun_verdicts() {
     // The second candidate completes its own TUN check and wins immediately.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[1].0,
             channel: Some(101),
             packet: echo_reply_for(&probes[1].4),
@@ -116,6 +119,7 @@ async fn every_candidate_verified_decides_without_the_window() {
     plane.flows.get_mut(&tcp_id).unwrap().active = true;
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: tcp_id,
             channel: None,
             packet: echo_reply_for(&request),
@@ -127,6 +131,7 @@ async fn every_candidate_verified_decides_without_the_window() {
     for (id, channel, _, _, probe_request) in &probes {
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: *id,
                 channel: Some(*channel),
                 packet: echo_reply_for(probe_request),
@@ -155,6 +160,7 @@ async fn faster_candidate_verified_inside_the_window_wins() {
     for (verified, probe) in [(1, &probes[1]), (2, &probes[0])] {
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: probe.0,
                 channel: Some(probe.1),
                 packet: echo_reply_for(&probe.4),
@@ -200,6 +206,7 @@ async fn round_verdict_reply_wins_and_noise_is_ignored() {
     // Unrelated packet on the preflight flow: no verdict, round stands.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id,
             channel: None,
             packet: vec![0u8; 40],
@@ -211,6 +218,7 @@ async fn round_verdict_reply_wins_and_noise_is_ignored() {
     // The matching echo reply wins: round retired, flow closed, Verified.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id,
             channel: None,
             packet: echo_reply_for(&request),
@@ -457,7 +465,7 @@ async fn fixed_tcp_round_failure_retries_without_transport_only_readiness() {
     assert!(session.has_flow(PREFLIGHT_ID));
     let retry = session.round.as_ref().unwrap().retry_at.unwrap();
     session.tcp_close(PREFLIGHT_ID).await.unwrap();
-    session.tcp_failed(PREFLIGHT_ID).await.unwrap();
+    session.tcp_failed(PREFLIGHT_ID, 1).await.unwrap();
     assert!(events.try_recv().is_err());
     session.poll_round(retry).await.unwrap();
     assert!(session.round.as_ref().unwrap().retry_at.is_none());
@@ -479,21 +487,22 @@ async fn tcp_preflight_does_not_count_as_ip_traffic() {
         let id = session.round.as_ref().unwrap().tcp_id.unwrap();
         if legacy {
             session
-                .tcp_opened_client(id, 9000, [1; 16], Some([2; 16]))
+                .tcp_opened_client(id, 1, 9000, [1; 16], Some([2; 16]))
                 .await
                 .unwrap();
         } else {
             session
-                .channels_tcp_opened(id, 9000, [1; 16], Some([2; 16]))
+                .channels_tcp_opened(id, 1, 9000, [1; 16], Some([2; 16]))
                 .await
                 .unwrap();
         }
         assert_eq!(session.stats, Stats::default());
         let request = session.round.as_ref().unwrap().request.clone();
-        session.tcp_connected(id).await.unwrap();
+        session.tcp_connected(id, 1).await.unwrap();
         assert_eq!(session.readiness, Some(Readiness::Probing));
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id,
                 channel: None,
                 packet: request.clone(),
@@ -503,6 +512,7 @@ async fn tcp_preflight_does_not_count_as_ip_traffic() {
         assert_eq!(session.readiness, Some(Readiness::Probing));
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id,
                 channel: None,
                 packet: echo_reply_for(&request),
@@ -531,7 +541,12 @@ async fn tcp_probe_ids_isolate_late_events_across_retries() {
         let (reader, writer) = tokio::io::split(remote);
         let mut peer = Control::new(reader, writer);
         session.begin_preflight().await.unwrap();
-        let Message::Open { id: first, .. } = peer.recv().await.unwrap() else {
+        let Message::Open {
+            generation: 1,
+            id: first,
+            ..
+        } = peer.recv().await.unwrap()
+        else {
             panic!("missing TCP probe Open");
         };
         assert!(
@@ -552,7 +567,10 @@ async fn tcp_probe_ids_isolate_late_events_across_retries() {
         ));
         let second = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Message::Open { id, .. } = peer.recv().await.unwrap() {
+                if let Message::Open {
+                    generation: 1, id, ..
+                } = peer.recv().await.unwrap()
+                {
                     break id;
                 }
             }
@@ -566,6 +584,7 @@ async fn tcp_probe_ids_isolate_late_events_across_retries() {
         assert_eq!(session.flow_count(), 0);
         session
             .dispatch_control(Message::Opened {
+                generation: 1,
                 id: first,
                 port: 9000,
                 key: [1; 16],
@@ -573,10 +592,11 @@ async fn tcp_probe_ids_isolate_late_events_across_retries() {
             })
             .await
             .unwrap();
-        session.tcp_connected(first).await.unwrap();
-        session.tcp_failed(first).await.unwrap();
+        session.tcp_connected(first, 1).await.unwrap();
+        session.tcp_failed(first, 1).await.unwrap();
         session
             .deliver_to_tun(Incoming {
+                generation: 1,
                 id: first,
                 channel: None,
                 packet: reply,
@@ -585,19 +605,30 @@ async fn tcp_probe_ids_isolate_late_events_across_retries() {
             .unwrap();
         if legacy {
             session
-                .dispatch_control(Message::Close { id: first })
+                .dispatch_control(Message::Close {
+                    generation: 1,
+                    id: first,
+                })
                 .await
                 .unwrap();
         } else {
             for message in [
                 Message::FlowOpened {
+                    generation: 1,
                     flow_id: first,
                     flow: test_key(),
                     channel: 99,
                 },
-                Message::Committed { flow_id: first },
-                Message::FlowClose { flow_id: first },
+                Message::Committed {
+                    generation: 1,
+                    flow_id: first,
+                },
+                Message::FlowClose {
+                    generation: 1,
+                    flow_id: first,
+                },
                 Message::FlowReject {
+                    generation: 1,
                     flow_id: first,
                     reason: Reason::ChannelFailed,
                 },
@@ -627,20 +658,20 @@ async fn retired_tcp_probe_events_do_not_kill_ready_session() {
         let (mut session, _events) = link_session(tcp);
         session.readiness = Some(Readiness::Ready);
         // Cancellation cannot remove Connected/Failed already in the event queue.
-        assert!(session.tcp_connected(PREFLIGHT_ID).await.is_ok());
-        assert!(session.tcp_failed(PREFLIGHT_ID).await.is_ok());
+        assert!(session.tcp_connected(PREFLIGHT_ID, 1).await.is_ok());
+        assert!(session.tcp_failed(PREFLIGHT_ID, 1).await.is_ok());
         if tcp {
             session
-                .tcp_opened_client(PREFLIGHT_ID, 9000, [0; 16], None)
+                .tcp_opened_client(PREFLIGHT_ID, 1, 9000, [0; 16], None)
                 .await
                 .unwrap();
             session.tcp_close(PREFLIGHT_ID).await.unwrap();
         } else {
             session
-                .channels_tcp_opened(PREFLIGHT_ID, 9000, [0; 16], None)
+                .channels_tcp_opened(PREFLIGHT_ID, 1, 9000, [0; 16], None)
                 .await
                 .unwrap();
-            session.committed(PREFLIGHT_ID).await.unwrap();
+            session.committed(PREFLIGHT_ID, 1).await.unwrap();
             session.close_flow(PREFLIGHT_ID, false).await.unwrap();
         }
         assert_eq!(session.readiness, Some(Readiness::Ready));
@@ -664,12 +695,14 @@ async fn borrowed_channel_failure_closes_its_flows_but_probe_timeout_does_not() 
         });
         selector.adopt(Candidate::Mosh, Some(10));
         selector.request(1, key, &bytes, StdInstant::now()).unwrap();
-        selector.bind_succeeded(1, StdInstant::now());
-        selector.committed(1);
+        selector.bind_succeeded(1, 1, StdInstant::now());
+        selector.committed(1, 1);
+        selector.take_queue(1);
         plane.selector = Some(selector);
         let mut flow = Flow::new(key, tokio::time::Instant::now());
         flow.channel = Some(10);
         flow.active = true;
+        flow.data_started = true;
         plane.flows.insert(1, flow);
         plane.by_key.insert(key, 1);
         let (command, _commands) = mpsc::channel(1);
@@ -789,6 +822,7 @@ async fn candidate_that_fails_after_its_echo_cannot_win() {
     // Obfs (channel 101) verifies first, then its path dies inside the window.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[1].0,
             channel: Some(probes[1].1),
             packet: echo_reply_for(&probes[1].4),
@@ -803,6 +837,7 @@ async fn candidate_that_fails_after_its_echo_cannot_win() {
     // Mosh verifies; it is the only live verified candidate when the window ends.
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[0].0,
             channel: Some(probes[0].1),
             packet: echo_reply_for(&probes[0].4),
@@ -872,6 +907,7 @@ async fn established_candidate_extends_the_window_and_can_win() {
     plane.flows.get_mut(&tcp_id).unwrap().active = true;
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: tcp_id,
             channel: None,
             packet: echo_reply_for(&request),
@@ -912,6 +948,7 @@ async fn established_candidate_extends_the_window_and_can_win() {
         .sent_at = Some(tokio::time::Instant::now() - Duration::from_millis(50));
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: probes[0].0,
             channel: Some(probes[0].1),
             packet: echo_reply_for(&probes[0].4),
@@ -944,6 +981,7 @@ async fn silent_candidates_do_not_extend_the_window() {
     plane.flows.get_mut(&tcp_id).unwrap().active = true;
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: tcp_id,
             channel: None,
             packet: echo_reply_for(&request),
@@ -979,6 +1017,7 @@ async fn window_extension_never_crosses_the_round_deadline() {
     plane.flows.get_mut(&tcp_id).unwrap().active = true;
     session
         .deliver_to_tun(Incoming {
+            generation: 1,
             id: tcp_id,
             channel: None,
             packet: echo_reply_for(&request),
@@ -1067,7 +1106,9 @@ async fn parallel_round() -> (
             .unwrap()
             .unwrap()
         {
-            Message::Open { id, .. } => {
+            Message::Open {
+                generation: 1, id, ..
+            } => {
                 assert_eq!(Some(id), session.round.as_ref().unwrap().tcp_id);
                 tcp = true;
             }

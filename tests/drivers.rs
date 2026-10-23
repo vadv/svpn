@@ -234,6 +234,26 @@ async fn datagram_garbage_before_peer_learned_is_dropped() {
 }
 
 #[tokio::test]
+async fn malformed_datagram_from_current_peer_does_not_close_driver() {
+    for profile in [Profile::Plain, Profile::Mosh, Profile::Obfs] {
+        let socket = udp().await;
+        let target = socket.local_addr().unwrap();
+        let peer = udp().await;
+        let mut driver = datagram(socket, profile, Some(peer.local_addr().unwrap()));
+        peer.send_to(&[0], target).await.unwrap();
+        if profile == Profile::Obfs {
+            peer.send_to(&[15; 32], target).await.unwrap();
+        }
+        let record = vec![0xAB; 64];
+        let mut wire = record.clone();
+        profile.wrap_in_place(&mut wire).unwrap();
+        peer.send_to(&wire, target).await.unwrap();
+        assert_eq!(next(&mut driver).await, Event::Wire(record));
+        driver.close().await;
+    }
+}
+
+#[tokio::test]
 async fn terminal_failure_releases_driver_with_a_full_event_queue() {
     let socket = udp().await;
     let target = socket.local_addr().unwrap();
@@ -249,7 +269,7 @@ async fn terminal_failure_releases_driver_with_a_full_event_queue() {
     })
     .await
     .expect("fill event queue");
-    sender.send_to(&[0], target).await.unwrap();
+    driver.command.send(Command::Send(vec![0])).await.unwrap();
     tokio::time::timeout(Duration::from_millis(100), driver.command.closed())
         .await
         .expect("terminal failure blocked behind Wire events");

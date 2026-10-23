@@ -67,18 +67,19 @@ pub fn succeed(selector: &mut Selector, id: u64, candidate: Candidate) {
     assert_eq!(
         actions,
         vec![Action::OpenFlow {
+            generation: 1,
             flow_id: id,
             candidate,
             channel: 100
         }]
     );
     assert_eq!(
-        selector.bind_succeeded(id, now),
+        selector.bind_succeeded(id, 1, now),
         vec![Action::Commit {
             flow_id: id,
             candidate,
-            attempt: attempt + 1
+            generation: 1
         }]
     );
-    assert!(selector.committed(id).is_empty());
+    assert!(selector.committed(id, 1).is_empty());
 }

@@ -1,7 +1,7 @@
 //! Flow lifecycle: admission and binding, the commit barrier, teardown, and
 //! link-loss retirement.
 
-use std::{collections::VecDeque, time::Instant as StdInstant};
+use std::time::Instant as StdInstant;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -13,12 +13,16 @@ use crate::selector::{Candidate, Reason};
 
 use super::burst::Burst;
 use super::round::{ROUND_RESEND, unanswered};
-use super::{FLOW_IDLE, Flow, PacketIo, Plane, Readiness, Session, TaskCommand};
+use super::state::idle_timeout;
+use super::{FLOW_CAP, Flow, PROBE_FLOW_RESERVE, PacketIo, Plane, Readiness, Session, TaskCommand};
 
 impl Session {
     // ────────────────────────── TCP transport events ──────────────────────────
 
-    pub async fn tcp_connected(&mut self, id: u64) -> Result<()> {
+    pub async fn tcp_connected(&mut self, id: u64, generation: u64) -> Result<()> {
+        if !self.binding_current(id, generation) {
+            return Ok(());
+        }
         if is_probe_flow(id) {
             if !self.has_flow(id)
                 || (self.client()
@@ -62,34 +66,74 @@ impl Session {
             }
             return Ok(());
         }
+        if !self.client() {
+            let pending = match &mut self.plane {
+                Plane::Channels(plane) => {
+                    let flow = plane.flows.get_mut(&id).context("flow missing")?;
+                    if !flow.tcp.as_ref().is_some_and(|tcp| {
+                        tcp.receiver.is_none()
+                            && tcp.out.as_ref().is_some_and(|out| !out.is_closed())
+                    }) {
+                        return Ok(());
+                    }
+                    flow.tcp_connected = true;
+                    flow.commit_pending
+                }
+                Plane::Tcp(plane) => {
+                    let flow = plane.flows.get_mut(&id).context("flow missing")?;
+                    if flow.tcp_receiver.is_some()
+                        || !flow.outgoing.as_ref().is_some_and(|out| !out.is_closed())
+                    {
+                        return Ok(());
+                    }
+                    flow.tcp_connected = true;
+                    flow.commit_pending
+                }
+            };
+            if pending {
+                self.commit(id, generation).await?;
+            }
+            return Ok(());
+        }
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {
-            let actions = selector.bind_succeeded(id, StdInstant::now());
+            let actions = selector.bind_succeeded(id, generation, StdInstant::now());
             self.execute_actions(actions).await?;
         } else if let Plane::Tcp(plane) = &mut self.plane
             && let Some(flow) = plane.flows.get_mut(&id)
         {
-            flow.active = true;
+            let _ = flow;
+            self.control
+                .send(Message::Commit {
+                    flow_id: id,
+                    generation,
+                })
+                .await?;
         }
         Ok(())
     }
 
-    pub async fn tcp_closed(&mut self, id: u64) -> Result<()> {
+    pub async fn tcp_closed(&mut self, id: u64, generation: u64) -> Result<()> {
+        if !self.binding_current(id, generation) {
+            return Ok(());
+        }
         if is_probe_flow(id) {
-            return self.tcp_failed(id).await;
+            return self.tcp_failed(id, generation).await;
         }
         let now = tokio::time::Instant::now();
         let expected = match &self.plane {
             Plane::Channels(plane) => plane.flows.get(&id).is_none_or(|flow| {
-                flow.fin_dwell.is_some() || now.duration_since(flow.last_seen) >= FLOW_IDLE
+                flow.tcp_close.finished()
+                    || now.duration_since(flow.last_seen) >= idle_timeout(flow.key.protocol)
             }),
             Plane::Tcp(plane) => plane.flows.get(&id).is_none_or(|flow| {
-                flow.fin_dwell.is_some() || now.duration_since(flow.last_seen) >= FLOW_IDLE
+                flow.tcp_close.finished()
+                    || now.duration_since(flow.last_seen) >= idle_timeout(flow.key.protocol)
             }),
         };
         if !expected {
-            return self.tcp_failed(id).await;
+            return self.tcp_failed(id, generation).await;
         }
         if self.has_flow(id) {
             self.close_flow(id, true).await?;
@@ -97,7 +141,10 @@ impl Session {
         Ok(())
     }
 
-    pub async fn tcp_failed(&mut self, id: u64) -> Result<()> {
+    pub async fn tcp_failed(&mut self, id: u64, generation: u64) -> Result<()> {
+        if !self.binding_current(id, generation) {
+            return Ok(());
+        }
         if is_probe_flow(id) {
             if !self.has_flow(id) {
                 return Ok(());
@@ -142,14 +189,13 @@ impl Session {
         if reset_requested {
             return self.close_flow(id, true).await;
         }
-        let recheck = self.readiness == Some(Readiness::Ready) && self.has_flow(id);
-        if let Plane::Channels(plane) = &mut self.plane
-            && let Some(selector) = plane.selector.as_mut()
+        if self
+            .retry_flow(id, generation, Reason::ChannelFailed)
+            .await?
         {
-            let actions = selector.bind_failed(id, Reason::ChannelFailed, StdInstant::now());
-            self.execute_actions(actions).await?;
+            return Ok(());
         }
-        // A failed active/committing connection cannot migrate to another transport.
+        let recheck = self.readiness == Some(Readiness::Ready) && self.has_flow(id);
         if self.has_flow(id) {
             self.close_flow(id, true).await?;
         }
@@ -172,18 +218,35 @@ impl Session {
         }
     }
 
+    pub(crate) fn flow_limit_reached(&self, id: u64) -> bool {
+        let count = match &self.plane {
+            Plane::Channels(plane) => plane.flows.len(),
+            Plane::Tcp(plane) => plane.flows.len(),
+        };
+        let ordinary = self.flow_count();
+        if is_probe_flow(id) {
+            count - ordinary >= PROBE_FLOW_RESERVE
+        } else {
+            ordinary >= FLOW_CAP
+        }
+    }
+
     // ────────────────────────── Open, bind, commit ──────────────────────────
 
     pub async fn flow_open(
         &mut self,
         flow_id: u64,
+        generation: u64,
         flow: FlowKey,
         channel: Option<u64>,
+        resume: bool,
     ) -> Result<()> {
-        let Plane::Channels(plane) = &mut self.plane else {
-            bail!("flow_open outside channels mode");
-        };
-        let Some(channel_id) = channel else {
+        ensure!(generation != 0, "zero binding generation");
+        let at_capacity = self.flow_limit_reached(flow_id);
+        if channel.is_none() {
+            let Plane::Channels(plane) = &mut self.plane else {
+                bail!("flow_open outside channels mode")
+            };
             ensure!(
                 !is_probe_flow(flow_id),
                 "server cannot originate preflight flow"
@@ -199,6 +262,16 @@ impl Session {
                 );
                 return Ok(());
             }
+            if at_capacity {
+                return self
+                    .control
+                    .send(Message::FlowReject {
+                        flow_id,
+                        generation,
+                        reason: Reason::ResourceExhausted,
+                    })
+                    .await;
+            }
             let now = tokio::time::Instant::now();
             plane.flows.insert(flow_id, Flow::new(flow, now));
             plane.by_key.insert(flow, flow_id);
@@ -213,111 +286,121 @@ impl Session {
                 }
             }
             return Ok(());
-        };
-        ensure!(
-            !is_probe_flow(flow_id) || plane.selector.is_none(),
-            "preflight flow_open on client"
-        );
-        // Client flow (c→s): the server registers and acknowledges it.
-        // FlowOpen ids need not increase: the selector emits them in HashMap
-        // iteration order. A duplicate id is a repeat of an already-accepted flow.
-        ensure!(flow.valid_for(self.client_ip), "invalid flow tuple");
-        if plane.flows.contains_key(&flow_id)
-            || (flow_id != PREFLIGHT_ID && plane.by_key.contains_key(&flow))
-        {
-            crate::debug!("flow_open reject duplicate id={flow_id}");
-            return self
-                .control
-                .send(Message::FlowReject {
-                    flow_id,
-                    reason: Reason::Unsupported,
-                })
-                .await;
         }
-        let now = tokio::time::Instant::now();
-        let mut registered = Flow::new(flow, now);
-        registered.channel = Some(channel_id);
-        plane.flows.insert(flow_id, registered);
+
+        if !self
+            .register_binding(flow_id, generation, flow, channel, resume)
+            .await?
+        {
+            return Ok(());
+        }
+        let channel_id = channel.context("flow channel missing")?;
+        let Plane::Channels(plane) = &mut self.plane else {
+            unreachable!()
+        };
+        let registered = plane
+            .flows
+            .get_mut(&flow_id)
+            .context("registered flow missing")?;
         if !is_probe_flow(flow_id) {
-            self.stats.opened_flows += 1;
             let transport = plane
                 .channels
                 .get(&channel_id)
                 .map(|h| h.candidate.to_string())
-                .unwrap_or_else(|| "tcp".to_string());
+                .unwrap_or_default();
             crate::debug!(
-                "flow_open role=server id={flow_id} channel={channel_id} transport={transport}"
+                "flow_open role=server id={flow_id} generation={generation} channel={channel_id} transport={transport}"
             );
-        }
-        // N3: the preflight flow must be reachable from the TUN side too —
-        // the kernel's echo reply routes back through `by_key`.
-        plane.by_key.insert(flow, flow_id);
-        if !is_probe_flow(flow_id) {
             self.control
                 .send(Message::FlowOpened {
                     flow_id,
+                    generation,
                     flow,
                     channel: channel_id,
                 })
                 .await?;
+            if registered.active {
+                self.control
+                    .send(Message::Committed {
+                        flow_id,
+                        generation,
+                    })
+                    .await?;
+            }
+            return Ok(());
         }
-        // FLOW_PROBE on the channel confirms the binding of both directions.
-        let challenge = channel::challenge().context("challenge generation failed")?;
-        let queued = plane.channels.get(&channel_id).is_some_and(|handle| {
-            handle
-                .command
+        let challenge = match registered.echo_pending {
+            Some(challenge) => challenge,
+            None if registered.active => {
+                self.control
+                    .send(Message::FlowOpened {
+                        flow_id,
+                        generation,
+                        flow,
+                        channel: channel_id,
+                    })
+                    .await?;
+                return self
+                    .control
+                    .send(Message::Committed {
+                        flow_id,
+                        generation,
+                    })
+                    .await;
+            }
+            None => channel::challenge().context("challenge generation failed")?,
+        };
+        registered.echo_pending = Some(challenge);
+        let queued = plane.channels.get(&channel_id).is_some_and(|h| {
+            h.command
                 .try_send(TaskCommand::Record(channel::Record::FlowProbe {
                     flow_id,
+                    generation,
                     challenge,
                 }))
                 .is_ok()
         });
         if !queued {
-            return self.close_flow(flow_id, true).await;
-        }
-        if let Some(flow_state) = plane.flows.get_mut(&flow_id) {
-            flow_state.echo_pending = Some(challenge);
+            self.close_flow(flow_id, true).await?;
         }
         Ok(())
     }
 
     /// Server: the client picked a channel for a server-originated flow.
-    pub async fn flow_channel(&mut self, flow_id: u64, channel: u64) -> Result<()> {
-        ensure!(!is_probe_flow(flow_id), "unexpected preflight flow_channel");
-        let Plane::Channels(plane) = &mut self.plane else {
-            bail!("flow_channel outside channels mode");
-        };
-        let Some(flow_state) = plane.flows.get_mut(&flow_id) else {
+    pub async fn flow_channel(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        channel: u64,
+    ) -> Result<()> {
+        if !self.binding_current(flow_id, generation) {
             return Ok(());
+        }
+        let Plane::Channels(plane) = &mut self.plane else {
+            bail!("flow_channel outside channels mode")
         };
-        let key = flow_state.key;
-        flow_state.channel = Some(channel);
-        let challenge = channel::challenge().context("challenge generation failed")?;
-        flow_state.echo_pending = Some(challenge);
+        let flow = plane.flows.get_mut(&flow_id).context("flow missing")?;
+        flow.channel = Some(channel);
         self.control
             .send(Message::FlowOpened {
                 flow_id,
-                flow: key,
+                generation,
+                flow: flow.key,
                 channel,
             })
-            .await?;
-        let queued = plane.channels.get(&channel).is_some_and(|handle| {
-            handle
-                .command
-                .try_send(TaskCommand::Record(channel::Record::FlowProbe {
-                    flow_id,
-                    challenge,
-                }))
-                .is_ok()
-        });
-        if !queued {
-            return self.close_flow(flow_id, true).await;
-        }
-        Ok(())
+            .await
     }
 
     /// Client: the server registered the binding — move to commit.
-    pub(crate) async fn flow_opened(&mut self, flow_id: u64, channel: u64) -> Result<()> {
+    pub(crate) async fn flow_opened(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        channel: u64,
+    ) -> Result<()> {
+        if !self.binding_current(flow_id, generation) {
+            return Ok(());
+        }
         let Plane::Channels(plane) = &mut self.plane else {
             bail!("flow_opened outside channels mode");
         };
@@ -350,17 +433,17 @@ impl Session {
                     .control
                     .send(Message::Commit {
                         flow_id,
-                        attempt: 0,
+                        generation,
                     })
                     .await;
             }
-        } else {
-            flow_state.channel = Some(channel);
+        } else if flow_state.channel != Some(channel) {
+            return Ok(());
         }
         let Some(selector) = plane.selector.as_mut() else {
             bail!("flow_opened on server");
         };
-        let actions = selector.bind_succeeded(flow_id, StdInstant::now());
+        let actions = selector.bind_succeeded(flow_id, generation, StdInstant::now());
         ensure!(
             flow_id != PREFLIGHT_ID || !actions.is_empty(),
             "stale preflight binding"
@@ -368,44 +451,79 @@ impl Session {
         self.execute_actions(actions).await
     }
 
-    pub(crate) async fn flow_rejected(&mut self, flow_id: u64, _reason: Reason) -> Result<()> {
+    pub(crate) async fn flow_rejected(
+        &mut self,
+        flow_id: u64,
+        generation: u64,
+        reason: Reason,
+    ) -> Result<()> {
+        if !self.binding_current(flow_id, generation) {
+            return Ok(());
+        }
         if self
             .round
             .as_ref()
-            .is_some_and(|round| round.tcp_id == Some(flow_id))
+            .is_some_and(|r| r.tcp_id == Some(flow_id))
         {
-            return self.tcp_failed(flow_id).await;
+            return self.tcp_failed(flow_id, generation).await;
         }
-        self.close_flow(flow_id, false).await
+        if !self.retry_flow(flow_id, generation, reason).await? {
+            self.close_flow(flow_id, false).await?;
+        }
+        Ok(())
     }
 
     /// Server: commit barrier passed — DATA allowed, the queue drains to the channel.
-    pub async fn commit(&mut self, flow_id: u64) -> Result<()> {
-        let Plane::Channels(plane) = &mut self.plane else {
-            bail!("commit outside channels mode");
-        };
-        ensure!(
-            !is_probe_flow(flow_id) || plane.selector.is_none(),
-            "preflight commit on client"
-        );
-        let Some(flow_state) = plane.flows.get_mut(&flow_id) else {
-            return Ok(());
-        };
-        if flow_state.active {
+    pub async fn commit(&mut self, flow_id: u64, generation: u64) -> Result<()> {
+        if !self.binding_current(flow_id, generation) {
             return Ok(());
         }
-        ensure!(
-            !is_probe_flow(flow_id) || flow_state.echo_pending.is_none(),
-            "preflight commit before flow echo"
-        );
-        flow_state.active = true;
-        let queue = std::mem::take(&mut flow_state.pending);
-        if is_probe_flow(flow_id) {
-            return self.control.send(Message::Committed { flow_id }).await;
+        match &mut self.plane {
+            Plane::Channels(plane) => {
+                let flow = plane.flows.get_mut(&flow_id).context("flow missing")?;
+                ensure!(
+                    !is_probe_flow(flow_id) || flow.echo_pending.is_none(),
+                    "preflight commit before flow echo"
+                );
+                flow.commit_pending = true;
+                let ready = match &flow.tcp {
+                    Some(tcp) => {
+                        flow.tcp_connected && tcp.out.as_ref().is_some_and(|out| !out.is_closed())
+                    }
+                    None => flow
+                        .channel
+                        .and_then(|id| plane.channels.get(&id))
+                        .is_some_and(|h| h.established && !h.command.is_closed()),
+                };
+                if !ready {
+                    return Ok(());
+                }
+                flow.commit_pending = false;
+                flow.active = true;
+            }
+            Plane::Tcp(plane) => {
+                let flow = plane.flows.get_mut(&flow_id).context("flow missing")?;
+                flow.commit_pending = true;
+                if !flow.tcp_connected
+                    || !flow.outgoing.as_ref().is_some_and(|out| !out.is_closed())
+                {
+                    return Ok(());
+                }
+                flow.commit_pending = false;
+                flow.active = true;
+                flow.binding_deadline = None;
+            }
         }
-        crate::debug!("flow_active role=server id={flow_id}");
-        self.send_pending(flow_id, queue).await?;
-        self.control.send(Message::Committed { flow_id }).await
+        self.control
+            .send(Message::Committed {
+                flow_id,
+                generation,
+            })
+            .await?;
+        if !is_probe_flow(flow_id) {
+            self.flush_flow(flow_id).await?;
+        }
+        Ok(())
     }
 
     /// Arm a probe burst: activate its flow and fire the first echo. The
@@ -436,7 +554,11 @@ impl Session {
             // A full datagram queue is packet loss; it ends as loss.
             handle
                 .command
-                .try_send(TaskCommand::Data(burst.attempt, request))
+                .try_send(TaskCommand::Data {
+                    flow_id: burst.attempt,
+                    generation: flow.generation,
+                    packet: request,
+                })
                 .ok();
         }
         burst.arm(now);
@@ -453,7 +575,16 @@ impl Session {
         Self::arm_burst(&mut self.plane, burst, now)
     }
 
-    pub async fn committed(&mut self, flow_id: u64) -> Result<()> {
+    pub async fn committed(&mut self, flow_id: u64, generation: u64) -> Result<()> {
+        if !self.binding_current(flow_id, generation) {
+            return Ok(());
+        }
+        if let Plane::Tcp(plane) = &mut self.plane {
+            let flow = plane.flows.get_mut(&flow_id).context("flow missing")?;
+            flow.active = true;
+            flow.binding_deadline = None;
+            return self.flush_flow(flow_id).await;
+        }
         if is_probe_flow(flow_id) {
             // a health burst owns this probe id, not the round.
             if self
@@ -497,7 +628,11 @@ impl Session {
                 // A full datagram queue is packet loss; ROUND_RESEND retries the probe.
                 if handle
                     .command
-                    .try_send(TaskCommand::Data(flow_id, rc.request.clone()))
+                    .try_send(TaskCommand::Data {
+                        flow_id,
+                        generation,
+                        packet: rc.request.clone(),
+                    })
                     .is_ok()
                 {
                     // First send wins: resends never move the RTT baseline.
@@ -512,53 +647,35 @@ impl Session {
         let Some(selector) = plane.selector.as_mut() else {
             bail!("committed on server");
         };
-        let actions = selector.committed(flow_id);
-        let queue = selector.take_queue(flow_id);
-        let Some(flow_state) = plane.flows.get_mut(&flow_id).filter(|_| queue.is_some()) else {
+        let actions = selector.committed(flow_id, generation);
+        if !selector.binding_active(flow_id, generation) {
             return Ok(());
-        };
-        flow_state.active = true;
-        crate::debug!("flow_active role=client id={flow_id}");
-        if let Some(queue) = queue {
-            self.send_pending(flow_id, queue).await?;
         }
-        self.execute_actions(actions).await
-    }
-
-    /// Both commit paths count queued packets at transport admission, exactly once.
-    pub async fn send_pending(&mut self, flow_id: u64, queue: VecDeque<Vec<u8>>) -> Result<()> {
-        let Plane::Channels(plane) = &self.plane else {
-            bail!("pending channel packets outside channels mode");
-        };
-        let flow = plane
-            .flows
-            .get(&flow_id)
-            .context("pending flow disappeared")?;
-        let tcp = flow.tcp.as_ref().and_then(|tcp| tcp.out.as_ref());
-        let channel = flow.channel.and_then(|id| plane.channels.get(&id));
-        for packet in queue {
-            if packet.is_empty() {
-                continue; // server-originated flow: no first packet
-            }
-            let length = packet.len();
-            let accepted = match (tcp, channel) {
-                (Some(send), _) => send.send(packet).await.is_ok(),
-                (None, Some(channel)) => channel
+        if let Some(flow) = plane.flows.get_mut(&flow_id) {
+            flow.active = true;
+        }
+        // A quiet rebound flow has no data to prove the new binding with:
+        // a challenge probe round-trip stands in until real traffic lands.
+        if let Some(flow) = plane.flows.get_mut(&flow_id)
+            && flow.recovery.is_some()
+            && flow.echo_pending.is_none()
+            && let Ok(challenge) = channel::challenge()
+        {
+            flow.echo_pending = Some(challenge);
+            let channel_id = flow.channel;
+            if let Some(handle) = channel_id.and_then(|id| plane.channels.get(&id)) {
+                handle
                     .command
-                    .try_send(TaskCommand::Data(flow_id, packet))
-                    .is_ok(),
-                (None, None) => false,
-            };
-            if accepted {
-                self.stats.record_tx(length, true);
-            } else {
-                self.stats.count_drop(
-                    &self.drop_prefix,
-                    &format!("flow {flow_id} output unavailable at commit"),
-                );
+                    .try_send(TaskCommand::Record(channel::Record::FlowProbe {
+                        flow_id,
+                        generation,
+                        challenge,
+                    }))
+                    .ok();
             }
         }
-        Ok(())
+        self.flush_flow(flow_id).await?;
+        self.execute_actions(actions).await
     }
 
     /// Link lost: retire every flow of this session's
@@ -626,6 +743,7 @@ impl Session {
     }
 
     pub async fn close_flow(&mut self, flow_id: u64, notify: bool) -> Result<()> {
+        let generation = self.flow_generation(flow_id).unwrap_or(1);
         if flow_id == PREFLIGHT_ID && self.readiness.is_some() {
             // N3: a restarting round retires its half-open preflight flow.
             let round_retry = self
@@ -643,7 +761,6 @@ impl Session {
                 "preflight closed before verification or after cleanup"
             );
         }
-        let mut actions = Vec::new();
         let mut closed_key = None;
         let mut closed_channel = None;
         match &mut self.plane {
@@ -660,36 +777,47 @@ impl Session {
                         plane.token_index.remove(&token);
                     }
                     if !is_probe_flow(flow_id) {
-                        self.stats.open_failed_flows += u64::from(!flow_state.active);
+                        self.stats.open_failed_flows +=
+                            u64::from(!flow_state.active && !flow_state.data_started);
+                        if flow_state.recovery.is_some() {
+                            crate::info!(
+                                "flow_recovery_abandoned id={flow_id} generation={generation} reason=closed"
+                            );
+                        }
                         self.stats.closed_flows += 1;
                         crate::debug!("flow_close id={flow_id}");
                     }
                 }
                 if let Some(selector) = plane.selector.as_mut() {
-                    actions = selector.closed(flow_id, Reason::ChannelFailed, StdInstant::now());
+                    selector.finished(flow_id);
                 }
                 if let Some(key) = closed_key {
                     self.notify_closed(flow_id, key).await?;
                 }
                 if notify {
-                    self.control.send(Message::FlowClose { flow_id }).await?;
+                    self.control
+                        .send(Message::FlowClose {
+                            flow_id,
+                            generation,
+                        })
+                        .await?;
                 }
             }
             Plane::Tcp(..) => {
                 self.tcp_close(flow_id).await?;
                 if notify {
-                    self.control.send(Message::Close { id: flow_id }).await?;
+                    self.control
+                        .send(Message::Close {
+                            id: flow_id,
+                            generation,
+                        })
+                        .await?;
                 }
             }
         }
         // A draining channel retires once its last flow closes (S3).
         if let Some(channel) = closed_channel {
             self.maybe_drain(channel).await?;
-        }
-        // execute_actions may return CloseFlow — break the recursion with a
-        // box (only for close with binding failure; empty actions are not boxed).
-        if !actions.is_empty() {
-            Box::pin(self.execute_actions(actions)).await?;
         }
         Ok(())
     }

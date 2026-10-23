@@ -32,14 +32,26 @@ pub enum TaskEvent {
     FlowEcho {
         channel: u64,
         flow_id: u64,
+        generation: u64,
         echo: [u8; 16],
+    },
+    /// FLOW_PROBE from the peer: the reply is sealed in the pump; the
+    /// session may count it as quiet-flow recovery evidence.
+    ProbeSeen {
+        channel: u64,
+        flow_id: u64,
+        generation: u64,
     },
 }
 
 /// Command from the session to a channel task.
 pub enum TaskCommand {
     /// Outgoing flow IP packet (the task fragments and encrypts it).
-    Data(u64, Vec<u8>),
+    Data {
+        flow_id: u64,
+        generation: u64,
+        packet: Vec<u8>,
+    },
     /// Control record (server FLOW_PROBE).
     Record(channel::Record),
 }
@@ -156,15 +168,17 @@ pub async fn pump(
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_seen = tokio::time::Instant::now();
     let mut next_packet_id: u64 = 0;
-    let chunk_cap = usize::from(ctx.max_wire).saturating_sub(45).max(512);
+    let chunk_cap = usize::from(ctx.max_wire)
+        .saturating_sub(channel::DATA_HEADER + 24)
+        .max(512);
     loop {
         let silence = last_seen + CONSENT_TIMEOUT;
         tokio::select! {
             cmd = command.recv() => match cmd {
-                Some(TaskCommand::Data(flow_id, packet)) => {
+                Some(TaskCommand::Data { flow_id, generation, packet }) => {
                     let packet_id = next_packet_id;
-                    next_packet_id += 1;
-                    for record in channel::fragment_packet(flow_id, packet_id, &packet, chunk_cap)? {
+                    next_packet_id = next_packet_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("packet ID exhausted"))?;
+                    for record in channel::fragment_packet(flow_id, generation, packet_id, &packet, chunk_cap)? {
                         let sealed = chan.seal(&record)?;
                         io.command.send(drivers::Command::Send(sealed)).await?;
                     }
@@ -182,23 +196,33 @@ pub async fn pump(
                     };
                     last_seen = tokio::time::Instant::now();
                     match record {
-                        channel::Record::Data { .. } => {
+                        channel::Record::Data { flow_id, generation, .. } => {
                             if let Some(packet) = chan.assemble(&record, std::time::Instant::now())? {
-                                ctx.incoming.send(Incoming { id: flow_id_of(&record), channel: Some(ctx.channel_id), packet }).await.ok();
+                                ctx.incoming.send(Incoming { id: flow_id, generation, channel: Some(ctx.channel_id), packet }).await.ok();
                             }
                         }
-                        channel::Record::FlowProbe { flow_id, challenge } => {
+                        channel::Record::FlowProbe { flow_id, generation, challenge } => {
                             let sealed = chan.seal(&channel::Record::FlowEcho {
                                 flow_id,
+                                generation,
                                 echo: challenge,
                             })?;
                             io.command.send(drivers::Command::Send(sealed)).await?;
+                            ctx.events
+                                .send(TaskEvent::ProbeSeen {
+                                    channel: ctx.channel_id,
+                                    flow_id,
+                                    generation,
+                                })
+                                .await
+                                .ok();
                         }
-                        channel::Record::FlowEcho { flow_id, echo } => {
+                        channel::Record::FlowEcho { flow_id, generation, echo } => {
                             ctx.events
                                 .send(TaskEvent::FlowEcho {
                                     channel: ctx.channel_id,
                                     flow_id,
+                                    generation,
                                     echo,
                                 })
                                 .await
@@ -219,12 +243,5 @@ pub async fn pump(
                 bail!("consent expired");
             }
         }
-    }
-}
-
-fn flow_id_of(record: &channel::Record) -> u64 {
-    match record {
-        channel::Record::Data { flow_id, .. } => *flow_id,
-        _ => unreachable!("flow_id_of takes DATA records only"),
     }
 }

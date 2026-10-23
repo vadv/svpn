@@ -24,15 +24,11 @@ def tcp_flow_ids(log):
 
 
 def test_udp_reselect_after_ban_expiry():
-    # S2 criterion: block UDP at start -> tcp, unblock -> new flows move to
-    # UDP, the TCP flow opened before the switch keeps flowing. S3: the
-    # switch needs two consecutive winning rounds, so the first challenge
-    # only arms the retry and the second one lands the reselection.
+    # Unblocked UDP serves new flows without interrupting the TCP veteran.
     ssh("iptables -w -A INPUT -p udp -j DROP")
     try:
         with session("reselect", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
-            # One established TCP flow must survive the transport switch; TCP
-            # idle teardown is 60 s, so keep it busy while the challenge runs.
+            # Keep the echo target's 20 s read timeout alive during the switch.
             with socket.create_connection((PEER, 9000), timeout=5) as veteran:
                 veteran.sendall(b"before")
                 assert recv_exact(veteran, 6) == b"before"

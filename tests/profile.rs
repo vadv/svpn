@@ -6,12 +6,12 @@ use svpn::channel::{self, Record};
 use svpn::pcap::PcapBuilder;
 use svpn::profile::*;
 
-/// Sealed V3 golden vector, channel 1, client seq 0.
+/// Node crypto AES-128-GCM vector: generation 1, channel 1, client seq 0.
 const V3: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0x9f, 0x18, 0xa2, 0xb2, 0xcf, 0x58, 0x82,
-    0xb0, 0xd3, 0xc1, 0x46, 0x8c, 0xf7, 0x39, 0x6c, 0x07, 0x6a, 0xde, 0xef, 0x46, 0x65, 0x2d, 0x65,
-    0xb9, 0x60, 0x71, 0x3f, 0x2a, 0xdc, 0x0e, 0x5e, 0x28, 0xe6, 0xab, 0x1c, 0x18, 0xa7, 0xd1, 0xf3,
-    0x1d,
+    0xb0, 0xd3, 0xc1, 0x46, 0x8c, 0xf7, 0x39, 0x6c, 0x07, 0x6a, 0xde, 0xef, 0x42, 0x36, 0x7b, 0x35,
+    0xf6, 0xaa, 0x2c, 0x83, 0xb9, 0x8b, 0x9c, 0x1e, 0x8f, 0x80, 0x79, 0xdb, 0xf0, 0x9b, 0x69, 0x4e,
+    0xc4, 0xd0, 0x09, 0xe8, 0x88, 0x69, 0xad, 0xcf, 0x16,
 ];
 
 // ── wire bounds ──
@@ -86,12 +86,22 @@ fn mosh_roundtrip_with_channel_records() {
     Profile::Mosh.unwrap_in_place(&mut wire).unwrap();
     let last = wire.len() - 1;
     wire[last] ^= 1;
-    assert!(server.open(&wire, std::time::Instant::now()).is_err());
+    assert_eq!(server.open(&wire, std::time::Instant::now()).unwrap(), None);
+    wire[last] ^= 1;
+    assert_eq!(
+        server.open(&wire, std::time::Instant::now()).unwrap(),
+        Some(Record::Keepalive)
+    );
     // Profiles cannot be mixed up: Plain on mosh wire yields a wrong nonce/order.
     let mut wire = client.seal(&Record::Keepalive).unwrap();
     Profile::Mosh.wrap_in_place(&mut wire).unwrap();
     Profile::Plain.unwrap_in_place(&mut wire).unwrap();
-    assert!(server.open(&wire, std::time::Instant::now()).is_err());
+    assert_eq!(server.open(&wire, std::time::Instant::now()).unwrap(), None);
+    Profile::Mosh.unwrap_in_place(&mut wire).unwrap();
+    assert_eq!(
+        server.open(&wire, std::time::Instant::now()).unwrap(),
+        Some(Record::Keepalive)
+    );
 }
 
 #[test]
@@ -166,9 +176,9 @@ fn mosh_socket_dance_writes_pcap() {
         _ => panic!("expected PROBE_B"),
     }
 
-    // Maximum inner packet: 2 fragments per the V7 specification.
+    // Maximum inner packet: two fragments.
     let packet = vec![0x5a; 1400];
-    for record in channel::fragment_packet(1, 1, &packet, channel::MAX_FRAGMENT).unwrap() {
+    for record in channel::fragment_packet(1, 1, 1, &packet, channel::MAX_FRAGMENT).unwrap() {
         send(&client_socket, server_addr, &mut client, &record);
         let received = recv(&server_socket, &mut server);
         if let Some(assembled) = server
@@ -197,6 +207,7 @@ fn obfs_roundtrip_with_channel_records() {
         Record::ProbeA { challenge: [4; 16] },
         Record::Data {
             flow_id: 2,
+            generation: 1,
             packet_id: 1,
             offset: 0,
             total_len: 28,
@@ -239,7 +250,11 @@ fn obfs_hides_length_and_respects_caps() {
 fn obfs_fragment_budget_fits_wire_cap() {
     let packet = vec![0x5c; 1400];
     let cap = Profile::Obfs.max_fragment();
-    let records = channel::fragment_packet(3, 1, &packet, cap).unwrap();
+    assert_eq!(cap, 1340);
+    assert_eq!(cap + channel::DATA_HEADER + 24 + OBF_HEADER + 30, MAX_WIRE);
+    assert_eq!(Profile::Plain.max_fragment(), 1372);
+    assert_eq!(Profile::Mosh.max_fragment(), 1372);
+    let records = channel::fragment_packet(3, 1, 1, &packet, cap).unwrap();
     assert!(records.len() <= 3);
     for record in &records {
         let mut wire = channel::Channel::new([0x55; 16], 1, true)
@@ -253,6 +268,7 @@ fn obfs_fragment_budget_fits_wire_cap() {
     let mut oversized = channel::Channel::new([0x55; 16], 1, true)
         .seal(&Record::Data {
             flow_id: 3,
+            generation: 1,
             packet_id: 2,
             offset: 0,
             total_len: 1400,
@@ -268,13 +284,19 @@ fn obfs_tampered_header_breaks_auth() {
     let mut server = channel::Channel::new([0x66; 16], 11, false);
     let mut wire = client.seal(&Record::Keepalive).unwrap();
     Profile::Obfs.wrap_in_place(&mut wire).unwrap();
+    let mut valid = wire.clone();
     // b1 ^= 1 always flips the low bit → mod16 differs by 1:
     // the receiver trims the wrong prefix and the AEAD rejects the record.
     let orig_prefix = usize::from(wire[0] % 16);
     wire[0] ^= 1;
     assert_ne!(usize::from(wire[0] % 16), orig_prefix);
     assert!(Profile::Obfs.unwrap_in_place(&mut wire).is_ok());
-    assert!(server.open(&wire, std::time::Instant::now()).is_err());
+    assert_eq!(server.open(&wire, std::time::Instant::now()).unwrap(), None);
+    Profile::Obfs.unwrap_in_place(&mut valid).unwrap();
+    assert_eq!(
+        server.open(&valid, std::time::Instant::now()).unwrap(),
+        Some(Record::Keepalive)
+    );
 }
 
 #[test]
@@ -341,7 +363,8 @@ fn obfs_socket_dance_writes_pcap() {
         _ => panic!("expected PROBE_B"),
     }
     let packet = vec![0x5d; 1400];
-    for record in channel::fragment_packet(1, 1, &packet, Profile::Obfs.max_fragment()).unwrap() {
+    for record in channel::fragment_packet(1, 1, 1, &packet, Profile::Obfs.max_fragment()).unwrap()
+    {
         send(&client_socket, server_addr, &mut client, &record);
         let received = recv(&server_socket, &mut server);
         if let Some(assembled) = server

@@ -1,21 +1,17 @@
 //! TUN-side packet path: admission of local packets, forwarding to flows,
 //! delivery from channels, and flow expiry.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    time::{Duration, Instant as StdInstant},
-};
+use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::control::{Message, Stats};
+use crate::control::Message;
 use crate::link_io::{self, FIRST_PROBE_ID, PREFLIGHT_ID, is_probe_flow};
 use crate::packet::{self, FlowKey};
 use crate::udp::Incoming;
 
-use super::{
-    ChannelHandle, FIN_DWELL, FLOW_IDLE, Flow, PacketIo, Plane, Session, TaskCommand, TcpFlow,
-};
+use super::state::idle_timeout;
+use super::{Flow, PacketIo, Plane, Session, TcpFlow};
 
 const FLOW_PENDING: usize = 64;
 
@@ -183,7 +179,20 @@ impl Session {
                 }
             }
         }
-        let is_client = self.client();
+        let known = match &self.plane {
+            Plane::Channels(plane) => plane.by_key.contains_key(&packet.flow),
+            Plane::Tcp(plane) => plane.by_key.contains_key(&packet.flow),
+        };
+        if is_client && packet.can_open && !known && self.flow_limit_reached(0) {
+            self.stats.opened_flows += 1;
+            self.stats.open_failed_flows += 1;
+            self.stats
+                .count_drop(&self.drop_prefix, "flow limit reached");
+            if let Some(id) = explicit_id {
+                self.notify_closed(id, packet.flow).await?;
+            }
+            return Ok(());
+        }
         match &mut self.plane {
             Plane::Channels(plane) => {
                 let now = tokio::time::Instant::now();
@@ -233,58 +242,31 @@ impl Session {
                 };
                 flow_state.last_seen = now;
                 flow_state.reset_requested |= is_client && packet.is_rst;
-                // FIN from the target (server TUN): schedule a dwell close;
-                // half-close data resets it — keep forwarding while data flows.
-                if packet.fin && !is_client {
-                    flow_state.fin_dwell.get_or_insert(now + FIN_DWELL);
-                } else if packet.tcp.is_some_and(|tcp| tcp.payload_len > 0) {
-                    flow_state.fin_dwell = None;
-                }
-                // Pre-active: the server buffers locally, the client hands to the selector.
-                if flow_state.active {
-                    forward_active(
-                        &mut self.stats,
-                        &self.drop_prefix,
-                        flow_id,
-                        flow_state,
-                        &plane.channels,
-                        bytes,
-                    );
-                } else if fresh {
-                    // The flow's first packet is already queued in selector.request().
-                } else if let Some(selector) = plane.selector.as_mut() {
-                    match selector.enqueue(flow_id, bytes) {
-                        Ok(()) => {}
-                        // The flow already went live or finished: a late
-                        // duplicate, not queue pressure.
-                        Err(crate::selector::Reject::Duplicate) => self.stats.count_drop_expected(
-                            &self.drop_prefix,
-                            &format!("flow {flow_id} duplicate packet"),
-                        ),
-                        Err(crate::selector::Reject::PendingFull) => {
-                            crate::debug!(
-                                "{} selector backlog: flow={} pre_active={} queued_bytes={} preparing={:?}",
-                                self.drop_prefix,
-                                flow_id,
-                                selector.pre_active_count(),
-                                selector.queued_bytes(),
-                                selector.preparation_candidate()
-                            );
-                            self.stats.count_drop(
-                                &self.drop_prefix,
-                                &format!("flow {flow_id} selector queue full"),
-                            );
+                flow_state.tcp_close.observe(packet, is_client, now);
+                if !fresh {
+                    if let Some(selector) = plane.selector.as_mut() {
+                        if selector.enqueue(flow_id, bytes).is_err() {
+                            self.stats
+                                .count_drop(&self.drop_prefix, "flow pending queue full");
                         }
+                    } else if !flow_state.active && flow_state.data_started {
+                        self.stats
+                            .count_drop_expected(&self.drop_prefix, "TCP binding recovering");
+                    } else if flow_state.pending.len()
+                        < if flow_state.data_started {
+                            1
+                        } else {
+                            FLOW_PENDING
+                        }
+                    {
+                        flow_state.pending.push_back(bytes.to_vec());
+                    } else {
+                        self.stats
+                            .count_drop(&self.drop_prefix, "flow pending queue full");
                     }
-                } else if flow_state.pending.len() < FLOW_PENDING {
-                    flow_state.pending.push_back(bytes.to_vec());
-                } else {
-                    self.stats.count_drop(
-                        &self.drop_prefix,
-                        &format!("flow {flow_id} pending buffer full"),
-                    );
                 }
                 self.execute_actions(open_actions).await?;
+                self.flush_flow(flow_id).await?;
             }
             Plane::Tcp(plane) => {
                 let now = tokio::time::Instant::now();
@@ -297,6 +279,21 @@ impl Session {
                                 .reject_unowned_tun_packet(bytes, packet, explicit_id)
                                 .await;
                         }
+                        if plane.flows.keys().filter(|id| !is_probe_flow(**id)).count()
+                            >= super::FLOW_CAP
+                            || plane
+                                .flows
+                                .iter()
+                                .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
+                                .count()
+                                >= crate::selector::PENDING_FLOWS
+                        {
+                            self.stats.open_failed_flows += 1;
+                            if let Some(id) = explicit_id {
+                                self.notify_closed(id, packet.flow).await?;
+                            }
+                            return Ok(());
+                        }
                         let id = explicit_id.unwrap_or_else(|| {
                             let id = plane.next_flow_id;
                             plane.next_flow_id += 1;
@@ -305,27 +302,14 @@ impl Session {
                         self.control
                             .send(Message::Open {
                                 id,
+                                generation: 1,
                                 flow: packet.flow,
                             })
                             .await?;
-                        plane.flows.insert(
-                            id,
-                            TcpFlow {
-                                key: packet.flow,
-                                active: false,
-                                reset_requested: false,
-                                outgoing: None,
-                                pending: VecDeque::from([bytes.to_vec()]),
-                                tcp_key: None,
-                                tcp_token: None,
-                                tcp_receiver: None,
-                                task: None,
-                                fin_dwell: None,
-                                last_ack: None,
-                                last_seen: now,
-                                created: now,
-                            },
-                        );
+                        let mut flow = TcpFlow::new(packet.flow, now);
+                        flow.pending.push_back(bytes.to_vec());
+                        flow.binding_deadline = Some(now + crate::selector::ATTEMPT_BUDGET);
+                        plane.flows.insert(id, flow);
                         plane.by_key.insert(packet.flow, id);
                         self.stats.opened_flows += 1;
                         // The first packet is already in the new flow's pending;
@@ -336,29 +320,24 @@ impl Session {
                 if let Some(flow_state) = plane.flows.get_mut(&id) {
                     flow_state.last_seen = now;
                     flow_state.reset_requested |= is_client && packet.is_rst;
-                    if packet.fin && !is_client {
-                        flow_state.fin_dwell.get_or_insert(now + FIN_DWELL);
-                    } else if packet.tcp.is_some_and(|tcp| tcp.payload_len > 0) {
-                        flow_state.fin_dwell = None;
-                    }
+                    flow_state.tcp_close.observe(packet, is_client, now);
                 }
                 let Some(flow_state) = plane.flows.get_mut(&id) else {
                     return Ok(());
                 };
-                if let Some(send) = &flow_state.outgoing {
-                    match send.try_send(bytes.to_vec()) {
-                        Ok(()) => self.stats.record_tx(bytes.len(), true),
-                        Err(_) => self.stats.count_drop(
-                            &self.drop_prefix,
-                            &format!("flow {id} transport queue full"),
-                        ),
+                if flow_state.pending.len()
+                    < if flow_state.data_started {
+                        1
+                    } else {
+                        FLOW_PENDING
                     }
-                } else if flow_state.pending.len() < FLOW_PENDING {
+                {
                     flow_state.pending.push_back(bytes.to_vec());
                 } else {
                     self.stats
-                        .count_drop(&self.drop_prefix, &format!("flow {id} pending buffer full"));
+                        .count_drop(&self.drop_prefix, "flow pending queue full");
                 }
+                self.flush_flow(id).await?;
             }
         }
         Ok(())
@@ -433,6 +412,8 @@ impl Session {
         };
         // A packet that overtook committed never reaches the TUN.
         if !flow_exists
+            || !self.binding_current(incoming.id, incoming.generation)
+            || channel != incoming.channel
             || key != Some(packet.flow)
             || !active
             || client_address != self.client_ip.octets()
@@ -491,31 +472,37 @@ impl Session {
             }
             return Ok(());
         }
+        // Data counts only once a packet actually reached the TUN; a failed write
+        // must not lift the pre-data FLOW_BUDGET bound.
         if !self.write_tun_packet(incoming.id, incoming.packet).await? {
             return Ok(());
         }
-        let from_target = self.client();
+        match &mut self.plane {
+            Plane::Channels(plane) => {
+                if let Some(flow) = plane.flows.get_mut(&incoming.id) {
+                    flow.data_started = true;
+                }
+            }
+            Plane::Tcp(plane) => {
+                if let Some(flow) = plane.flows.get_mut(&incoming.id) {
+                    flow.data_started = true;
+                }
+            }
+        }
+        self.recovery_delivered(incoming.id, "peer_packet");
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            if packet.fin && from_target {
-                flow_state.fin_dwell.get_or_insert(now + FIN_DWELL);
-            } else if packet.tcp.is_some_and(|tcp| tcp.payload_len > 0) {
-                flow_state.fin_dwell = None;
-            }
+            flow_state.tcp_close.observe(&packet, from_client, now);
         }
         if let Plane::Tcp(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            if packet.fin && from_target {
-                flow_state.fin_dwell.get_or_insert(now + FIN_DWELL);
-            } else if packet.tcp.is_some_and(|tcp| tcp.payload_len > 0) {
-                flow_state.fin_dwell = None;
-            }
+            flow_state.tcp_close.observe(&packet, from_client, now);
         }
-        // Only authenticated client resets retire a flow, after successful TUN delivery.
+        // The client TCP stack owns reset decisions; a target RST may be out of window.
         if from_client && packet.is_rst {
             self.close_flow(incoming.id, true).await?;
         }
@@ -523,91 +510,72 @@ impl Session {
     }
 
     pub async fn expire_flows(&mut self, now: tokio::time::Instant) -> Result<()> {
-        match &mut self.plane {
-            Plane::Channels(plane) => {
-                let budget = crate::selector::FLOW_BUDGET;
-                let dwell_expired: Vec<u64> = plane
+        let expired: Vec<_> = match &self.plane {
+            Plane::Channels(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| {
+                    **id != PREFLIGHT_ID
+                        && ((!flow.data_started
+                            && now.duration_since(flow.created) >= crate::selector::FLOW_BUDGET)
+                            || (flow.data_started
+                                && super::recovery::recovery_expired(&flow.recovery, now))
+                            || (flow.active
+                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                    || now.duration_since(flow.last_seen)
+                                        >= idle_timeout(flow.key.protocol))))
+                })
+                .map(|(&id, _)| id)
+                .collect(),
+            Plane::Tcp(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| {
+                    **id != PREFLIGHT_ID
+                        && ((!flow.data_started
+                            && now.duration_since(flow.created) >= crate::selector::FLOW_BUDGET)
+                            || (flow.data_started
+                                && super::recovery::recovery_expired(&flow.recovery, now))
+                            || (flow.active
+                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                    || now.duration_since(flow.last_seen)
+                                        >= idle_timeout(flow.key.protocol))))
+                })
+                .map(|(&id, _)| id)
+                .collect(),
+        };
+        for id in expired {
+            crate::debug!("flow_close id={id} lifetime expired");
+            self.close_flow(id, true).await?;
+        }
+        let timed_out: Vec<_> = match &self.plane {
+            Plane::Tcp(plane) if plane.server_ip.is_some() => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| {
+                    !is_probe_flow(**id)
+                        && !flow.active
+                        && flow.binding_deadline.is_some_and(|at| now >= at)
+                })
+                .map(|(&id, flow)| (id, flow.generation))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (id, generation) in timed_out {
+            if let Plane::Tcp(plane) = &mut self.plane {
+                plane
                     .flows
-                    .iter()
-                    .filter_map(|(&id, flow)| Some((id, flow.fin_dwell?)))
-                    .filter(|(_, at)| now >= *at)
-                    .map(|(id, _)| id)
-                    .collect();
-                let expired: Vec<u64> = plane
-                    .flows
-                    .iter()
-                    .filter(|(id, flow)| {
-                        **id != PREFLIGHT_ID
-                            && ((flow.active && now.duration_since(flow.last_seen) > FLOW_IDLE)
-                                || (!flow.active && now.duration_since(flow.created) > budget))
-                    })
-                    .map(|(&id, _)| id)
-                    .collect();
-                for id in dwell_expired {
-                    if id != PREFLIGHT_ID {
-                        crate::debug!("flow_close id={id} fin dwell");
-                    }
-                    self.close_flow(id, true).await?;
-                }
-                for id in expired {
-                    if id != PREFLIGHT_ID {
-                        crate::debug!("flow_close id={id} budget={budget:?} idle={FLOW_IDLE:?}");
-                    }
-                    self.close_flow(id, true).await?;
-                }
+                    .get_mut(&id)
+                    .expect("flow collected above")
+                    .binding_deadline = None;
             }
-            Plane::Tcp(plane) => {
-                let expired: Vec<u64> = plane
-                    .flows
-                    .iter()
-                    .filter(|(id, flow)| {
-                        **id != PREFLIGHT_ID
-                            && now.duration_since(flow.created) > FLOW_IDLE
-                            && now.duration_since(flow.last_seen) > FLOW_IDLE
-                    })
-                    .map(|(&id, _)| id)
-                    .collect();
-                for id in expired {
-                    self.tcp_close(id).await?;
-                }
+            if !self
+                .retry_flow(id, generation, crate::selector::Reason::PathTimeout)
+                .await?
+            {
+                self.close_flow(id, true).await?;
             }
         }
         Ok(())
-    }
-}
-
-fn forward_active(
-    stats: &mut Stats,
-    drop_prefix: &str,
-    flow_id: u64,
-    flow_state: &mut Flow,
-    channels: &HashMap<u64, ChannelHandle>,
-    bytes: &[u8],
-) {
-    if let Some(tcp_out) = flow_state.tcp.as_ref().and_then(|tcp| tcp.out.clone()) {
-        if tcp_out.try_send(bytes.to_vec()).is_ok() {
-            stats.inner_tx_packets += 1;
-            stats.inner_tx_bytes += bytes.len() as u64;
-        } else {
-            stats.count_drop(drop_prefix, &format!("flow {flow_id} output queue full"));
-        }
-    } else if let Some(channel_id) = flow_state.channel
-        && let Some(handle) = channels.get(&channel_id)
-    {
-        if handle
-            .command
-            .try_send(TaskCommand::Data(flow_id, bytes.to_vec()))
-            .is_ok()
-        {
-            stats.inner_tx_packets += 1;
-            stats.inner_tx_bytes += bytes.len() as u64;
-        } else {
-            stats.count_drop(drop_prefix, &format!("flow {flow_id} channel queue full"));
-        }
-    } else {
-        stats.count_drop(
-            drop_prefix,
-            &format!("flow {flow_id} active without output"),
-        );
     }
 }

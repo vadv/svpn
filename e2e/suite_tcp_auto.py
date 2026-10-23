@@ -1,4 +1,4 @@
-"""TCP/auto group: RST delivery, idle teardown, TCP transports and auto fallback."""
+"""TCP/auto group: RST delivery, idle/half-close survival, transports and fallback."""
 
 import pathlib
 import re
@@ -38,7 +38,7 @@ def test_client_rst_delivery():
         print(f"PASS client RST {name}: target socket closed, link remains usable")
 
 
-def test_idle_tcp_teardown():
+def test_idle_tcp_survival():
     configs = [
         ("mosh", ["--mimic", "mosh"]),
         ("tcp-none", ["--mimic", "none", "--tcp-port", "41036"]),
@@ -76,23 +76,23 @@ def test_idle_tcp_teardown():
                             return int(counts[-1]) if counts else None
 
                         until(lambda: active_flows() == 2)
-                        # Keep the sockets and verify the 60 s idle policy, not just eventual closure.
-                        time.sleep(45)
-                        assert active_flows() == 2, "TCP flows expired before the idle threshold"
-                        time.sleep(16)
-                        until(lambda: active_flows() == 0, seconds=14)
-                        client.settimeout(4)
-                        try:
-                            client.sendall(b"resume")
-                            received = client.recv(1)
-                        except (ConnectionResetError, BrokenPipeError):
-                            pass
-                        else:
-                            raise AssertionError(f"idle client expected reset, received {received!r}")
+                        time.sleep(75)
+                        assert active_flows() == 2, "quiet TCP flows expired"
+                        client.settimeout(35)
+                        target.settimeout(35)
+                        client.sendall(b"resume")
+                        client.shutdown(socket.SHUT_WR)
                         remote.stdin.write("wake\n")
                         remote.stdin.flush()
+                        assert recv_exact(target, 6) == b"resume"
+                        assert target.recv(1) == b""
+                        # Both directions remain usable after 20 s in half-close.
+                        assert recv_exact(client, 6) == b"resume"
+                        assert client.recv(1) == b""
+                        target.sendall(b"after")
+                        target.shutdown(socket.SHUT_WR)
                         output, _ = remote.communicate(timeout=8)
-                        assert remote.returncode == 0 and "target reset" in output, output
+                        assert remote.returncode == 0 and "half-close survived" in output, output
                     tcp_echo(11)
                     assert process.poll() is None
                     assert "data path lost" not in path.read_text(), path.read_text()
@@ -104,7 +104,7 @@ def test_idle_tcp_teardown():
                             remote.kill()
                             remote.communicate(timeout=3)
             cleanup_verified(process)
-            print(f"PASS idle TCP {name}: client and target receive reset on resumption; new flow works")
+            print(f"PASS TCP {name}: 75s idle and 20s half-close survive in both directions")
         finally:
             if name == "auto-tcp":
                 command(["iptables", "-w", "-D"] + rule)
@@ -250,7 +250,7 @@ def test_auto_exhausted():
 
 TESTS = [
     ("test_client_rst_delivery", test_client_rst_delivery),
-    ("test_idle_tcp_teardown", test_idle_tcp_teardown),
+    ("test_idle_tcp_survival", test_idle_tcp_survival),
     ("test_tcp_transport", test_tcp_transport),
     ("test_tcp_ephemeral", test_tcp_ephemeral),
     ("test_tcp_udp_blocked", test_tcp_udp_blocked),

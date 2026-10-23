@@ -132,5 +132,9 @@ fn counters_and_key_budgets_never_wrap() {
     let packet = Cipher::new([7; 16], 42, true).seal(b"packet").unwrap();
     let mut server = Cipher::new([7; 16], 42, false);
     server.received_blocks = MAX_BLOCKS;
-    assert!(server.open(&packet).is_err());
+    let error = server.open(&packet).unwrap_err();
+    assert!(
+        !error.is::<svpn::crypto::InvalidPacket>(),
+        "key exhaustion is terminal"
+    );
 }

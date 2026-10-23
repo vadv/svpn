@@ -16,6 +16,7 @@ import integration
 import matrix
 import suite_bootstrap
 import suite_pool
+import suite_recovery
 import suite_reselect
 import suite_tcp_auto
 import suite_udp
@@ -27,7 +28,7 @@ test_lifecycle_hooks test_configuration test_server_hooks test_authentication te
 test_agent_identity test_no_ssh_binary test_custom_tun_name test_kernel_tun_name
 test_log_levels test_client_stats test_secondary_server_address test_hostname_servers
 test_pool_two_servers test_pool_udp_ports test_pool_failover test_pool_backoff
-test_pool_all_down test_data test_client_rst_delivery test_idle_tcp_teardown
+test_pool_all_down test_data test_client_rst_delivery test_idle_tcp_survival
 test_low_fd_limit test_ssh_loss test_heartbeat_loss test_blocked_stderr
 test_server_blocked_stderr test_sigkill_takeover test_masquerade test_udp_port_range
 test_tcp_transport test_tcp_ephemeral test_tcp_udp_blocked test_tcp_teardown
@@ -40,6 +41,11 @@ test_auto_pool_shared_pair
 RESELECT_BASELINE = """
 test_udp_reselect_after_ban_expiry test_degraded_incumbent_switches_and_drains
 test_incumbent_drift_ramp_switches test_symmetric_noise_does_not_switch
+""".split()
+RECOVERY_BASELINE = """
+test_recovery_restores_tcp_without_second_accept
+test_recovery_does_not_retransmit_uncertain_udp
+test_recovery_without_alternative_closes_within_budget
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -73,11 +79,13 @@ def integration_groups():
         "udp": suite_udp,
         "tcp-auto": suite_tcp_auto,
         "reselect": suite_reselect,
+        "recovery": suite_recovery,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    assert [by_fn[test][1] for test in tests] == BASELINE + RESELECT_BASELINE, "original order"
+    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE
+    assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
     assert len(tests) == len(set(tests)) == len(by_fn), "a test is assigned twice or dropped"
     for group, suite in suites.items():
@@ -94,6 +102,7 @@ def integration_groups():
         "udp": 5,
         "tcp-auto": 10,
         "reselect": 4,
+        "recovery": 3,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -111,7 +120,7 @@ def integration_groups():
             ):
                 integration.main()
             assert called == expected, (group, args)
-    print("PASS integration: 46 cases assigned once, CLI/env selection and original order")
+    print(f"PASS integration: {len(tests)} cases assigned once, CLI/env selection and original order")
 
 
 def matrix_groups():
@@ -138,6 +147,25 @@ def matrix_groups():
             matrix.main()
         assert called == expected, group
     print("PASS matrix: 8 rows assigned once, original order and dispatch")
+
+
+def flow_cleanup_statistics():
+    def snapshot(server, opened, closed, active=0, failed=0):
+        prefix = "[server] " if server else ""
+        return (
+            f"t+ 250.000s {prefix}heartbeat received stats=Stats {{ "
+            f"opened_flows: {opened}, open_failed_flows: {failed}, "
+            f"closed_flows: {closed}, active_flows: {active} }}\n"
+        )
+
+    done = snapshot(False, 128, 128) + snapshot(True, 128, 128)
+    assert suite_udp._flows_reclaimed(done, 128)
+    assert not suite_udp._flows_reclaimed("", 128)
+    assert not suite_udp._flows_reclaimed(snapshot(False, 128, 128), 128)
+    assert not suite_udp._flows_reclaimed(snapshot(False, 0, 0) + snapshot(True, 0, 0), 128)
+    assert not suite_udp._flows_reclaimed(done + snapshot(True, 129, 128, active=1), 128)
+    assert not suite_udp._flows_reclaimed(done + snapshot(False, 129, 129, failed=1), 128)
+    print("PASS flow cleanup: both peers, latest counters, no dependence on per-flow debug logs")
 
 
 def matrix_diagnostics():
@@ -243,5 +271,6 @@ if __name__ == "__main__":
     integration_groups()
     matrix_groups()
     matrix_diagnostics()
+    flow_cleanup_statistics()
     invalid_groups()
     shell_groups()

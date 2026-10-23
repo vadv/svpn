@@ -33,6 +33,12 @@ fn deadline() -> Instant {
 #[tokio::test]
 async fn full_dance_verifies_both_sides() {
     let (mut s_io, mut s_ch, mut c_io, mut c_ch) = mosh_pair().await;
+    let mut invalid = c_ch.seal(&svpn::channel::Record::Keepalive).unwrap();
+    *invalid.last_mut().unwrap() ^= 1;
+    c_io.command
+        .send(drivers::Command::Send(invalid))
+        .await
+        .unwrap();
     let (server, client) = tokio::join!(
         server(&mut s_io, &mut s_ch, 1425, deadline()),
         client(&mut c_io, &mut c_ch, 1425, deadline()),

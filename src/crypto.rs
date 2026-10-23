@@ -12,6 +12,9 @@ const DIRECTION: u64 = 1 << 63;
 /// than the per-flow window of 128 from the first version.
 pub const WINDOW: u64 = 4096;
 
+#[derive(Debug)]
+pub struct InvalidPacket(&'static str);
+
 pub struct Cipher {
     cipher: Aes128Gcm,
     aad: [u8; 16],
@@ -28,6 +31,14 @@ pub struct ReplayWindow {
     /// Age bitmap: bit 0 of word 0 is the freshest counter.
     pub seen: [u64; (WINDOW / 64) as usize],
 }
+
+impl std::fmt::Display for InvalidPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidPacket {}
 
 impl Cipher {
     pub fn new(key: [u8; 16], flow_id: u64, client: bool) -> Self {
@@ -83,17 +94,17 @@ impl Cipher {
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         ensure!(
             (8 + TAG_BYTES..=8 + MAX_PLAINTEXT + TAG_BYTES).contains(&packet.len()),
-            "invalid UDP length"
+            InvalidPacket("invalid UDP length")
         );
         let sequence = u64::from_be_bytes(packet[..8].try_into()?);
         ensure!(
             sequence & DIRECTION != self.outgoing_direction,
-            "wrong UDP direction"
+            InvalidPacket("wrong UDP direction")
         );
         let counter = sequence & !DIRECTION;
         ensure!(
             counter < MAX_PACKETS && self.replay.allows(counter),
-            "replayed or expired UDP packet"
+            InvalidPacket("replayed or expired UDP packet")
         );
         let end = packet.len() - TAG_BYTES;
         let blocks = block_cost(end - 8);
@@ -111,7 +122,7 @@ impl Cipher {
                 // The length of `tag` is guaranteed by the packet.len() check above.
                 tag.into(),
             )
-            .map_err(|_| anyhow!("invalid UDP authentication"))?;
+            .map_err(|_| InvalidPacket("invalid UDP authentication"))?;
         self.replay.commit(counter);
         self.received_blocks += blocks;
         Ok(plain)

@@ -3,6 +3,9 @@
 import contextlib
 import socket
 import sys
+import time
+
+from _lib import recv_exact
 
 with contextlib.ExitStack() as stack:
     listener = stack.enter_context(socket.socket())
@@ -13,14 +16,17 @@ with contextlib.ExitStack() as stack:
     print("listening", flush=True)
     clients = [stack.enter_context(listener.accept()[0]) for _ in range(2)]
     for stream in clients:
-        stream.settimeout(5)
+        stream.settimeout(35)
         stream.sendall(b"ready")
-    # Neither socket has a read timeout running during the idle period.
+    # Do not read either socket until the idle period ends.
     if sys.stdin.readline() == "wake\n":
-        try:
-            clients[1].sendall(b"resume")
-            received = clients[1].recv(1)
-        except (ConnectionResetError, BrokenPipeError):
-            print("target reset", flush=True)
-        else:
-            raise AssertionError(f"expected TCP reset, received {received!r}")
+        assert recv_exact(clients[0], 6) == b"resume"
+        assert clients[0].recv(1) == b""
+        clients[1].sendall(b"resume")
+        clients[1].shutdown(socket.SHUT_WR)
+        time.sleep(20)
+        clients[0].sendall(b"resume")
+        clients[0].shutdown(socket.SHUT_WR)
+        assert recv_exact(clients[1], 5) == b"after"
+        assert clients[1].recv(1) == b""
+        print("half-close survived", flush=True)

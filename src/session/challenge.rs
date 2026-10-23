@@ -172,6 +172,8 @@ impl Session {
             self.control
                 .send(Message::FlowOpen {
                     flow_id: attempt,
+                    generation: 1,
+                    resume: false,
                     flow: key,
                     channel: Some(channel),
                 })
@@ -232,6 +234,8 @@ impl Session {
                 self.control
                     .send(Message::FlowOpen {
                         flow_id: attempt,
+                        generation: 1,
+                        resume: false,
                         flow: key,
                         channel: Some(channel),
                     })

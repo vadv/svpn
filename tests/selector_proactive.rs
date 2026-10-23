@@ -63,55 +63,182 @@ fn proactive_exhaustion_emits_exhausted_once() {
         actions.as_slice(),
         [Action::TryTcp {
             flow_id: 1,
-            attempt: 5
+            generation: 1
         }]
     ));
-    let actions = selector.bind_failed(1, Reason::PathTimeout, now);
+    let actions = selector.bind_failed(1, 1, Reason::PathTimeout, now);
     assert_eq!(
         actions,
-        vec![Action::Exhausted {
-            reasons: vec![
-                (Candidate::Quic, Reason::PathTimeout),
-                (Candidate::WebRtc, Reason::OneWay),
-                (Candidate::Obfs, Reason::SizeProbeFailed),
-                (Candidate::Mosh, Reason::PathTimeout),
-                (Candidate::Tcp, Reason::PathTimeout),
-            ]
+        vec![Action::ResetBinding {
+            flow_id: 1,
+            generation: 2,
+            from: Some(Candidate::Tcp),
+            reason: Reason::PathTimeout
         }]
     );
-    // No repeat is emitted: new flows get an honest failure, not a second stop
-    // (flow 1 is also cleaned up — Exhausted was returned before its fail).
+    assert!(selector.has_queued(1));
+    let actions = selector.poll(now + FLOW_BUDGET);
+    assert!(actions.contains(&Action::CloseFlow { flow_id: 1 }));
+    assert!(actions.contains(&Action::Exhausted {
+        reasons: vec![
+            (Candidate::Quic, Reason::PathTimeout),
+            (Candidate::WebRtc, Reason::OneWay),
+            (Candidate::Obfs, Reason::SizeProbeFailed),
+            (Candidate::Mosh, Reason::PathTimeout),
+            (Candidate::Tcp, Reason::PathTimeout),
+        ]
+    }));
+    // New admissions wait for a fresh budget without repeating the stop signal.
+    let later = now + FLOW_BUDGET;
     let actions = selector
-        .request(2, key(2), b"second", now)
+        .request(2, key(2), b"second", later)
         .expect("admission");
     assert!(
         !actions
             .iter()
             .any(|action| matches!(action, Action::Exhausted { .. }))
     );
-    // The fail order is not deterministic (HashMap): we check both are present.
-    for failed in [1, 2] {
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            Action::FailFlow { flow_id, .. } if *flow_id == failed
-        )));
+    assert!(actions.is_empty());
+    assert!(selector.has_queued(2));
+    let actions = selector.poll(later + FLOW_BUDGET);
+    assert!(actions.contains(&Action::CloseFlow { flow_id: 2 }));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::Exhausted { .. }))
+    );
+}
+
+#[test]
+fn proactive_tcp_failure_or_timeout_bans_tcp_until_the_queue_expires() {
+    for timeout in [false, true] {
+        let mut selector = Selector::new_proactive(Allowed {
+            tcp: true,
+            ..Allowed::default()
+        });
+        let now = Instant::now();
+        selector.adopt(Candidate::Tcp, None);
+        selector.request(1, key(1), b"first", now).unwrap();
+        for generation in [0, 2] {
+            assert!(
+                selector
+                    .bind_failed(1, generation, Reason::PathTimeout, now)
+                    .is_empty()
+            );
+        }
+        assert!(selector.banned.is_empty());
+        let actions = if timeout {
+            selector.poll(now + ATTEMPT_BUDGET)
+        } else {
+            selector.bind_failed(1, 1, Reason::PathTimeout, now)
+        };
+        assert_eq!(
+            actions,
+            vec![Action::ResetBinding {
+                flow_id: 1,
+                generation: 2,
+                from: Some(Candidate::Tcp),
+                reason: Reason::PathTimeout
+            }]
+        );
+        assert!(!selector.allowed.contains(&Candidate::Tcp));
+        assert_eq!(selector.last_good, None);
+        assert_eq!(selector.banned, vec![(Candidate::Tcp, Reason::PathTimeout)]);
+        assert!(selector.poll(now + ATTEMPT_BUDGET * 2).is_empty());
+        assert!(selector.has_queued(1));
+        assert_eq!(selector.queued_bytes(), 5);
+        let actions = selector.poll(now + FLOW_BUDGET);
+        assert!(actions.contains(&Action::CloseFlow { flow_id: 1 }));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Exhausted { .. }))
+                .count(),
+            1
+        );
+        assert!(actions.contains(&Action::Exhausted {
+            reasons: vec![(Candidate::Tcp, Reason::PathTimeout)]
+        }));
+        assert_eq!(selector.queued_bytes(), 0);
+        assert!(
+            selector
+                .poll(now + FLOW_BUDGET + Duration::from_secs(1))
+                .is_empty()
+        );
     }
 }
 
 #[test]
-fn proactive_tcp_failure_bans_tcp_but_keeps_udp_flow_fallback() {
-    let only_tcp = Allowed {
+fn proactive_tcp_failure_keeps_udp_flow_queue_for_a_verified_alternative() {
+    let mut selector = Selector::new_proactive(Allowed {
+        quic: true,
         tcp: true,
         ..Allowed::default()
-    };
-    let mut selector = Selector::new_proactive(only_tcp);
+    });
     let now = Instant::now();
-    selector
-        .request(1, key(1), b"first", now)
-        .expect("admission");
-    // flow 1 is on TCP; the connect failure bans TCP, no other candidates remain.
-    let actions = selector.bind_failed(1, Reason::EndpointUnavailable, now);
-    assert!(matches!(actions.as_slice(), [Action::Exhausted { .. }]));
+    selector.adopt(Candidate::Quic, Some(10));
+    selector.adopt(Candidate::Tcp, None);
+    assert_eq!(
+        selector.request(1, key(1), b"first", now).unwrap(),
+        vec![Action::TryTcp {
+            flow_id: 1,
+            generation: 1
+        }]
+    );
+    selector.enqueue(1, b"second").unwrap();
+    assert_eq!(
+        selector.bind_failed(1, 1, Reason::EndpointUnavailable, now),
+        vec![
+            Action::ResetBinding {
+                flow_id: 1,
+                generation: 2,
+                from: Some(Candidate::Tcp),
+                reason: Reason::EndpointUnavailable
+            },
+            Action::OpenFlow {
+                flow_id: 1,
+                generation: 2,
+                candidate: Candidate::Quic,
+                channel: 10
+            }
+        ]
+    );
+    assert!(!selector.allowed.contains(&Candidate::Tcp));
+    assert_eq!(selector.last_good, None);
+    // A stale TCP failure must not re-ban a candidate proven healthy since then.
+    selector.adopt(Candidate::Tcp, None);
+    assert!(
+        selector
+            .bind_failed(1, 1, Reason::PathTimeout, now)
+            .is_empty()
+    );
+    assert!(selector.allowed.contains(&Candidate::Tcp));
+    assert!(selector.bind_succeeded(1, 1, now).is_empty());
+    assert!(selector.committed(1, 1).is_empty());
+    assert!(selector.take_queue(1).is_none());
+    assert_eq!(selector.queued_bytes(), 11);
+    selector.bind_succeeded(1, 2, now);
+    selector.committed(1, 2);
+    assert_eq!(
+        selector.take_queue(1).unwrap(),
+        [b"first".to_vec(), b"second".to_vec()]
+    );
+    assert!(selector.take_queue(1).unwrap().is_empty());
+    assert_eq!(selector.queued_bytes(), 0);
+}
+
+#[test]
+fn checking_a_healthy_tcp_binding_does_not_ban_tcp() {
+    let mut selector = Selector::new_proactive(Allowed {
+        tcp: true,
+        ..Allowed::default()
+    });
+    let now = Instant::now();
+    selector.request(1, key(1), b"first", now).unwrap();
+    selector.enter_checking(now);
+    assert!(selector.banned.is_empty());
+    assert!(selector.allowed.contains(&Candidate::Tcp));
+    assert!(selector.has_queued(1));
 }
 
 // ── channel loss ──
@@ -143,7 +270,7 @@ fn proactive_unverified_channel_loss_bans_candidate_and_falls_back() {
             selector.channel_lost(Candidate::Mosh, 10, Reason::ChannelFailed, now),
             vec![Action::TryTcp {
                 flow_id: 1,
-                attempt: 2
+                generation: 1
             }]
         );
         assert_eq!(
@@ -156,12 +283,12 @@ fn proactive_unverified_channel_loss_bans_candidate_and_falls_back() {
                 .is_empty()
         );
         assert_eq!(
-            selector.bind_failed(1, Reason::PathTimeout, now),
-            vec![Action::Exhausted {
-                reasons: vec![
-                    (Candidate::Mosh, Reason::ChannelFailed),
-                    (Candidate::Tcp, Reason::PathTimeout)
-                ],
+            selector.bind_failed(1, 1, Reason::PathTimeout, now),
+            vec![Action::ResetBinding {
+                flow_id: 1,
+                generation: 2,
+                from: Some(Candidate::Tcp),
+                reason: Reason::PathTimeout
             }]
         );
     }

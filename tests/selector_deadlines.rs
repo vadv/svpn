@@ -33,15 +33,15 @@ fn poll_aborts_channel_on_attempt_deadline() {
 // ── flow budget ──
 
 #[test]
-fn commit_barrier_has_no_fallback() {
+fn commit_barrier_cannot_outlive_original_budget() {
     let mut selector = Selector::new(all());
     let start = Instant::now();
     selector.request(1, key(1), b"a", start).expect("admission");
     selector.channel_ready(Candidate::Quic, 1, 100, start);
     selector.probes_passed(Candidate::Quic, 100, start);
     selector.peer_verified(Candidate::Quic, 100, start);
-    selector.bind_succeeded(1, start);
-    // committed did not arrive: the flow deadline closes it without trying webrtc.
+    selector.bind_succeeded(1, 1, start);
+    // Committed never arrived: retries cannot extend the admission deadline.
     let actions = selector.poll(start + FLOW_BUDGET);
     assert_eq!(
         actions,
@@ -96,8 +96,8 @@ fn active_flow_survives_budget_deadline() {
     selector.probes_passed(Candidate::Quic, 100, start);
     selector.peer_verified(Candidate::Quic, 100, start);
     let _ = selector.poll(start + Duration::from_secs(1));
-    let _ = selector.bind_succeeded(1, start + Duration::from_secs(1));
-    let _ = selector.committed(1);
+    let _ = selector.bind_succeeded(1, 1, start + Duration::from_secs(1));
+    let _ = selector.committed(1, 1);
     let now = start + FLOW_BUDGET + Duration::from_secs(5);
     let actions = selector.poll(now);
     assert!(
@@ -126,10 +126,18 @@ fn bind_deadline_moves_flow_to_next_candidate() {
     let actions = selector.poll(start + Duration::from_secs(6));
     assert!(matches!(
         actions.as_slice(),
-        [Action::PrepareChannel {
-            candidate: Candidate::WebRtc,
-            ..
-        }]
+        [
+            Action::ResetBinding {
+                flow_id: 1,
+                generation: 2,
+                from: Some(Candidate::Quic),
+                reason: Reason::PathTimeout
+            },
+            Action::PrepareChannel {
+                candidate: Candidate::WebRtc,
+                ..
+            }
+        ]
     ));
     assert!(selector.channels.contains_key(&Candidate::Quic));
 }

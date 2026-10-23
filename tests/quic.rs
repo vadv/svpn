@@ -133,7 +133,7 @@ async fn foreign_target_is_forbidden() {
 async fn full_exchange_with_independent_peer() {
     let (fixture, tunnel) = tunneled().await;
     let budget = tunnel.max_payload().unwrap();
-    let probe = |len: usize| (0..len as u8).collect::<Vec<u8>>();
+    let probe = |len: usize| (0..len).map(|i| i as u8).collect::<Vec<u8>>();
     for len in [1, 64, 500, FRAGMENT_BUDGET, budget] {
         let payload = probe(len);
         tunnel.send(&payload).unwrap();
@@ -145,7 +145,10 @@ async fn full_exchange_with_independent_peer() {
         assert_eq!(echoed.as_ref(), expected, "echo mismatch at len {len}");
     }
     // The channel fragment budget agrees with the QUIC limit.
-    assert!(fragment_budget(&tunnel).unwrap() <= FRAGMENT_BUDGET);
+    assert_eq!(
+        fragment_budget(&tunnel).unwrap() + channel::DATA_HEADER + 24,
+        budget.min(FRAGMENT_BUDGET)
+    );
     assert!(fragment_budget(&tunnel).unwrap() >= 1000);
     tunnel.close();
     fixture.server.close(0u32.into(), b"done");
@@ -187,11 +190,11 @@ async fn channel_records_flow_through_tunnel() {
     // Full channel cycle: fragmentation → datagrams → echo peer → reassembly.
     let mut client = channel::Channel::new([0x99; 16], 21, true);
     let mut server = channel::Channel::new([0x99; 16], 21, false);
-    let mut reassembly = channel::Reassembly::default();
+    let mut assembled = None;
     let now = std::time::Instant::now();
     let packet: Vec<u8> = (0..1400u32).map(|i| i as u8).collect();
     for record in
-        channel::fragment_packet(9, 1, &packet, fragment_budget(&tunnel).unwrap()).unwrap()
+        channel::fragment_packet(9, 1, 1, &packet, fragment_budget(&tunnel).unwrap()).unwrap()
     {
         let wire = client.seal(&record).unwrap();
         tunnel.send(&wire).unwrap();
@@ -202,8 +205,12 @@ async fn channel_records_flow_through_tunnel() {
         // The echo peer reverses the bytes: reversing again restores the original.
         let expected: Vec<u8> = wire.iter().rev().cloned().collect();
         assert_eq!(echoed.as_ref(), expected);
+        let restored: Vec<u8> = echoed.iter().rev().copied().collect();
+        let received = server.open(&restored, now).unwrap().unwrap();
+        assert_eq!(received, record);
+        assembled = server.assemble(&received, now).unwrap().or(assembled);
     }
-    let _ = (&mut server, &mut reassembly, now);
+    assert_eq!(assembled, Some(packet));
     // A direct echo check: reversing the reversed bytes yields the original.
     let direct = client.seal(&channel::Record::Keepalive).unwrap();
     tunnel.send(&direct).unwrap();
@@ -213,7 +220,6 @@ async fn channel_records_flow_through_tunnel() {
         .unwrap();
     let expected: Vec<u8> = direct.iter().rev().cloned().collect();
     assert_eq!(echoed.as_ref(), expected);
-    let _ = (&mut server, &mut reassembly, now);
     tunnel.close();
     fixture.server.close(0u32.into(), b"done");
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tun_rs::AsyncDevice;
 
 use crate::control::{Endpoint, Strategy};
@@ -18,7 +18,7 @@ use crate::packet::{self, FlowKey};
 use crate::selector::{Action, Candidate, Reason, Selector};
 use crate::webrtc;
 
-use super::{ChannelHandle, TOMBSTONE_CAP, TOMBSTONE_TTL};
+use super::{ChannelHandle, FIN_DWELL, FLOW_IDLE, TCP_IDLE, TOMBSTONE_CAP, TOMBSTONE_TTL};
 
 // ────────────────────────── Tombstones ──────────────────────────
 
@@ -154,6 +154,7 @@ pub struct FlowTcp {
     /// Server: outgoing-packet channel after binding resolution.
     pub receiver: Option<mpsc::Receiver<Vec<u8>>>,
     pub task: Option<tokio::task::JoinHandle<()>>,
+    pub cancel: Option<oneshot::Sender<()>>,
 }
 
 impl Drop for FlowTcp {
@@ -164,23 +165,87 @@ impl Drop for FlowTcp {
     }
 }
 
+#[derive(Default)]
+pub struct TcpClose {
+    fin_end: [Option<u32>; 2],
+    acknowledged: [bool; 2],
+    acked_until: [Option<u32>; 2],
+    pub deadline: Option<tokio::time::Instant>,
+}
+
+impl TcpClose {
+    pub fn observe(
+        &mut self,
+        packet: &packet::Packet,
+        from_client: bool,
+        now: tokio::time::Instant,
+    ) {
+        let Some(tcp) = packet.tcp else { return };
+        if from_client && tcp.flags & 0x17 == 0x02 {
+            *self = Self::default();
+            return;
+        }
+        if self.finished() || tcp.flags & 0x04 != 0 {
+            return;
+        }
+        let direction = usize::from(from_client);
+        if packet.fin && tcp.flags & 0x02 == 0 {
+            let end = tcp.seq.wrapping_add(tcp.payload_len as u32).wrapping_add(1);
+            // A duplicate ACK of earlier data does not acknowledge this FIN.
+            if self.acked_until[direction].is_none_or(|ack| (end.wrapping_sub(ack) as i32) > 0)
+                && self.fin_end[direction] != Some(end)
+            {
+                self.fin_end[direction] = Some(end);
+                self.acknowledged[direction] = false;
+            }
+        }
+        if tcp.flags & 0x10 != 0 {
+            let peer = 1 - direction;
+            if self.acked_until[peer].is_none_or(|ack| (tcp.ack.wrapping_sub(ack) as i32) >= 0) {
+                self.acked_until[peer] = Some(tcp.ack);
+            }
+            if self.fin_end[peer] == Some(tcp.ack) {
+                self.acknowledged[peer] = true;
+            }
+        }
+        if self.finished() {
+            self.deadline = Some(now + FIN_DWELL);
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        self.acknowledged == [true; 2]
+    }
+}
+
+pub struct Recovery {
+    pub started: tokio::time::Instant,
+    pub from: Option<Candidate>,
+    pub attempts: u32,
+}
+
 pub struct Flow {
     pub key: FlowKey,
+    pub generation: u64,
+    /// Sticky: a transport has accepted user data; its delivery is uncertain.
+    pub data_started: bool,
+    pub recovery: Option<Recovery>,
     /// Binding channel; None until `flow_channel`/`flow_opened` agrees.
     pub channel: Option<u64>,
     /// Server awaits an echo to its FLOW_PROBE.
     pub echo_pending: Option<[u8; 16]>,
     /// DATA allowed: commit barrier passed.
     pub active: bool,
+    /// Server: Commit and authenticated TCP binding may arrive in either order.
+    pub commit_pending: bool,
+    pub tcp_connected: bool,
     /// The client kernel requested reset; a subsequent transport close is expected.
     pub reset_requested: bool,
     /// Pre-active queue of complete IP packets (server) until commit.
     pub pending: VecDeque<Vec<u8>>,
     /// Tcp candidate: a dedicated connection instead of a shared channel.
     pub tcp: Option<FlowTcp>,
-    /// Server saw FIN from the target: close the flow if no data for 15s
-    /// (half-close keeps sending data and resets the timer).
-    pub fin_dwell: Option<tokio::time::Instant>,
+    pub tcp_close: TcpClose,
     /// Newest client ACK (TCP flows): seeds the link-loss reset.
     pub last_ack: Option<u32>,
     /// Last packet time (idle timeout) and creation time (budget).
@@ -192,13 +257,18 @@ impl Flow {
     pub fn new(key: FlowKey, now: tokio::time::Instant) -> Self {
         Self {
             key,
+            generation: 1,
+            data_started: false,
+            recovery: None,
             channel: None,
             echo_pending: None,
             active: false,
+            commit_pending: false,
+            tcp_connected: false,
             reset_requested: false,
             pending: VecDeque::new(),
             tcp: None,
-            fin_dwell: None,
+            tcp_close: TcpClose::default(),
             last_ack: None,
             last_seen: now,
             created: now,
@@ -216,8 +286,8 @@ pub struct ChannelsPlane {
     pub tcp_port: Option<u16>,
     /// Client: TCP fallback camouflage, for stats labeling.
     pub tcp_camouflage: Option<Camouflage>,
-    /// Server: binding-frame token → flow.
-    pub token_index: HashMap<[u8; 16], u64>,
+    /// Server: binding-frame token → (flow, generation).
+    pub token_index: HashMap<[u8; 16], (u64, u64)>,
     /// Server: public ports, bind address, and QUIC endpoint.
     pub ports: HashMap<Strategy, u16>,
     pub bind: Ipv4Addr,
@@ -256,12 +326,7 @@ impl ChannelsPlane {
                     // waits for its probes forever.
                     return selector.channel_lost(handle.candidate, channel_id, reason, now);
                 }
-                return self
-                    .flows
-                    .iter()
-                    .filter(|(_, flow)| flow.channel == Some(channel_id))
-                    .map(|(&flow_id, _)| Action::CloseFlow { flow_id })
-                    .collect();
+                return Vec::new();
             }
             return Vec::new();
         }
@@ -290,7 +355,14 @@ impl ChannelsPlane {
 /// TCP mode: per-flow connections with binding tokens.
 pub struct TcpFlow {
     pub key: FlowKey,
+    pub generation: u64,
+    pub data_started: bool,
+    pub recovery: Option<Recovery>,
+    pub retry_at: Option<tokio::time::Instant>,
+    pub binding_deadline: Option<tokio::time::Instant>,
     pub active: bool,
+    pub commit_pending: bool,
+    pub tcp_connected: bool,
     pub reset_requested: bool,
     pub outgoing: Option<mpsc::Sender<Vec<u8>>>,
     pub pending: VecDeque<Vec<u8>>,
@@ -298,11 +370,40 @@ pub struct TcpFlow {
     pub tcp_token: Option<[u8; 16]>,
     pub tcp_receiver: Option<mpsc::Receiver<Vec<u8>>>,
     pub task: Option<tokio::task::JoinHandle<()>>,
-    pub fin_dwell: Option<tokio::time::Instant>,
+    pub cancel: Option<oneshot::Sender<()>>,
+    pub tcp_close: TcpClose,
     /// Newest client ACK: seeds the link-loss reset.
     pub last_ack: Option<u32>,
     pub last_seen: tokio::time::Instant,
     pub created: tokio::time::Instant,
+}
+
+impl TcpFlow {
+    pub fn new(key: FlowKey, now: tokio::time::Instant) -> Self {
+        Self {
+            key,
+            generation: 1,
+            data_started: false,
+            recovery: None,
+            retry_at: None,
+            binding_deadline: None,
+            active: false,
+            commit_pending: false,
+            tcp_connected: false,
+            reset_requested: false,
+            outgoing: None,
+            pending: VecDeque::new(),
+            tcp_key: None,
+            tcp_token: None,
+            tcp_receiver: None,
+            task: None,
+            cancel: None,
+            tcp_close: TcpClose::default(),
+            last_ack: None,
+            last_seen: now,
+            created: now,
+        }
+    }
 }
 
 impl Drop for TcpFlow {
@@ -316,7 +417,7 @@ impl Drop for TcpFlow {
 pub struct TcpPlane {
     pub mode: crate::tcp::Mode,
     pub server_ip: Option<Ipv4Addr>,
-    pub token_index: HashMap<[u8; 16], u64>,
+    pub token_index: HashMap<[u8; 16], (u64, u64)>,
     pub flows: HashMap<u64, TcpFlow>,
     pub by_key: HashMap<FlowKey, u64>,
     pub next_flow_id: u64,
@@ -360,4 +461,8 @@ pub enum Readiness {
     /// The technical flow is retired; retain the verified UDP channel until Ready.
     Verified(Option<u64>),
     Ready,
+}
+
+pub(super) fn idle_timeout(protocol: u8) -> Duration {
+    if protocol == 6 { TCP_IDLE } else { FLOW_IDLE }
 }

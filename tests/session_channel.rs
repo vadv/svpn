@@ -29,7 +29,7 @@ async fn replay_cannot_keep_a_channel_ready() {
     let (events, mut established) = mpsc::channel(4);
     let (incoming, _incoming) = mpsc::channel(4);
     let (_command, mut commands) = mpsc::channel(4);
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let mut channel = channel::Channel::new([7; 16], 9, false);
         let ctx = ChannelCtx {
             events,
@@ -58,6 +58,7 @@ async fn replay_cannot_keep_a_channel_ready() {
     ));
     let replay = peer
         .seal(&channel::Record::FlowProbe {
+            generation: 1,
             flow_id: 1,
             challenge: [5; 16],
         })
@@ -72,26 +73,68 @@ async fn replay_cannot_keep_a_channel_ready() {
             let Some(drivers::Event::Wire(bytes)) = client_io.events.recv().await else {
                 panic!("peer transport closed");
             };
-            if matches!(peer.open(&bytes, StdInstant::now()).unwrap(), Some(channel::Record::FlowEcho { flow_id: 1, echo }) if echo == [5; 16]) {
+            if matches!(peer.open(&bytes, StdInstant::now()).unwrap(), Some(channel::Record::FlowEcho { generation: 1, flow_id: 1, echo }) if echo == [5; 16]) {
                 break;
             }
         }
     }).await.unwrap();
     client_io
         .command
-        .send(drivers::Command::Send(replay))
+        .send(drivers::Command::Send(replay.clone()))
         .await
         .unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(1), task)
+    let fresh = peer
+        .seal(&channel::Record::FlowProbe {
+            generation: 1,
+            flow_id: 2,
+            challenge: [6; 16],
+        })
+        .unwrap();
+    let mut forged = fresh.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    client_io
+        .command
+        .send(drivers::Command::Send(forged))
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+        .unwrap();
+    client_io
+        .command
+        .send(drivers::Command::Send(fresh))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let Some(drivers::Event::Wire(bytes)) = client_io.events.recv().await else {
+                panic!("peer transport closed");
+            };
+            if let Some(channel::Record::FlowEcho {
+                generation: 1,
+                flow_id,
+                echo,
+            }) = peer.open(&bytes, StdInstant::now()).unwrap()
+            {
+                assert_eq!((flow_id, echo), (2, [6; 16]), "replayed probe echoed twice");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let error = tokio::time::timeout(CONSENT_TIMEOUT + Duration::from_secs(2), async {
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                result = &mut task => break result.unwrap().unwrap_err(),
+                _ = tick.tick() => {
+                    if client_io.command.send(drivers::Command::Send(replay.clone())).await.is_err() {
+                        break task.await.unwrap().unwrap_err();
+                    }
+                }
+            }
+        }
+    }).await.expect("replays prolonged channel consent");
     client_io.close().await;
-    assert!(
-        error.to_string().contains("replayed or expired UDP packet"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("consent expired"), "{error:#}");
 }
 
 // ── failure handling ──
@@ -176,7 +219,7 @@ async fn peer_channel_failure_unblocks_tcp_fallback() {
         plane.channel_failed(None, Some(10), Reason::ChannelFailed, now),
         vec![Action::TryTcp {
             flow_id: 1,
-            attempt: 2
+            generation: 1
         }]
     );
     assert!(plane.channels.is_empty());
@@ -190,14 +233,14 @@ async fn peer_channel_failure_unblocks_tcp_fallback() {
     );
     let selector = plane.selector.as_mut().unwrap();
     assert_eq!(
-        selector.bind_succeeded(1, now),
+        selector.bind_succeeded(1, 1, now),
         vec![Action::Commit {
             flow_id: 1,
             candidate: Candidate::Tcp,
-            attempt: 2,
+            generation: 1,
         }]
     );
-    assert!(selector.committed(1).is_empty());
+    assert!(selector.committed(1, 1).is_empty());
 }
 
 #[test]
@@ -222,23 +265,38 @@ fn stale_failure_does_not_consume_current_attempt() {
         plane.channel_failed(Some(1), None, Reason::Unsupported, now),
         vec![Action::TryTcp {
             flow_id: 1,
-            attempt: 2
+            generation: 1
         }]
     );
     assert!(plane.attempt.is_none());
 }
 
-#[tokio::test]
-async fn server_channel_failure_closes_only_its_flows() {
-    let key = test_key();
-    let mut plane = test_plane(None);
-    for (id, channel) in [(1, Some(10)), (2, Some(20)), (3, None)] {
+#[tokio::test(start_paused = true)]
+async fn server_channel_failure_preserves_tcp_but_closes_sent_udp() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (writer, reader) = tokio::io::duplex(4096);
+    let (mut session, mut events) =
+        link_session_with(false, Control::new(tokio::io::empty(), writer));
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.selector = None;
+    plane.server_ip = None;
+    for (id, channel) in [(1, Some(10)), (2, Some(20)), (3, None), (4, Some(10))] {
+        let mut key = test_key();
+        key.source_port += id as u16;
+        if id == 4 {
+            key.protocol = 17;
+        }
         let mut flow = Flow::new(key, tokio::time::Instant::now());
         flow.channel = channel;
+        flow.active = true;
+        flow.data_started = true;
+        plane.by_key.insert(key, id);
         plane.flows.insert(id, flow);
     }
-    let (command, _) = mpsc::channel(1);
-    let task = tokio::spawn(std::future::pending());
+    let (command, _commands) = mpsc::channel(1);
     plane.channels.insert(
         10,
         ChannelHandle {
@@ -246,20 +304,64 @@ async fn server_channel_failure_closes_only_its_flows() {
             key: [7; 16],
             established: true,
             command,
-            task,
+            task: tokio::spawn(std::future::pending()),
             cancel: None,
             relay: None,
         },
     );
-    assert_eq!(
-        plane.channel_failed(None, Some(10), Reason::ChannelFailed, StdInstant::now()),
-        vec![Action::CloseFlow { flow_id: 1 }]
-    );
-    assert!(
-        plane
-            .channel_failed(None, Some(10), Reason::ChannelFailed, StdInstant::now())
-            .is_empty()
-    );
+    session
+        .channel_failed(None, Some(10), Reason::ChannelFailed)
+        .await
+        .unwrap();
+    let Plane::Channels(plane) = &session.plane else {
+        unreachable!()
+    };
+    assert!(!plane.channels.contains_key(&10));
+    assert!(!plane.flows[&1].active);
+    assert!(plane.flows[&1].recovery.is_some());
+    assert!(plane.flows[&2].active && plane.flows[&3].active);
+    assert!(!plane.flows.contains_key(&4));
+    assert!(matches!(
+        events.try_recv().unwrap().1,
+        link_io::Event::Closed { id: 4, .. }
+    ));
+    let mut lines = BufReader::new(reader).lines();
+    let mut messages = Vec::new();
+    for _ in 0..2 {
+        let line = tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        messages.push(serde_json::from_str::<Message>(&line).unwrap());
+    }
+    assert!(messages.iter().any(|m| matches!(
+        m,
+        Message::FlowReject {
+            flow_id: 1,
+            generation: 1,
+            reason: Reason::ChannelFailed
+        }
+    )));
+    assert!(messages.iter().any(|m| matches!(
+        m,
+        Message::FlowClose {
+            flow_id: 4,
+            generation: 1
+        }
+    )));
+
+    tokio::time::advance(svpn::selector::RECOVERY_BUDGET).await;
+    session
+        .expire_flows(tokio::time::Instant::now())
+        .await
+        .unwrap();
+    assert!(!session.has_flow(1));
+    assert!(session.has_flow(2) && session.has_flow(3));
+    assert!(matches!(
+        events.try_recv().unwrap().1,
+        link_io::Event::Closed { id: 1, .. }
+    ));
 }
 
 // ── task cleanup ──
@@ -301,6 +403,7 @@ async fn session_drop_aborts_flow_channel_and_handshake_tasks() {
         match &mut session.plane {
             Plane::Channels(plane) => {
                 plane.flows.get_mut(&1).unwrap().tcp = Some(FlowTcp {
+                    cancel: None,
                     key: [0; 16],
                     token: None,
                     out: None,
@@ -708,7 +811,11 @@ async fn reused_established_channel_opens_probe_and_expiry_spares_it() {
     lines.read_line(&mut line).await.unwrap();
     let open: Message = serde_json::from_str(line.trim()).unwrap();
     let Message::FlowOpen {
-        flow_id, channel, ..
+        generation: 1,
+        resume: false,
+        flow_id,
+        channel,
+        ..
     } = open
     else {
         panic!("expected FlowOpen for the reused channel");
@@ -729,7 +836,7 @@ async fn reused_established_channel_opens_probe_and_expiry_spares_it() {
     lines.read_line(&mut line).await.unwrap();
     let closed: Message = serde_json::from_str(line.trim()).unwrap();
     assert!(
-        matches!(closed, Message::FlowClose { .. }),
+        matches!(closed, Message::FlowClose { generation: 1, .. }),
         "the expired probe flow is closed"
     );
     let mut line = String::new();

@@ -10,6 +10,7 @@ use crate::packet::FlowKey;
 pub const ATTEMPT_BUDGET: Duration = Duration::from_secs(5);
 /// Shared budget of selection and commit for a new flow (from admission).
 pub const FLOW_BUDGET: Duration = Duration::from_secs(30);
+pub const RECOVERY_BUDGET: Duration = Duration::from_secs(10);
 /// Hold-down for a failed candidate and a total failure.
 pub const HOLD_DOWN: Duration = Duration::from_secs(30);
 /// Pre-active queue: packets of a flow waiting for transport readiness.
@@ -95,22 +96,36 @@ impl std::fmt::Display for Reason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Start preparing a strategy channel: `channel_prepare` + probes.
-    PrepareChannel { candidate: Candidate, attempt: u64 },
+    PrepareChannel {
+        candidate: Candidate,
+        attempt: u64,
+    },
     /// Abort the preparation (deadline/cancel): release the attempt's resources.
-    AbortChannel { candidate: Candidate, attempt: u64 },
-    /// Register a flow on a ready channel: `flow_open` + FLOW_PROBE.
+    AbortChannel {
+        candidate: Candidate,
+        attempt: u64,
+    },
+    /// Retire only the binding; preserve the logical flow and unsent queue.
+    ResetBinding {
+        flow_id: u64,
+        generation: u64,
+        from: Option<Candidate>,
+        reason: Reason,
+    },
     OpenFlow {
         flow_id: u64,
+        generation: u64,
         candidate: Candidate,
         channel: u64,
     },
-    /// Connect the TCP candidate for a single flow (connect + probe).
-    TryTcp { flow_id: u64, attempt: u64 },
-    /// Send `commit` — an irreversible barrier; no fallback after it.
+    TryTcp {
+        flow_id: u64,
+        generation: u64,
+    },
     Commit {
         flow_id: u64,
         candidate: Candidate,
-        attempt: u64,
+        generation: u64,
     },
     /// Flow not established: the reason goes to control `flow_reject`/the log.
     FailFlow {
@@ -119,11 +134,17 @@ pub enum Action {
         reason: Reason,
     },
     /// Close the flow and its local resources (no fallback).
-    CloseFlow { flow_id: u64 },
+    CloseFlow {
+        flow_id: u64,
+    },
     /// Proactive-auto: no candidates left — the session stops.
-    Exhausted { reasons: Vec<(Candidate, Reason)> },
+    Exhausted {
+        reasons: Vec<(Candidate, Reason)>,
+    },
     /// the backoff ban expired; the candidate is eligible again.
-    BanExpired { candidate: Candidate },
+    BanExpired {
+        candidate: Candidate,
+    },
 }
 
 /// Admission rejection of a new flow.
