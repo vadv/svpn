@@ -47,9 +47,28 @@ pub struct Link {
     pub assigned: Arc<std::sync::OnceLock<(Ipv4Addr, Ipv4Addr)>>,
 }
 
+/// Sticky exit counters, surfaced in the periodic stats report.
+#[derive(Default)]
+pub struct StickyStats {
+    pub lookup_hit: u64,
+    pub lookup_miss: u64,
+    pub failover_moves: u64,
+}
+
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
+    /// Sticky exit: destination grouping; None = weighted balance.
+    pub geo: Option<crate::geo::Geo>,
+    /// Stable node ids (configured `server` strings) and weights, for rendezvous.
+    pub nodes: Vec<(String, u32)>,
+    /// Sticky owners: group key → link index. An alive owner keeps its group
+    /// (no snap-back); reassigned only when the owner cannot serve new flows.
+    pub exit_owners: std::collections::HashMap<u64, usize>,
+    /// Failover persistence; None in balance mode.
+    pub exit_state: Option<crate::exit_state::ExitState>,
+    /// Sticky exit counters, surfaced in the periodic stats report.
+    pub sticky: StickyStats,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
     pub events: mpsc::Sender<(Epoch, Event)>,
     pub incoming: mpsc::Receiver<(Epoch, Event)>,
@@ -142,6 +161,12 @@ impl Hub {
         if self.links.len() > 1 {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
+        }
+        if self.geo.is_some() {
+            report.push_str(&format!(
+                "\nsticky: lookup hit {} / miss {} | failover moves {}",
+                self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
+            ));
         }
         for line in per_link {
             report.push('\n');
@@ -300,9 +325,44 @@ impl Hub {
         });
     }
 
-    /// The flow key is available here for a future destination-stickiness policy.
-    fn pick(&mut self, _key: &FlowKey) -> Option<Epoch> {
-        self.pool.pick()
+    pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
+        let Some(geo) = &self.geo else {
+            return self.pool.pick();
+        };
+        let group = match geo.lookup(key.destination) {
+            Some(asn) => crate::geo::asn_key(asn),
+            None => crate::geo::ip_key(key.destination),
+        };
+        if let Some(&owner) = self.exit_owners.get(&group) {
+            if let Some(epoch) = self.pool.ready_epoch(owner) {
+                self.sticky.lookup_hit += 1;
+                return Some(epoch);
+            }
+            // Startup grace: a saved owner still connecting keeps its groups.
+            // Not a miss: no rendezvous is attempted.
+            if self.pool.is_connecting(owner) {
+                return None;
+            }
+        }
+        self.sticky.lookup_miss += 1;
+        let previous = self.exit_owners.get(&group).copied();
+        let next = crate::geo::rendezvous(group, &self.nodes)
+            .into_iter()
+            .find_map(|link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
+        if let Some((link, epoch)) = next {
+            if previous != Some(link) {
+                if previous.is_some() {
+                    self.sticky.failover_moves += 1;
+                }
+                self.exit_owners.insert(group, link);
+                if let Some(state) = &mut self.exit_state {
+                    state.assign(group, &self.nodes[link].0);
+                    state.flush_due(StdInstant::now());
+                }
+            }
+            return Some(epoch);
+        }
+        None
     }
 
     async fn relay(
@@ -493,11 +553,31 @@ pub async fn run(
     stats_interval: u32,
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
+    geo: Option<crate::geo::Geo>,
+    exit_state: Option<crate::exit_state::ExitState>,
 ) -> Result<()> {
     ensure!(!servers.is_empty(), "no servers configured");
     let pool = Pool::new(servers.iter().map(|s| s.weight));
+    let nodes: Vec<(String, u32)> = servers
+        .iter()
+        .map(|s| (s.server.clone(), s.weight))
+        .collect();
+    let mut exit_state = exit_state;
+    let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+    let exit_owners = match &mut exit_state {
+        Some(state) => {
+            state.retain_nodes(&ids);
+            state.owner_indices(&ids)
+        }
+        None => std::collections::HashMap::new(),
+    };
     let (events, incoming) = mpsc::channel(QUEUE);
     let mut hub = Hub {
+        geo,
+        nodes,
+        exit_owners,
+        exit_state,
+        sticky: StickyStats::default(),
         links: servers
             .into_iter()
             .map(|params| Link {
@@ -530,6 +610,9 @@ pub async fn run(
     let result = hub
         .relay(started, stats_interval, &mut tun, &mut hooks, &mut shutdown)
         .await;
+    if let Some(state) = &mut hub.exit_state {
+        state.flush();
+    }
     let canceled = hooks.cancel_up().await;
     hub.tasks.shutdown().await;
     let cleanup = match canceled {

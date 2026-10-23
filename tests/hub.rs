@@ -64,6 +64,11 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
             })
             .collect(),
         pool: Pool::new([1, 1]),
+        geo: None,
+        nodes: Vec::new(),
+        exit_owners: std::collections::HashMap::new(),
+        exit_state: None,
+        sticky: StickyStats::default(),
         tasks: JoinSet::new(),
         events,
         incoming,
@@ -380,7 +385,9 @@ async fn parallel_bootstrap_failures_exit_without_creating_a_tun() {
                 None,
                 0,
                 Hooks::default(),
-                shutdown
+                shutdown,
+                None,
+                None
             ),
             peer
         );
