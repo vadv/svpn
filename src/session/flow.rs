@@ -514,6 +514,9 @@ impl Session {
                 flow.binding_deadline = None;
             }
         }
+        if !is_probe_flow(flow_id) {
+            crate::debug!("flow_active role=server id={flow_id}");
+        }
         self.control
             .send(Message::Committed {
                 flow_id,
@@ -654,6 +657,7 @@ impl Session {
         if let Some(flow) = plane.flows.get_mut(&flow_id) {
             flow.active = true;
         }
+        crate::debug!("flow_active role=client id={flow_id}");
         // A quiet rebound flow has no data to prove the new binding with:
         // a challenge probe round-trip stands in until real traffic lands.
         if let Some(flow) = plane.flows.get_mut(&flow_id)

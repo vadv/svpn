@@ -726,7 +726,17 @@ impl Session {
             .filter(|(_, flow)| channel.is_some() && flow.channel == channel)
             .map(|(&id, flow)| (id, flow.generation))
             .collect();
-        let was_live = channel.is_some_and(|id| plane.channels.contains_key(&id));
+        // Only the verified incumbent of its candidate can take the data
+        // path down; a fresh challenge channel failing never can (it was
+        // never serving). Checked before stop_channel drops the handle.
+        let lost_incumbent = channel.is_some_and(|id| {
+            plane.channels.get(&id).is_some_and(|handle| {
+                plane
+                    .selector
+                    .as_ref()
+                    .is_some_and(|selector| selector.ready_channel(handle.candidate) == Some(id))
+            })
+        });
         if let Some(id) = channel {
             self.stop_channel(id).await;
         }
@@ -740,7 +750,7 @@ impl Session {
                 self.close_flow(id, true).await?;
             }
         }
-        let recheck = was_live
+        let recheck = lost_incumbent
             && self.readiness == Some(Readiness::Ready)
             && self.round.is_none()
             && matches!(&self.plane, Plane::Channels(plane) if plane.selector.as_ref().is_some_and(|s| !s.channels.keys().any(|c| s.ready_channel(*c).is_some())));

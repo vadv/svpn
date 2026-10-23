@@ -140,6 +140,43 @@ async fn replay_cannot_keep_a_channel_ready() {
 // ── failure handling ──
 
 #[tokio::test]
+async fn challenge_channel_failure_keeps_tcp_incumbent_serving() {
+    // A Tcp incumbent has no selector channel entry (adopt(Tcp, None)); a
+    // fresh unverified challenge channel dying must not announce a lost
+    // data path — the incumbent keeps serving.
+    let (mut session, mut events) = link_session(false);
+    session.readiness = Some(Readiness::Ready);
+    let (command, _commands) = mpsc::channel(1);
+    let task = tokio::spawn(async {});
+    let Plane::Channels(plane) = &mut session.plane else {
+        unreachable!()
+    };
+    plane.selector.as_mut().unwrap().adopt(Candidate::Tcp, None);
+    plane.channels.insert(
+        7,
+        ChannelHandle {
+            candidate: svpn::selector::Candidate::Mosh,
+            key: [7; 16],
+            established: true,
+            cancel: None,
+            command,
+            task,
+            relay: None,
+        },
+    );
+    session
+        .channel_failed(None, Some(7), svpn::selector::Reason::ChannelFailed)
+        .await
+        .unwrap();
+    assert!(
+        events.try_recv().is_err(),
+        "no Checking for a challenge channel"
+    );
+    assert_eq!(session.readiness, Some(Readiness::Ready));
+    assert!(session.round.is_none());
+}
+
+#[tokio::test]
 async fn last_channel_loss_signals_checking() {
     let (mut session, mut events) = link_session(false);
     session.readiness = Some(Readiness::Ready);
