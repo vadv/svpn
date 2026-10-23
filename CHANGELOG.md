@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.9.0
+
+Sticky exit release.
+
+- New `exit-policy = "sticky-asn"` for `multi` mode: every destination ASN
+  group is pinned to one pool server via weighted rendezvous hashing, so a
+  service sees the client from a single stable external IP while the owning
+  server is alive. Failover moves a group to the next server in its
+  rendezvous order; a rejoining ex-owner never snaps the group back.
+- Geo data: DB-IP ASN Lite (CC BY 4.0), loaded once at startup from `geo-db`;
+  a missing or corrupt file degrades to plain `balance` with a warning.
+  `scripts/update-asn-db.sh` installs monthly updates atomically (staging +
+  fsync + `.prev` rollback, systemd restart, cron-friendly exit codes).
+- Failover transitions and first assignments that skip an unavailable
+  primary are persisted to `exit-state` (default: `geo-db` with a
+  `.state.json` suffix, batched writes); a 10-second startup grace lets a
+  restored owner reconnect before its groups fail over.
+- Addresses outside the database get a stable exit by address hash with no
+  recorded state; node identity is `host:port`, so a stale state file after
+  a config change is dropped with a warning.
+- Metrics: `sticky_hit`, `sticky_miss`, `sticky_failover_moves` in the
+  periodic stats report.
+- e2e: sticky-asn suite (destination pinning, balance regression,
+  failover + rejoin, restart restore). Docs: README (+en),
+  THIRD-PARTY-NOTICES attribution for DB-IP.
+
 ## v0.8.0
 
 Flow recovery release.
