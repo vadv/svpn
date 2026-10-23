@@ -396,20 +396,37 @@ async fn final_udp_port_does_not_wrap() {
 
 #[tokio::test]
 async fn claims_sequential_ports_and_skips_busy() {
-    let mut next = 61000;
-    let first = claim_udp_port(Ipv4Addr::LOCALHOST, &mut next, 61010)
+    // Hardcoded ports flake on shared CI runners (anything may hold 61000);
+    // find a free base port and occupy its successor instead.
+    let (base, guard) = free_adjacent_pair().await;
+    let max = base + 10;
+    let mut next = u32::from(base);
+    let first = claim_udp_port(Ipv4Addr::LOCALHOST, &mut next, max)
         .await
         .unwrap();
-    assert_eq!(first, 61000);
-    // Occupy port 61001 to check that busy ports are skipped.
-    let guard = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 61001))
+    assert_eq!(first, base);
+    let second = claim_udp_port(Ipv4Addr::LOCALHOST, &mut next, max)
         .await
         .unwrap();
-    let second = claim_udp_port(Ipv4Addr::LOCALHOST, &mut next, 61010)
-        .await
-        .unwrap();
-    assert_eq!(second, 61002);
+    assert_eq!(second, base + 2, "busy port must be skipped");
     drop(guard);
+}
+
+/// Returns a free port whose successor is held by the returned socket.
+async fn free_adjacent_pair() -> (u16, tokio::net::UdpSocket) {
+    for base in 40000..60000u16 {
+        let probe = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base)).await;
+        if probe.is_err() {
+            continue;
+        }
+        drop(probe);
+        if let Ok(guard) =
+            tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, base + 1)).await
+        {
+            return (base, guard);
+        }
+    }
+    panic!("no adjacent UDP port pair available");
 }
 
 #[tokio::test]
