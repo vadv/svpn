@@ -171,6 +171,49 @@ A lost server is restarted with backoff, its TCP flows are reset, and traffic
 moves to the remaining servers. The client TUN is created once the first
 server is ready.
 
+## Sticky-ASN: a stable exit IP
+
+Anti-fraud systems ban clients whose external IP changes from connection to
+connection. The `exit-policy = "sticky-asn"` mode in `multi` pins every
+destination address group (ASN) to one pool server: the service sees the
+client from a single IP while the owning server is alive. When the old owner
+comes back, nothing changes: a healthy current exit beats the preference
+order.
+
+You need an ASN database — **DB-IP ASN Lite**
+(<https://download.db-ip.com/free/>, CC BY 4.0 license, ~400k IPv4 ranges,
+updated monthly). Download it with `scripts/update-asn-db.sh` (copy it to
+the router, e.g. into `/usr/local/bin/`); the database path must match
+`geo-db` in the config. By default the script installs the database to
+`/etc/svpn/asn.csv` (override with the `SVPN_ASN_DB` variable):
+
+```toml
+exit-policy = "sticky-asn"
+geo-db = "/etc/svpn/asn.csv"
+# exit-state = "…"   # default: geo-db with a .state.json suffix:
+                     # /etc/svpn/asn.state.json (failover transitions)
+```
+
+Files: `asn.csv` — the database (~40 MB, mode 600, the previous working
+version is kept alongside as `asn.csv.prev`), `asn.state.json` — owner
+assignments. The database is read at startup, no hot reload — after an
+update the script restarts `svpn.service` via systemd itself; without
+systemd (OpenWrt/procd) restart the service manually. Update monthly —
+cron (`0 4 2 * * root SVPN_ASN_DB=/etc/svpn/asn.csv /usr/local/bin/update-asn-db.sh`)
+or a systemd timer.
+
+Caveats:
+
+- A stable server ≠ a stable public IP: every pool server needs its own
+  fixed egress IPv4.
+- The database is IPv4-only: dual-stack services will see the client
+  directly over IPv6 — block IPv6 (see “Limitations”).
+- The monthly IP→ASN reclassification moves some groups once — that is a
+  property of the data, not a malfunction. An address outside the database
+  gets a stable exit by address hash, with no state recorded.
+- A corrupt or missing database file is not fatal: svpn logs a warning and
+  works as a regular `balance`.
+
 ## Hooks in detail
 
 All hooks are shell commands run via `/bin/sh -c`, limited to 10 seconds. For
