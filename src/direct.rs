@@ -141,7 +141,7 @@ struct TcpFlow {
 struct UdpFlow {
     id: u64,
     socket: Option<Arc<UdpSocket>>,
-    abort: AbortHandle,
+    abort: Option<AbortHandle>,
     last_seen: Instant,
 }
 
@@ -174,13 +174,14 @@ impl Shared {
         let mut closed = false;
         {
             let mut state = self.state.lock().unwrap();
-            if let Some(entry) = state.tcp.get_mut(&flow) {
-                if entry.id == id && matches!(entry.stage, TcpStage::Relay { .. }) {
-                    entry.stage = TcpStage::Dwell {
-                        until: Instant::now() + FIN_DWELL,
-                    };
-                    closed = true;
-                }
+            if let Some(entry) = state.tcp.get_mut(&flow)
+                && entry.id == id
+                && matches!(entry.stage, TcpStage::Relay { .. })
+            {
+                entry.stage = TcpStage::Dwell {
+                    until: Instant::now() + FIN_DWELL,
+                };
+                closed = true;
             }
         }
         if closed {
@@ -194,7 +195,9 @@ impl Shared {
             let mut state = self.state.lock().unwrap();
             match state.udp.remove(&flow) {
                 Some(entry) if entry.id == id => {
-                    entry.abort.abort();
+                    if let Some(abort) = entry.abort {
+                        abort.abort();
+                    }
                     true
                 }
                 _ => false,
@@ -287,9 +290,15 @@ impl DirectEngine {
             );
             entry.last_seen = Instant::now();
             let nat_port = entry.nat_port;
-            return rewrite_tuple(bytes, cfg.peer, cfg.client, nat_port, self.shared.listener_port)
-                .map(Some)
-                .context("direct open: rewrite");
+            return rewrite_tuple(
+                bytes,
+                cfg.peer,
+                cfg.client,
+                nat_port,
+                self.shared.listener_port,
+            )
+            .map(Some)
+            .context("direct open: rewrite");
         }
         ensure!(
             state.tcp.len() + state.udp.len() < MAX_FLOWS,
@@ -304,9 +313,14 @@ impl DirectEngine {
         let nat_port = state
             .allocate_port(self.shared.listener_port)
             .context("direct nat port space exhausted")?;
-        let rewritten =
-            rewrite_tuple(bytes, cfg.peer, cfg.client, nat_port, self.shared.listener_port)
-                .context("direct open: rewrite")?;
+        let rewritten = rewrite_tuple(
+            bytes,
+            cfg.peer,
+            cfg.client,
+            nat_port,
+            self.shared.listener_port,
+        )
+        .context("direct open: rewrite")?;
         state.tcp.insert(
             packet.flow,
             TcpFlow {
@@ -391,36 +405,46 @@ impl DirectEngine {
             "direct open: flow does not originate from the client address"
         );
         let payload = udp_payload(bytes).context("direct udp open: bad packet")?;
-        let state = self.shared.state.lock().unwrap();
-        if let Some(entry) = state.udp.get(&packet.flow) {
-            ensure!(entry.id == id, "direct open: stale flow id");
-            return Ok(()); // the dial task carries this datagram
-        }
-        ensure!(
-            state.tcp.len() + state.udp.len() < MAX_FLOWS,
-            "direct flow capacity exhausted ({MAX_FLOWS})"
-        );
         let destination = SocketAddrV4::new(packet.flow.destination, packet.flow.destination_port);
         let first = payload.to_vec();
         let flow = packet.flow;
-        drop(state);
-        // The Hub is the only opener, so the spawn gap cannot double-insert.
-        let handle = self
-            .shared
-            .tasks
-            .lock()
-            .await
-            .spawn(udp_flow(self.shared.clone(), id, flow, destination, first));
-        let mut state = self.shared.state.lock().unwrap();
-        state.udp.insert(
+        {
+            let state = self.shared.state.lock().unwrap();
+            if let Some(entry) = state.udp.get(&packet.flow) {
+                ensure!(entry.id == id, "direct open: stale flow id");
+                return Ok(()); // the dial task carries this datagram
+            }
+            ensure!(
+                state.tcp.len() + state.udp.len() < MAX_FLOWS,
+                "direct flow capacity exhausted ({MAX_FLOWS})"
+            );
+        }
+        // Insert before spawning: dial failure may finish the task before
+        // its abort handle can be registered.
+        self.shared.state.lock().unwrap().udp.insert(
             flow,
             UdpFlow {
                 id,
                 socket: None,
-                abort: handle,
+                abort: None,
                 last_seen: Instant::now(),
             },
         );
+        let handle = self.shared.tasks.lock().await.spawn(udp_flow(
+            self.shared.clone(),
+            id,
+            flow,
+            destination,
+            first,
+        ));
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(entry) = state.udp.get_mut(&flow)
+            && entry.id == id
+        {
+            entry.abort = Some(handle);
+        } else {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -444,12 +468,12 @@ impl DirectEngine {
             entry.last_seen = Instant::now();
             entry.socket.clone()
         };
-        if let Some(socket) = socket {
-            if let Err(error) = socket.send(payload).await {
-                // A network error closes only this flow (spec §5.3).
-                self.shared.finish_udp(parsed.flow, id).await;
-                return Err(error).context("direct udp send");
-            }
+        if let Some(socket) = socket
+            && let Err(error) = socket.send(payload).await
+        {
+            // A network error closes only this flow (spec §5.3).
+            self.shared.finish_udp(parsed.flow, id).await;
+            return Err(error).context("direct udp send");
         }
         Ok(())
     }
@@ -489,7 +513,10 @@ impl DirectEngine {
         }
         let desired = peer_route(cfg.peer, cfg.tun_index);
         manager.add(&desired).with_context(|| {
-            format!("add direct return route peer {}/32 via {}", cfg.peer, cfg.tun_name)
+            format!(
+                "add direct return route peer {}/32 via {}",
+                cfg.peer, cfg.tun_name
+            )
         })?;
         if !route_present(&mut manager, cfg.peer, cfg.tun_index)? {
             bail!(
@@ -583,14 +610,18 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
         }
         let claim = {
             let mut state = shared.state.lock().unwrap();
-            state
-                .tcp
-                .values_mut()
-                .find(|entry| {
-                    entry.nat_port == remote.port()
-                        && matches!(entry.stage, TcpStage::Pending { .. })
-                })
-                .map(|entry| (entry.id, entry.flow))
+            state.tcp.values_mut().find_map(|entry| {
+                if entry.nat_port != remote.port()
+                    || !matches!(entry.stage, TcpStage::Pending { .. })
+                {
+                    return None;
+                }
+                // Mark Relay before spawning: a refused outbound connection
+                // can finish before the task handle is registered below.
+                entry.stage = TcpStage::Relay { abort: None };
+                entry.last_seen = Instant::now();
+                Some((entry.id, entry.flow))
+            })
         };
         let Some((id, flow)) = claim else {
             crate::debug!(
@@ -605,13 +636,12 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
             .spawn(relay(shared.clone(), id, flow, stream));
         let mut state = shared.state.lock().unwrap();
         match state.tcp.get_mut(&flow) {
-            Some(entry) if entry.id == id && matches!(entry.stage, TcpStage::Pending { .. }) => {
-                entry.stage = TcpStage::Relay {
-                    abort: Some(handle),
-                };
-                entry.last_seen = Instant::now();
-            }
-            // The reservation timed out between claim and spawn: undo.
+            Some(entry) if entry.id == id => match &mut entry.stage {
+                TcpStage::Relay { abort } => *abort = Some(handle),
+                // The relay already finished and emitted its close.
+                TcpStage::Dwell { .. } => handle.abort(),
+                TcpStage::Pending { .. } => handle.abort(),
+            },
             _ => handle.abort(),
         }
     }
@@ -725,7 +755,10 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<u64> {
             false
         }
         TcpStage::Relay { .. } if entry.last_seen + TCP_IDLE <= now => {
-            if let TcpStage::Relay { abort: Some(handle) } = &entry.stage {
+            if let TcpStage::Relay {
+                abort: Some(handle),
+            } = &entry.stage
+            {
                 handle.abort();
             }
             entry.stage = TcpStage::Dwell {
@@ -738,7 +771,9 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<u64> {
     });
     state.udp.retain(|_, entry| {
         if entry.last_seen + UDP_IDLE <= now {
-            entry.abort.abort();
+            if let Some(abort) = &entry.abort {
+                abort.abort();
+            }
             closed.push(entry.id);
             false
         } else {
@@ -756,8 +791,8 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<u64> {
 /// could loop back into the TUN default (spec §5.1) — then connects with a
 /// bounded budget. The in-progress error surfaces later via SO_ERROR.
 async fn tcp_connect(config: &DirectConfig, destination: SocketAddrV4) -> Result<TcpStream> {
-    let socket =
-        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).context("direct tcp socket")?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .context("direct tcp socket")?;
     socket
         .set_nonblocking(true)
         .context("direct tcp nonblocking")?;
@@ -787,7 +822,7 @@ fn udp_dial(config: &DirectConfig, destination: SocketAddrV4) -> Result<UdpSocke
     socket
         .connect(&socket2::SockAddr::from(destination))
         .context("direct udp connect")?;
-    Ok(UdpSocket::from_std(socket.into()).context("direct udp register")?)
+    UdpSocket::from_std(socket.into()).context("direct udp register")
 }
 
 /// Binds `socket` to the captured physical uplink before any connect or
@@ -819,8 +854,7 @@ fn bind_uplink(socket: &Socket, uplink: &Uplink) -> Result<()> {
 fn validate(config: &DirectConfig) -> Result<()> {
     // Loopback stays allowed: integration tests drive the kernel paths over
     // loopback without a real TUN (packet::unicast would reject it).
-    let usable =
-        |ip: Ipv4Addr| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast();
+    let usable = |ip: Ipv4Addr| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast();
     ensure!(
         usable(config.client) && usable(config.peer) && config.client != config.peer,
         "invalid direct tunnel pair"

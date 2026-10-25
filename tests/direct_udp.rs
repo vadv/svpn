@@ -11,7 +11,7 @@ use std::{
 
 use socket2::{Domain, Socket, Type};
 use svpn::{
-    direct::{DirectConfig, DirectEngine, DirectEvent, Uplink, MAX_FLOWS, UDP_IDLE},
+    direct::{DirectConfig, DirectEngine, DirectEvent, MAX_FLOWS, UDP_IDLE, Uplink},
     packet::{self, FlowKey, internet_checksum},
 };
 
@@ -20,7 +20,11 @@ const PEER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 /// The loopback interface, probed with the same binding the engine uses.
 /// `None` means this environment cannot bind devices (unprivileged Linux).
 fn loopback_uplink() -> Option<Uplink> {
-    let name = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
+    let name = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
     let mut manager = route_manager::RouteManager::new().ok()?;
     let list = manager.list().ok()?;
     let index = list
@@ -89,7 +93,12 @@ fn udp_packet(flow: &FlowKey, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn transport_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
+fn transport_checksum(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: u8,
+    segment: &[u8],
+) -> u16 {
     let mut buf = Vec::with_capacity(12 + segment.len());
     buf.extend_from_slice(&source.octets());
     buf.extend_from_slice(&destination.octets());
@@ -162,13 +171,16 @@ async fn udp_relay_sizes_zero_full_and_oversize() {
     assert_eq!(id, 5, "replies carry the flow id");
     assert_eq!(&bytes[28..], b"ping");
     let parsed = packet::parse(&bytes, true).unwrap();
-    assert_eq!(parsed.flow, FlowKey {
-        protocol: 17,
-        source: Ipv4Addr::LOCALHOST,
-        destination: client(),
-        source_port: echo_port,
-        destination_port: 50001,
-    });
+    assert_eq!(
+        parsed.flow,
+        FlowKey {
+            protocol: 17,
+            source: Ipv4Addr::LOCALHOST,
+            destination: client(),
+            source_port: echo_port,
+            destination_port: 50001,
+        }
+    );
     assert!(checksums_ok(&bytes));
 
     // Zero-length datagram relays both ways.
@@ -194,7 +206,10 @@ async fn udp_relay_sizes_zero_full_and_oversize() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(engine.poll_event().is_none(), "oversized reply must not surface");
+    assert!(
+        engine.poll_event().is_none(),
+        "oversized reply must not surface"
+    );
     engine
         .forward_udp(5, &udp_packet(&flow, b"alive"))
         .await
@@ -292,6 +307,32 @@ async fn flow_table_capacity_is_bounded() {
 }
 
 // ── full TCP relay ──
+
+#[tokio::test]
+async fn failed_udp_dial_cannot_leave_an_untracked_flow() {
+    let uplink = Uplink {
+        name: "svpn-invalid0".to_owned(),
+        index: u32::MAX,
+    };
+    let mut engine = engine(&uplink).await;
+    let flow = FlowKey {
+        protocol: 17,
+        source: client(),
+        destination: Ipv4Addr::LOCALHOST,
+        source_port: 50999,
+        destination_port: 9,
+    };
+    let request = udp_packet(&flow, b"x");
+    let parsed = packet::parse(&request, true).unwrap();
+    engine.open_udp(77, &parsed, &request).await.unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(3), engine.recv_event())
+        .await
+        .expect("failed dial must close the registered flow");
+    assert!(matches!(event, DirectEvent::Closed { id: 77 }));
+    assert_eq!(engine.flow_count(), 0);
+    engine.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn tcp_relay_with_half_close() {

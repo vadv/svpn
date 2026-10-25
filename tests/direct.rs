@@ -9,7 +9,7 @@ use std::{
 
 use socket2::{Domain, Socket, Type};
 use svpn::{
-    direct::{DirectConfig, DirectEngine, DirectEvent, PENDING_TIMEOUT, Uplink, MAX_PENDING},
+    direct::{DirectConfig, DirectEngine, DirectEvent, MAX_PENDING, PENDING_TIMEOUT, Uplink},
     packet::{self, FlowKey, internet_checksum},
 };
 
@@ -47,6 +47,25 @@ fn config() -> DirectConfig {
 
 async fn engine() -> DirectEngine {
     DirectEngine::new(config()).await.unwrap()
+}
+
+fn loopback_uplink() -> Option<Uplink> {
+    let name = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
+    let mut manager = route_manager::RouteManager::new().ok()?;
+    let index = manager
+        .list()
+        .ok()?
+        .iter()
+        .find(|route| route.if_name().is_some_and(|if_name| if_name == name))?
+        .if_index()?;
+    Some(Uplink {
+        name: name.to_owned(),
+        index,
+    })
 }
 
 fn flow(protocol: u8, source_port: u16, destination_port: u16) -> FlowKey {
@@ -124,7 +143,12 @@ fn build_udp(flow: &FlowKey, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn transport_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
+fn transport_checksum(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: u8,
+    segment: &[u8],
+) -> u16 {
     let mut buf = Vec::with_capacity(12 + segment.len());
     buf.extend_from_slice(&source.octets());
     buf.extend_from_slice(&destination.octets());
@@ -171,10 +195,7 @@ async fn syn_rewrite_preserves_options_and_recomputes_checksums() {
     ];
     let syn = build_tcp(&flow, 0x02, 0xdead_beef, 0, &options, &[], &[]);
     let parsed = packet::parse(&syn, true).unwrap();
-    let rewritten = engine
-        .open_tcp(1, &parsed, &syn)
-        .unwrap()
-        .unwrap();
+    let rewritten = engine.open_tcp(1, &parsed, &syn).unwrap().unwrap();
 
     assert_eq!(tuple_of(&rewritten), (PEER, client()));
     assert_eq!(
@@ -255,7 +276,15 @@ async fn reverse_synack_maps_back_to_original_tuple() {
         source_port: engine.listen_port(),
         destination_port: nat_port,
     };
-    let synack = build_tcp(&kernel, 0x12, 9000, 1001, &[0x01, 0x01, 0x01, 0x01], &[], &[]);
+    let synack = build_tcp(
+        &kernel,
+        0x12,
+        9000,
+        1001,
+        &[0x01, 0x01, 0x01, 0x01],
+        &[],
+        &[],
+    );
     let back = engine.rewrite_reverse(&synack).unwrap();
     let parsed = packet::parse(&back, true).unwrap();
     assert_eq!(
@@ -335,17 +364,26 @@ async fn pending_timeout_frees_the_reservation() {
 /// Completes the kernel side over loopback: the local accept validates the
 /// pending nat port, the outbound dial fails (no uplink privilege or a
 /// refused port), and the mapping enters FIN_DWELL.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
-    let mut engine = engine().await;
-    // Loopback destination: the outbound dial fails fast and stays offline
-    // even where the fake uplink index happens to match a real interface.
+    let Some(uplink) = loopback_uplink() else {
+        return;
+    };
+    let destination = tokio::net::TcpListener::bind((PEER, 0)).await.unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = destination.accept().await.unwrap();
+        drop(stream);
+    });
+    let mut cfg = config();
+    cfg.uplink = uplink;
+    let mut engine = DirectEngine::new(cfg).await.unwrap();
     let flow = FlowKey {
         protocol: 6,
         source: client(),
-        destination: Ipv4Addr::new(127, 0, 0, 3),
+        destination: PEER,
         source_port: 44444,
-        destination_port: 1,
+        destination_port,
     };
     let syn = build_tcp(&flow, 0x02, 1000, 0, &[], &[], &[]);
     let parsed = packet::parse(&syn, true).unwrap();
@@ -370,6 +408,10 @@ async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
         .await
         .unwrap();
     assert!(matches!(closed, DirectEvent::Closed { id: 7 }));
+    server.await.unwrap();
+    // Real kernel accept/connect needs wall-clock I/O; pause only after it
+    // completes so FIN_DWELL itself can be advanced deterministically.
+    tokio::time::pause();
 
     // Retransmitted FIN keeps flowing in both directions during the dwell.
     let fin = build_tcp(&flow, 0x11, 2000, 3000, &[], &[], &[]);
@@ -390,7 +432,10 @@ async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
         &[],
     );
     let back = engine.rewrite_reverse(&kernel_fin).unwrap();
-    assert_eq!(packet::parse(&back, true).unwrap().flow.destination, client());
+    assert_eq!(
+        packet::parse(&back, true).unwrap().flow.destination,
+        client()
+    );
     assert!(checksums_ok(&back));
 
     // A fresh SYN on the same original tuple is rejected during the dwell.
@@ -468,10 +513,15 @@ async fn shutdown_is_bounded() {
     for port in 1..=8u16 {
         let syn = build_tcp(&flow(6, 30000 + port, 443), 0x02, 1, 0, &[], &[], &[]);
         let parsed = packet::parse(&syn, true).unwrap();
-        engine.open_tcp(u64::from(port), &parsed, &syn).unwrap().unwrap();
+        engine
+            .open_tcp(u64::from(port), &parsed, &syn)
+            .unwrap()
+            .unwrap();
     }
     let port = engine.listen_port();
     engine.shutdown().await.unwrap();
     // The listener is gone: the OS port is free again.
-    tokio::net::TcpListener::bind((client(), port)).await.unwrap();
+    tokio::net::TcpListener::bind((client(), port))
+        .await
+        .unwrap();
 }
