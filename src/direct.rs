@@ -595,7 +595,7 @@ impl DirectEngine {
                     self.route = None;
                 }
                 match verified {
-                    Err(error) => return Err(error.context("verify direct return route")),
+                    Err(error) => Err(error.context("verify direct return route")),
                     // Ok(false): a successful add the listing never shows.
                     Ok(_) => bail!(
                         "direct return route peer {}/32 via {} did not install",
@@ -613,21 +613,19 @@ impl DirectEngine {
                     self.route = Some(RouteBinding::Preinstalled);
                     return Ok(());
                 }
-                return Err(error).with_context(|| {
+                Err(error).with_context(|| {
                     format!(
                         "foreign route blocks the direct return route peer {}/32 via {}",
                         cfg.peer, cfg.tun_name
                     )
-                });
+                })
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "add direct return route peer {}/32 via {}",
-                        cfg.peer, cfg.tun_name
-                    )
-                });
-            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "add direct return route peer {}/32 via {}",
+                    cfg.peer, cfg.tun_name
+                )
+            }),
         }
     }
 
