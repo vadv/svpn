@@ -22,6 +22,7 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
     LinkParams {
         server: server.to_string(),
         weight: 1,
+        countries: Vec::new(),
         identity: None,
         user: None,
         ssh_port: 22,
@@ -65,6 +66,8 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
             .collect(),
         pool: Pool::new([1, 1]),
         geo: None,
+        country: None,
+        home_country: None,
         nodes: Vec::new(),
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
@@ -387,8 +390,7 @@ async fn parallel_bootstrap_failures_exit_without_creating_a_tun() {
                 0,
                 Hooks::default(),
                 shutdown,
-                None,
-                None
+                GeoExits::default()
             ),
             peer
         );

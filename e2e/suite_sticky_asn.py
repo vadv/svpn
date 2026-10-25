@@ -209,7 +209,7 @@ def test_restart_restore():
     cleanup_verified(process, server_hosts=HOSTS)
     persisted = json.loads(STATE.read_text())
     # Persisted identity is host:port (spec); the default ssh port is 22.
-    assert persisted == {"version": 1, "owners": {str(asn): f"{spare}:22"}}, persisted
+    assert persisted == {"version": 2, "country": {}, "asn": {str(asn): f"{spare}:22"}}, persisted
     with session("sticky-restart-2", args=sticky_args(), server_hosts=HOSTS, ready_timeout=20) as (
         process,
         path,

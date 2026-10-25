@@ -105,6 +105,59 @@ fn sticky_asn_is_multi_only() {
     assert_eq!(multi.exit_policy, ExitPolicy::StickyAsn);
 }
 
+// ── geo country flags ──
+
+#[test]
+fn country_flags_parse_and_require_country_db() {
+    let multi = client(&[
+        "multi",
+        "--server",
+        "203.0.113.1,countries=de+AT",
+        "--server",
+        "203.0.113.2",
+        "--country-db",
+        "country.csv",
+        "--home-country",
+        "ru",
+    ]);
+    assert_eq!(multi.home_country.as_deref(), Some("RU"));
+    assert_eq!(
+        multi.country_db.as_deref(),
+        Some(std::path::Path::new("country.csv")),
+        "CLI paths stay cwd-relative, unlike config-relative ones"
+    );
+    assert_eq!(
+        resolve_servers(&multi.server, &multi.globals).unwrap()[0].countries,
+        ["DE", "AT"]
+    );
+    // Direct home needs no exit policy: single mode accepts it too.
+    let single = client(&[
+        "--server",
+        "203.0.113.1",
+        "--country-db",
+        "c.csv",
+        "--home-country",
+        "RU",
+    ]);
+    assert_eq!(single.home_country.as_deref(), Some("RU"));
+    for args in [
+        vec!["multi", "--server", "203.0.113.1", "--home-country", "RU"],
+        vec![
+            "multi",
+            "--server",
+            "203.0.113.1,countries=DE",
+            "--server",
+            "203.0.113.2",
+        ],
+        vec!["--server", "203.0.113.1", "--home-country", "R1"],
+    ] {
+        let error = Cli::try_parse_from(["svpn"].into_iter().chain(args.clone()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{args:?}");
+    }
+}
+
 // ── config exclusivity ──
 
 #[test]

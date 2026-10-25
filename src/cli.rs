@@ -1,6 +1,6 @@
 //! CLI grammar and source selection. No network or TUN side effects.
 
-use crate::server_spec::{Globals, ServerSpec, resolve_perf, resolve_servers};
+use crate::server_spec::{Globals, ServerSpec, parse_country_code, resolve_perf, resolve_servers};
 use crate::{DEFAULT_PORT_RANGE, MimicArg, hooks, logging, parse_byte_size, parse_port_range};
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind, parser::ValueSource,
@@ -36,6 +36,12 @@ pub struct ClientArgs {
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
+    /// DB-IP Country Lite CSV database for country exits and home direct.
+    #[arg(long, value_name = "FILE")]
+    pub country_db: Option<PathBuf>,
+    /// Two-letter home country; its destinations bypass VPN exits (direct).
+    #[arg(long, value_name = "CC", value_parser = parse_country_code)]
+    pub home_country: Option<String>,
     /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.
     #[arg(long, value_name = "FILE")]
     pub exit_state: Option<PathBuf>,
@@ -117,6 +123,20 @@ pub enum Mode {
 
 pub struct Cli {
     pub command: Mode,
+}
+
+impl ClientArgs {
+    /// Geo coupling (spec): home-country or per-server countries require
+    /// country-db. An unused country-db is ignored at runtime, not here.
+    pub(crate) fn validate_geo(&self) -> anyhow::Result<()> {
+        let needs_db = self.home_country.is_some()
+            || self.server.iter().any(|spec| !spec.countries().is_empty());
+        anyhow::ensure!(
+            !needs_db || self.country_db.is_some(),
+            "home-country or server countries require country-db"
+        );
+        Ok(())
+    }
 }
 
 impl Cli {
@@ -209,6 +229,7 @@ impl Cli {
                 // Validate every server before the runtime can open the first SSH session.
                 if !from_file {
                     resolve_servers(&client.server, &client.globals).map_err(invalid)?;
+                    client.validate_geo().map_err(invalid)?;
                 }
                 Mode::Client(client)
             }

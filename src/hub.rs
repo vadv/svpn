@@ -59,11 +59,41 @@ pub struct StickyStats {
     pub failover_moves: u64,
 }
 
+/// A destination country with assigned servers: the candidates constraint
+/// of spec §3. Country is the constraint, ASN — when covered by the ASN
+/// database — the affinity inside it.
+struct CountryRoute {
+    /// Packed ISO code — the rendezvous key payload.
+    packed: u32,
+    /// Links configured for the country, in configuration order.
+    candidates: Vec<usize>,
+    /// Destination ASN when the ASN database covers it.
+    asn: Option<u32>,
+}
+
+impl CountryRoute {
+    /// The typed persistence key (spec §4): a scoped `CC:ASN` key keeps its
+    /// country, a bare country key otherwise.
+    fn exit_key(&self) -> crate::exit_state::ExitKey {
+        let code = crate::geo::unpack_country(self.packed);
+        match self.asn {
+            Some(asn) => crate::exit_state::ExitKey::ScopedAsn(code, asn),
+            None => crate::exit_state::ExitKey::Country(code),
+        }
+    }
+}
+
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
-    /// Sticky exit: destination grouping; None = weighted balance.
+    /// Sticky exit: ASN grouping under exit-policy sticky-asn;
+    /// None = weighted balance.
     pub geo: Option<crate::geo::Geo>,
+    /// Sticky exit: country table for the destination Country constraint;
+    /// None = no country routing.
+    pub country: Option<crate::geo::Geo>,
+    /// Packed home country for direct admission; None — direct disabled.
+    pub home_country: Option<u32>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
     /// Sticky owners: group key → link index. An alive owner keeps its group
@@ -168,7 +198,7 @@ impl Hub {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
         }
-        if self.geo.is_some() {
+        if self.geo.is_some() || self.country.is_some() {
             report.push_str(&format!(
                 "\nsticky: lookup hit {} / miss {} | failover moves {}",
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
@@ -332,13 +362,23 @@ impl Hub {
     }
 
     pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
-        let Some(geo) = &self.geo else {
-            return self.pool.pick();
-        };
         // Retry throttled persistence even when no failover follows.
         if let Some(state) = &mut self.exit_state {
             state.flush_due(StdInstant::now());
         }
+        // An assigned country constrains candidates before any ASN
+        // affinity (spec §3): a constrained flow never spills to a
+        // non-candidate exit, even under exit-policy=balance.
+        if let Some(route) = self.country_route(key.destination) {
+            let group = match route.asn {
+                Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
+                None => crate::geo::country_key(route.packed),
+            };
+            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key());
+        }
+        let Some(geo) = &self.geo else {
+            return self.pool.pick();
+        };
         let Some(asn) = geo.lookup(key.destination) else {
             // Uncovered /32: deterministic stateless rendezvous, never
             // recorded in exit_owners or persisted (spec: no /32 overrides).
@@ -348,6 +388,48 @@ impl Hub {
                 .find_map(|link| self.pool.ready_epoch(link));
         };
         let group = crate::geo::asn_key(asn);
+        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn))
+    }
+
+    /// The destination's country when servers are assigned to it (spec
+    /// §3): a constraint on candidates. An unassigned country and a
+    /// database miss are no constraint — the global sticky-ASN or balance
+    /// selection applies unchanged.
+    fn country_route(&self, destination: Ipv4Addr) -> Option<CountryRoute> {
+        let packed = self.country.as_ref()?.lookup(destination)?;
+        let code = crate::geo::unpack_country(packed);
+        let candidates: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.params.countries.contains(&code))
+            .map(|(link, _)| link)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(CountryRoute {
+            packed,
+            candidates,
+            // The ASN affinity applies only under exit-policy sticky-asn:
+            // without the ASN database the group is the country itself.
+            asn: self.geo.as_ref().and_then(|geo| geo.lookup(destination)),
+        })
+    }
+
+    /// Sticky owner of `group`: an alive owner keeps the group (no
+    /// snap-back), a Checking owner keeps it while a reserve serves new
+    /// flows, a restored owner still connecting holds the group through
+    /// the startup grace, then the group fails over inside `candidates`
+    /// and the deviation is persisted under `key`. `None` candidates —
+    /// every configured link.
+    fn sticky_epoch(
+        &mut self,
+        group: u64,
+        candidates: Option<&[usize]>,
+        key: crate::exit_state::ExitKey,
+    ) -> Option<Epoch> {
+        let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
         if let Some(&owner) = self.exit_owners.get(&group) {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
                 self.sticky.lookup_hit += 1;
@@ -359,7 +441,7 @@ impl Hub {
                 self.sticky.lookup_hit += 1;
                 return crate::geo::rendezvous(group, &self.nodes)
                     .into_iter()
-                    .filter(|&link| link != owner)
+                    .filter(|&link| link != owner && serves(link))
                     .find_map(|link| self.pool.ready_epoch(link));
             }
             // Startup grace: a restored owner still connecting keeps its
@@ -374,17 +456,21 @@ impl Hub {
         }
         self.sticky.lookup_miss += 1;
         let previous = self.exit_owners.get(&group).copied();
-        let order = crate::geo::rendezvous(group, &self.nodes);
+        let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
+            .into_iter()
+            .filter(|&link| serves(link))
+            .collect();
         let next = order
             .iter()
             .find_map(|&link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
         let (link, epoch) = next?;
         if previous != Some(link) {
             self.exit_owners.insert(group, link);
-            // Baseline — first node of the rendezvous order — reproduces
-            // itself and needs no disk. Deviations (a failover transition or
-            // a first assignment that skipped an unavailable primary) do not,
-            // so they are persisted; a restart must not snap back (spec).
+            // Baseline — first node of the (restricted) rendezvous order —
+            // reproduces itself and needs no disk. Deviations (a failover
+            // transition or a first assignment that skipped an unavailable
+            // primary) do not, so they are persisted; a restart must not
+            // snap back (spec).
             let deviation = order.first() != Some(&link);
             if previous.is_some() {
                 self.sticky.failover_moves += 1;
@@ -393,7 +479,7 @@ impl Hub {
                 && let Some(state) = &mut self.exit_state
             {
                 // Batched: dirty here, flushed by flush_due / clean stop.
-                state.assign(group, &self.nodes[link].0);
+                state.assign(key, &self.nodes[link].0);
             }
         }
         Some(epoch)
@@ -581,15 +667,62 @@ impl Hub {
     }
 }
 
+/// Geo-driven exit inputs of one client run (spec §2-4): the ASN affinity
+/// table, the country constraint table and the one shared owner state.
+#[derive(Default)]
+pub struct GeoExits {
+    /// ASN database; None — sticky-asn degraded to weighted balance.
+    pub geo: Option<crate::geo::Geo>,
+    /// Country database; None — no country routing.
+    pub country: Option<crate::geo::Geo>,
+    /// Packed home country for direct admission; None — direct disabled.
+    pub home_country: Option<u32>,
+    /// Sticky owner persistence; None — nothing sticky is active.
+    pub exit_state: Option<crate::exit_state::ExitState>,
+}
+
+/// A restored owner's rendezvous group, or `None` to drop it (spec §4):
+/// typed keys map onto disjoint numeric key domains — the persisted
+/// strings are never hashed — and a country or scoped owner restores only
+/// while its node is still a candidate for the country, so the scoped key
+/// keeps its country before the first flow.
+#[doc(hidden)]
+pub fn restored_group(
+    servers: &[LinkParams],
+    key: crate::exit_state::ExitKey,
+    link: usize,
+) -> Option<u64> {
+    let candidate = |code: &str| {
+        servers
+            .get(link)
+            .is_some_and(|params| params.countries.iter().any(|c| c == code))
+    };
+    match key {
+        crate::exit_state::ExitKey::Asn(asn) => Some(crate::geo::asn_key(asn)),
+        crate::exit_state::ExitKey::Country(code) if candidate(&code) => {
+            Some(crate::geo::country_key(crate::geo::pack_country(&code)?))
+        }
+        crate::exit_state::ExitKey::ScopedAsn(code, asn) if candidate(&code) => Some(
+            crate::geo::scoped_asn_key(crate::geo::pack_country(&code)?, asn),
+        ),
+        _ => None,
+    }
+}
+
 pub async fn run(
     servers: Vec<LinkParams>,
     started: Option<oneshot::Sender<()>>,
     stats_interval: u32,
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
-    geo: Option<crate::geo::Geo>,
-    exit_state: Option<crate::exit_state::ExitState>,
+    exits: GeoExits,
 ) -> Result<()> {
+    let GeoExits {
+        geo,
+        country,
+        home_country,
+        exit_state,
+    } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
     let pool = Pool::new(servers.iter().map(|s| s.weight));
     // Stable node identity is host:port (spec): a port change is a new node.
@@ -602,7 +735,13 @@ pub async fn run(
     let exit_owners = match &mut exit_state {
         Some(state) => {
             state.retain_nodes(&ids);
-            state.owner_indices(&ids)
+            state
+                .owner_indices(&ids)
+                .into_iter()
+                .filter_map(|(key, link)| {
+                    restored_group(&servers, key, link).map(|group| (group, link))
+                })
+                .collect()
         }
         None => std::collections::HashMap::new(),
     };
@@ -611,6 +750,8 @@ pub async fn run(
     let (events, incoming) = mpsc::channel(QUEUE);
     let mut hub = Hub {
         geo,
+        country,
+        home_country,
         nodes,
         exit_owners,
         exit_state,

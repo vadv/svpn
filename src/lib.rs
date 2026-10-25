@@ -123,12 +123,18 @@ pub fn main_entry() -> ExitCode {
     }
 }
 
-fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_state::ExitState>)> {
-    match (args.exit_policy, &args.geo_db) {
-        (cli::ExitPolicy::Balance, None) => Ok((None, None)),
+/// Startup loading of the geo exit inputs (spec §2-4): the ASN database
+/// (sticky-asn affinity), the country database (Country constraint and,
+/// later, direct) and the one shared owner state file.
+fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
+    // Runtime twin of the parse-time validation (spec §2): home-country or
+    // per-server countries without a country database cannot start.
+    args.validate_geo()?;
+    let asn = match (args.exit_policy, &args.geo_db) {
+        (cli::ExitPolicy::Balance, None) => None,
         (cli::ExitPolicy::Balance, Some(_)) => {
             crate::warn!("geo-db set without exit-policy sticky-asn — ignoring");
-            Ok((None, None))
+            None
         }
         (cli::ExitPolicy::StickyAsn, None) => {
             anyhow::bail!("exit-policy sticky-asn requires geo-db")
@@ -140,22 +146,59 @@ fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_sta
                     path.display(),
                     geo.rows()
                 );
-                let state_path = args
-                    .exit_state
-                    .clone()
-                    .unwrap_or_else(|| path.with_extension("state.json"));
-                Ok((
-                    Some(geo),
-                    Some(exit_state::ExitState::load(Some(state_path))),
-                ))
+                Some(geo)
             }
-            // Graceful degradation: a missing/broken database must not stop the VPN.
+            // Graceful degradation: a missing/broken ASN database must not
+            // stop the VPN. The country database below is strict — a wrong
+            // country table misroutes flows instead of losing affinity.
             Err(error) => {
                 crate::error!("{error:#} — falling back to balance");
-                Ok((None, None))
+                None
             }
         },
-    }
+    };
+    let country_routing = args.server.iter().any(|spec| !spec.countries().is_empty());
+    let country = match (
+        &args.country_db,
+        country_routing || args.home_country.is_some(),
+    ) {
+        (Some(path), true) => {
+            let country = geo::Geo::load_country(path)?;
+            crate::info!(
+                "country database {}: {} IPv4 ranges",
+                path.display(),
+                country.rows()
+            );
+            Some(country)
+        }
+        (Some(_), false) => {
+            crate::warn!("country-db set without home-country or server countries — ignoring");
+            None
+        }
+        (None, _) => None,
+    };
+    // One state file for every domain (spec §4): the explicit path, else
+    // beside the ASN database, else beside the country database.
+    let state_path = args
+        .exit_state
+        .clone()
+        .or_else(|| {
+            args.geo_db
+                .as_ref()
+                .map(|path| path.with_extension("state.json"))
+        })
+        .or_else(|| {
+            args.country_db
+                .as_ref()
+                .map(|path| path.with_extension("state.json"))
+        });
+    let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
+    Ok(hub::GeoExits {
+        geo: asn,
+        country,
+        home_country: args.home_country.as_deref().and_then(geo::pack_country),
+        exit_state: state,
+    })
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -190,7 +233,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Mode::Client(args) => {
-            let (geo, exit_state) = load_geo(&args)?;
+            let exits = load_geo(&args)?;
             let hooks = args.hooks.resolve()?;
             let servers = resolve_servers(&args.server, &args.globals)?;
             let mut interrupt =
@@ -200,15 +243,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("install SIGTERM handler")?;
             let (stop, shutdown) = tokio::sync::watch::channel(false);
-            let client = hub::run(
-                servers,
-                None,
-                args.stats_interval,
-                hooks,
-                shutdown,
-                geo,
-                exit_state,
-            );
+            let client = hub::run(servers, None, args.stats_interval, hooks, shutdown, exits);
             tokio::pin!(client);
             tokio::select! {
                 result = &mut client => result,
@@ -259,7 +294,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, None, None) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default()) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),

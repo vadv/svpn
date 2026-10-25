@@ -79,6 +79,8 @@ pub struct ServerSpec {
     server: String,
     ssh_port: Option<u16>,
     weight: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_countries")]
+    countries: Vec<String>,
     #[serde(rename = "ssh-user")]
     user: Option<String>,
     #[serde(rename = "ssh-identity")]
@@ -106,6 +108,8 @@ pub struct ServerSpec {
 pub struct LinkParams {
     pub server: String,
     pub weight: u32,
+    /// Country constraint of this exit; empty — none (spec: manual only).
+    pub countries: Vec<String>,
     pub identity: Option<PathBuf>,
     pub user: Option<String>,
     pub ssh_port: u16,
@@ -134,6 +138,11 @@ impl ServerSpec {
             server: normalize_host(host)?,
             ..Self::default()
         })
+    }
+
+    /// Normalized two-letter ISO codes; empty — no country constraint.
+    pub fn countries(&self) -> &[String] {
+        &self.countries
     }
 
     pub(crate) fn without_weight(&self, mode: &str) -> Result<()> {
@@ -189,6 +198,11 @@ impl ServerSpec {
         if let Some(name) = self.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
             validate_tun_name(name).context("peer-tun-name")?;
         }
+        let mut seen = HashSet::new();
+        ensure!(
+            self.countries.iter().all(|code| seen.insert(code)),
+            "duplicate country code in countries"
+        );
         validate_mimic_fields(self.mimic.as_deref().unwrap_or_default())?;
         Ok(())
     }
@@ -213,6 +227,7 @@ impl ServerSpec {
         let params = LinkParams {
             server: self.server.clone(),
             weight: self.weight.unwrap_or(1),
+            countries: self.countries.clone(),
             identity: self
                 .identity
                 .as_ref()
@@ -307,6 +322,7 @@ impl FromStr for ServerSpec {
                 server,
                 ssh_port,
                 weight: None,
+                countries: Vec::new(),
                 user: None,
                 identity: None,
                 host_key: None,
@@ -345,6 +361,12 @@ impl FromStr for ServerSpec {
                                 })
                                 .collect::<Result<_>>()?,
                         );
+                    }
+                    "countries" => {
+                        spec.countries = value
+                            .split('+')
+                            .map(|code| parse_country_code(code).map_err(anyhow::Error::msg))
+                            .collect::<Result<_>>()?;
                     }
                     "remote-bin" => spec.remote_bin = Some(value.into()),
                     "peer-tun" => spec.peer_tun_name = Some(value.into()),
@@ -556,6 +578,25 @@ pub(crate) fn parse_host_key(value: &str) -> Result<Fingerprint> {
         "hostkey / --ssh-host-key expects SHA256:…"
     );
     Ok(pin)
+}
+
+/// Uppercased two-letter ISO country code: `"ru"` → `"RU"`.
+pub(crate) fn parse_country_code(value: &str) -> Result<String, String> {
+    match value.as_bytes() {
+        [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
+            Ok(value.to_ascii_uppercase())
+        }
+        _ => Err("country code must be two ASCII letters, e.g. RU".into()),
+    }
+}
+
+fn deserialize_countries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    <Vec<String> as serde::Deserialize>::deserialize(deserializer)?
+        .into_iter()
+        .map(|code| parse_country_code(&code).map_err(serde::de::Error::custom))
+        .collect()
 }
 
 fn deserialize_host<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
