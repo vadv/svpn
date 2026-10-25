@@ -2,8 +2,8 @@
 //! real loopback sockets where the platform privilege allows, plus the
 //! unprivileged parser/rewrite negative cases. Linux raw sockets need
 //! `CAP_NET_RAW` — unprivileged Linux reports the denial explicitly or
-//! skips the socket tests with the same probe direct UDP uses; the Darwin
-//! datagram ICMP socket needs no privilege.
+//! skips the socket tests with the same probe direct UDP uses. Raw ICMP
+//! requires CAP_NET_RAW/root on both supported systems.
 
 use std::{collections::HashMap, io, net::Ipv4Addr, time::Duration};
 
@@ -16,7 +16,7 @@ use svpn::{
             rewrite_icmp_error,
         },
     },
-    packet::{self, FlowKey, internet_checksum},
+    packet::{self, FlowKey, Packet, internet_checksum},
 };
 
 const PEER: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -94,8 +94,8 @@ fn denied(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn engine(uplink: &Uplink) -> IcmpEngine {
-    IcmpEngine::new(DirectConfig {
+async fn engine(uplink: &Uplink) -> Option<IcmpEngine> {
+    match IcmpEngine::new(DirectConfig {
         client: client(),
         peer: PEER,
         tun_name: "svpn0".to_owned(),
@@ -104,7 +104,25 @@ async fn engine(uplink: &Uplink) -> IcmpEngine {
         uplink: uplink.clone(),
     })
     .await
-    .unwrap()
+    {
+        Ok(engine) => Some(engine),
+        Err(error) if denied(&error) => {
+            eprintln!("skipping: raw ICMP requires CAP_NET_RAW/root");
+            None
+        }
+        Err(error) => panic!("unexpected ICMP setup error: {error:#}"),
+    }
+}
+
+async fn open_live(engine: &mut IcmpEngine, id: u64, packet: &Packet, bytes: &[u8]) -> bool {
+    match engine.open_icmp(id, packet, bytes).await {
+        Ok(()) => true,
+        Err(error) if denied(&error) => {
+            eprintln!("skipping: raw ICMP requires CAP_NET_RAW/root");
+            false
+        }
+        Err(error) => panic!("unexpected ICMP open error: {error:#}"),
+    }
 }
 
 /// Client echo request `source → destination` with a custom TTL and valid
@@ -400,7 +418,9 @@ async fn echo_roundtrip_preserves_id_seq_payload_and_ttl() {
         eprintln!("skipping: cannot bind sockets to loopback (needs CAP_NET_RAW on Linux)");
         return;
     };
-    let mut engine = engine(&uplink).await;
+    let Some(mut engine) = engine(&uplink).await else {
+        return;
+    };
     let source = engine.uplink_source();
     assert_eq!(source, PEER, "the loopback uplink pins 127.0.0.1");
     assert_ne!(
@@ -420,7 +440,9 @@ async fn echo_roundtrip_preserves_id_seq_payload_and_ttl() {
     let parsed = packet::parse(&request, true).unwrap();
     assert_eq!(parsed.flow, flow);
     assert!(parsed.can_open);
-    engine.open_icmp(5, &parsed, &request).await.unwrap();
+    if !open_live(&mut engine, 5, &parsed, &request).await {
+        return;
+    }
     assert_eq!(engine.flow_count(), 1);
 
     let event = next_event(&mut engine).await;
@@ -461,11 +483,15 @@ async fn two_flows_same_destination_demux_by_id() {
         eprintln!("skipping: cannot bind sockets to loopback (needs CAP_NET_RAW on Linux)");
         return;
     };
-    let mut engine = engine(&uplink).await;
+    let Some(mut engine) = engine(&uplink).await else {
+        return;
+    };
     for (flow_id, echo_id) in [(11u64, 0x0101u16), (22, 0x0202)] {
         let request = request_packet(client(), PEER, echo_id, 1, b"demux", 64);
         let parsed = packet::parse(&request, true).unwrap();
-        engine.open_icmp(flow_id, &parsed, &request).await.unwrap();
+        if !open_live(&mut engine, flow_id, &parsed, &request).await {
+            return;
+        }
     }
     assert_eq!(engine.flow_count(), 2);
     let mut seen = HashMap::new();
@@ -492,10 +518,14 @@ async fn icmp_idle_expiry_closes_the_flow_and_rejects_late_traffic() {
         eprintln!("skipping: cannot bind sockets to loopback (needs CAP_NET_RAW on Linux)");
         return;
     };
-    let mut engine = engine(&uplink).await;
+    let Some(mut engine) = engine(&uplink).await else {
+        return;
+    };
     let request = request_packet(client(), PEER, 0x0707, 1, b"idle", 64);
     let parsed = packet::parse(&request, true).unwrap();
-    engine.open_icmp(9, &parsed, &request).await.unwrap();
+    if !open_live(&mut engine, 9, &parsed, &request).await {
+        return;
+    }
     assert_eq!(engine.flow_count(), 1);
 
     tokio::time::advance(UDP_IDLE + Duration::from_secs(2)).await;

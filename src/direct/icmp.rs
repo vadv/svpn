@@ -6,17 +6,13 @@
 //! address — the client's tunnel address never leaves the machine, because
 //! a TUN source is not routable back. The original id/seq/payload ride the
 //! request; the reply is rebuilt as the original tuple `destination →
-//! client` with the reply's TTL. The Darwin datagram ICMP API rewrites the
-//! identifier in the kernel, so the flow keeps the original id and patches
-//! it back on receive — the platform-side translation spec §5.4 allows.
+//! client` with the reply's TTL.
 //!
-//! Linux uses one `SOCK_RAW` ICMP socket per flow: it needs `CAP_NET_RAW`,
-//! and a missing privilege is an explicit ICMP-only error — direct TCP/UDP
-//! stay up and there is no VPN fallback. Raw sockets also see ICMP errors
-//! quoting our requests; they are rewritten for the client (outer
-//! destination and the embedded original source become the client). Darwin
-//! uses the unprivileged `SOCK_DGRAM` ICMP socket, which the kernel limits
-//! to echo replies — errors never reach it there.
+//! Linux and macOS use one `SOCK_RAW` ICMP socket per flow: it needs
+//! `CAP_NET_RAW`/root, and a missing privilege is an explicit ICMP-only
+//! error — direct TCP/UDP stay up and there is no VPN fallback. Raw sockets
+//! also see ICMP errors quoting our requests; they are rewritten for the
+//! client (outer destination and embedded original source become client).
 //!
 //! No `IP_HDRINCL` and no `unsafe` (the crate forbids it): the kernel
 //! builds the IPv4 header, and binding to the uplink address pins the
@@ -24,7 +20,7 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
@@ -358,11 +354,7 @@ impl IcmpEngine {
         };
         let socket = match &existing {
             Some(socket) => socket.clone(),
-            None => Arc::new(icmp_socket(
-                &cfg.uplink,
-                self.shared.source,
-                flow.destination,
-            )?),
+            None => Arc::new(icmp_socket(&cfg.uplink, self.shared.source)?),
         };
         let message = echo_request_message(&echo);
         send_request(&socket, flow.destination, ttl, &message).await?;
@@ -493,18 +485,12 @@ fn uplink_source(uplink: &Uplink) -> Result<Ipv4Addr> {
     bail!("the direct uplink has no usable IPv4 source address")
 }
 
-/// One ICMP socket per flow: pinned to the uplink, bound to the uplink's
-/// address — the on-wire source. Linux needs `CAP_NET_RAW` for the raw
-/// socket; the Darwin datagram socket needs no privilege but is limited to
-/// echo and connected to the destination, so the kernel itself drops
-/// replies from any other source.
-fn icmp_socket(uplink: &Uplink, source: Ipv4Addr, destination: Ipv4Addr) -> Result<UdpSocket> {
-    #[cfg(target_os = "linux")]
+/// One raw ICMP socket per flow: pinned to the uplink and its physical
+/// source. Raw mode preserves the echo id and the IPv4 header on both
+/// supported systems; direct already requires network privileges.
+fn icmp_socket(uplink: &Uplink, source: Ipv4Addr) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
-        .context("direct icmp raw socket (SOCK_RAW needs CAP_NET_RAW)")?;
-    #[cfg(target_os = "macos")]
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
-        .context("direct icmp datagram socket (SOCK_DGRAM ICMP)")?;
+        .context("direct icmp raw socket (SOCK_RAW needs CAP_NET_RAW/root)")?;
     socket
         .set_nonblocking(true)
         .context("direct icmp nonblocking")?;
@@ -512,10 +498,6 @@ fn icmp_socket(uplink: &Uplink, source: Ipv4Addr, destination: Ipv4Addr) -> Resu
     socket
         .bind(&socket2::SockAddr::from(SocketAddrV4::new(source, 0)))
         .context("bind direct icmp socket to the uplink source address")?;
-    #[cfg(target_os = "macos")]
-    socket
-        .connect(&socket2::SockAddr::from(SocketAddrV4::new(destination, 0)))
-        .context("connect direct icmp socket (filters replies by source)")?;
     UdpSocket::from_std(socket.into()).context("register direct icmp socket")
 }
 
@@ -530,19 +512,9 @@ async fn send_request(
     message: &[u8],
 ) -> Result<()> {
     socket.set_ttl(u32::from(ttl)).context("direct icmp ttl")?;
-    let sent = {
-        #[cfg(target_os = "linux")]
-        {
-            socket
-                .send_to(message, SocketAddr::from(SocketAddrV4::new(destination, 0)))
-                .await
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = destination;
-            socket.send(message).await
-        }
-    };
+    let sent = socket
+        .send_to(message, SocketAddr::from(SocketAddrV4::new(destination, 0)))
+        .await;
     let written = sent.context("direct icmp send")?;
     ensure!(
         written == message.len(),
@@ -555,18 +527,11 @@ async fn send_request(
 /// One flow's receive loop: hands every received datagram to the matcher
 /// and ends on a socket error; idle expiry aborts it.
 async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpSocket>) {
-    // Read window: the Linux buffer covers a full reply packet — its IP
-    // total length exposes truncation — while the Darwin datagram API
-    // truncates silently, so its window is one byte past the fitting bound.
-    #[cfg(target_os = "linux")]
+    // Raw sockets include the IPv4 header, whose total length exposes
+    // truncation of a full-MTU reply.
     let mut buf = vec![0u8; shared.cfg.mtu as usize];
-    #[cfg(target_os = "macos")]
-    let mut buf = vec![0u8; shared.cfg.mtu as usize + 1];
     loop {
-        #[cfg(target_os = "linux")]
         let received = socket.recv_from(&mut buf).await.map(|(len, _)| len);
-        #[cfg(target_os = "macos")]
-        let received = socket.recv(&mut buf).await;
         let len = match received {
             Ok(len) => len,
             Err(error) => {
@@ -574,11 +539,6 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
                 break;
             }
         };
-        #[cfg(target_os = "macos")]
-        if len == buf.len() {
-            crate::debug!("direct icmp {flow:?}: reply exceeds the MTU — dropped");
-            continue;
-        }
         handle_receive(&shared, &flow, id, &buf[..len]);
     }
     shared.finish_icmp(&flow, id).await;
@@ -586,8 +546,8 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
 
 /// One received datagram: an echo reply of this flow — matched by source
 /// and id against the original tuple — is rebuilt for the TUN with the
-/// app-visible id and the reply's TTL. On Linux raw sockets an ICMP error
-/// quoting this flow's request is rewritten for the client. Everything
+/// app-visible id and the reply's TTL. An ICMP error quoting this flow's
+/// request is also rewritten for the client. Everything
 /// else — malformed or unrelated — is dropped (spec §5.4).
 fn handle_receive(shared: &Shared, flow: &FlowKey, id: u64, bytes: &[u8]) {
     if let Some((source, ttl, echo)) = parse_echo_reply_ip(bytes)
@@ -598,7 +558,6 @@ fn handle_receive(shared: &Shared, flow: &FlowKey, id: u64, bytes: &[u8]) {
         deliver(shared, flow, id, packet);
         return;
     }
-    #[cfg(target_os = "linux")]
     if let Some((error_flow, packet)) = rewrite_icmp_error(bytes, shared.cfg.client, shared.source)
         && error_flow == *flow
     {
