@@ -17,6 +17,7 @@ mod cmdline;
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod direct;
 pub mod drivers;
 pub mod exit_state;
 pub mod framing;

@@ -3149,6 +3149,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rlimit",
+ "route_manager",
  "russh",
  "sctp-proto",
  "serde",
