@@ -252,7 +252,7 @@ async fn udp_idle_expiry_closes_the_flow() {
             break event;
         }
     };
-    assert!(matches!(closed, DirectEvent::Closed { id: 8 }));
+    assert!(matches!(closed, DirectEvent::Closed { id: 8, .. }));
     assert_eq!(engine.flow_count(), 0);
     // A late datagram of the closed flow is not accepted anywhere.
     assert!(engine.forward_udp(8, &request).await.is_err());
@@ -329,7 +329,7 @@ async fn failed_udp_dial_cannot_leave_an_untracked_flow() {
     let event = tokio::time::timeout(Duration::from_secs(3), engine.recv_event())
         .await
         .expect("failed dial must close the registered flow");
-    assert!(matches!(event, DirectEvent::Closed { id: 77 }));
+    assert!(matches!(event, DirectEvent::Closed { id: 77, .. }));
     assert_eq!(engine.flow_count(), 0);
     engine.shutdown().await.unwrap();
 }
@@ -390,7 +390,7 @@ async fn tcp_relay_with_half_close() {
     let closed = tokio::time::timeout(Duration::from_secs(3), engine.recv_event())
         .await
         .unwrap();
-    assert!(matches!(closed, DirectEvent::Closed { id: 9 }));
+    assert!(matches!(closed, DirectEvent::Closed { id: 9, .. }));
     assert_eq!(engine.flow_count(), 1);
     engine.shutdown().await.unwrap();
 }

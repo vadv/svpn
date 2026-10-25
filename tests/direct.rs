@@ -353,7 +353,7 @@ async fn pending_timeout_frees_the_reservation() {
             break event;
         }
     };
-    assert!(matches!(closed, DirectEvent::Closed { id: 9 }));
+    assert!(matches!(closed, DirectEvent::Closed { id: 9, .. }));
     assert_eq!(engine.flow_count(), 0);
     let reopened = engine.open_tcp(10, &parsed, &syn).unwrap().unwrap();
     assert_ne!(nat_port_of(&first), nat_port_of(&reopened));
@@ -407,7 +407,7 @@ async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
     let closed = tokio::time::timeout(Duration::from_secs(5), engine.recv_event())
         .await
         .unwrap();
-    assert!(matches!(closed, DirectEvent::Closed { id: 7 }));
+    assert!(matches!(closed, DirectEvent::Closed { id: 7, .. }));
     server.await.unwrap();
     // Real kernel accept/connect needs wall-clock I/O; pause only after it
     // completes so FIN_DWELL itself can be advanced deterministically.
@@ -503,6 +503,62 @@ async fn stale_flow_id_is_rejected() {
     let data = build_tcp(&flow(6, 15000, 443), 0x18, 2, 1, &[], b"x", &[]);
     assert!(engine.forward_tcp(5, &data).is_err()); // stale generation
     assert!(engine.forward_tcp(4, &data).is_ok());
+}
+
+// ── uplink discovery and route ownership ──
+
+#[test]
+fn uplink_discovery_pins_the_ipv4_default_route() {
+    let mut manager = route_manager::RouteManager::new().unwrap();
+    let routes = manager.list().unwrap();
+    let is_default = |route: &route_manager::Route| {
+        route.destination() == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED) && route.prefix() == 0
+    };
+    if !routes.iter().any(|route| is_default(route)) {
+        eprintln!("skipping: this environment has no IPv4 default route");
+        return;
+    }
+    let uplink = svpn::direct::discover_uplink().unwrap();
+    // Never a longest-prefix pick: the returned interface must carry an
+    // actual default route (a 0.0.0.0/1 tunnel route does not count).
+    assert!(routes.iter().any(|route| {
+        is_default(route)
+            && route.if_index() == Some(uplink.index)
+            && route.if_name().is_some_and(|name| name == &uplink.name)
+    }));
+}
+
+#[test]
+fn peer_route_match_requires_exact_prefix_and_interface() {
+    use std::net::IpAddr;
+    let peer = Ipv4Addr::new(10, 77, 0, 1);
+    let route = route_manager::Route::new(IpAddr::V4(peer), 32).with_if_index(3);
+    assert!(svpn::direct::peer_route_matches(&route, peer, 3));
+    assert!(
+        !svpn::direct::peer_route_matches(&route, peer, 4),
+        "a route via another interface is foreign"
+    );
+    let wide = route_manager::Route::new(IpAddr::V4(peer), 24).with_if_index(3);
+    assert!(
+        !svpn::direct::peer_route_matches(&wide, peer, 3),
+        "only the /32 return route counts"
+    );
+    let other =
+        route_manager::Route::new(IpAddr::V4(Ipv4Addr::new(10, 77, 0, 9)), 32).with_if_index(3);
+    assert!(
+        !svpn::direct::peer_route_matches(&other, peer, 3),
+        "a different destination is not the peer route"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let off_table = route_manager::Route::new(IpAddr::V4(peer), 32)
+            .with_if_index(3)
+            .with_table(200);
+        assert!(
+            !svpn::direct::peer_route_matches(&off_table, peer, 3),
+            "a non-main-table route is not the return route"
+        );
+    }
 }
 
 // ── shutdown ──

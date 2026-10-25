@@ -66,7 +66,7 @@ pub use cli::{Cli, Mode};
 pub use cmdline::{parse_byte_size, parse_port_range, serve_command, shell_quote};
 pub(crate) use mimic::DEFAULT_PORT_RANGE;
 pub use mimic::{MimicArg, MimicPlan, plan_mimic};
-pub use tun::{is_busy_tun, validate_tun_name};
+pub use tun::{if_index_of, is_busy_tun, validate_tun_name};
 
 /// Binary entry point: parses CLI, sets up logging and the runtime.
 pub fn main_entry() -> ExitCode {
@@ -194,10 +194,28 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 .map(|path| path.with_extension("state.json"))
         });
     let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
+    // Direct (spec §5.1): with a home country, the physical uplink of the
+    // IPv4 default route is captured now — before the hub runs and before
+    // any user hook can change the routing view. A missing uplink fails
+    // startup: direct has no unbound fallback and must never silently
+    // degrade to the VPN path.
+    let uplink = match args.home_country {
+        Some(_) => {
+            let uplink = crate::direct::discover_uplink()?;
+            crate::info!(
+                "direct uplink: {} (interface index {})",
+                uplink.name,
+                uplink.index
+            );
+            Some(uplink)
+        }
+        None => None,
+    };
     Ok(hub::GeoExits {
         geo: asn,
         country,
         home_country: args.home_country.as_deref().and_then(geo::pack_country),
+        uplink,
         exit_state: state,
     })
 }

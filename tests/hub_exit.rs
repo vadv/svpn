@@ -108,6 +108,9 @@ fn selector_hub(
         geo,
         country,
         home_country: None,
+        uplink: None,
+        direct: None,
+        icmp: None,
         nodes: servers
             .iter()
             .enumerate()

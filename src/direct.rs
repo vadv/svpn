@@ -79,13 +79,24 @@ pub struct Uplink {
 
 /// Discovers the interface of the IPv4 default route — the physical uplink
 /// the direct engine must pin its sockets to. Call it before `hooks.start`
-/// replaces the routing view.
+/// replaces the routing view. `find_route(0.0.0.0)` is a longest-prefix
+/// match and would happily pick a tunnel's `0.0.0.0/1`, so the default
+/// route itself is selected — the kernel's preference is the lowest
+/// metric, ties keep the first listed.
 pub fn discover_uplink() -> Result<Uplink> {
     let mut manager = route_manager::RouteManager::new().context("route manager")?;
     let route = manager
-        .find_route(&IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .list()
         .context("list routes")?
-        .context("no IPv4 default route — cannot capture the physical uplink")?;
+        .iter()
+        .filter(|route| {
+            route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                && route.prefix() == 0
+                && table_is_main(route)
+        })
+        .min_by_key(|route| route_metric(route).unwrap_or(u32::MAX))
+        .context("no IPv4 default route — cannot capture the physical uplink")?
+        .clone();
     let uplink = match (route.if_name().cloned(), route.if_index()) {
         (Some(name), Some(index @ 1..)) => Uplink { name, index },
         _ => bail!("IPv4 default route has no usable interface identity"),
@@ -115,16 +126,25 @@ pub enum DirectEvent {
     /// Outbound packet to write into the TUN, e.g. a rebuilt UDP reply.
     Packet { id: u64, bytes: Vec<u8> },
     /// Flow finished (relay done, dial failed, idle or pending timeout).
-    /// The Hub reconciles its owner table from this event.
-    Closed { id: u64 },
+    /// `key` names the original tuple so the Hub reconciles exactly this
+    /// owner; a late close of a replaced generation must not affect it.
+    Closed { id: u64, key: FlowKey },
 }
 
 #[derive(Debug)]
 enum TcpStage {
     /// Reservation for a rewritten SYN, waiting for the local accept.
     Pending { deadline: Instant },
-    /// Accepted locally: dialing or relaying. The abort handle is attached
-    /// right after the task spawn; the idle sweep uses it.
+    /// Accepted locally, the outbound connect still unresolved: keeps its
+    /// slot in the MAX_PENDING budget until the connect resolves (spec
+    /// §5.5 counts accepts and connects).
+    Connecting {
+        abort: Option<AbortHandle>,
+        deadline: Instant,
+    },
+    /// Accepted and connected; relays bytes in both directions. The abort
+    /// handle is attached right after the task spawn; the idle sweep uses
+    /// it.
     Relay { abort: Option<AbortHandle> },
     /// Copy finished; both forward and reverse mappings live on so kernel
     /// FIN/ACK/retransmissions keep flowing to the application.
@@ -171,15 +191,21 @@ struct Shared {
 
 impl Shared {
     /// Relay teardown: keep the mapping for FIN_DWELL, then report once.
-    /// Only the task that performs the Relay→Dwell transition reports, so a
-    /// flow never emits two closes.
+    /// Only the task that performs the Connecting/Relay→Dwell transition
+    /// reports, so a flow never emits two closes. The Dwell mark happens
+    /// under the lock before the send, so an aborted task can never be
+    /// waiting to send a close it already cannot report — and a task that
+    /// IS sending cannot be aborted by the sweep (it only aborts Relay).
     async fn finish_tcp(&self, flow: FlowKey, id: u64) {
         let mut closed = false;
         {
             let mut state = self.state.lock().unwrap();
             if let Some(entry) = state.tcp.get_mut(&flow)
                 && entry.id == id
-                && matches!(entry.stage, TcpStage::Relay { .. })
+                && matches!(
+                    entry.stage,
+                    TcpStage::Connecting { .. } | TcpStage::Relay { .. }
+                )
             {
                 entry.stage = TcpStage::Dwell {
                     until: Instant::now() + FIN_DWELL,
@@ -188,28 +214,48 @@ impl Shared {
             }
         }
         if closed {
-            let _ = self.events.send(DirectEvent::Closed { id }).await;
+            let _ = self
+                .events
+                .send(DirectEvent::Closed { id, key: flow })
+                .await;
         }
     }
 
-    /// UDP teardown: drop the mapping, abort the flow task, report once.
+    /// UDP teardown: drop the mapping — but only when it is still the
+    /// closing generation, checked under the same lock — then report once.
+    /// The report is awaited to completion before anything abortable runs:
+    /// cancelling a task that still owes the reliable close must be
+    /// impossible (the receive task self-terminates on its socket error,
+    /// so no abort is needed here at all).
     async fn finish_udp(&self, flow: FlowKey, id: u64) {
-        let removed = {
+        let abort = {
             let mut state = self.state.lock().unwrap();
-            match state.udp.remove(&flow) {
-                Some(entry) if entry.id == id => {
-                    if let Some(abort) = entry.abort {
-                        abort.abort();
-                    }
-                    true
-                }
-                _ => false,
+            match state.udp.get(&flow) {
+                // A stale close must leave a replacement mapping untouched.
+                Some(entry) if entry.id == id => state.udp.remove(&flow).unwrap().abort,
+                _ => return,
             }
         };
-        if removed {
-            let _ = self.events.send(DirectEvent::Closed { id }).await;
+        let _ = self
+            .events
+            .send(DirectEvent::Closed { id, key: flow })
+            .await;
+        if let Some(abort) = abort {
+            abort.abort();
         }
     }
+}
+
+/// How the `peer/32` return route came to exist (spec §5.2). Only the
+/// engine-installed variant is ever deleted: a preexisting route — created
+/// by the TUN bring-up or an operator hook, or installed concurrently while
+/// our own add raced to EEXIST — is foreign property for the whole run.
+#[derive(Debug)]
+enum RouteBinding {
+    /// Present before the engine ensured it: never removed by us.
+    Preinstalled,
+    /// Installed and verified by this engine: removed on shutdown.
+    Owned(route_manager::Route),
 }
 
 /// Standalone direct TCP+UDP engine. The Hub owns it, feeds client packets
@@ -220,9 +266,8 @@ pub struct DirectEngine {
     expiry: tokio::task::JoinHandle<()>,
     packets_rx: mpsc::Receiver<DirectEvent>,
     events_rx: mpsc::Receiver<DirectEvent>,
-    /// The peer/32 return route when this engine installed it; shutdown
-    /// deletes exactly this one and never a foreign route.
-    route: Option<route_manager::Route>,
+    /// Ownership state of the `peer/32` return route.
+    route: Option<RouteBinding>,
 }
 
 impl DirectEngine {
@@ -234,7 +279,13 @@ impl DirectEngine {
         validate(&config)?;
         let listener = TcpListener::bind(SocketAddr::from(SocketAddrV4::new(config.client, 0)))
             .await
-            .context("direct TCP listener bind (client tunnel address)")?;
+            .with_context(|| {
+                format!(
+                    "direct TCP listener bind on the TUN client address {} \
+                     (AddrNotAvailable: the negotiated client address is not on the TUN)",
+                    config.client
+                )
+            })?;
         let listener_port = listener
             .local_addr()
             .context("direct TCP listener address")?
@@ -310,7 +361,12 @@ impl DirectEngine {
         let pending = state
             .tcp
             .values()
-            .filter(|entry| matches!(entry.stage, TcpStage::Pending { .. }))
+            .filter(|entry| {
+                matches!(
+                    entry.stage,
+                    TcpStage::Pending { .. } | TcpStage::Connecting { .. }
+                )
+            })
             .count();
         ensure!(pending < MAX_PENDING, "direct pending capacity exhausted");
         let nat_port = state
@@ -445,9 +501,10 @@ impl DirectEngine {
             && entry.id == id
         {
             entry.abort = Some(handle);
-        } else {
-            handle.abort();
         }
+        // Gone or replaced: the task is either exiting after reporting its
+        // own close or has no mapping to serve — aborting it could cancel an
+        // in-flight close report, so it runs out on its own socket error.
         Ok(())
     }
 
@@ -503,8 +560,11 @@ impl DirectEngine {
 
     /// Installs the one `peer/32 → TUN` return route unless the TUN or a
     /// hook already provides it (then it is not ours and never deleted).
-    /// Linux: unicast route in the main table (254). Verifies the exact
-    /// route after installation.
+    /// Linux: unicast route in the main table (254). Ownership is recorded
+    /// the moment our add succeeds — a failed verification rolls the route
+    /// back instead of orphaning it, and a failed rollback keeps the
+    /// binding so shutdown retries. An EEXIST race converts to preinstalled
+    /// (the route is not ours) but never overwrites a foreign route.
     pub fn ensure_peer_route(&mut self) -> Result<()> {
         if self.route.is_some() {
             return Ok(());
@@ -512,24 +572,63 @@ impl DirectEngine {
         let cfg = &self.shared.cfg;
         let mut manager = route_manager::RouteManager::new().context("route manager")?;
         if route_present(&mut manager, cfg.peer, cfg.tun_index)? {
+            self.route = Some(RouteBinding::Preinstalled);
             return Ok(());
         }
         let desired = peer_route(cfg.peer, cfg.tun_index);
-        manager.add(&desired).with_context(|| {
-            format!(
-                "add direct return route peer {}/32 via {}",
-                cfg.peer, cfg.tun_name
-            )
-        })?;
-        if !route_present(&mut manager, cfg.peer, cfg.tun_index)? {
-            bail!(
-                "direct return route peer {}/32 via {} did not install",
-                cfg.peer,
-                cfg.tun_name
-            );
+        match manager.add(&desired) {
+            Ok(()) => {
+                // Ownership first: a failing verification must not orphan
+                // the route this engine just installed.
+                self.route = Some(RouteBinding::Owned(desired.clone()));
+                let verified = route_present(&mut manager, cfg.peer, cfg.tun_index);
+                if let Ok(true) = verified {
+                    return Ok(());
+                }
+                // Roll our own route back, then fail startup.
+                let rollback = remove_route(&mut manager, &desired);
+                if let Err(error) = &rollback {
+                    // Deleting failed: keep the binding — shutdown retries
+                    // the removal instead of leaking the route.
+                    crate::warn!("direct return route rollback failed — {error:#}");
+                } else {
+                    self.route = None;
+                }
+                match verified {
+                    Err(error) => return Err(error.context("verify direct return route")),
+                    // Ok(false): a successful add the listing never shows.
+                    Ok(_) => bail!(
+                        "direct return route peer {}/32 via {} did not install",
+                        cfg.peer,
+                        cfg.tun_name
+                    ),
+                }
+            }
+            // Someone else (TUN bring-up, operator hook) installed the exact
+            // route between our check and add: theirs, never deleted. A
+            // foreign peer/32 via another interface is a startup error — it
+            // would break the direct return path, and we never delete it.
+            Err(error) if error.raw_os_error() == Some(17) => {
+                if route_present(&mut manager, cfg.peer, cfg.tun_index)? {
+                    self.route = Some(RouteBinding::Preinstalled);
+                    return Ok(());
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "foreign route blocks the direct return route peer {}/32 via {}",
+                        cfg.peer, cfg.tun_name
+                    )
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "add direct return route peer {}/32 via {}",
+                        cfg.peer, cfg.tun_name
+                    )
+                });
+            }
         }
-        self.route = Some(desired);
-        Ok(())
     }
 
     /// Bounded teardown: the listener, all flow tasks and the expiry timer
@@ -553,13 +652,23 @@ impl DirectEngine {
             crate::warn!("direct engine: tasks did not stop within 1 s");
         }
         drop(tasks);
-        if let Some(route) = self.route.take() {
+        if let Some(RouteBinding::Owned(route)) = self.route.take() {
             let mut manager = route_manager::RouteManager::new().context("route manager")?;
-            manager
-                .delete(&route)
-                .context("delete owned direct return route")?;
+            remove_route(&mut manager, &route).context("delete owned direct return route")?;
         }
         Ok(())
+    }
+}
+
+impl TcpFlow {
+    /// The outbound connect resolved: the flow leaves the pending budget
+    /// and becomes a relaying connection.
+    fn connected(&mut self) {
+        if let TcpStage::Connecting { abort, .. } = &self.stage {
+            self.stage = TcpStage::Relay {
+                abort: abort.clone(),
+            };
+        }
     }
 }
 
@@ -619,9 +728,14 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
                 {
                     return None;
                 }
-                // Mark Relay before spawning: a refused outbound connection
-                // can finish before the task handle is registered below.
-                entry.stage = TcpStage::Relay { abort: None };
+                // Mark Connecting before spawning: a refused outbound
+                // connection can finish before the task handle is registered
+                // below. The stage keeps the pending budget until the
+                // outbound connect resolves.
+                entry.stage = TcpStage::Connecting {
+                    abort: None,
+                    deadline: Instant::now() + PENDING_TIMEOUT,
+                };
                 entry.last_seen = Instant::now();
                 Some((entry.id, entry.flow))
             })
@@ -640,11 +754,17 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
         let mut state = shared.state.lock().unwrap();
         match state.tcp.get_mut(&flow) {
             Some(entry) if entry.id == id => match &mut entry.stage {
-                TcpStage::Relay { abort } => *abort = Some(handle),
-                // The relay already finished and emitted its close.
-                TcpStage::Dwell { .. } => handle.abort(),
+                TcpStage::Connecting { abort, .. } | TcpStage::Relay { abort } => {
+                    *abort = Some(handle)
+                }
+                // The relay already finished: its close report may still be
+                // in flight — aborting here could cancel it, so the task
+                // runs out on its own.
+                TcpStage::Dwell { .. } => {}
+                // A replaced reservation has nothing to serve.
                 TcpStage::Pending { .. } => handle.abort(),
             },
+            // Gone: the sweeper removed it and reported the close itself.
             _ => handle.abort(),
         }
     }
@@ -662,6 +782,17 @@ async fn relay(shared: Arc<Shared>, id: u64, flow: FlowKey, mut accepted: TcpStr
             return shared.finish_tcp(flow, id).await;
         }
     };
+    // The connect resolved: the flow leaves the pending budget and
+    // refreshes its relay idle clock.
+    {
+        let mut state = shared.state.lock().unwrap();
+        if let Some(entry) = state.tcp.get_mut(&flow)
+            && entry.id == id
+        {
+            entry.connected();
+            entry.last_seen = Instant::now();
+        }
+    }
     if let Err(error) = copy_bidirectional(&mut accepted, &mut outbound).await {
         crate::debug!("direct tcp {flow:?}: relay — {error}");
     }
@@ -713,8 +844,9 @@ async fn udp_flow(
         };
         {
             let mut state = shared.state.lock().unwrap();
-            if let Some(entry) = state.udp.get_mut(&flow) {
-                entry.last_seen = Instant::now();
+            match state.udp.get_mut(&flow) {
+                Some(entry) if entry.id == id => entry.last_seen = Instant::now(),
+                _ => return,
             }
         }
         if len > max_payload {
@@ -727,29 +859,48 @@ async fn udp_flow(
     shared.finish_udp(flow, id).await;
 }
 
-/// Timer-driven expiry: pending reservations, dwell ends, idle relays and
-/// idle UDP flows; retired ports age out. Works without incoming traffic.
+/// Timer-driven expiry: pending reservations and unresolved connects,
+/// dwell ends, idle relays and idle UDP flows; retired ports age out. Works
+/// without incoming traffic. Completed flow tasks are reaped every cycle:
+/// an unreaped JoinSet grows with total historical flows, not the live
+/// table.
 async fn expiry_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(EXPIRY_TICK);
     loop {
         tick.tick().await;
+        {
+            let mut tasks = shared.tasks.lock().await;
+            while tasks.try_join_next().is_some() {}
+        }
         let closed = {
             let mut state = shared.state.lock().unwrap();
             sweep(&mut state, Instant::now())
         };
-        for id in closed {
-            let _ = shared.events.send(DirectEvent::Closed { id }).await;
+        for (key, id) in closed {
+            let _ = shared.events.send(DirectEvent::Closed { id, key }).await;
         }
     }
 }
 
-fn sweep(state: &mut DirectState, now: Instant) -> Vec<u64> {
+fn sweep(state: &mut DirectState, now: Instant) -> Vec<(FlowKey, u64)> {
     let mut closed = Vec::new();
     let mut retired = std::mem::take(&mut state.retired);
-    state.tcp.retain(|_, entry| match entry.stage {
-        TcpStage::Pending { deadline } if deadline <= now => {
+    state.tcp.retain(|key, entry| match entry.stage {
+        // A reservation or an accepted-but-unresolved connect that never
+        // resolved: both hold a pending budget slot (spec §5.5). The
+        // connect's own budget resolves it earlier in every healthy path.
+        TcpStage::Pending { deadline } | TcpStage::Connecting { deadline, .. }
+            if deadline <= now =>
+        {
+            if let TcpStage::Connecting {
+                abort: Some(handle),
+                ..
+            } = &entry.stage
+            {
+                handle.abort();
+            }
             retired.push_back((entry.nat_port, now + PORT_RETIRE));
-            closed.push(entry.id);
+            closed.push((*key, entry.id));
             false
         }
         TcpStage::Dwell { until } if until <= now => {
@@ -767,17 +918,17 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<u64> {
             entry.stage = TcpStage::Dwell {
                 until: now + FIN_DWELL,
             };
-            closed.push(entry.id);
+            closed.push((*key, entry.id));
             true
         }
         _ => true,
     });
-    state.udp.retain(|_, entry| {
+    state.udp.retain(|key, entry| {
         if entry.last_seen + UDP_IDLE <= now {
             if let Some(abort) = &entry.abort {
                 abort.abort();
             }
-            closed.push(entry.id);
+            closed.push((*key, entry.id));
             false
         } else {
             true
@@ -1007,12 +1158,45 @@ fn route_present(
     tun_index: u32,
 ) -> Result<bool> {
     let routes = manager.list().context("list routes")?;
-    Ok(routes.iter().any(|route| {
-        route.destination() == IpAddr::V4(peer)
-            && route.prefix() == 32
-            && route.if_index() == Some(tun_index)
-            && table_is_main(route)
-    }))
+    Ok(routes
+        .iter()
+        .any(|route| peer_route_matches(route, peer, tun_index)))
+}
+
+/// The kernel's preference between equal default routes: the lower
+/// metric wins. Absent (macOS/BSD) every listed default is equivalent.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn route_metric(route: &route_manager::Route) -> Option<u32> {
+    route.metric()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn route_metric(_route: &route_manager::Route) -> Option<u32> {
+    None
+}
+
+/// Whether `route` is exactly the `peer/32` return route via this TUN
+/// interface (main table on Linux). The ownership notion of spec §5.2.
+pub fn peer_route_matches(route: &route_manager::Route, peer: Ipv4Addr, tun_index: u32) -> bool {
+    route.destination() == IpAddr::V4(peer)
+        && route.prefix() == 32
+        && route.if_index() == Some(tun_index)
+        && table_is_main(route)
+}
+
+/// Deletes a route this engine owns. A route that already vanished — the
+/// TUN interface was removed first, taking its routes with it — is
+/// success, not an error.
+fn remove_route(
+    manager: &mut route_manager::RouteManager,
+    route: &route_manager::Route,
+) -> Result<()> {
+    match manager.delete(route) {
+        Ok(()) => Ok(()),
+        // ENOENT: already gone with the interface.
+        Err(error) if error.raw_os_error() == Some(2) => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
 }
 
 #[cfg(target_os = "linux")]

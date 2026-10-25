@@ -53,6 +53,15 @@ pub fn is_busy_tun(error: &anyhow::Error) -> bool {
         .is_some_and(|io| io.raw_os_error() == Some(16))
 }
 
+/// Interface index of a TUN by name — the route identity the direct
+/// engine needs for its return route.
+pub fn if_index_of(name: &str) -> Result<u32> {
+    let index = nix::net::if_::if_nametoindex(name)
+        .with_context(|| format!("TUN {name} interface index"))?;
+    ensure!(index != 0, "TUN {name} has no interface index");
+    Ok(index)
+}
+
 /// Pids (besides us) holding /dev/net/tun, for the final EBUSY report.
 pub fn stale_tun_holders() -> String {
     let me = std::process::id();

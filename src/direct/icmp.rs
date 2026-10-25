@@ -68,7 +68,10 @@ pub fn parse_echo_request(bytes: &[u8]) -> Option<Echo> {
 /// reply's, never guessed. Linux delivers the real packet, so its total
 /// length must fit the read; Darwin synthesizes the header with a
 /// byte-swapped length field, so only the datagram boundary is trusted.
-pub fn parse_echo_reply_ip(bytes: &[u8]) -> Option<(Ipv4Addr, u8, Echo)> {
+/// `mtu` is the read window bound: a reply longer than the TUN can carry —
+/// including one the kernel truncated to the window, whose all-zero tail
+/// can leave the ICMP checksum valid — is rejected whole (spec §5.4).
+pub fn parse_echo_reply_ip(bytes: &[u8], mtu: usize) -> Option<(Ipv4Addr, u8, Echo)> {
     let (header, total) = ipv4_header(bytes)?;
     if bytes[9] != 1 {
         return None;
@@ -78,6 +81,9 @@ pub fn parse_echo_reply_ip(bytes: &[u8]) -> Option<(Ipv4Addr, u8, Echo)> {
         return None;
     }
     let end = total.min(bytes.len());
+    if end > mtu {
+        return None;
+    }
     let echo = echo_message(&bytes[header..end], 0)?;
     let source = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
     Some((source, bytes[8], echo))
@@ -238,23 +244,26 @@ struct Shared {
 }
 
 impl Shared {
-    /// Flow teardown: drop the mapping, abort the receive task, report once
-    /// through the reliable channel.
+    /// Flow teardown: drop the mapping — but only when it is still the
+    /// closing generation, checked under the same lock — then report once.
+    /// The report is awaited to completion before anything abortable runs:
+    /// cancelling a task that still owes the reliable close must be
+    /// impossible (the receive task self-terminates on its socket error).
     async fn finish_icmp(&self, flow: &FlowKey, id: u64) {
-        let removed = {
+        let abort = {
             let mut state = self.state.lock().unwrap();
-            match state.flows.remove(flow) {
-                Some(entry) if entry.id == id => {
-                    if let Some(abort) = entry.abort {
-                        abort.abort();
-                    }
-                    true
-                }
-                _ => false,
+            match state.flows.get(flow) {
+                // A stale close must leave a replacement mapping untouched.
+                Some(entry) if entry.id == id => state.flows.remove(flow).unwrap().abort,
+                _ => return,
             }
         };
-        if removed {
-            let _ = self.events.send(DirectEvent::Closed { id }).await;
+        let _ = self
+            .events
+            .send(DirectEvent::Closed { id, key: *flow })
+            .await;
+        if let Some(abort) = abort {
+            abort.abort();
         }
     }
 }
@@ -377,10 +386,14 @@ impl IcmpEngine {
                 socket,
             ));
             let mut state = self.shared.state.lock().unwrap();
-            match state.flows.get_mut(&flow) {
-                Some(entry) if entry.id == id => entry.abort = Some(handle),
-                _ => handle.abort(),
+            if let Some(entry) = state.flows.get_mut(&flow)
+                && entry.id == id
+            {
+                entry.abort = Some(handle);
             }
+            // Gone or replaced: the task is either exiting after reporting
+            // its own close or has no mapping to serve — aborting it could
+            // cancel an in-flight close report, so it runs out on its own.
         }
         Ok(())
     }
@@ -528,8 +541,10 @@ async fn send_request(
 /// and ends on a socket error; idle expiry aborts it.
 async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpSocket>) {
     // Raw sockets include the IPv4 header, whose total length exposes
-    // truncation of a full-MTU reply.
-    let mut buf = vec![0u8; shared.cfg.mtu as usize];
+    // truncation of a full-MTU reply. The window is one byte past the MTU:
+    // anything longer — including a datagram the kernel truncated to fill
+    // it — is rejected whole rather than forwarded looking valid.
+    let mut buf = vec![0u8; shared.cfg.mtu as usize + 1];
     loop {
         let received = socket.recv_from(&mut buf).await.map(|(len, _)| len);
         let len = match received {
@@ -539,6 +554,10 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
                 break;
             }
         };
+        if len > shared.cfg.mtu as usize {
+            crate::debug!("direct icmp {flow:?}: reply of {len} B exceeds the TUN MTU — dropped");
+            continue;
+        }
         handle_receive(&shared, &flow, id, &buf[..len]);
     }
     shared.finish_icmp(&flow, id).await;
@@ -550,7 +569,7 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
 /// request is also rewritten for the client. Everything
 /// else — malformed or unrelated — is dropped (spec §5.4).
 fn handle_receive(shared: &Shared, flow: &FlowKey, id: u64, bytes: &[u8]) {
-    if let Some((source, ttl, echo)) = parse_echo_reply_ip(bytes)
+    if let Some((source, ttl, echo)) = parse_echo_reply_ip(bytes, shared.cfg.mtu as usize)
         && source == flow.destination
         && echo.id == flow.source_port
     {
@@ -569,10 +588,9 @@ fn handle_receive(shared: &Shared, flow: &FlowKey, id: u64, bytes: &[u8]) {
 /// closed or replaced flow is dropped instead.
 fn deliver(shared: &Shared, flow: &FlowKey, id: u64, bytes: Vec<u8>) {
     let mut state = shared.state.lock().unwrap();
-    if let Some(entry) = state.flows.get_mut(flow) {
-        entry.last_seen = Instant::now();
-    } else {
-        return;
+    match state.flows.get_mut(flow) {
+        Some(entry) if entry.id == id => entry.last_seen = Instant::now(),
+        _ => return,
     }
     drop(state);
     let _ = shared.packets.try_send(DirectEvent::Packet { id, bytes });
@@ -580,21 +598,27 @@ fn deliver(shared: &Shared, flow: &FlowKey, id: u64, bytes: Vec<u8>) {
 
 /// Timer-driven expiry: an idle flow (no request, reply or error for
 /// `UDP_IDLE`, the spec §5.5 ICMP budget) dies without new traffic and its
-/// close is reported through the reliable channel.
+/// close is reported through the reliable channel. Completed flow tasks
+/// are reaped every cycle: an unreaped JoinSet grows with total historical
+/// flows, not the live table.
 async fn icmp_expiry_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(EXPIRY_TICK);
     loop {
         tick.tick().await;
+        {
+            let mut tasks = shared.tasks.lock().await;
+            while tasks.try_join_next().is_some() {}
+        }
         let closed = {
             let mut state = shared.state.lock().unwrap();
             let now = Instant::now();
             let mut closed = Vec::new();
-            state.flows.retain(|_, entry| {
+            state.flows.retain(|key, entry| {
                 if entry.last_seen + UDP_IDLE <= now {
                     if let Some(abort) = &entry.abort {
                         abort.abort();
                     }
-                    closed.push(entry.id);
+                    closed.push((*key, entry.id));
                     false
                 } else {
                     true
@@ -602,8 +626,8 @@ async fn icmp_expiry_loop(shared: Arc<Shared>) {
             });
             closed
         };
-        for id in closed {
-            let _ = shared.events.send(DirectEvent::Closed { id }).await;
+        for (key, id) in closed {
+            let _ = shared.events.send(DirectEvent::Closed { id, key }).await;
         }
     }
 }

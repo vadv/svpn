@@ -276,34 +276,69 @@ fn parse_echo_reply_rejects_malformed() {
         payload: b"probe".to_vec(),
     };
     let reply = echo_reply_packet(PEER, client(), 64, &echo);
-    let (_, ttl, parsed) = parse_echo_reply_ip(&reply).unwrap();
+    let (_, ttl, parsed) = parse_echo_reply_ip(&reply, 1400).unwrap();
     assert_eq!(ttl, 64);
     assert_eq!(parsed, echo);
 
     assert!(
-        parse_echo_reply_ip(&ip_packet(&icmp_message(8, 0x4321, 7, b"probe"))).is_none(),
+        parse_echo_reply_ip(&ip_packet(&icmp_message(8, 0x4321, 7, b"probe")), 1400).is_none(),
         "a request is not a reply"
     );
     let mut bad = ip_packet(&icmp_message(0, 0x4321, 7, b"probe"));
     corrupt_icmp_checksum(&mut bad);
-    assert!(parse_echo_reply_ip(&bad).is_none(), "bad checksum");
+    assert!(parse_echo_reply_ip(&bad, 1400).is_none(), "bad checksum");
     assert!(
-        parse_echo_reply_ip(&ip_packet(&[0, 0, 0])).is_none(),
+        parse_echo_reply_ip(&ip_packet(&[0, 0, 0]), 1400).is_none(),
         "short message"
     );
 
     let mut truncated = reply.clone();
     truncated.truncate(reply.len() - 1);
     assert!(
-        parse_echo_reply_ip(&truncated).is_none(),
+        parse_echo_reply_ip(&truncated, 1400).is_none(),
         "a truncated raw read never parses"
     );
     let mut version = reply.clone();
     version[0] = 0x60;
-    assert!(parse_echo_reply_ip(&version).is_none(), "not IPv4");
+    assert!(parse_echo_reply_ip(&version, 1400).is_none(), "not IPv4");
     let mut protocol = reply.clone();
     protocol[9] = 17;
-    assert!(parse_echo_reply_ip(&protocol).is_none(), "not protocol 1");
+    assert!(
+        parse_echo_reply_ip(&protocol, 1400).is_none(),
+        "not protocol 1"
+    );
+}
+
+#[test]
+fn oversized_replies_are_rejected_by_the_mtu_bound() {
+    // A 1401-byte reply with an all-zero payload: dropping its final zero
+    // byte leaves the ICMP checksum valid, so checksum verification can
+    // never prove completeness (review P1). The bound is size, not the
+    // checksum: the engine reads through an MTU+1 window, so the kernel
+    // never truncates a larger datagram down to the MTU — it arrives one
+    // byte over and is rejected whole; the parser enforces the same bound.
+    let echo = Echo {
+        id: 0x4321,
+        seq: 7,
+        payload: vec![0u8; 1401 - 28],
+    };
+    let reply = echo_reply_packet(PEER, client(), 64, &echo);
+    assert_eq!(reply.len(), 1401);
+    assert!(checksums_ok(&reply), "the fixture must be a valid reply");
+    assert!(
+        parse_echo_reply_ip(&reply, 1400).is_none(),
+        "a reply longer than the TUN MTU never parses"
+    );
+    let mut truncated = reply.clone();
+    truncated.truncate(1400);
+    assert!(
+        checksums_ok(&truncated),
+        "the checksum still verifies — only the size bound exposes it"
+    );
+    assert!(
+        parse_echo_reply_ip(&reply, 1401).is_some(),
+        "the full reply fits a window one byte larger"
+    );
 }
 
 #[test]
@@ -320,7 +355,7 @@ fn echo_reply_packet_restores_the_original_tuple() {
         &echo,
     );
     assert_eq!(bytes.len(), 38);
-    let (source, ttl, parsed) = parse_echo_reply_ip(&bytes).unwrap();
+    let (source, ttl, parsed) = parse_echo_reply_ip(&bytes, 1400).unwrap();
     assert_eq!(source, Ipv4Addr::new(9, 9, 9, 9));
     assert_eq!(ttl, 57, "the reply's own TTL is preserved");
     assert_eq!(parsed, echo);
@@ -450,7 +485,7 @@ async fn echo_roundtrip_preserves_id_seq_payload_and_ttl() {
         panic!("expected a packet event, got {event:?}");
     };
     assert_eq!(id, 5, "replies carry the flow id");
-    let (from, ttl, echo) = parse_echo_reply_ip(&bytes).unwrap();
+    let (from, ttl, echo) = parse_echo_reply_ip(&bytes, 1400).unwrap();
     assert_eq!(from, PEER);
     assert_eq!(ttl, 64);
     assert_eq!(
@@ -472,7 +507,7 @@ async fn echo_roundtrip_preserves_id_seq_payload_and_ttl() {
     let DirectEvent::Packet { bytes, .. } = event else {
         panic!("expected a packet event, got {event:?}");
     };
-    let (_, _, echo) = parse_echo_reply_ip(&bytes).unwrap();
+    let (_, _, echo) = parse_echo_reply_ip(&bytes, 1400).unwrap();
     assert_eq!(echo.seq, 8);
     engine.shutdown().await.unwrap();
 }
@@ -500,7 +535,7 @@ async fn two_flows_same_destination_demux_by_id() {
         let DirectEvent::Packet { id, bytes } = event else {
             panic!("expected a packet event, got {event:?}");
         };
-        let (_, _, echo) = parse_echo_reply_ip(&bytes).unwrap();
+        let (_, _, echo) = parse_echo_reply_ip(&bytes, 1400).unwrap();
         seen.insert(id, echo.id);
     }
     assert_eq!(
@@ -539,7 +574,7 @@ async fn icmp_idle_expiry_closes_the_flow_and_rejects_late_traffic() {
             closed => break closed,
         }
     };
-    assert!(matches!(closed, DirectEvent::Closed { id: 9 }));
+    assert!(matches!(closed, DirectEvent::Closed { id: 9, .. }));
     assert_eq!(engine.flow_count(), 0);
     assert!(
         engine.forward_icmp(9, &request).await.is_err(),
