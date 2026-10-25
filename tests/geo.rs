@@ -235,6 +235,11 @@ fn country_codes_pack_roundtrip_and_key_domains_stay_disjoint() {
     assert!(ip_key(Ipv4Addr::new(255, 255, 255, 255)) < country_key(0));
     assert!(country_key(0xFFFF) < scoped_asn_key(0, 0));
     assert_ne!(asn_key(0x5553), country_key(0x5553));
+    assert_ne!(
+        scoped_asn_key(pack_country("CH").unwrap(), 64500),
+        scoped_asn_key(pack_country("CL").unwrap(), 64500),
+        "country bits must not be overwritten by the scoped domain tag"
+    );
 }
 
 // ── lookup ──

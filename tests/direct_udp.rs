@@ -386,12 +386,17 @@ async fn tcp_relay_with_half_close() {
     });
     client.await.unwrap();
 
-    // Copy completion keeps the mapping in dwell and reports the close once.
-    let closed = tokio::time::timeout(Duration::from_secs(3), engine.recv_event())
-        .await
-        .unwrap();
-    assert!(matches!(closed, DirectEvent::Closed { id: 9, .. }));
+    // Copy completion keeps the mapping in dwell; terminal close is emitted
+    // only by the expiry sweep after FIN_DWELL.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !engine.tcp_in_dwell(flow) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(engine.flow_count(), 1);
+    assert!(engine.poll_event().is_none());
     engine.shutdown().await.unwrap();
 }
 

@@ -244,25 +244,31 @@ struct Shared {
 }
 
 impl Shared {
-    /// Flow teardown: drop the mapping — but only when it is still the
-    /// closing generation, checked under the same lock — then report once.
-    /// The report is awaited to completion before anything abortable runs:
-    /// cancelling a task that still owes the reliable close must be
-    /// impossible (the receive task self-terminates on its socket error).
+    fn remove_icmp(&self, flow: &FlowKey, id: u64) -> Option<IcmpFlow> {
+        let mut state = self.state.lock().unwrap();
+        match state.flows.get(flow) {
+            Some(entry) if entry.id == id => state.flows.remove(flow),
+            _ => None,
+        }
+    }
+
     async fn finish_icmp(&self, flow: &FlowKey, id: u64) {
-        let abort = {
-            let mut state = self.state.lock().unwrap();
-            match state.flows.get(flow) {
-                // A stale close must leave a replacement mapping untouched.
-                Some(entry) if entry.id == id => state.flows.remove(flow).unwrap().abort,
-                _ => return,
-            }
+        let Some(entry) = self.remove_icmp(flow, id) else {
+            return;
         };
         let _ = self
             .events
             .send(DirectEvent::Closed { id, key: *flow })
             .await;
-        if let Some(abort) = abort {
+        if let Some(abort) = entry.abort {
+            abort.abort();
+        }
+    }
+
+    fn forget_icmp(&self, flow: &FlowKey, id: u64) {
+        if let Some(entry) = self.remove_icmp(flow, id)
+            && let Some(abort) = entry.abort
+        {
             abort.abort();
         }
     }
@@ -420,7 +426,9 @@ impl IcmpEngine {
         };
         let message = echo_request_message(&echo);
         if let Err(error) = send_request(&socket, parsed.flow.destination, ttl, &message).await {
-            self.shared.finish_icmp(&parsed.flow, id).await;
+            // The Hub reconciles its own dispatch failure synchronously;
+            // awaiting the reliable queue here can deadlock the Hub.
+            self.shared.forget_icmp(&parsed.flow, id);
             return Err(error).context("direct icmp send");
         }
         Ok(())

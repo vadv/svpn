@@ -119,6 +119,7 @@ fn selector_hub(
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
         sticky: StickyStats::default(),
+        direct_stats: Default::default(),
         grace_until: None,
         tasks: JoinSet::new(),
         events,
@@ -301,6 +302,7 @@ fn sticky_counters_track_lookup_and_failover() {
     );
     pick_link(&mut hub, key);
     assert_eq!(hub.sticky.lookup_hit, 1, "a served owner is a hit");
+    assert_eq!((hub.sticky.asn_miss, hub.sticky.asn_hit), (1, 1));
 
     hub.pool.failed(primary, Instant::now(), "test").unwrap();
     pick_link(&mut hub, key);
@@ -539,6 +541,7 @@ fn assigned_country_scopes_the_asn_group() {
         svpn::geo::rendezvous(svpn::geo::asn_key(100), &hub.nodes)[0],
         "a country-miss destination keeps the global AS100 group"
     );
+    assert_eq!((hub.sticky.country_miss, hub.sticky.asn_miss), (1, 1));
 }
 
 #[test]

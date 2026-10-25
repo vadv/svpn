@@ -122,6 +122,7 @@ async fn direct_hub(direct: Option<DirectEngine>) -> (Hub, mpsc::Receiver<svpn::
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
         sticky: StickyStats::default(),
+        direct_stats: Default::default(),
         grace_until: None,
         tasks: JoinSet::new(),
         events,
@@ -314,8 +315,8 @@ async fn direct_close_tombstones_only_the_current_generation() {
 #[tokio::test]
 async fn stale_direct_packet_is_dropped_before_tun_write() {
     let (mut hub, _remote) = direct_hub(None).await;
-    let datagram = udp_datagram(40031, AWAY_DST, 53);
-    let key = packet::parse(&datagram, true).unwrap().flow;
+    let datagram = udp_reply(AWAY_DST, 53, 40031);
+    let key = packet::parse(&datagram, false).unwrap().flow;
     hub.routes.by_key.insert(key, Target::Direct(9));
     // No TUN is available in this unit test. A stale generation must be
     // discarded before the missing-TUN error path is reached.
@@ -329,6 +330,41 @@ async fn stale_direct_packet_is_dropped_before_tun_write() {
     .await
     .unwrap();
     assert_eq!(hub.routes.by_key[&key], Target::Direct(9));
+}
+
+#[tokio::test]
+async fn current_direct_reply_reaches_the_tun_write_path() {
+    let (mut hub, _remote) = direct_hub(None).await;
+    let reply = udp_reply(AWAY_DST, 53, 40032);
+    let key = packet::parse(&reply, false).unwrap().flow;
+    hub.routes.by_key.insert(key, Target::Direct(9));
+    let error = hub
+        .handle_direct_event(
+            DirectEvent::Packet {
+                id: 9,
+                bytes: reply,
+            },
+            &mut None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("direct packet without client TUN")
+    );
+}
+
+#[tokio::test]
+async fn direct_dispatch_error_reconciles_without_a_close_event() {
+    let (mut hub, _remote) = direct_hub(None).await;
+    let datagram = udp_datagram(40033, AWAY_DST, 53);
+    let key = packet::parse(&datagram, true).unwrap().flow;
+    hub.routes.by_key.insert(key, Target::Direct(12));
+    assert_eq!(hub.dispatch(&datagram, client()).await.unwrap(), None);
+    assert!(!hub.routes.by_key.contains_key(&key));
+    assert!(hub.tombstones.entries.is_empty());
+    assert_eq!((hub.direct_stats.failed, hub.direct_stats.closed), (1, 1));
 }
 
 #[tokio::test]
@@ -356,6 +392,26 @@ async fn udp_close_forgets_without_a_tombstone() {
         Target::Remote(Owner { .. })
     ));
     assert_eq!(remote.try_recv().unwrap().bytes, datagram);
+}
+
+fn udp_reply(source: Ipv4Addr, source_port: u16, client_port: u16) -> Vec<u8> {
+    let mut bytes = udp_datagram(client_port, source, source_port);
+    bytes[12..16].copy_from_slice(&source.octets());
+    bytes[16..20].copy_from_slice(&client().octets());
+    bytes[20..22].copy_from_slice(&source_port.to_be_bytes());
+    bytes[22..24].copy_from_slice(&client_port.to_be_bytes());
+    let flow = FlowKey {
+        protocol: 17,
+        source,
+        destination: client(),
+        source_port,
+        destination_port: client_port,
+    };
+    let checksum = transport_checksum(&flow, 17, &bytes[20..]);
+    bytes[26..28].copy_from_slice(&checksum.to_be_bytes());
+    let header = internet_checksum(&bytes[..20]);
+    bytes[10..12].copy_from_slice(&header.to_be_bytes());
+    bytes
 }
 
 fn udp_datagram(source_port: u16, destination: Ipv4Addr, destination_port: u16) -> Vec<u8> {

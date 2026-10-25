@@ -118,7 +118,7 @@ SVPN не создаёт country routes. До `hooks.start` автоматиче
 
 IP/TCP checksums пересчитываются. NAT rewrite сохраняет seq/ack, flags и options. SVPN автоматически обеспечивает один `peer/32 → этот TUN` route, если TUN/hook его ещё не создали; удаляется только owned route. Ручная country route configuration отсутствует.
 
-Завершение socket copy не делает NAT mapping свободным: local kernel ещё может отправлять FIN/ACK/retransmission. Mapping переживает teardown и bounded `FIN_DWELL` (4 минуты); retired ports ограничены и expire. Повторное использование original tuple до retirement отклоняется. Поздний close старого поколения не удаляет новый owner.
+Завершение socket copy не делает NAT mapping свободным: local kernel ещё может отправлять FIN/ACK/retransmission. Mapping и Hub owner переживают teardown и bounded `FIN_DWELL` (4 минуты); terminal `Closed` отправляется только при удалении mapping по expiry. Retired ports ограничены и expire. Повторное использование original tuple до retirement отклоняется. Поздний close старого поколения не удаляет новый owner.
 
 ### 5.3 UDP
 
@@ -133,8 +133,8 @@ Direct ICMP echo использует raw host ICMP socket на Linux и macOS �
 - IPv4 только; существующий запрет fragmented IPv4 остаётся и явно покрывается тестами.
 - Hub dispatch: reverse-NAT listener traffic → существующий current owner → retired flow → только затем classification нового flow. Reverse SYN-ACK никогда не проходит обычный unowned admission.
 - Единый owner table — `Route::Remote(Owner)` / `Route::Direct(id)`. Epoch retirement затрагивает только Remote. Любой remote write, включая dying-link drained RST, проверяет текущего owner. Direct переживает failure unrelated link.
-- Tombstone создаётся для direct close только если `(FlowKey,id)` всё ещё current; late close старого поколения не блокирует replacement.
-- Лимиты: 4096 direct flows, 64 pending accepts/connects, очереди по 1024 packet/event; packet queue занимает не более `1024 * MTU`. Close/reconciliation идёт отдельным reliable channel, не теряется при полной packet queue.
+- Tombstone создаётся для direct close только если `(FlowKey,id)` всё ещё current и mapping действительно retired; late close старого поколения не блокирует replacement. Ответы direct engine проверяются в server→client направлении по `(FlowKey,id)`.
+- Лимиты: совокупно 4096 direct TCP/UDP/ICMP mappings, 64 pending accepts/connects; очереди по 1024 packet/event на engine, packet queue занимает не более `1024 * MTU` на engine. Close/reconciliation идёт отдельным reliable channel, не теряется при полной packet queue. Hub-originated send error reconciles synchronously и не ждёт очередь, которую сам Hub дренирует.
 - UDP/ICMP idle — 60 секунд; TCP idle — 2 часа 4 минуты; FIN dwell — 4 минуты. Периодический expiry работает без входящего трафика. Односторонне активный TCP не считается idle.
 - Pending/open/connect исчерпание capacity не мешает существующим flows. Unanswered SYN освобождает reservation по timeout.
 - Bounded shutdown закрывает listener, sockets и flow tasks, join/abort завершается до удаления TUN; owned return route удаляется и на ошибочном выходе.
@@ -143,7 +143,7 @@ Direct ICMP echo использует raw host ICMP socket на Linux и macOS �
 
 ## 6. Наблюдаемость
 
-Stats раздельно показывают Country/ASN lookup hit/miss, failover moves и direct flows/errors. Логи содержат коды стран и network errors, но не payload, ключи или содержимое DB-строк целиком.
+Stats раздельно показывают Country/ASN lookup hit/miss, failover moves и direct opened/failed/closed. Direct traffic не входит в remote-link accounting. Логи содержат коды стран и network errors, но не payload, ключи или содержимое DB-строк целиком.
 
 ## 7. Приёмка
 

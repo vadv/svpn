@@ -125,8 +125,8 @@ pub fn main_entry() -> ExitCode {
 }
 
 /// Startup loading of the geo exit inputs (spec §2-4): the ASN database
-/// (sticky-asn affinity), the country database (Country constraint and,
-/// later, direct) and the one shared owner state file.
+/// (sticky-asn affinity), the country database (Country constraint and
+/// direct-home) and the one shared owner state file.
 fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
     // Runtime twin of the parse-time validation (spec §2): home-country or
     // per-server countries without a country database cannot start.

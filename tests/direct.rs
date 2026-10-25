@@ -404,11 +404,20 @@ async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
         .unwrap();
     drop(kernel_side);
 
-    let closed = tokio::time::timeout(Duration::from_secs(5), engine.recv_event())
-        .await
-        .unwrap();
-    assert!(matches!(closed, DirectEvent::Closed { id: 7, .. }));
     server.await.unwrap();
+    // Relay completion enters dwell but must not emit the terminal close
+    // until the NAT mapping actually retires.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !engine.tcp_in_dwell(flow) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        engine.poll_event().is_none(),
+        "close is deferred until dwell ends"
+    );
     // Real kernel accept/connect needs wall-clock I/O; pause only after it
     // completes so FIN_DWELL itself can be advanced deterministically.
     tokio::time::pause();
@@ -449,6 +458,10 @@ async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
         }
     };
     assert_ne!(nat_port_of(&reopened), nat_port);
+    let closed = tokio::time::timeout(Duration::from_secs(5), engine.recv_event())
+        .await
+        .unwrap();
+    assert!(matches!(closed, DirectEvent::Closed { id: 7, .. }));
 }
 
 // ── guards and capacity ──
@@ -514,7 +527,7 @@ fn uplink_discovery_pins_the_ipv4_default_route() {
     let is_default = |route: &route_manager::Route| {
         route.destination() == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED) && route.prefix() == 0
     };
-    if !routes.iter().any(|route| is_default(route)) {
+    if !routes.iter().any(&is_default) {
         eprintln!("skipping: this environment has no IPv4 default route");
         return;
     }

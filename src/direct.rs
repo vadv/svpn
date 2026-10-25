@@ -190,30 +190,20 @@ struct Shared {
 }
 
 impl Shared {
-    /// Relay teardown: keep the mapping for FIN_DWELL, then report once.
-    /// Only the task that performs the Connecting/Relay→Dwell transition
-    /// reports, so a flow never emits two closes. The Dwell mark happens
-    /// under the lock before the send, so an aborted task can never be
-    /// waiting to send a close it already cannot report — and a task that
-    /// IS sending cannot be aborted by the sweep (it only aborts Relay).
-    async fn finish_tcp(&self, flow: FlowKey, id: u64) {
-        let mut closed = false;
-        {
+    /// A failed outbound connect has no useful NAT mapping to retain:
+    /// remove it and notify the Hub promptly. Relay completion uses dwell.
+    async fn fail_tcp(&self, flow: FlowKey, id: u64) {
+        let removed = {
             let mut state = self.state.lock().unwrap();
-            if let Some(entry) = state.tcp.get_mut(&flow)
-                && entry.id == id
-                && matches!(
-                    entry.stage,
-                    TcpStage::Connecting { .. } | TcpStage::Relay { .. }
-                )
-            {
-                entry.stage = TcpStage::Dwell {
-                    until: Instant::now() + FIN_DWELL,
-                };
-                closed = true;
+            let matches = state.tcp.get(&flow).is_some_and(|entry| {
+                entry.id == id && matches!(entry.stage, TcpStage::Connecting { .. })
+            });
+            if matches {
+                state.tcp.remove(&flow);
             }
-        }
-        if closed {
+            matches
+        };
+        if removed {
             let _ = self
                 .events
                 .send(DirectEvent::Closed { id, key: flow })
@@ -221,26 +211,53 @@ impl Shared {
         }
     }
 
-    /// UDP teardown: drop the mapping — but only when it is still the
-    /// closing generation, checked under the same lock — then report once.
-    /// The report is awaited to completion before anything abortable runs:
-    /// cancelling a task that still owes the reliable close must be
-    /// impossible (the receive task self-terminates on its socket error,
-    /// so no abort is needed here at all).
+    /// Relay teardown enters FIN_DWELL without retiring the Hub owner.
+    /// The expiry sweep emits the one terminal Closed event when both NAT
+    /// mappings are actually removed; delayed ACK/FIN segments can therefore
+    /// still use forward_tcp during the dwell.
+    async fn finish_tcp(&self, flow: FlowKey, id: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.tcp.get_mut(&flow)
+            && entry.id == id
+            && matches!(
+                entry.stage,
+                TcpStage::Connecting { .. } | TcpStage::Relay { .. }
+            )
+        {
+            entry.stage = TcpStage::Dwell {
+                until: Instant::now() + FIN_DWELL,
+            };
+        }
+    }
+
+    fn remove_udp(&self, flow: FlowKey, id: u64) -> Option<UdpFlow> {
+        let mut state = self.state.lock().unwrap();
+        match state.udp.get(&flow) {
+            Some(entry) if entry.id == id => state.udp.remove(&flow),
+            _ => None,
+        }
+    }
+
+    /// Background UDP teardown reports through the reliable channel. The
+    /// Hub-originated send-error path uses forget_udp instead: awaiting this
+    /// channel from Hub dispatch could deadlock while the Hub is the drain.
     async fn finish_udp(&self, flow: FlowKey, id: u64) {
-        let abort = {
-            let mut state = self.state.lock().unwrap();
-            match state.udp.get(&flow) {
-                // A stale close must leave a replacement mapping untouched.
-                Some(entry) if entry.id == id => state.udp.remove(&flow).unwrap().abort,
-                _ => return,
-            }
+        let Some(entry) = self.remove_udp(flow, id) else {
+            return;
         };
         let _ = self
             .events
             .send(DirectEvent::Closed { id, key: flow })
             .await;
-        if let Some(abort) = abort {
+        if let Some(abort) = entry.abort {
+            abort.abort();
+        }
+    }
+
+    fn forget_udp(&self, flow: FlowKey, id: u64) {
+        if let Some(entry) = self.remove_udp(flow, id)
+            && let Some(abort) = entry.abort
+        {
             abort.abort();
         }
     }
@@ -321,6 +338,16 @@ impl DirectEngine {
     pub fn flow_count(&self) -> usize {
         let state = self.shared.state.lock().unwrap();
         state.tcp.len() + state.udp.len()
+    }
+
+    /// Whether a TCP mapping is retaining its NAT state after socket relay
+    /// completion. The Hub must keep its owner until this becomes false.
+    pub fn tcp_in_dwell(&self, flow: FlowKey) -> bool {
+        let state = self.shared.state.lock().unwrap();
+        matches!(
+            state.tcp.get(&flow).map(|entry| &entry.stage),
+            Some(TcpStage::Dwell { .. })
+        )
     }
 
     /// First packet (SYN) of a new direct TCP flow: installs the reservation
@@ -531,8 +558,9 @@ impl DirectEngine {
         if let Some(socket) = socket
             && let Err(error) = socket.send(payload).await
         {
-            // A network error closes only this flow (spec §5.3).
-            self.shared.finish_udp(parsed.flow, id).await;
+            // Hub dispatch reconciles the close synchronously; never await
+            // the reliable queue while the Hub itself is its drain.
+            self.shared.forget_udp(parsed.flow, id);
             return Err(error).context("direct udp send");
         }
         Ok(())
@@ -777,7 +805,7 @@ async fn relay(shared: Arc<Shared>, id: u64, flow: FlowKey, mut accepted: TcpStr
         Ok(stream) => stream,
         Err(error) => {
             crate::debug!("direct tcp {flow:?}: connect {destination} — {error:#}");
-            return shared.finish_tcp(flow, id).await;
+            return shared.fail_tcp(flow, id).await;
         }
     };
     // The connect resolved: the flow leaves the pending budget and
@@ -903,7 +931,7 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<(FlowKey, u64)> {
         }
         TcpStage::Dwell { until } if until <= now => {
             retired.push_back((entry.nat_port, now + PORT_RETIRE));
-            // The close was already reported when the relay finished.
+            closed.push((*key, entry.id));
             false
         }
         TcpStage::Relay { .. } if entry.last_seen + TCP_IDLE <= now => {
@@ -916,7 +944,6 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<(FlowKey, u64)> {
             entry.stage = TcpStage::Dwell {
                 until: now + FIN_DWELL,
             };
-            closed.push((*key, entry.id));
             true
         }
         _ => true,

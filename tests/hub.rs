@@ -75,6 +75,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
         sticky: StickyStats::default(),
+        direct_stats: Default::default(),
         grace_until: None,
         tasks: JoinSet::new(),
         events,

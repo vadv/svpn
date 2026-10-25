@@ -159,10 +159,11 @@ pub fn country_key(packed: u32) -> u64 {
     (1 << 33) | u64::from(packed)
 }
 
-/// Rendezvous key for sticky-ASN scoped to a country — `(country, asn)` — in
-/// a domain above the bare country keys.
+/// Rendezvous key for sticky-ASN scoped to a country — `(country, asn)`.
+/// The tag is above the complete 16-bit country field (bits 32..47), so
+/// countries such as CH/CL cannot alias through the domain bit.
 pub fn scoped_asn_key(packed: u32, asn: u32) -> u64 {
-    (1 << 34) | (u64::from(packed) << 32) | u64::from(asn)
+    (1 << 48) | (u64::from(packed) << 32) | u64::from(asn)
 }
 
 /// Weighted rendezvous order: node indices, most preferred first.

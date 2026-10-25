@@ -50,6 +50,7 @@ test_recovery_without_alternative_closes_within_budget
 """.split()
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
+test_country_asn_scope test_direct_home_and_vpn
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -108,7 +109,7 @@ def integration_groups():
         "tcp-auto": 10,
         "reselect": 4,
         "recovery": 3,
-        "sticky-asn": 4,
+        "sticky-asn": 6,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]

@@ -59,6 +59,33 @@ pub struct StickyStats {
     pub lookup_hit: u64,
     pub lookup_miss: u64,
     pub failover_moves: u64,
+    pub country_hit: u64,
+    pub country_miss: u64,
+    pub asn_hit: u64,
+    pub asn_miss: u64,
+}
+
+impl StickyStats {
+    fn lookup(&mut self, country: bool, hit: bool) {
+        if hit {
+            self.lookup_hit += 1;
+        } else {
+            self.lookup_miss += 1;
+        }
+        match (country, hit) {
+            (true, true) => self.country_hit += 1,
+            (true, false) => self.country_miss += 1,
+            (false, true) => self.asn_hit += 1,
+            (false, false) => self.asn_miss += 1,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct DirectStats {
+    pub opened: u64,
+    pub failed: u64,
+    pub closed: u64,
 }
 
 /// A destination country with assigned servers: the candidates constraint
@@ -113,6 +140,7 @@ pub struct Hub {
     pub exit_state: Option<crate::exit_state::ExitState>,
     /// Sticky exit counters, surfaced in the periodic stats report.
     pub sticky: StickyStats,
+    pub direct_stats: DirectStats,
     /// Restored owners keep their groups while connecting until this instant.
     pub grace_until: Option<StdInstant>,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
@@ -256,6 +284,13 @@ impl Hub {
         bytes: &[u8],
     ) -> Result<Option<Dispatched>> {
         let key = parsed.flow;
+        let direct_flows = self.direct.as_ref().map_or(0, DirectEngine::flow_count)
+            + self.icmp.as_ref().map_or(0, IcmpEngine::flow_count);
+        if direct_flows >= crate::direct::MAX_FLOWS {
+            self.direct_stats.failed += 1;
+            crate::warn!("vpn: dropped packet — direct flow capacity exhausted");
+            return Ok(None);
+        }
         let id = self.routes.allocate()?;
         let (accepted, rewritten) = match key.protocol {
             6 => match &mut self.direct {
@@ -305,14 +340,17 @@ impl Hub {
             },
         };
         if accepted {
+            self.direct_stats.opened += 1;
             self.routes.by_key.insert(key, Target::Direct(id));
+        } else {
+            self.direct_stats.failed += 1;
         }
         Ok(rewritten.map(Dispatched::Direct))
     }
 
     /// An established direct flow: later packets go to the engine. A
-    /// network error closes only this flow — the engine reports the close
-    /// itself through the reliable channel (spec §5.3, §5.4).
+    /// network error closes only this flow and is reconciled here, without
+    /// waiting for the reliable event queue that this Hub itself drains.
     async fn forward_direct(
         &mut self,
         id: u64,
@@ -320,29 +358,35 @@ impl Hub {
         bytes: &[u8],
     ) -> Result<Option<Dispatched>> {
         let result: Result<Option<Vec<u8>>> = match key.protocol {
-            6 => self
-                .direct
-                .as_mut()
-                .context("direct engine missing for an established TCP flow")?
-                .forward_tcp(id, bytes),
-            17 => self
-                .direct
-                .as_mut()
-                .context("direct engine missing for an established UDP flow")?
-                .forward_udp(id, bytes)
-                .await
-                .map(|()| None),
-            _ => self
-                .icmp
-                .as_mut()
-                .context("direct icmp engine missing for an established ICMP flow")?
-                .forward_icmp(id, bytes)
-                .await
-                .map(|()| None),
+            6 => match self.direct.as_mut() {
+                Some(engine) => engine.forward_tcp(id, bytes),
+                None => Err(anyhow::anyhow!(
+                    "direct engine missing for an established TCP flow"
+                )),
+            },
+            17 => match self.direct.as_mut() {
+                Some(engine) => engine.forward_udp(id, bytes).await.map(|()| None),
+                None => Err(anyhow::anyhow!(
+                    "direct engine missing for an established UDP flow"
+                )),
+            },
+            _ => match self.icmp.as_mut() {
+                Some(engine) => engine.forward_icmp(id, bytes).await.map(|()| None),
+                None => Err(anyhow::anyhow!(
+                    "direct icmp engine missing for an established ICMP flow"
+                )),
+            },
         };
         match result {
             Ok(rewritten) => Ok(rewritten.map(Dispatched::Direct)),
             Err(error) => {
+                self.direct_stats.failed += 1;
+                if self.routes.forget_direct(key, id) {
+                    self.direct_stats.closed += 1;
+                    if key.protocol == 6 {
+                        self.tombstones.insert(key, StdInstant::now());
+                    }
+                }
                 crate::error!("vpn: dropped packet — direct flow {key:?}: {error:#}");
                 Ok(None)
             }
@@ -361,7 +405,7 @@ impl Hub {
             DirectEvent::Packet { id, bytes } => {
                 // A queued reply from an old generation must not be written
                 // into a replacement flow (or after its close).
-                let current = packet::parse(&bytes, true).is_some_and(|packet| {
+                let current = packet::parse(&bytes, false).is_some_and(|packet| {
                     matches!(self.routes.by_key.get(&packet.flow), Some(Target::Direct(current)) if *current == id)
                 });
                 if !current {
@@ -387,8 +431,11 @@ impl Hub {
             DirectEvent::Closed { id, key } => {
                 // Only TCP tuples get a CLOSED-endpoint reply; UDP and ICMP
                 // flows just vanish (same as a retired remote epoch).
-                if self.routes.forget_direct(key, id) && key.protocol == 6 {
-                    self.tombstones.insert(key, StdInstant::now());
+                if self.routes.forget_direct(key, id) {
+                    self.direct_stats.closed += 1;
+                    if key.protocol == 6 {
+                        self.tombstones.insert(key, StdInstant::now());
+                    }
                 }
             }
         }
@@ -431,6 +478,19 @@ impl Hub {
             report.push_str(&format!(
                 "\nsticky: lookup hit {} / miss {} | failover moves {}",
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
+            ));
+            report.push_str(&format!(
+                "\ncountry: lookup hit {} / miss {} | asn: lookup hit {} / miss {}",
+                self.sticky.country_hit,
+                self.sticky.country_miss,
+                self.sticky.asn_hit,
+                self.sticky.asn_miss
+            ));
+        }
+        if self.home_country.is_some() {
+            report.push_str(&format!(
+                "\ndirect: opened {} / failed {} / closed {}",
+                self.direct_stats.opened, self.direct_stats.failed, self.direct_stats.closed
             ));
         }
         for line in per_link {
@@ -608,7 +668,7 @@ impl Hub {
                 Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
                 None => crate::geo::country_key(route.packed),
             };
-            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key());
+            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key(), true);
         }
         let Some(geo) = &self.geo else {
             return self.pool.pick();
@@ -616,13 +676,13 @@ impl Hub {
         let Some(asn) = geo.lookup(key.destination) else {
             // Uncovered /32: deterministic stateless rendezvous, never
             // recorded in exit_owners or persisted (spec: no /32 overrides).
-            self.sticky.lookup_miss += 1;
+            self.sticky.lookup(false, false);
             return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
                 .into_iter()
                 .find_map(|link| self.pool.ready_epoch(link));
         };
         let group = crate::geo::asn_key(asn);
-        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn))
+        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
     }
 
     /// The destination's country when servers are assigned to it (spec
@@ -662,17 +722,18 @@ impl Hub {
         group: u64,
         candidates: Option<&[usize]>,
         key: crate::exit_state::ExitKey,
+        country: bool,
     ) -> Option<Epoch> {
         let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
         if let Some(&owner) = self.exit_owners.get(&group) {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
-                self.sticky.lookup_hit += 1;
+                self.sticky.lookup(country, true);
                 return Some(epoch);
             }
             // Checking owner keeps its group: serve new flows from a reserve
             // without migrating (spec: no migration on Checking).
             if self.pool.link_checking(owner) {
-                self.sticky.lookup_hit += 1;
+                self.sticky.lookup(country, true);
                 return crate::geo::rendezvous(group, &self.nodes)
                     .into_iter()
                     .filter(|&link| link != owner && serves(link))
@@ -688,7 +749,7 @@ impl Hub {
                 return None;
             }
         }
-        self.sticky.lookup_miss += 1;
+        self.sticky.lookup(country, false);
         let previous = self.exit_owners.get(&group).copied();
         let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
             .into_iter()
@@ -954,6 +1015,7 @@ impl Hub {
             if let Some(epoch) = rst_of
                 && queued_epoch == epoch
                 && let Event::Packet(packet) = &queued
+                && self.routes.accepts(epoch, packet)
                 && packet::parse(&packet.bytes, false).is_some_and(|p| p.is_rst)
                 && let Some(tun) = tun.as_ref()
             {
@@ -1105,6 +1167,7 @@ pub async fn run(
         exit_owners,
         exit_state,
         sticky: StickyStats::default(),
+        direct_stats: DirectStats::default(),
         grace_until,
         links: servers
             .into_iter()

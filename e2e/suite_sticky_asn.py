@@ -4,6 +4,7 @@ import ipaddress
 import json
 import pathlib
 import re
+import socket
 
 from _lib import (
     CLIENT_POOL,
@@ -20,7 +21,9 @@ from _lib import (
 
 HOSTS = (SERVER, SERVER2)
 CSV = pathlib.Path("/tmp/e2e-asn.csv")
+COUNTRY_CSV = pathlib.Path("/tmp/e2e-country.csv")
 STATE = pathlib.Path("/var/lib/svpn/exit-state.json")
+TARGET = "172.30.77.4"
 # One /17 block per row: 131072 synthetic rows pass Geo::load's 100k-row floor and give
 # every subnet a distinct ASN, so rendezvous picks differ across destination groups.
 HOST_BITS = 15
@@ -28,6 +31,7 @@ ROWS = 1 << (32 - HOST_BITS)
 FILLER_ASN = 2_000_000
 
 _geo_asn = None
+_country_ready = False
 
 
 def _dotted(value):
@@ -46,6 +50,50 @@ def write_geo():
                 asn = _geo_asn if row == peer_row else FILLER_ASN + row
                 out.write(f'"{_dotted(start)}","{_dotted(start | mask)}",{asn},"synthetic"\n')
     return _geo_asn
+
+
+def write_country():
+    global _country_ready
+    if _country_ready:
+        return
+    target_row = int(ipaddress.IPv4Address(TARGET)) >> HOST_BITS
+    mask = (1 << HOST_BITS) - 1
+    with COUNTRY_CSV.open("w") as out:
+        for row in range(ROWS):
+            start = row << HOST_BITS
+            country = "RU" if row == target_row else "DE"
+            out.write(f'"{_dotted(start)}","{_dotted(start | mask)}",{country}\n')
+    _country_ready = True
+
+
+def country_args(home=False):
+    write_geo()
+    write_country()
+    args = [
+        "svpn",
+        "multi",
+        "--server",
+        f"{SERVER},user=root,identity=/keys/client,countries=RU",
+        "--server",
+        f"{SERVER2},user=root,identity=/keys/client,countries=DE",
+        "--peer-tun-name",
+        "svpn0",
+        "--tun-name",
+        "svpn0",
+        "--exit-policy",
+        "sticky-asn",
+        "--geo-db",
+        str(CSV),
+        "--country-db",
+        str(COUNTRY_CSV),
+        "--exit-state",
+        str(STATE),
+        "--stats-interval",
+        "1",
+    ]
+    if home:
+        args += ["--home-country", "RU"]
+    return args
 
 
 def sticky_args():
@@ -226,9 +274,70 @@ def test_restart_restore():
     print("PASS sticky restart: persisted exit state restores the failed-over owner, no snap-back")
 
 
+def direct_opened(path):
+    found = re.findall(r"direct: opened (\d+) / failed (\d+) / closed (\d+)", path.read_text())
+    return tuple(int(value) for value in found[-1]) if found else None
+
+
+def target_tcp_echo(index, timeout=15):
+    payload = bytes([index]) * 65536
+    with socket.create_connection((TARGET, 9000), timeout=timeout) as stream:
+        stream.settimeout(timeout)
+        reader = stream.makefile("rb")
+        source = reader.readline().strip().decode()
+        stream.sendall(payload)
+        stream.shutdown(socket.SHUT_WR)
+        received = reader.read()
+    assert ipaddress.ip_address(source)
+    assert received == payload, "target TCP echo or half-close failed"
+    return source
+
+
+def udp_echo(peer, payload=b"direct-udp"):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(15)
+        sock.sendto(payload, (peer, 9000))
+        data, _ = sock.recvfrom(65535)
+    assert data == payload
+
+
+def test_country_asn_scope():
+    fresh_state()
+    with session("country-asn", args=country_args(), server_hosts=HOSTS, ready_timeout=20) as (
+        process,
+        path,
+    ):
+        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        baseline = opened(path)
+        assert target_tcp_echo(0) == SERVER
+        tcp_echo(1, peer=PEER)
+        until(lambda: delta(path, baseline) == {SERVER: 1, SERVER2: 1}, seconds=20)
+    cleanup_verified(process, server_hosts=HOSTS)
+    print("PASS country+ASN: RU target and DE tunnel peer stay on their scoped servers")
+
+
+def test_direct_home_and_vpn():
+    fresh_state()
+    with session("direct-home", args=country_args(home=True), server_hosts=HOSTS, ready_timeout=20) as (
+        process,
+        path,
+    ):
+        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        baseline = opened(path)
+        assert target_tcp_echo(2) == "172.30.77.3"
+        udp_echo(TARGET)
+        tcp_echo(3, peer=PEER)
+        until(lambda: direct_opened(path) == (2, 0, 0), seconds=20)
+        until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
+    cleanup_verified(process, server_hosts=HOSTS)
+    print("PASS direct+VPN: home TCP/UDP bypass servers while DE traffic uses scoped VPN")
+
+
 TESTS = [
     ("test_sticky_dst", test_sticky_dst),
     ("test_balance_diff", test_balance_diff),
     ("test_failover_move", test_failover_move),
     ("test_restart_restore", test_restart_restore),
+    ("test_country_asn_scope", test_country_asn_scope),
+    ("test_direct_home_and_vpn", test_direct_home_and_vpn),
 ]
