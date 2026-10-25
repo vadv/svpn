@@ -126,7 +126,7 @@ IP/TCP checksums пересчитываются. NAT rewrite сохраняет 
 
 ### 5.4 ICMP
 
-Direct ICMP echo использует host ICMP socket и сохраняет echo id/sequence/payload для приложения; platform-side identifier translation допускается. Linux raw socket требует `CAP_NET_RAW` (одного `CAP_NET_ADMIN` для TUN недостаточно). Отсутствие privilege даёт явный unsupported/error только для ICMP без VPN fallback; TCP/UDP direct не отключаются. Android `VpnService.protect()` не выдаёт raw-socket privilege и не является runtime acceptance в этом PR. Ответы проверяются по original flow; malformed, unrelated и late replies отбрасываются. Синтетический локальный echo reply запрещён.
+Direct ICMP echo использует host ICMP socket и сохраняет echo id/sequence/payload для приложения; platform-side identifier translation допускается. Linux raw socket требует `CAP_NET_RAW` (одного `CAP_NET_ADMIN` для TUN недостаточно). Отсутствие privilege даёт явный unsupported/error только для ICMP без VPN fallback; TCP/UDP direct не отключаются. Android `VpnService.protect()` не выдаёт raw-socket privilege и не является runtime acceptance в этом PR. Ответы проверяются по original flow; malformed, unrelated и late replies отбрасываются. Запрос уходит с IPv4-адреса физического uplink (source NAT): TUN-адрес клиента в физической сети не маршрутизируется обратно; ответ восстанавливает tuple `destination → client` с TTL и id ответа. Linux raw-сокет доставляет и ICMP-ошибки (unreachable/time exceeded/parameter problem), цитирующие наш echo-запрос: внешний destination и вложенный original source переписываются в client с пересчётом всех затронутых checksums; Darwin dgram-сокет ошибки не доставляет. Синтетический локальный echo reply запрещён.
 
 ### 5.5 Ограничения, dispatch и очереди
 

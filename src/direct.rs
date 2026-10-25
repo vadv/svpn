@@ -1,4 +1,5 @@
-//! Direct System Stack engine (spec §5.2-5.3): home-country TCP/UDP flows
+//! Direct System Stack engine (spec §5.2-5.3; the ICMP sibling of spec
+//! §5.4 lives in the `icmp` submodule): home-country TCP/UDP flows
 //! leave through the host stack on the physical uplink instead of the VPN.
 //!
 //! TCP turns the client kernel into the local endpoint: the original tuple
@@ -35,6 +36,8 @@ use tokio::{
 use crate::packet::{self, FlowKey, Packet, internet_checksum};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
+
+pub mod icmp;
 
 /// Whole direct table across every stage (spec §5.5).
 pub const MAX_FLOWS: usize = 4096;
