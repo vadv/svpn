@@ -365,11 +365,12 @@ def test_direct_home_and_vpn():
         source = target_tcp_echo(2)
         assert source == "172.30.77.3", source
         udp_echo(TARGET)
+        command(["ping", "-n", "-c", "1", "-W", "2", TARGET])
         tcp_echo(3, peer=PEER)
-        until(lambda: direct_opened(path) == (2, 0, 0), seconds=20)
+        until(lambda: direct_opened(path) == (3, 0, 0), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
     cleanup_verified(process, server_hosts=HOSTS)
-    print("PASS direct+VPN: home TCP/UDP bypass servers while DE traffic uses scoped VPN")
+    print("PASS direct+VPN: home TCP/UDP/ICMP bypass servers while DE traffic uses scoped VPN")
 
 
 TESTS = [

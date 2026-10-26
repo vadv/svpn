@@ -155,16 +155,16 @@ fn icmp_message(kind: u8, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
     icmp
 }
 
-/// Destination-unreachable error from `outer_source` quoting the first 28
-/// bytes (IP header + 8) of `quoted_request`, with valid checksums.
-fn icmp_unreachable(
+/// Build an ICMP error quoting the request's IPv4 header and first 8 bytes.
+fn icmp_error(
+    kind: u8,
     outer_source: Ipv4Addr,
     outer_destination: Ipv4Addr,
     quoted_request: &[u8],
 ) -> Vec<u8> {
     let quote = &quoted_request[..28];
     let mut icmp = vec![0u8; 8 + quote.len()];
-    icmp[0] = 3;
+    icmp[0] = kind;
     icmp[1] = 1;
     icmp[8..].copy_from_slice(quote);
     let checksum = internet_checksum(&icmp);
@@ -330,7 +330,7 @@ fn darwin_raw_headers_normalize_before_echo_and_error_parsing() {
     let client = Ipv4Addr::new(10, 77, 0, 2);
     let destination = Ipv4Addr::new(9, 9, 9, 9);
     let request = request_packet(physical, destination, 77, 3, b"quote", 54);
-    let mut error = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &request);
+    let mut error = icmp_error(3, Ipv4Addr::new(192, 0, 2, 9), physical, &request);
     let total = u16::from_be_bytes([error[2], error[3]]);
     let offset = u16::from_be_bytes([error[6], error[7]]);
     error[2..4].copy_from_slice(&total.to_ne_bytes());
@@ -404,7 +404,7 @@ fn rewrite_icmp_error_restores_client_addresses() {
     let client = Ipv4Addr::new(10, 77, 0, 2);
     let destination = Ipv4Addr::new(9, 9, 9, 9);
     let request = request_packet(physical, destination, 77, 3, b"quote", 54);
-    let error = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &request);
+    let error = icmp_error(3, Ipv4Addr::new(192, 0, 2, 9), physical, &request);
 
     let (flow, rewritten) = rewrite_icmp_error(&error, client, physical).unwrap();
     assert_eq!(
@@ -445,13 +445,13 @@ fn rewrite_icmp_error_restores_client_addresses() {
         b"quote",
         54,
     );
-    let error = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &foreign);
+    let error = icmp_error(3, Ipv4Addr::new(192, 0, 2, 9), physical, &foreign);
     assert!(
         rewrite_icmp_error(&error, client, physical).is_none(),
         "an error quoting someone else's request is unrelated"
     );
 
-    let mut bad = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &request);
+    let mut bad = icmp_error(3, Ipv4Addr::new(192, 0, 2, 9), physical, &request);
     corrupt_icmp_checksum(&mut bad);
     assert!(
         rewrite_icmp_error(&bad, client, physical).is_none(),
@@ -460,7 +460,7 @@ fn rewrite_icmp_error_restores_client_addresses() {
 
     let mut udp_quote = request.clone();
     udp_quote[9] = 17;
-    let error = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &udp_quote);
+    let error = icmp_error(3, Ipv4Addr::new(192, 0, 2, 9), physical, &udp_quote);
     assert!(
         rewrite_icmp_error(&error, client, physical).is_none(),
         "an error quoting a non-echo packet never matches"
@@ -476,6 +476,21 @@ fn rewrite_icmp_error_restores_client_addresses() {
         rewrite_icmp_error(&reply, client, physical).is_none(),
         "an echo reply is not an error"
     );
+}
+
+#[test]
+fn rewrite_icmp_error_accepts_time_exceeded_and_parameter_problem() {
+    let physical = Ipv4Addr::LOCALHOST;
+    let client = Ipv4Addr::new(10, 77, 0, 2);
+    let destination = Ipv4Addr::new(9, 9, 9, 9);
+    let request = request_packet(physical, destination, 77, 3, b"quote", 1);
+    for kind in [11, 12] {
+        let error = icmp_error(kind, Ipv4Addr::new(192, 0, 2, 9), physical, &request);
+        let (flow, rewritten) = rewrite_icmp_error(&error, client, physical).unwrap();
+        assert_eq!(flow.destination, destination);
+        assert_eq!(rewritten[20], kind);
+        assert!(checksums_ok(&rewritten));
+    }
 }
 
 // ── live loopback echo (needs the platform ICMP privilege) ──
