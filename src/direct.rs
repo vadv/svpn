@@ -85,18 +85,23 @@ pub struct Uplink {
 /// metric, ties keep the first listed.
 pub fn discover_uplink() -> Result<Uplink> {
     let mut manager = route_manager::RouteManager::new().context("route manager")?;
-    let route = manager
-        .list()
-        .context("list routes")?
+    let routes = manager.list().context("list routes")?;
+    select_uplink(&routes)
+}
+
+/// Select the preferred main-table IPv4 default route. Linux omits a zero
+/// metric in netlink, so an absent metric is the highest priority (zero),
+/// not a reason to prefer a backup with an explicit positive metric.
+pub fn select_uplink(routes: &[route_manager::Route]) -> Result<Uplink> {
+    let route = routes
         .iter()
         .filter(|route| {
             route.destination() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
                 && route.prefix() == 0
                 && table_is_main(route)
         })
-        .min_by_key(|route| route_metric(route).unwrap_or(u32::MAX))
-        .context("no IPv4 default route — cannot capture the physical uplink")?
-        .clone();
+        .min_by_key(|route| route_metric(route).unwrap_or(0))
+        .context("no IPv4 default route — cannot capture the physical uplink")?;
     let uplink = match (route.if_name().cloned(), route.if_index()) {
         (Some(name), Some(index @ 1..)) => Uplink { name, index },
         _ => bail!("IPv4 default route has no usable interface identity"),
@@ -1211,7 +1216,8 @@ fn route_present(
 }
 
 /// The kernel's preference between equal default routes: the lower
-/// metric wins. Absent (macOS/BSD) every listed default is equivalent.
+/// metric wins. An absent metric is zero on Linux/Windows; on macOS/BSD
+/// every listed default is equivalent.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn route_metric(route: &route_manager::Route) -> Option<u32> {
     route.metric()
@@ -1240,10 +1246,15 @@ fn remove_route(
 ) -> Result<()> {
     match manager.delete(route) {
         Ok(()) => Ok(()),
-        // ENOENT: already gone with the interface.
-        Err(error) if error.raw_os_error() == Some(2) => Ok(()),
+        Err(error) if route_error_is_missing(&error) => Ok(()),
         Err(error) => Err(anyhow::Error::new(error)),
     }
+}
+
+/// Deletion is idempotent after a down-hook or interface removal. Linux
+/// reports ENOENT; macOS route(4) reports ESRCH for a missing route.
+pub fn route_error_is_missing(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(2 | 3))
 }
 
 #[cfg(target_os = "linux")]

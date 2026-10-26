@@ -198,8 +198,8 @@ fn owner_indices_are_typed_and_skip_foreign_entries() {
     let path = state_path("indices");
     std::fs::write(
         &path,
-        r#"{"version":2,"country":{"RU":"node-a","??":"node-a"},
-            "asn":{"64512":"node-a","RU:64500":"node-b","junk":"node-a"}}"#,
+        r#"{"version":2,"country":{"RU":"node-a","??":"node-a","64512":"node-b"},
+            "asn":{"64512":"node-a","RU:64500":"node-b","DE":"node-a","junk":"node-a"}}"#,
     )
     .unwrap();
     let state = ExitState::load(Some(path.clone()));

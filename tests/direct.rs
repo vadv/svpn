@@ -613,6 +613,36 @@ fn uplink_discovery_pins_the_ipv4_default_route() {
     }));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn default_route_without_metric_beats_positive_metric_backup() {
+    use std::net::IpAddr;
+    let primary = route_manager::Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        .with_if_name("eth0".to_string())
+        .with_if_index(1)
+        .with_table(254);
+    let backup = route_manager::Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        .with_if_name("eth1".to_string())
+        .with_if_index(2)
+        .with_table(254)
+        .with_metric(100);
+    let selected = svpn::direct::select_uplink(&[backup, primary]).unwrap();
+    assert_eq!(selected.name, "eth0");
+    assert_eq!(selected.index, 1);
+}
+
+#[test]
+fn missing_route_cleanup_accepts_enoent_and_esrch() {
+    for errno in [2, 3] {
+        assert!(svpn::direct::route_error_is_missing(
+            &std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    assert!(!svpn::direct::route_error_is_missing(
+        &std::io::Error::from_raw_os_error(13)
+    ));
+}
+
 #[test]
 fn peer_route_match_requires_exact_prefix_and_interface() {
     use std::net::IpAddr;

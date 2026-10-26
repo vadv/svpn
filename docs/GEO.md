@@ -76,7 +76,7 @@ Country — constraint, ASN — affinity:
 { "version": 2, "country": { "RU": "de.example.com:22" }, "asn": { "64512": "nl.example.com:22", "RU:64500": "de.example.com:22" } }
 ```
 
-Пустые maps обязательны при записи. Строковые ключи типизированы: Country — ISO code, global ASN — число, scoped ASN — `CC:ASN`. Scoped key сохраняет Country, поэтому restore фильтрует кандидатов до первого flow. V1 `{version:1,owners:{...}}` мигрирует только в global `asn`; при следующем write тот же файл становится v2. Повреждённое/чужое состояние деградирует в пустое. Сохраняются только отклонения от baseline/failover, batched atomic write остаётся прежним. Direct и stateless per-IP выбор не сохраняются.
+Пустые maps обязательны при записи. Строковые ключи типизированы: Country — ISO code, global ASN — число, scoped ASN — `CC:ASN`. При restore домен определяется исходной map: числовой ключ в `country` или ISO-ключ в `asn` отбрасывается как corrupt, а не переносится в другой домен. Scoped key сохраняет Country, поэтому restore фильтрует кандидатов до первого flow. V1 `{version:1,owners:{...}}` мигрирует только в global `asn`; при следующем write тот же файл становится v2. Повреждённое/чужое состояние деградирует в пустое. Сохраняются только отклонения от baseline/failover, batched atomic write остаётся прежним. Direct и stateless per-IP выбор не сохраняются.
 
 Persistence keys не используются для hashing. Legacy global ASN hash (`u64 ASN`, big-endian + node) и uncovered-IP domain (`1 << 32`) замораживаются golden-тестами; Country и scoped ASN получают отдельные непересекающиеся encodings.
 
@@ -103,7 +103,7 @@ App → TUN → new flow ───▶│ Country == home?                   │
                           Physical Internet
 ```
 
-SVPN не создаёт country routes. До `hooks.start` автоматически запоминается интерфейс физического IPv4 default route. Каждый исходящий direct socket привязывается к нему до connect/send: Linux `SO_BINDTODEVICE`, macOS `IP_BOUND_IF`, Android `VpnService.protect(fd)`. Это неизменяемая защита от возврата в TUN; отсутствие/смена uplink требует перезапуска, неявный unbound fallback запрещён. TUN перекрывает физический default более специфичными маршрутами пользовательского hook.
+SVPN не создаёт country routes. До `hooks.start` автоматически запоминается интерфейс физического IPv4 default route; у Linux отсутствующий metric эквивалентен нулю и выигрывает у backup с положительным metric. Каждый исходящий direct socket привязывается к нему до connect/send: Linux `SO_BINDTODEVICE`, macOS `IP_BOUND_IF`, Android `VpnService.protect(fd)`. Это неизменяемая защита от возврата в TUN; отсутствие/смена uplink требует перезапуска, неявный unbound fallback запрещён. TUN перекрывает физический default более специфичными маршрутами пользовательского hook.
 
 ### 5.2 TCP
 
@@ -116,7 +116,7 @@ SVPN не создаёт country routes. До `hooks.start` автоматиче
 5. Данные копируются с backpressure и независимым half-close.
 6. Обратные listener-пакеты распознаются до обычного admission по `(client, listen_port, peer, nat_port)` и переписываются в `destination:dport → client:sport`.
 
-IP/TCP checksums пересчитываются. NAT rewrite сохраняет seq/ack, flags и options. SVPN автоматически обеспечивает один `peer/32 → этот TUN` route, если TUN/hook его ещё не создали; удаляется только owned route. Ручная country route configuration отсутствует.
+IP/TCP checksums пересчитываются. NAT rewrite сохраняет seq/ack, flags и options. SVPN автоматически обеспечивает один `peer/32 → этот TUN` route, если TUN/hook его ещё не создали; удаляется только owned route. Удаление уже исчезнувшего route идемпотентно (`ENOENT`/`ESRCH`). Ручная country route configuration отсутствует.
 
 Завершение socket copy не делает NAT mapping свободным: local kernel ещё может отправлять FIN/ACK/retransmission. При обычном teardown mapping и Hub owner переживают bounded `FIN_DWELL` (4 минуты); terminal `Closed` отправляется только при удалении mapping по expiry. При connect/relay/socket failure надёжный `Failed` сразу уведомляет Hub и учитывается в `failed`, но TCP mapping всё равно сохраняется до dwell expiry для reverse FIN/RST; повторный expiry `Closed` не считается повторно. Retired ports ограничены и expire. Повторное использование original tuple до retirement отклоняется. Поздний close старого поколения не удаляет новый owner. Validation rejection сохраняет owner и engine mapping; только действительно удалённый mapping считается terminal failure.
 
@@ -126,7 +126,7 @@ IP/TCP checksums пересчитываются. NAT rewrite сохраняет 
 
 ### 5.4 ICMP
 
-Direct ICMP echo использует raw host ICMP socket на Linux и macOS и сохраняет echo id/sequence/payload для приложения. Raw socket требует `CAP_NET_RAW`/root (одного `CAP_NET_ADMIN` для TUN недостаточно). Отсутствие privilege даёт явный unsupported/error только для ICMP без VPN fallback; TCP/UDP direct не отключаются. Android `VpnService.protect()` не выдаёт raw-socket privilege и не является runtime acceptance в этом PR. Ответы проверяются по original flow; malformed, unrelated и late replies отбрасываются. Запрос уходит с IPv4-адреса физического uplink (source NAT): TUN-адрес клиента в физической сети не маршрутизируется обратно; ответ восстанавливает tuple `destination → client` с TTL и id ответа. Raw-сокет доставляет и ICMP-ошибки (unreachable/time exceeded/parameter problem), цитирующие наш echo-запрос: внешний destination и вложенный original source переписываются в client с пересчётом всех затронутых checksums. Синтетический локальный echo reply запрещён.
+Direct ICMP echo использует raw host ICMP socket на Linux и macOS и сохраняет echo id/sequence/payload для приложения. На macOS outer `ip_len`/`ip_off` нормализуются из host byte order до разбора; вложенный quoted IPv4 header остаётся wire-order. Raw socket требует `CAP_NET_RAW`/root (одного `CAP_NET_ADMIN` для TUN недостаточно). Отсутствие privilege даёт явный unsupported/error только для ICMP без VPN fallback; TCP/UDP direct не отключаются. Android `VpnService.protect()` не выдаёт raw-socket privilege и не является runtime acceptance в этом PR. Ответы проверяются по original flow; malformed, unrelated и late replies отбрасываются. Запрос уходит с IPv4-адреса физического uplink (source NAT): TUN-адрес клиента в физической сети не маршрутизируется обратно; ответ восстанавливает tuple `destination → client` с TTL и id ответа. Raw-сокет доставляет и ICMP-ошибки (unreachable/time exceeded/parameter problem), цитирующие наш echo-запрос: внешний destination и вложенный original source переписываются в client с пересчётом всех затронутых checksums. Синтетический локальный echo reply запрещён.
 
 ### 5.5 Ограничения, dispatch и очереди
 
@@ -153,16 +153,16 @@ Stats раздельно показывают Country/ASN lookup hit/miss, failo
 - Несколько стран на сервере и несколько серверов на страну.
 - Независимые Country/ASN owners, weighted order, Checking, startup grace, failover/no snap-back.
 - Country constraint + scoped ASN; unassigned Country сохраняет глобальную ASN.
-- V1→V2 migration, пустые maps, unknown/corrupt state, atomic persistence.
+- V1→V2 migration, пустые maps, unknown/corrupt state, typed-map domain validation, atomic persistence.
 - Existing balance без Geo остаётся неизменным.
 
 ### Direct
 
 - TCP SYN/SYN-ACK/reverse rewrite/checksums, options, data в обе стороны, FIN/RST, half-close и reconnect тем же tuple.
 - Delayed final ACK и retransmitted FIN после copy completion; NAT-port не переиспользуется во время dwell.
-- Real-TUN handshake с non-default negotiated pair и selective routes; `peer/32` возвращается в тот же TUN.
+- Real-TUN handshake с non-default negotiated pair и selective routes; `peer/32` возвращается в тот же TUN; missing default metric и `ENOENT`/`ESRCH` cleanup.
 - UDP request/reply, несколько destinations на разных flows, timeout, oversized и late packet после close.
-- ICMP echo id/sequence/payload, permission denial, malformed/unrelated/late replies.
+- ICMP echo id/sequence/payload, Darwin host-order outer headers, permission denial, malformed/unrelated/late replies.
 - Full-MTU, bounded queues, malformed packets, short writes, connect/send/recv timeout и capacity exhaustion без вреда существующим flows.
 - Direct предшествует Country/ASN; non-home идёт по прежнему VPN; direct owner не принимает stale remote packet/close/drained RST и переживает unrelated link failure.
 - Shutdown при stalled sockets завершается bounded и не оставляет tasks/owned routes.

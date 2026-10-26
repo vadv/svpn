@@ -12,8 +12,8 @@ use svpn::{
     direct::{
         DirectConfig, DirectEvent, UDP_IDLE, Uplink,
         icmp::{
-            Echo, IcmpEngine, echo_reply_packet, parse_echo_reply_ip, parse_echo_request,
-            rewrite_icmp_error,
+            Echo, IcmpEngine, echo_reply_packet, normalize_darwin_raw_ip, parse_echo_reply_ip,
+            parse_echo_request, rewrite_icmp_error,
         },
     },
     packet::{self, FlowKey, Packet, internet_checksum},
@@ -307,6 +307,39 @@ fn parse_echo_reply_rejects_malformed() {
         parse_echo_reply_ip(&protocol, 1400).is_none(),
         "not protocol 1"
     );
+}
+
+#[test]
+fn darwin_raw_headers_normalize_before_echo_and_error_parsing() {
+    let echo = Echo {
+        id: 0x4321,
+        seq: 7,
+        // 256-byte IP packet catches the native 0x0100 length case.
+        payload: vec![0x5a; 228],
+    };
+    let mut reply = echo_reply_packet(PEER, client(), 64, &echo);
+    let total = u16::from_be_bytes([reply[2], reply[3]]);
+    let offset = u16::from_be_bytes([reply[6], reply[7]]);
+    reply[2..4].copy_from_slice(&total.to_ne_bytes());
+    reply[6..8].copy_from_slice(&offset.to_ne_bytes());
+    normalize_darwin_raw_ip(&mut reply);
+    let (_, _, parsed) = parse_echo_reply_ip(&reply, 1400).unwrap();
+    assert_eq!(parsed, echo);
+
+    let physical = Ipv4Addr::LOCALHOST;
+    let client = Ipv4Addr::new(10, 77, 0, 2);
+    let destination = Ipv4Addr::new(9, 9, 9, 9);
+    let request = request_packet(physical, destination, 77, 3, b"quote", 54);
+    let mut error = icmp_unreachable(Ipv4Addr::new(192, 0, 2, 9), physical, &request);
+    let total = u16::from_be_bytes([error[2], error[3]]);
+    let offset = u16::from_be_bytes([error[6], error[7]]);
+    error[2..4].copy_from_slice(&total.to_ne_bytes());
+    error[6..8].copy_from_slice(&offset.to_ne_bytes());
+    normalize_darwin_raw_ip(&mut error);
+    let (flow, rewritten) = rewrite_icmp_error(&error, client, physical).unwrap();
+    assert_eq!(flow.destination, destination);
+    assert_eq!(&rewritten[16..20], client.octets());
+    assert_eq!(internet_checksum(&rewritten[28..48]), 0);
 }
 
 #[test]

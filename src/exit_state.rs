@@ -186,17 +186,26 @@ impl ExitState {
         Ok(())
     }
 
-    /// Restore link indices per typed key. Stored keys that do not parse and
-    /// nodes that left the configuration are skipped.
+    /// Restore link indices per typed key. The originating map is part of
+    /// the type: a numeric Country entry or an alphabetic ASN entry is
+    /// corrupt, not a key in the other domain. Stored keys that do not
+    /// parse and nodes that left the configuration are skipped.
     pub fn owner_indices(&self, ids: &[String]) -> HashMap<ExitKey, usize> {
-        self.country
-            .iter()
-            .chain(self.asn.iter())
-            .filter_map(|(stored, node)| {
-                let key = ExitKey::parse(stored)?;
-                ids.iter().position(|id| id == node).map(|link| (key, link))
-            })
-            .collect()
+        let country = self.country.iter().filter_map(|(stored, node)| {
+            let key = ExitKey::parse(stored)?;
+            if !matches!(key, ExitKey::Country(_)) {
+                return None;
+            }
+            ids.iter().position(|id| id == node).map(|link| (key, link))
+        });
+        let asn = self.asn.iter().filter_map(|(stored, node)| {
+            let key = ExitKey::parse(stored)?;
+            if matches!(key, ExitKey::Country(_)) {
+                return None;
+            }
+            ids.iter().position(|id| id == node).map(|link| (key, link))
+        });
+        country.chain(asn).collect()
     }
 }
 

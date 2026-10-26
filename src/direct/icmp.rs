@@ -65,9 +65,8 @@ pub fn parse_echo_request(bytes: &[u8]) -> Option<Echo> {
 
 /// A validated echo reply read from the flow socket: the buffer carries
 /// the reply's own IPv4 header, so the source address and TTL are the
-/// reply's, never guessed. Linux delivers the real packet, so its total
-/// length must fit the read; Darwin synthesizes the header with a
-/// byte-swapped length field, so only the datagram boundary is trusted.
+/// reply's, never guessed. Raw receive normalization happens before this
+/// parser, so both Linux and Darwin use wire-order lengths here.
 /// `mtu` is the read window bound: a reply longer than the TUN can carry —
 /// including one the kernel truncated to the window, whose all-zero tail
 /// can leave the ICMP checksum valid — is rejected whole (spec §5.4).
@@ -76,17 +75,31 @@ pub fn parse_echo_reply_ip(bytes: &[u8], mtu: usize) -> Option<(Ipv4Addr, u8, Ec
     if bytes[9] != 1 {
         return None;
     }
-    #[cfg(target_os = "linux")]
     if total > bytes.len() {
         return None;
     }
-    let end = total.min(bytes.len());
+    let end = total;
     if end > mtu {
         return None;
     }
     let echo = echo_message(&bytes[header..end], 0)?;
     let source = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
     Some((source, bytes[8], echo))
+}
+
+/// Normalize the outer IPv4 header returned by Darwin raw ICMP sockets.
+/// Darwin returns `ip_len` and `ip_off` in host byte order; the quoted IPv4
+/// header inside an ICMP error remains wire order and is deliberately not
+/// touched. The socket receive path calls this only on macOS; keeping the
+/// transformation public makes the platform fixture testable everywhere.
+pub fn normalize_darwin_raw_ip(bytes: &mut [u8]) {
+    if bytes.len() < 20 {
+        return;
+    }
+    let total = u16::from_ne_bytes([bytes[2], bytes[3]]);
+    bytes[2..4].copy_from_slice(&total.to_be_bytes());
+    let offset = u16::from_ne_bytes([bytes[6], bytes[7]]);
+    bytes[6..8].copy_from_slice(&offset.to_be_bytes());
 }
 
 /// Rewrites an ICMP error (unreachable, time exceeded, parameter problem)
@@ -577,7 +590,10 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
             crate::debug!("direct icmp {flow:?}: reply of {len} B exceeds the TUN MTU — dropped");
             continue;
         }
-        handle_receive(&shared, &flow, id, &buf[..len]);
+        let bytes = &mut buf[..len];
+        #[cfg(target_os = "macos")]
+        normalize_darwin_raw_ip(bytes);
+        handle_receive(&shared, &flow, id, bytes);
     }
     shared.finish_icmp(&flow, id).await;
 }
