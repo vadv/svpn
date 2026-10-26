@@ -27,7 +27,7 @@ COUNTRY_CSV = pathlib.Path("/tmp/e2e-country.csv")
 STATE = pathlib.Path("/var/lib/svpn/exit-state.json")
 TARGET = "172.30.77.4"
 LOCAL_TARGET = "172.31.77.4"
-BY_TARGET = "172.31.77.5"
+BY_TARGET = "172.32.77.5"
 # One /17 block per row: 131072 synthetic rows pass Geo::load's 100k-row floor and give
 # every subnet a distinct ASN, so rendezvous picks differ across destination groups.
 HOST_BITS = 15
@@ -151,7 +151,9 @@ def country_args(local_exit=False):
             "--local-exits",
             "RU,BY",
             "--server-up",
-            LOCAL_EGRESS_UP + '\nip route replace 172.31.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n',
+            LOCAL_EGRESS_UP
+            + '\nip route replace 172.31.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n'
+            + '\nip route replace 172.32.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n',
             "--server-down",
             LOCAL_EGRESS_DOWN,
         ]

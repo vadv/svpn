@@ -19,7 +19,7 @@ Belarus uses the ISO code `BY`, Russia uses `RU`.
 
 | Machine | Requirements |
 |---|---|
-| Linux client | Root for this recipe, TUN, `iproute2`, `nftables`, `curl`, `gzip` and a normal default route through the physical interface |
+| Linux client | Root for this recipe, TUN, `iproute2`, `nftables`, `curl`, `gzip` and a default route through the physical interface and gateway |
 | Each of the two VPSs | Linux, TUN, `iproute2`, `nftables`, root SSH and working Internet egress |
 | Network | Permit SSH, TCP `41020` and UDP `60000–60009` to each VPS |
 
@@ -101,7 +101,6 @@ servers' IPv4 addresses in `servers` **and in the hooks**. Replace the key
 path.
 
 ```toml
-mode = "multi"
 exit-policy = "sticky-asn"
 country-db = "/etc/svpn/country.csv"
 geo-db = "/etc/svpn/asn.csv"
@@ -118,7 +117,7 @@ udp-port-range = "60000-60009"
 
 # Protect the VPS addresses before replacing the default route. This assumes
 # no pre-existing host routes for these addresses.
-up-command = "wan=$(ip route show default | awk 'NR==1{print $5}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
+up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
 down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
 
 # These server hooks run on each VPS and at the local-exit on the client.
@@ -128,8 +127,9 @@ n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((100 + n))
 table=svpn_egress_$n
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
 ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-ip route replace default dev "$wan" table "$table_id"
+ip route replace default via "$gateway" dev "$wan" table "$table_id"
 nft delete table inet "$table" 2>/dev/null || true
 nft -f - <<EOF
 add table inet $table
@@ -242,7 +242,6 @@ sudo svpn root@nl.example.com
 Sticky ASN without local-exit:
 
 ```toml
-mode = "multi"
 exit-policy = "sticky-asn"
 geo-db = "/etc/svpn/asn.csv"
 ```
@@ -250,7 +249,6 @@ geo-db = "/etc/svpn/asn.csv"
 Country selection without local-exit:
 
 ```toml
-mode = "multi"
 country-db = "/etc/svpn/country.csv"
 
 [[servers]]
