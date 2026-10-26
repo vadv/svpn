@@ -108,7 +108,7 @@ fn sticky_asn_is_multi_only() {
 // ── geo country flags ──
 
 #[test]
-fn country_flags_parse_and_require_country_db() {
+fn local_exit_flags_parse_and_require_country_db() {
     let multi = client(&[
         "multi",
         "--server",
@@ -117,10 +117,13 @@ fn country_flags_parse_and_require_country_db() {
         "203.0.113.2",
         "--country-db",
         "country.csv",
-        "--home-country",
-        "ru",
+        "--local-exits",
+        "ru,by",
     ]);
-    assert_eq!(multi.home_country.as_deref(), Some("RU"));
+    assert_eq!(
+        multi.local_exits.as_deref(),
+        Some(&[String::from("RU"), String::from("BY")][..])
+    );
     assert_eq!(
         multi.country_db.as_deref(),
         Some(std::path::Path::new("country.csv")),
@@ -130,18 +133,20 @@ fn country_flags_parse_and_require_country_db() {
         resolve_servers(&multi.server, &multi.globals).unwrap()[0].countries,
         ["DE", "AT"]
     );
-    // Direct home needs no exit policy: single mode accepts it too.
     let single = client(&[
         "--server",
         "203.0.113.1",
         "--country-db",
         "c.csv",
-        "--home-country",
+        "--local-exits",
         "RU",
     ]);
-    assert_eq!(single.home_country.as_deref(), Some("RU"));
+    assert_eq!(
+        single.local_exits.as_deref(),
+        Some(&[String::from("RU")][..])
+    );
     for args in [
-        vec!["multi", "--server", "203.0.113.1", "--home-country", "RU"],
+        vec!["multi", "--server", "203.0.113.1", "--local-exits", "RU"],
         vec![
             "multi",
             "--server",
@@ -149,7 +154,15 @@ fn country_flags_parse_and_require_country_db() {
             "--server",
             "203.0.113.2",
         ],
-        vec!["--server", "203.0.113.1", "--home-country", "R1"],
+        vec!["--server", "203.0.113.1", "--local-exits", "R1"],
+        vec![
+            "--server",
+            "203.0.113.1",
+            "--country-db",
+            "c.csv",
+            "--local-exits",
+            "RU,ru",
+        ],
     ] {
         let error = Cli::try_parse_from(["svpn"].into_iter().chain(args.clone()))
             .err()

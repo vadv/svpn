@@ -43,8 +43,7 @@ MASQUERADE_RULES = """table inet svpn_masq {
 }
 """
 
-# One policy table and one NAT table per claimed inner pair. The same hook
-# configures a remote serve and the local serve; neither uses country routes.
+# Each claimed inner pair gets an isolated policy table and NAT table.
 LOCAL_EGRESS_UP = r"""
 set -eu
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
@@ -119,7 +118,7 @@ def enable_target_masquerade():
     )
 
 
-def country_args(home=False):
+def country_args(local_exit=False):
     write_geo()
     write_country()
     args = [
@@ -144,10 +143,10 @@ def country_args(home=False):
         "--stats-interval",
         "1",
     ]
-    if home:
+    if local_exit:
         args += [
-            "--home-country",
-            "RU",
+            "--local-exits",
+            "RU,BY",
             "--server-up",
             LOCAL_EGRESS_UP,
             "--server-down",
@@ -338,9 +337,13 @@ def test_restart_restore():
     print("PASS sticky restart: persisted exit state restores the failed-over owner, no snap-back")
 
 
-def direct_opened(path):
+def local_opened(path):
     found = re.findall(r"local-exit: opened (\d+) / failed (\d+) / closed (\d+)", path.read_text())
     return tuple(int(value) for value in found[-1]) if found else None
+
+
+def ping_local(destination):
+    command(["ping", "-n", "-c", "1", "-W", "2", destination])
 
 
 def target_tcp_echo(index, timeout=15):
@@ -387,13 +390,13 @@ def test_country_asn_scope():
     print("PASS country+ASN: RU target and DE tunnel peer stay on their scoped servers")
 
 
-def test_direct_home_and_vpn():
+def test_local_exits_and_vpn():
     fresh_state()
     # The internal Compose network intentionally has no default route. Give
-    # LocalExit a physical test uplink; connected routes remain intact.
+    # Use the physical test uplink for local-exit; connected routes remain intact.
     command(["ip", "route", "replace", "default", "dev", "eth0"])
-    args = country_args(home=True)
-    with session("direct-home", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
+    args = country_args(local_exit=True)
+    with session("local-exit", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
         until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
         command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
@@ -404,7 +407,7 @@ def test_direct_home_and_vpn():
         udp_echo(TARGET)
         command(["ping", "-n", "-c", "1", "-W", "2", TARGET])
         tcp_echo(3, peer=PEER)
-        until(lambda: direct_opened(path) == (3, 0, 0), seconds=20)
+        until(lambda: local_opened(path) == (3, 0, 0), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
         local_tuns = {
             item["ifname"]
@@ -423,12 +426,19 @@ def test_direct_home_and_vpn():
         assert "svpn_egress_" in command(["nft", "list", "tables"]).stdout
     cleanup_verified(process, server_hosts=HOSTS)
 
-    with session("local-restart", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
+    restart_args = list(args)
+    down = restart_args.index("--server-down")
+    restart_args[down + 1] = "sleep 3\n" + restart_args[down + 1]
+    with session("local-restart", args=restart_args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
         until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
-        command(["ping", "-n", "-c", "1", "-W", "2", TARGET])
+        until(lambda: local_opened(path) is not None, seconds=10)
+        baseline = local_opened(path)
+        command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
+        ping_local(TARGET)
+        until(lambda: local_opened(path)[0] == baseline[0] + 1, seconds=20)
     cleanup_verified(process, server_hosts=HOSTS)
     assert "svpn_egress_" not in command(["nft", "list", "tables"]).stdout
-    print("PASS direct+VPN: home TCP/UDP/ICMP bypass servers; SIGKILL restart works")
+    print("PASS local-exit+VPN: local TCP/UDP/ICMP and restart work")
 
 
 TESTS = [
@@ -437,5 +447,5 @@ TESTS = [
     ("test_failover_move", test_failover_move),
     ("test_restart_restore", test_restart_restore),
     ("test_country_asn_scope", test_country_asn_scope),
-    ("test_direct_home_and_vpn", test_direct_home_and_vpn),
+    ("test_local_exits_and_vpn", test_local_exits_and_vpn),
 ]

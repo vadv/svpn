@@ -50,7 +50,7 @@ test_recovery_without_alternative_closes_within_budget
 """.split()
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
-test_country_asn_scope test_direct_home_and_vpn
+test_country_asn_scope test_local_exits_and_vpn
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),

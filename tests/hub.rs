@@ -67,7 +67,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         pool: Pool::new([1, 1]),
         geo: None,
         country: None,
-        home_country: None,
+        local_exits: Vec::new(),
         local: None,
         local_task: None,
         nodes: Vec::new(),
@@ -102,19 +102,19 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
     bytes[33] = 0x10;
     let parsed = packet::parse(&bytes, true).unwrap();
     assert_eq!(
-        hub.dispatch(&bytes, client_ip).await.unwrap(),
-        packet::tcp_reset_for(&parsed).map(Dispatched::Reset),
+        hub.dispatch(&bytes, client_ip).unwrap(),
+        packet::tcp_reset_for(&parsed),
         "resumed TCP traffic must not disappear after its owner is forgotten"
     );
     bytes[33] = 4;
-    assert!(hub.dispatch(&bytes, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     bytes[33] = 2;
-    assert!(hub.dispatch(&bytes, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     bytes[33] = 0x10;
     bytes[12] = 192;
-    assert!(hub.dispatch(&bytes, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     bytes[12] = 10;
-    assert!(hub.dispatch(&[0; 20], client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&[0; 20], client_ip).unwrap().is_none());
 
     let epoch = Epoch {
         link: 0,
@@ -126,7 +126,7 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
     hub.routes
         .by_key
         .insert(parsed.flow, Target::Remote(Owner { epoch, id: 41 }));
-    assert!(hub.dispatch(&bytes, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     let forwarded = incoming.try_recv().unwrap();
     assert_eq!(forwarded.id, 41);
     assert_eq!(forwarded.bytes, bytes);
@@ -135,7 +135,7 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
         Some(Target::Remote(owner)) => owner.epoch.generation = 2,
         _ => panic!("expected a remote owner"),
     }
-    assert!(hub.dispatch(&bytes, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     assert!(incoming.try_recv().is_err());
     assert_eq!(
         match hub.routes.by_key[&parsed.flow] {
@@ -165,7 +165,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
     let client_ip = params.tun_addr;
     let syn = tcp_packet(false);
     let key = packet::parse(&syn, true).unwrap().flow;
-    assert!(hub.dispatch(&syn, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&syn, client_ip).unwrap().is_none());
     let original = from_first.try_recv().unwrap();
     let owner = Owner {
         epoch: first,
@@ -176,7 +176,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
 
     let mut ack = syn.clone();
     ack[33] = 0x10;
-    assert!(hub.dispatch(&ack, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&ack, client_ip).unwrap().is_none());
     assert_eq!(from_first.try_recv().unwrap().id, owner.id);
     assert!(from_second.try_recv().is_err());
 
@@ -196,10 +196,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
     let expected = packet::tcp_reset_for(&packet::parse(&ack, true).unwrap());
     assert!(expected.is_some());
     for _ in 0..3 {
-        assert_eq!(
-            hub.dispatch(&ack, client_ip).await.unwrap(),
-            expected.map(Dispatched::Reset)
-        );
+        assert_eq!(hub.dispatch(&ack, client_ip).unwrap(), expected);
     }
     assert!(hub.routes.by_key.is_empty());
     assert!(from_first.try_recv().is_err());
@@ -208,7 +205,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
     assert!(tun.is_none());
 
     // The rejected ACKs must not consume a weighted selection or a flow ID.
-    assert!(hub.dispatch(&syn, client_ip).await.unwrap().is_none());
+    assert!(hub.dispatch(&syn, client_ip).unwrap().is_none());
     let fresh = from_second.try_recv().unwrap();
     assert_eq!(fresh.id, owner.id + 1);
     assert_eq!(fresh.bytes, syn);

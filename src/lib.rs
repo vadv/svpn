@@ -157,10 +157,11 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         },
     };
     let country_routing = args.server.iter().any(|spec| !spec.countries().is_empty());
-    let country = match (
-        &args.country_db,
-        country_routing || args.home_country.is_some(),
-    ) {
+    let local_exits = args
+        .local_exits
+        .as_ref()
+        .is_some_and(|codes| !codes.is_empty());
+    let country = match (&args.country_db, country_routing || local_exits) {
         (Some(path), true) => {
             let country = geo::Geo::load_country(path)?;
             crate::info!(
@@ -171,7 +172,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
             Some(country)
         }
         (Some(_), false) => {
-            crate::warn!("country-db set without home-country or server countries — ignoring");
+            crate::warn!("country-db set without local-exits or server countries — ignoring");
             None
         }
         (None, _) => None,
@@ -191,10 +192,20 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 .map(|path| path.with_extension("state.json"))
         });
     let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
+    let local_exits = args
+        .local_exits
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|code| {
+            geo::pack_country(code)
+                .ok_or_else(|| anyhow::anyhow!("invalid local-exit country {code}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(hub::GeoExits {
         geo: asn,
         country,
-        home_country: args.home_country.as_deref().and_then(geo::pack_country),
+        local_exits,
         exit_state: state,
     })
 }

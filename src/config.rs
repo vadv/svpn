@@ -47,7 +47,7 @@ struct FileConfig {
     exit_policy: Option<crate::cli::ExitPolicy>,
     geo_db: Option<PathBuf>,
     country_db: Option<PathBuf>,
-    home_country: Option<String>,
+    local_exits: Option<Vec<String>>,
     exit_state: Option<PathBuf>,
     up_script: Option<PathBuf>,
     down_script: Option<PathBuf>,
@@ -206,10 +206,14 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         exit_policy: file.exit_policy.unwrap_or_default(),
         geo_db: file.geo_db.map(|path| base.join(path)),
         country_db: file.country_db.map(|path| base.join(path)),
-        home_country: file
-            .home_country
-            .as_deref()
-            .map(parse_country_code)
+        local_exits: file
+            .local_exits
+            .map(|codes| {
+                codes
+                    .into_iter()
+                    .map(|code| parse_country_code(&code))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
             .transpose()
             .map_err(anyhow::Error::msg)?,
         exit_state: file.exit_state.map(|path| base.join(path)),

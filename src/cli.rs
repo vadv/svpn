@@ -36,12 +36,12 @@ pub struct ClientArgs {
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
-    /// DB-IP Country Lite CSV database for country exits and LocalExit.
+    /// DB-IP Country Lite CSV database for country routing and local-exits.
     #[arg(long, value_name = "FILE")]
     pub country_db: Option<PathBuf>,
-    /// Two-letter home country; matching destinations use LocalExit.
-    #[arg(long, value_name = "CC", value_parser = parse_country_code)]
-    pub home_country: Option<String>,
+    /// ISO alpha-2 countries whose destinations use local-exit; comma-separated.
+    #[arg(long, value_delimiter = ',', value_name = "CC", value_parser = parse_country_code)]
+    pub local_exits: Option<Vec<String>>,
     /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.
     #[arg(long, value_name = "FILE")]
     pub exit_state: Option<PathBuf>,
@@ -126,14 +126,25 @@ pub struct Cli {
 }
 
 impl ClientArgs {
-    /// Geo coupling (spec): home-country or per-server countries require
-    /// country-db. An unused country-db is ignored at runtime, not here.
+    /// Geo coupling: local-exits or per-server countries require country-db.
+    /// An unused country-db is ignored at runtime, not here.
     pub(crate) fn validate_geo(&self) -> anyhow::Result<()> {
-        let needs_db = self.home_country.is_some()
+        if let Some(codes) = &self.local_exits {
+            for (index, code) in codes.iter().enumerate() {
+                anyhow::ensure!(
+                    !codes[..index].contains(code),
+                    "duplicate local-exit country {code}"
+                );
+            }
+        }
+        let needs_db = self
+            .local_exits
+            .as_ref()
+            .is_some_and(|codes| !codes.is_empty())
             || self.server.iter().any(|spec| !spec.countries().is_empty());
         anyhow::ensure!(
             !needs_db || self.country_db.is_some(),
-            "home-country or server countries require country-db"
+            "local-exits or server countries require country-db"
         );
         Ok(())
     }

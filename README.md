@@ -330,12 +330,12 @@ sudo setcap cap_net_admin=ep /usr/local/bin/svpn
 Готовый набор hooks для split VPN: российские сайты напрямую, остальной
 мир — через туннель.
 
-### LocalExit: домашняя страна через локальный выход
+### local-exit
 
-`home-country` направляет raw IPv4 через второй локальный `svpn serve` и
-kernel forwarding/NAT, не через TCP-proxy и не через список country routes.
-Нужны forwarding, NAT/return-route и source-scoped egress rule; команды и
-поведение после SIGKILL описаны в [docs/LOCAL-EXIT.md](docs/LOCAL-EXIT.md).
+`local-exits = ["RU", "BY"]` направляет IPv4-пакеты этих стран через
+локальный выход. Остальные потоки используют обычный выбор сервера. Для
+локального выхода нужны `server-up` и `server-down`, настраивающие forwarding,
+NAT и обратный маршрут.
 
 ### RU напрямую, мир через VPN (Linux)
 

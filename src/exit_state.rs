@@ -1,11 +1,6 @@
-//! Sticky exit owner persistence: failover transitions survive restarts.
-//!
-//! Store failover owners; plain rendezvous assignments need no disk.
-//! Writes are batched and atomic. Corrupt or foreign-version state loads empty.
-//!
-//! Version 2 keeps independent country and ASN maps. Scoped ASN keys retain
-//! their country; v1 `owners` migrates to global ASN only. [`ExitKey`] makes
-//! the domain explicit.
+//! Persistent failover owners for sticky routing.
+//! Writes are atomic; corrupt or foreign-version state loads empty.
+//! Version 2 separates country, global ASN and country-scoped ASN keys.
 
 use std::{
     collections::HashMap,
@@ -23,11 +18,11 @@ const FLUSH_EVERY: Duration = Duration::from_secs(5);
 /// Typed persistent exit key: one sticky assignment per domain.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ExitKey {
-    /// Global ASN (`asn` map, numeric key).
+    /// Global ASN.
     Asn(u32),
-    /// Country-scoped ASN (`CC:ASN`), including its country for candidate filtering.
+    /// Country-scoped ASN (`CC:ASN`).
     ScopedAsn(String, u32),
-    /// Country (`country` map, ISO code key).
+    /// Country (`CC`).
     Country(String),
 }
 

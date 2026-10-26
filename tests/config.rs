@@ -293,12 +293,12 @@ countries = {countries}
 }
 
 #[test]
-fn country_codes_and_home_country_are_validated() {
+fn local_exit_country_codes_are_validated() {
     for field in [
-        "home-country = 'R'",
-        "home-country = 'RUS'",
-        "home-country = 'R1'",
-        "home-country = ''",
+        "local-exits = ['R']",
+        "local-exits = ['RUS']",
+        "local-exits = ['R1']",
+        "local-exits = ['']",
     ] {
         let text = format!(
             "{SINGLE}country-db = 'c.csv'
@@ -320,22 +320,25 @@ countries = {countries}
     let args = parse(
         &format!(
             "{SINGLE}country-db = 'c.csv'
-home-country = 'ru'
+local-exits = ['ru', 'by']
 "
         ),
         Path::new("."),
         false,
     )
     .unwrap();
-    assert_eq!(args.home_country.as_deref(), Some("RU"));
+    assert_eq!(
+        args.local_exits,
+        Some(vec![String::from("RU"), String::from("BY")])
+    );
 }
 
 #[test]
-fn home_country_or_countries_require_country_db() {
+fn local_exits_or_countries_require_country_db() {
     assert!(
         parse(
             &format!(
-                "{SINGLE}home-country = 'RU'
+                "{SINGLE}local-exits = ['RU']
 "
             ),
             Path::new("."),

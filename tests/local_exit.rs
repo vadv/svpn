@@ -1,4 +1,4 @@
-//! LocalExit core: fixed inner pair validation, stateless 1:1 address
+//! local-exit core: fixed inner pair validation, stateless 1:1 address
 //! translation at the hub boundary, and startup failure cleanup. The full
 //! handshake needs a real second TUN (privileged), so the failure path is
 //! pinned instead; heartbeats are the existing session loop, covered by the
@@ -10,29 +10,17 @@ use std::net::Ipv4Addr;
 
 use svpn::{
     link_io::Epoch,
-    local_exit::{LOCAL_PAIR, LocalPair, start},
+    local_exit::{LocalPair, start},
     packet::{self, internet_checksum, translate_v4},
 };
 
 const PRIMARY_SERVER: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 const PRIMARY_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 2);
-const LOCAL_SERVER: Ipv4Addr = LOCAL_PAIR.0;
-const LOCAL_CLIENT: Ipv4Addr = LOCAL_PAIR.1;
+const LOCAL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 77, 254, 1);
+const LOCAL_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 77, 254, 2);
 const REMOTE: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
 
 // ── inner pair ──
-
-#[test]
-fn default_pair_accepted_against_distinct_primary() {
-    let pair = LocalPair::new(PRIMARY_SERVER, PRIMARY_CLIENT).unwrap();
-    assert_eq!(
-        pair,
-        LocalPair {
-            server: LOCAL_SERVER,
-            client: LOCAL_CLIENT
-        }
-    );
-}
 
 #[test]
 fn claimed_pairs_are_unique_and_owned() {
@@ -42,18 +30,10 @@ fn claimed_pairs_are_unique_and_owned() {
 }
 
 #[test]
-fn pair_rejected_on_any_primary_collision() {
-    for (server, client) in [
-        (LOCAL_SERVER, LOCAL_CLIENT),
-        (LOCAL_CLIENT, LOCAL_SERVER),
-        (PRIMARY_SERVER, LOCAL_SERVER),
-        (LOCAL_CLIENT, PRIMARY_CLIENT),
-    ] {
-        assert!(
-            LocalPair::new(server, client).is_err(),
-            "collision {server}/{client} must be rejected"
-        );
-    }
+fn claim_skips_the_primary_pair() {
+    let (pair, _guard) = LocalPair::claim(LOCAL_SERVER, LOCAL_CLIENT).unwrap();
+    assert_ne!(pair.server, LOCAL_SERVER);
+    assert_ne!(pair.client, LOCAL_CLIENT);
 }
 
 // ── translation fixtures ──

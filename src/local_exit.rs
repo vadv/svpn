@@ -1,20 +1,12 @@
-//! LocalExit core: a second, local SVPN server path for home-country traffic
-//! (docs/LOCAL-EXIT.md). It is a packet path, not a TCP proxy: the local
-//! serve creates a REAL second TUN and runs the unchanged server session, so
-//! the host kernel forwarding/conntrack/NAT handles the egress. The control
-//! channel is the existing JSONL protocol over an in-memory duplex; the data
-//! plane is the existing TCP-mode raw-IP flow framing over a loopback-only
-//! ephemeral listener (`127.0.0.1:0`, no camouflage) — no SSH, no external
-//! listener, no application TCP termination. The client side exposes the
-//! `session::run_link` parts for the Hub to spawn; both sessions heartbeat
-//! through the existing session loop.
+//! local-exit passes raw IPv4 through a local serve and a second TUN.
+//! Control uses a duplex; packet framing reuses loopback TCP transport.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio::{
     io::split,
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 
@@ -24,14 +16,6 @@ use crate::link_io::{Delivery, Epoch, Event, LinkIo, Packet};
 use crate::session::TransportConfig;
 use crate::tcp::Mode;
 
-/// Preferred inner pair for the local path. The primary and local TUNs must
-/// never share an address: duplicate point-to-point addresses silently
-/// misroute instead of failing.
-pub const LOCAL_PAIR: (Ipv4Addr, Ipv4Addr) =
-    (Ipv4Addr::new(10, 77, 254, 1), Ipv4Addr::new(10, 77, 254, 2));
-
-/// Per-direction buffering of the in-memory control channel: one control
-/// line plus slack, matching `control::MAX_LINE`.
 const CONTROL_BUFFER: usize = 8192;
 
 /// Claimed inner pair of the local exit.
@@ -44,23 +28,7 @@ pub struct LocalPair {
 }
 
 impl LocalPair {
-    /// The default dedicated pair, rejected when it shares any address with
-    /// the primary tunnel pair.
-    pub fn new(primary_server: Ipv4Addr, primary_client: Ipv4Addr) -> Result<Self> {
-        let (server, client) = LOCAL_PAIR;
-        ensure!(
-            server != primary_server
-                && server != primary_client
-                && client != primary_server
-                && client != primary_client,
-            "local-exit pair {server}/{client} collides with the primary pair \
-             {primary_server}/{primary_client}"
-        );
-        Ok(Self { server, client })
-    }
-
-    /// Claim a distinct pool pair for both local TUNs. The port token also
-    /// prevents another SVPN process from reusing the addresses.
+    /// Claim a distinct pair and hold its ownership token.
     pub fn claim(
         primary_server: Ipv4Addr,
         primary_client: Ipv4Addr,
@@ -84,30 +52,21 @@ impl LocalPair {
     }
 }
 
-/// Local serve task: aborted on drop, joinable for a clean stop.
+/// Local serve task, stopped with its owner.
 pub struct LocalServer {
-    task: JoinHandle<()>,
-    /// Terminal serve result, sent as the task's last act.
-    result: oneshot::Receiver<Result<()>>,
+    task: JoinHandle<Result<()>>,
 }
 
 impl LocalServer {
-    /// Emergency stop: kills the serve task immediately. Down hooks do not
-    /// run; the kernel closes the TUN descriptor. Prefer dropping the client
-    /// control half, which ends the serve gracefully.
+    /// Abort immediately; down hooks do not run.
     pub fn abort(&self) {
         self.task.abort();
     }
 
-    /// Wait for the serve task to end and return its result.
     pub async fn join(&mut self) -> Result<()> {
-        let outcome = (&mut self.result).await;
-        let _ = (&mut self.task).await;
-        match outcome {
+        match (&mut self.task).await {
             Ok(result) => result,
-            // The sender is dropped only on a panic or an abort; the joined
-            // task error above is already unwound or ignored at this point.
-            Err(_) => bail!("local serve task ended without a result"),
+            Err(error) => bail!("local serve task: {error}"),
         }
     }
 }
@@ -118,38 +77,20 @@ impl Drop for LocalServer {
     }
 }
 
-/// Everything the Hub needs to spawn and own the local client session:
-/// `session::run_link(control, pair.server, pair.client, mtu, config, io)`,
-/// with `outgoing`/`events` as the packet ports of that session.
+/// Client-side session parts owned by the Hub.
 pub struct LocalExit {
-    /// Control channel of the local client session (handshake complete).
     pub control: Control,
-    /// `TransportConfig::Tcp` for `run_link`: loopback, no camouflage.
     pub config: TransportConfig,
-    /// Packet port of the local client session. `peer_ip` (the local server
-    /// TUN address) is the probe destination; `packets` receives translated
-    /// client-TUN reads.
     pub io: LinkIo,
-    /// Fixed inner pair of the local exit.
     pub pair: LocalPair,
-    /// Send translated client-TUN packets into the local client session.
     pub outgoing: mpsc::Sender<Packet>,
-    /// Events of the local client session: packets to translate back into
-    /// the client TUN, and flow closes.
     pub events: mpsc::Receiver<(Epoch, Event)>,
-    /// Latest heartbeat snapshot of the local client session.
     pub latest: watch::Receiver<Stats>,
-    /// Delivery counters of the local client session.
     pub delivery: std::sync::Arc<Delivery>,
-    /// The local serve task; dropped with the handle.
     pub server: LocalServer,
 }
 
-/// Bring up the local exit: a spawned local serve (control handshake, a real
-/// second TUN named `tun_name`, the server session) and the client-side
-/// handshake for `session::run_link`. `epoch` tags the LinkIo events; the
-/// hooks are the configured `server_up`/`server_down`, applied to the local
-/// serve with the same semantics as a remote serve.
+/// Start the local serve and complete the client handshake.
 pub async fn start(
     epoch: Epoch,
     primary: (Ipv4Addr, Ipv4Addr),
@@ -165,24 +106,15 @@ pub async fn start(
     let (client_read, client_write) = split(client_stream);
     let server_control = Control::new(server_read, server_write);
     let mut client_control = Control::new(client_read, client_write);
-    let (result_tx, result_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let result = serve_local(server_control, pair, pair_guard, mtu, tun_name.as_deref()).await;
-        // The serve task ends only after its result is handed over; the
-        // server session and its TUN are gone by the time the send returns.
-        let _ = result_tx.send(result);
+        serve_local(server_control, pair, pair_guard, mtu, tun_name.as_deref()).await
     });
-    let mut server = LocalServer {
-        task,
-        result: result_rx,
-    };
+    let mut server = LocalServer { task };
     let port = match client_handshake(&mut client_control, pair, mtu, server_up, server_down).await
     {
         Ok(port) => port,
         Err(client_error) => {
-            // Dropping the control half is the graceful stop: the serve task
-            // unwinds through its own error path, closes its TUN and runs
-            // the down hook. No task or TUN outlives this call.
+            // Closing control lets the serve close its TUN and run down hooks.
             drop(client_control);
             let server_error = server
                 .join()
@@ -226,9 +158,7 @@ pub async fn start(
     })
 }
 
-/// Local serve: the remote serve handshake without SSH, UDP strategies,
-/// perf and addrpool claims — the fixed inner pair is honored as given, and
-/// the data plane is the loopback-only TCP listener.
+/// Run the server handshake and session without SSH or UDP strategies.
 async fn serve_local(
     mut control: Control,
     pair: LocalPair,
@@ -256,9 +186,6 @@ async fn serve_local(
     crate::validate_addresses(server_ip, client_ip, hello_mtu)?;
     ensure!(hello_mtu == mtu, "local MTU mismatch");
     control.send(Message::Ready { version: VERSION }).await?;
-    // Loopback-only and ephemeral: raw-IP flow framing, not an application
-    // TCP proxy; the actual port is announced in endpoints and reused by the
-    // session.
     let listener = crate::tcp::bind_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
     let port = listener
         .local_addr()
@@ -287,8 +214,7 @@ async fn serve_local(
         Message::DeclineAddr => bail!("client declined the local address pair"),
         _ => bail!("expected accept_addr or decline_addr"),
     }
-    // The REAL second TUN: the server session must run unchanged so the
-    // host kernel forwarding/conntrack/NAT owns the egress.
+    // The second TUN is the kernel forwarding/NAT boundary.
     let tun = crate::open_tun(tun_name, pair.server, pair.client, mtu).await?;
     let tun_name = tun.name().context("local-exit TUN name")?;
     let _peer_route = crate::tun::PeerRoute::install(pair.client, &tun_name)?;
@@ -303,9 +229,7 @@ async fn serve_local(
     crate::serve_tail(control, tun, pair.server, pair.client, mtu, config).await
 }
 
-/// Client side of the local handshake (the `open_link` sequence without SSH):
-/// Hello/Ready, Endpoints, Assigned/AcceptAddr, TunReady, optional
-/// ServerHooks with HookResult, final TunReady. Returns the data-plane port.
+/// Complete the client handshake and return the loopback TCP port.
 async fn client_handshake(
     control: &mut Control,
     pair: LocalPair,

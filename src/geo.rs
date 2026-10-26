@@ -137,21 +137,17 @@ pub fn asn_key(asn: u32) -> u64 {
     u64::from(asn)
 }
 
-/// Rendezvous key for an uncovered destination: stable per-address stickiness
-/// without any persistence, in a separate domain from ASN keys.
+/// Stable per-address key, disjoint from ASN and country keys.
 pub fn ip_key(ip: Ipv4Addr) -> u64 {
     (1 << 32) | u64::from(u32::from(ip))
 }
 
-/// Rendezvous key for a country group, in a domain above every ASN and
-/// bare-IP key.
+/// Country key in a separate rendezvous domain.
 pub fn country_key(packed: u32) -> u64 {
     (1 << 33) | u64::from(packed)
 }
 
-/// Rendezvous key for sticky-ASN scoped to a country — `(country, asn)`.
-/// The tag is above the complete 16-bit country field (bits 32..47), so
-/// countries such as CH/CL cannot alias through the domain bit.
+/// `(country, asn)` key; the high tag prevents country aliases.
 pub fn scoped_asn_key(packed: u32, asn: u32) -> u64 {
     (1 << 48) | (u64::from(packed) << 32) | u64::from(asn)
 }
@@ -236,8 +232,7 @@ pub fn pack_country(code: &str) -> Option<u32> {
     }
 }
 
-/// The two-letter code for a [`pack_country`] payload, e.g. 0x5255 → "RU";
-/// state keys and logs use the ISO code, not the packed form.
+/// Convert a packed country payload back to its two-letter code.
 pub fn unpack_country(packed: u32) -> String {
     format!("{}{}", (packed >> 8) as u8 as char, packed as u8 as char)
 }

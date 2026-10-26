@@ -55,30 +55,18 @@ impl PeerRoute {
         let index = if_index_of(tun_name)?;
         let route = peer_route(peer, index);
         let mut manager = route_manager::RouteManager::new().context("route manager")?;
-        let binding = Self { route };
-        if route_present(&mut manager, peer, index)? {
-            return Ok(binding);
-        }
-        match manager.add(&binding.route) {
-            Ok(()) => {}
+        match manager.add(&route) {
+            Ok(()) => Ok(Self { route }),
             Err(error) if error.raw_os_error() == Some(17) => {
                 ensure!(
                     route_present(&mut manager, peer, index)?,
                     "foreign route blocks local-exit peer {peer}/32 via {tun_name}"
                 );
-                return Ok(binding);
+                Ok(Self { route })
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("add local-exit peer route {peer}/32 via {tun_name}")
-                });
-            }
+            Err(error) => Err(error)
+                .with_context(|| format!("add local-exit peer route {peer}/32 via {tun_name}")),
         }
-        ensure!(
-            route_present(&mut manager, peer, index)?,
-            "local-exit peer route {peer}/32 via {tun_name} did not install"
-        );
-        Ok(binding)
     }
 }
 

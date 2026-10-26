@@ -107,7 +107,7 @@ fn selector_hub(
         pool,
         geo,
         country,
-        home_country: None,
+        local_exits: Vec::new(),
         local: None,
         local_task: None,
         nodes: servers

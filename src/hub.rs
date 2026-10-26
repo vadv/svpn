@@ -129,8 +129,8 @@ pub struct Hub {
     /// Sticky exit: country table for the destination Country constraint;
     /// None = no country routing.
     pub country: Option<crate::geo::Geo>,
-    /// Packed home country for LocalExit admission.
-    pub home_country: Option<u32>,
+    /// Packed countries whose destinations use local-exit.
+    pub local_exits: Vec<u32>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -158,21 +158,11 @@ pub struct Hub {
     pub pair: watch::Sender<Option<(Ipv4Addr, Ipv4Addr)>>,
 }
 
-/// What dispatching one client packet produced for the TUN.
-#[derive(Debug, PartialEq)]
-pub enum Dispatched {
-    Reset([u8; 40]),
-}
-
 impl Hub {
     /// Return a CLOSED-endpoint reset for unowned TCP traffic.
     /// Check the current owner and retired flows before classifying a new
-    /// flow; home country is considered before VPN ownership.
-    pub async fn dispatch(
-        &mut self,
-        bytes: &[u8],
-        client_ip: Ipv4Addr,
-    ) -> Result<Option<Dispatched>> {
+    /// flow; local-exit countries are considered before VPN ownership.
+    pub fn dispatch(&mut self, bytes: &[u8], client_ip: Ipv4Addr) -> Result<Option<[u8; 40]>> {
         let parsed = match packet::parse(bytes, true) {
             Some(parsed) if parsed.flow.valid_for(client_ip) => parsed,
             Some(_) => {
@@ -196,10 +186,7 @@ impl Hub {
         };
         let now = StdInstant::now();
         if self.tombstones.active(&parsed.flow, now) {
-            return Ok(self
-                .tombstones
-                .respond(&parsed.flow, &parsed, now)
-                .map(Dispatched::Reset));
+            return Ok(self.tombstones.respond(&parsed.flow, &parsed, now));
         }
         match self.routes.by_key.get(&parsed.flow) {
             Some(Target::Direct(id)) => self.forward_local(*id, bytes),
@@ -221,32 +208,29 @@ impl Hub {
             }
             // A non-serving owner still owns the flow: no reset, no reassign.
             Some(Target::Remote(_)) => Ok(None),
-            None if parsed.can_open => self.open_flow(&parsed, bytes, client_ip).await,
-            None => Ok(packet::tcp_reset_for(&parsed).map(Dispatched::Reset)),
+            None if parsed.can_open => self.open_flow(&parsed, bytes, client_ip),
+            None => Ok(packet::tcp_reset_for(&parsed)),
         }
     }
 
-    /// Whether the destination is an exact match of the home country (spec
-    /// §3.1): direct applies; a database miss is a non-home destination.
-    fn is_home(&self, destination: Ipv4Addr) -> bool {
-        self.home_country.is_some_and(|home| {
-            self.country
-                .as_ref()
-                .and_then(|geo| geo.lookup(destination))
-                == Some(home)
-        })
+    /// A database match in local-exits uses the local path; misses use VPN.
+    fn is_local_exit(&self, destination: Ipv4Addr) -> bool {
+        self.country
+            .as_ref()
+            .and_then(|geo| geo.lookup(destination))
+            .is_some_and(|country| self.local_exits.contains(&country))
     }
 
-    /// Classification of a new flow: home traffic uses LocalExit and never
-    /// falls back to the VPN; everything else picks the remote owner.
-    async fn open_flow(
+    /// Local-exit traffic never falls back to the VPN; other traffic picks a
+    /// remote owner.
+    fn open_flow(
         &mut self,
         parsed: &packet::Packet,
         bytes: &[u8],
         client_ip: Ipv4Addr,
-    ) -> Result<Option<Dispatched>> {
+    ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
-        if self.is_home(key.destination) {
+        if self.is_local_exit(key.destination) {
             return self.open_local(parsed, bytes);
         }
         let Some(epoch) = self.pick(&key) else {
@@ -262,7 +246,7 @@ impl Hub {
         Ok(None)
     }
 
-    fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<Dispatched>> {
+    fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
         let Some(local) = &self.local else {
             self.local_stats.failed += 1;
@@ -298,7 +282,7 @@ impl Hub {
         Ok(None)
     }
 
-    fn forward_local(&mut self, id: u64, bytes: &[u8]) -> Result<Option<Dispatched>> {
+    fn forward_local(&mut self, id: u64, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
         let key = packet::parse(bytes, true).map(|packet| packet.flow);
         let Some(local) = &self.local else {
             return Ok(None);
@@ -316,7 +300,6 @@ impl Hub {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => delivery.dropped(),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.local_stats.failed += 1;
                 if let Some(key) = key {
                     self.close_local(id, key, true);
                 }
@@ -389,13 +372,37 @@ impl Hub {
         }
     }
 
-    fn local_stopped(&mut self, reason: String) {
+    async fn local_stopped(&mut self, reason: String, tun: &mut Option<AsyncDevice>) {
         crate::error!("local-exit: {reason}");
         self.local_stats.failed += 1;
         if let Some(local) = &mut self.local {
             local.ready = false;
-            local.events = None;
-            local.server.abort();
+        }
+        // Deliver terminal packets before dropping the local event channel.
+        loop {
+            let event = self
+                .local
+                .as_mut()
+                .and_then(|local| local.events.as_mut()?.try_recv().ok());
+            let Some(event) = event else { break };
+            if let Err(error) = self.handle_local_event(event, tun).await {
+                crate::warn!("local-exit: terminal event failed — {error:#}");
+                break;
+            }
+        }
+        let Some(local) = self.local.take() else {
+            return;
+        };
+        let mut server = local.server;
+        match tokio::time::timeout(
+            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
+            server.join(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::warn!("local-exit: serve cleanup failed — {error:#}"),
+            Err(_) => crate::warn!("local-exit: serve cleanup timed out"),
         }
         let mut retired = Vec::new();
         self.routes.by_key.retain(|key, target| {
@@ -459,7 +466,7 @@ impl Hub {
                 self.sticky.asn_miss
             ));
         }
-        if self.home_country.is_some() {
+        if !self.local_exits.is_empty() {
             report.push_str(&format!(
                 "\nlocal-exit: opened {} / failed {} / closed {}",
                 self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
@@ -743,7 +750,7 @@ impl Hub {
         peer: Ipv4Addr,
         params: &LinkParams,
     ) -> Result<()> {
-        if self.home_country.is_none() || self.local.is_some() {
+        if self.local_exits.is_empty() || self.local.is_some() {
             return Ok(());
         }
         let epoch = Epoch {
@@ -801,7 +808,12 @@ impl Hub {
             return Ok(());
         };
         drop(local.outgoing);
-        match tokio::time::timeout(Duration::from_secs(2), local.server.join()).await {
+        match tokio::time::timeout(
+            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
+            local.server.join(),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 local.server.abort();
@@ -841,17 +853,14 @@ impl Hub {
                     ensure!(length != 0, "client TUN closed");
                     let local =
                         (*self.pair.borrow()).map_or(params.tun_addr, |(client, _)| client);
-                    match self.dispatch(&buffer[..length], local).await? {
-                        Some(Dispatched::Reset(reset)) => {
-                            let tun = tun.as_ref().context("TCP reset without client TUN")?;
-                            let result = tokio::time::timeout(
-                                Duration::from_millis(100),
-                                tun.send(&reset),
-                            )
-                            .await;
-                            finish_write(&self.links[0].delivery, reset.len(), result)?;
-                        }
-                        None => {}
+                    if let Some(reset) = self.dispatch(&buffer[..length], local)? {
+                        let tun = tun.as_ref().context("TCP reset without client TUN")?;
+                        let result = tokio::time::timeout(
+                            Duration::from_millis(100),
+                            tun.send(&reset),
+                        )
+                        .await;
+                        finish_write(&self.links[0].delivery, reset.len(), result)?;
                     }
                 }
                 event = self.incoming.recv() => {
@@ -869,7 +878,7 @@ impl Hub {
                 }, if self.local.as_ref().is_some_and(|local| local.events.is_some()) => {
                     match event {
                         Some(event) => self.handle_local_event(event, tun).await?,
-                        None => self.local_stopped("event channel closed".to_owned()),
+                        None => self.local_stopped("event channel closed".to_owned(), tun).await,
                     }
                 }
                 result = async {
@@ -884,7 +893,7 @@ impl Hub {
                         Ok(Err(error)) => format!("{error:#}"),
                         Err(error) => format!("local client task: {error}"),
                     };
-                    self.local_stopped(reason);
+                    self.local_stopped(reason, tun).await;
                 }
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
@@ -1035,8 +1044,8 @@ pub struct GeoExits {
     pub geo: Option<crate::geo::Geo>,
     /// Country database; None — no country routing.
     pub country: Option<crate::geo::Geo>,
-    /// Packed home country for LocalExit admission.
-    pub home_country: Option<u32>,
+    /// Packed countries whose destinations use local-exit.
+    pub local_exits: Vec<u32>,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
@@ -1077,7 +1086,7 @@ pub async fn run(
     let GeoExits {
         geo,
         country,
-        home_country,
+        local_exits,
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
@@ -1108,7 +1117,7 @@ pub async fn run(
     let mut hub = Hub {
         geo,
         country,
-        home_country,
+        local_exits,
         local: None,
         local_task: None,
         nodes,
