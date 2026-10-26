@@ -380,6 +380,25 @@ impl Hub {
         match result {
             Ok(rewritten) => Ok(rewritten.map(Dispatched::Direct)),
             Err(error) => {
+                // Validation/rejection errors leave the engine mapping in
+                // place. Only a mapping actually removed by the engine is a
+                // terminal flow failure; otherwise the next valid packet
+                // must still use this same generation.
+                let retained = match key.protocol {
+                    6 | 17 => self
+                        .direct
+                        .as_ref()
+                        .is_some_and(|engine| engine.owns(key, id)),
+                    1 => self
+                        .icmp
+                        .as_ref()
+                        .is_some_and(|engine| engine.owns(key, id)),
+                    _ => false,
+                };
+                if retained {
+                    crate::debug!("vpn: rejected direct packet, retained flow {key:?}: {error:#}");
+                    return Ok(None);
+                }
                 self.direct_stats.failed += 1;
                 if self.routes.forget_direct(key, id) {
                     self.direct_stats.closed += 1;
@@ -428,18 +447,24 @@ impl Hub {
                     }
                 }
             }
-            DirectEvent::Closed { id, key } => {
-                // Only TCP tuples get a CLOSED-endpoint reply; UDP and ICMP
-                // flows just vanish (same as a retired remote epoch).
-                if self.routes.forget_direct(key, id) {
-                    self.direct_stats.closed += 1;
-                    if key.protocol == 6 {
-                        self.tombstones.insert(key, StdInstant::now());
-                    }
-                }
-            }
+            DirectEvent::Closed { id, key } => self.close_direct_event(id, key, false),
+            DirectEvent::Failed { id, key } => self.close_direct_event(id, key, true),
         }
         Ok(())
+    }
+
+    fn close_direct_event(&mut self, id: u64, key: FlowKey, failed: bool) {
+        // Only TCP tuples get a CLOSED-endpoint reply; UDP and ICMP flows
+        // just vanish (same as a retired remote epoch).
+        if self.routes.forget_direct(key, id) {
+            self.direct_stats.closed += 1;
+            if failed {
+                self.direct_stats.failed += 1;
+            }
+            if key.protocol == 6 {
+                self.tombstones.insert(key, StdInstant::now());
+            }
+        }
     }
 
     pub fn stats_report(&mut self, elapsed: Duration) -> String {

@@ -368,6 +368,19 @@ async fn direct_dispatch_error_reconciles_without_a_close_event() {
 }
 
 #[tokio::test]
+async fn direct_failed_event_counts_background_failure() {
+    let (mut hub, _remote) = direct_hub(None).await;
+    let datagram = udp_datagram(40034, AWAY_DST, 53);
+    let key = packet::parse(&datagram, true).unwrap().flow;
+    hub.routes.by_key.insert(key, Target::Direct(13));
+    hub.handle_direct_event(DirectEvent::Failed { id: 13, key }, &mut None)
+        .await
+        .unwrap();
+    assert!(!hub.routes.by_key.contains_key(&key));
+    assert_eq!((hub.direct_stats.failed, hub.direct_stats.closed), (1, 1));
+}
+
+#[tokio::test]
 async fn udp_close_forgets_without_a_tombstone() {
     let (mut hub, mut remote) = direct_hub(Some(engine().await)).await;
     let ip = client();

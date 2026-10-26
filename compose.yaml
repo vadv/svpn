@@ -59,7 +59,8 @@ services:
     image: svpn-test:local
     init: true
     command: [python3, -u, /e2e/integration.py]
-    cap_add: [NET_ADMIN]
+    # NET_RAW is required by Linux SO_BINDTODEVICE for direct sockets.
+    cap_add: [NET_ADMIN, NET_RAW]
     devices: [/dev/net/tun:/dev/net/tun]
     environment:
       SVPN_TEST_LOG_DIR: /testlogs

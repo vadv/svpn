@@ -119,16 +119,18 @@ pub struct DirectConfig {
 }
 
 /// Engine output for the Hub. `Packet` rides the lossy queue (dropped under
-/// pressure, never blocks a flow); `Closed` rides the reliable channel and
-/// is never lost to packet-queue pressure. Both are tagged with the flow id.
+/// pressure, never blocks a flow); terminal events ride the reliable channel
+/// and are never lost to packet-queue pressure. Both are tagged with the flow id.
 #[derive(Debug)]
 pub enum DirectEvent {
     /// Outbound packet to write into the TUN, e.g. a rebuilt UDP reply.
     Packet { id: u64, bytes: Vec<u8> },
-    /// Flow finished (relay done, dial failed, idle or pending timeout).
+    /// Flow finished normally (relay done, idle or pending timeout).
     /// `key` names the original tuple so the Hub reconciles exactly this
     /// owner; a late close of a replaced generation must not affect it.
     Closed { id: u64, key: FlowKey },
+    /// A background socket/connect/relay failure terminated this flow.
+    Failed { id: u64, key: FlowKey },
 }
 
 #[derive(Debug)]
@@ -190,25 +192,31 @@ struct Shared {
 }
 
 impl Shared {
-    /// A failed outbound connect has no useful NAT mapping to retain:
-    /// remove it and notify the Hub promptly. Relay completion uses dwell.
+    /// A failed outbound connect/relay still owns an accepted kernel socket:
+    /// retain its NAT mapping through FIN_DWELL so the resulting FIN/RST can
+    /// be rewritten, but notify the Hub promptly with a failure outcome.
     async fn fail_tcp(&self, flow: FlowKey, id: u64) {
-        let removed = {
+        {
             let mut state = self.state.lock().unwrap();
-            let matches = state.tcp.get(&flow).is_some_and(|entry| {
-                entry.id == id && matches!(entry.stage, TcpStage::Connecting { .. })
-            });
-            if matches {
-                state.tcp.remove(&flow);
+            let Some(entry) = state.tcp.get_mut(&flow) else {
+                return;
+            };
+            if entry.id != id
+                || !matches!(
+                    entry.stage,
+                    TcpStage::Connecting { .. } | TcpStage::Relay { .. }
+                )
+            {
+                return;
             }
-            matches
-        };
-        if removed {
-            let _ = self
-                .events
-                .send(DirectEvent::Closed { id, key: flow })
-                .await;
+            entry.stage = TcpStage::Dwell {
+                until: Instant::now() + FIN_DWELL,
+            };
         }
+        let _ = self
+            .events
+            .send(DirectEvent::Failed { id, key: flow })
+            .await;
     }
 
     /// Relay teardown enters FIN_DWELL without retiring the Hub owner.
@@ -238,7 +246,7 @@ impl Shared {
         }
     }
 
-    /// Background UDP teardown reports through the reliable channel. The
+    /// Background UDP failure reports through the reliable channel. The
     /// Hub-originated send-error path uses forget_udp instead: awaiting this
     /// channel from Hub dispatch could deadlock while the Hub is the drain.
     async fn finish_udp(&self, flow: FlowKey, id: u64) {
@@ -247,7 +255,7 @@ impl Shared {
         };
         let _ = self
             .events
-            .send(DirectEvent::Closed { id, key: flow })
+            .send(DirectEvent::Failed { id, key: flow })
             .await;
         if let Some(abort) = entry.abort {
             abort.abort();
@@ -338,6 +346,18 @@ impl DirectEngine {
     pub fn flow_count(&self) -> usize {
         let state = self.shared.state.lock().unwrap();
         state.tcp.len() + state.udp.len()
+    }
+
+    /// Whether this exact generation still owns an engine mapping. Hub
+    /// dispatch uses this to distinguish a rejected packet from a terminal
+    /// socket failure without desynchronizing the two tables.
+    pub(crate) fn owns(&self, flow: FlowKey, id: u64) -> bool {
+        let state = self.shared.state.lock().unwrap();
+        match flow.protocol {
+            6 => state.tcp.get(&flow).is_some_and(|entry| entry.id == id),
+            17 => state.udp.get(&flow).is_some_and(|entry| entry.id == id),
+            _ => false,
+        }
     }
 
     /// Whether a TCP mapping is retaining its NAT state after socket relay
@@ -821,8 +841,10 @@ async fn relay(shared: Arc<Shared>, id: u64, flow: FlowKey, mut accepted: TcpStr
     }
     if let Err(error) = copy_bidirectional(&mut accepted, &mut outbound).await {
         crate::debug!("direct tcp {flow:?}: relay — {error}");
+        shared.fail_tcp(flow, id).await;
+    } else {
+        shared.finish_tcp(flow, id).await;
     }
-    shared.finish_tcp(flow, id).await;
 }
 
 /// One connected UDP socket per flow; sends the first datagram after the

@@ -4,6 +4,7 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -15,6 +16,14 @@ use svpn::{
 
 const PEER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DST: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+
+// These two kernel-side tests bind the same synthetic peer port range;
+// serialize them so parallel test threads cannot race for a NAT port.
+static KERNEL_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn kernel_test_lock() -> &'static tokio::sync::Mutex<()> {
+    KERNEL_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 /// A real local IPv4 address (UDP connect is a route lookup, no packets):
 /// macOS binds only 127.0.0.1 by default, so the client side of the loopback
@@ -365,10 +374,73 @@ async fn pending_timeout_frees_the_reservation() {
 /// pending nat port, the outbound dial fails (no uplink privilege or a
 /// refused port), and the mapping enters FIN_DWELL.
 #[tokio::test]
+async fn failed_connect_retains_nat_mapping_for_kernel_fin() {
+    let Some(uplink) = loopback_uplink() else {
+        return;
+    };
+    let _kernel_guard = kernel_test_lock().lock().await;
+    let destination = tokio::net::TcpListener::bind((PEER, 0)).await.unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    drop(destination); // The outbound connect is refused.
+    let mut cfg = config();
+    cfg.uplink = uplink;
+    let mut engine = DirectEngine::new(cfg).await.unwrap();
+    let flow = FlowKey {
+        protocol: 6,
+        source: client(),
+        destination: PEER,
+        source_port: 44445,
+        destination_port,
+    };
+    let syn = build_tcp(&flow, 0x02, 1000, 0, &[], &[], &[]);
+    let parsed = packet::parse(&syn, true).unwrap();
+    let rewritten = engine.open_tcp(70, &parsed, &syn).unwrap().unwrap();
+    let nat_port = nat_port_of(&rewritten);
+    let kernel_side = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    kernel_side.set_reuse_address(true).unwrap();
+    kernel_side
+        .bind(&socket2::SockAddr::from(SocketAddrV4::new(PEER, nat_port)))
+        .unwrap();
+    kernel_side
+        .connect(&socket2::SockAddr::from(SocketAddrV4::new(
+            client(),
+            engine.listen_port(),
+        )))
+        .unwrap();
+    drop(kernel_side);
+    let event = tokio::time::timeout(Duration::from_secs(5), engine.recv_event())
+        .await
+        .expect("failed connect must report a terminal failure");
+    assert!(matches!(event, DirectEvent::Failed { id: 70, .. }));
+    assert!(engine.tcp_in_dwell(flow));
+    assert_eq!(engine.flow_count(), 1);
+    let fin = build_tcp(&flow, 0x11, 2000, 3000, &[], &[], &[]);
+    assert!(engine.forward_tcp(70, &fin).unwrap().is_some());
+    let kernel_fin = build_tcp(
+        &FlowKey {
+            protocol: 6,
+            source: client(),
+            destination: PEER,
+            source_port: engine.listen_port(),
+            destination_port: nat_port,
+        },
+        0x11,
+        3001,
+        2001,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(engine.rewrite_reverse(&kernel_fin).is_some());
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn dwell_keeps_both_mappings_then_retires_the_tuple() {
     let Some(uplink) = loopback_uplink() else {
         return;
     };
+    let _kernel_guard = kernel_test_lock().lock().await;
     let destination = tokio::net::TcpListener::bind((PEER, 0)).await.unwrap();
     let destination_port = destination.local_addr().unwrap().port();
     let server = tokio::spawn(async move {

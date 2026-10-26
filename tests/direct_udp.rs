@@ -329,7 +329,7 @@ async fn failed_udp_dial_cannot_leave_an_untracked_flow() {
     let event = tokio::time::timeout(Duration::from_secs(3), engine.recv_event())
         .await
         .expect("failed dial must close the registered flow");
-    assert!(matches!(event, DirectEvent::Closed { id: 77, .. }));
+    assert!(matches!(event, DirectEvent::Failed { id: 77, .. }));
     assert_eq!(engine.flow_count(), 0);
     engine.shutdown().await.unwrap();
 }

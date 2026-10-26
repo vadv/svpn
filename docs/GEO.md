@@ -118,7 +118,7 @@ SVPN не создаёт country routes. До `hooks.start` автоматиче
 
 IP/TCP checksums пересчитываются. NAT rewrite сохраняет seq/ack, flags и options. SVPN автоматически обеспечивает один `peer/32 → этот TUN` route, если TUN/hook его ещё не создали; удаляется только owned route. Ручная country route configuration отсутствует.
 
-Завершение socket copy не делает NAT mapping свободным: local kernel ещё может отправлять FIN/ACK/retransmission. Mapping и Hub owner переживают teardown и bounded `FIN_DWELL` (4 минуты); terminal `Closed` отправляется только при удалении mapping по expiry. Retired ports ограничены и expire. Повторное использование original tuple до retirement отклоняется. Поздний close старого поколения не удаляет новый owner.
+Завершение socket copy не делает NAT mapping свободным: local kernel ещё может отправлять FIN/ACK/retransmission. При обычном teardown mapping и Hub owner переживают bounded `FIN_DWELL` (4 минуты); terminal `Closed` отправляется только при удалении mapping по expiry. При connect/relay/socket failure надёжный `Failed` сразу уведомляет Hub и учитывается в `failed`, но TCP mapping всё равно сохраняется до dwell expiry для reverse FIN/RST; повторный expiry `Closed` не считается повторно. Retired ports ограничены и expire. Повторное использование original tuple до retirement отклоняется. Поздний close старого поколения не удаляет новый owner. Validation rejection сохраняет owner и engine mapping; только действительно удалённый mapping считается terminal failure.
 
 ### 5.3 UDP
 

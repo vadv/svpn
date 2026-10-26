@@ -14,6 +14,7 @@ from _lib import (
     cleanup_verified,
     command,
     session,
+    ssh,
     ssh_to,
     tcp_echo,
     until,
@@ -29,6 +30,17 @@ TARGET = "172.30.77.4"
 HOST_BITS = 15
 ROWS = 1 << (32 - HOST_BITS)
 FILLER_ASN = 2_000_000
+MASQUERADE_RULES = """table inet svpn_masq {
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    ip saddr 10.77.0.0/24 accept
+  }
+  chain masq {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 10.77.0.0/24 oifname "eth0" masquerade
+  }
+}
+"""
 
 _geo_asn = None
 _country_ready = False
@@ -64,6 +76,16 @@ def write_country():
             country = "RU" if row == target_row else "DE"
             out.write(f'"{_dotted(start)}","{_dotted(start | mask)}",{country}\n')
     _country_ready = True
+
+
+def enable_target_masquerade():
+    # Remote exits need the administrator-provided NAT fixture; unlike the
+    # tunnel peer, the external target has no route back to 10.77.0.0/24.
+    ssh(
+        "mkdir -p /etc/nftables.d && cat > /etc/nftables.d/svpn.nft <<'NFT'\n"
+        + MASQUERADE_RULES
+        + "NFT\nnft -f /etc/nftables.d/svpn.nft"
+    )
 
 
 def country_args(home=False):
@@ -157,6 +179,10 @@ def kill_and_degrade(process, path, owner):
     degraded = path.read_text().count("serving (1/2 servers ready,")
     command(ssh_to(owner) + ["pkill", "-x", "svpn"])
     until(lambda: path.read_text().count("serving (1/2 servers ready,") > degraded, seconds=15)
+    # A checking owner intentionally lends new flows to a reserve without
+    # migrating the sticky group. Wait for the actual failed/backoff state
+    # before testing failover persistence.
+    until(lambda: f"vpn[{owner}]: link failed" in path.read_text(), seconds=15)
     return steady
 
 
@@ -303,28 +329,41 @@ def udp_echo(peer, payload=b"direct-udp"):
 
 def test_country_asn_scope():
     fresh_state()
-    with session("country-asn", args=country_args(), server_hosts=HOSTS, ready_timeout=20) as (
-        process,
-        path,
-    ):
-        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
-        baseline = opened(path)
-        assert target_tcp_echo(0) == SERVER
-        tcp_echo(1, peer=PEER)
-        until(lambda: delta(path, baseline) == {SERVER: 1, SERVER2: 1}, seconds=20)
-    cleanup_verified(process, server_hosts=HOSTS)
+    enable_target_masquerade()
+    try:
+        with session("country-asn", args=country_args(), server_hosts=HOSTS, ready_timeout=20) as (
+            process,
+            path,
+        ):
+            until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+            command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
+            command(["ip", "route", "replace", f"{PEER}/32", "dev", "svpn0"])
+            baseline = opened(path)
+            source = target_tcp_echo(0)
+            assert source == SERVER, source
+            tcp_echo(1, peer=PEER)
+            until(lambda: delta(path, baseline) == {SERVER: 1, SERVER2: 1}, seconds=20)
+        cleanup_verified(process, server_hosts=HOSTS)
+    finally:
+        ssh("nft delete table inet svpn_masq", check=False)
     print("PASS country+ASN: RU target and DE tunnel peer stay on their scoped servers")
 
 
 def test_direct_home_and_vpn():
     fresh_state()
+    # The internal Compose network intentionally has no default route. Give
+    # direct a physical test uplink; ordinary connected routes remain intact.
+    command(["ip", "route", "replace", "default", "dev", "eth0"])
     with session("direct-home", args=country_args(home=True), server_hosts=HOSTS, ready_timeout=20) as (
         process,
         path,
     ):
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
+        command(["ip", "route", "replace", f"{PEER}/32", "dev", "svpn0"])
         baseline = opened(path)
-        assert target_tcp_echo(2) == "172.30.77.3"
+        source = target_tcp_echo(2)
+        assert source == "172.30.77.3", source
         udp_echo(TARGET)
         tcp_echo(3, peer=PEER)
         until(lambda: direct_opened(path) == (2, 0, 0), seconds=20)

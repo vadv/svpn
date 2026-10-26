@@ -584,6 +584,27 @@ async fn icmp_idle_expiry_closes_the_flow_and_rejects_late_traffic() {
     engine.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn invalid_echo_request_keeps_live_mapping() {
+    let Some(uplink) = loopback_uplink() else {
+        return;
+    };
+    let Some(mut engine) = engine(&uplink).await else {
+        return;
+    };
+    let request = request_packet(client(), PEER, 0x0711, 1, b"validation", 64);
+    let parsed = packet::parse(&request, true).unwrap();
+    if !open_live(&mut engine, 11, &parsed, &request).await {
+        return;
+    }
+    let mut invalid = request.clone();
+    invalid[22] ^= 1; // ICMP checksum, while the outer IPv4 parser stays valid.
+    assert!(engine.forward_icmp(11, &invalid).await.is_err());
+    assert!(engine.forward_icmp(11, &request).await.is_ok());
+    assert_eq!(engine.flow_count(), 1);
+    engine.shutdown().await.unwrap();
+}
+
 // ── privilege denial ──
 
 #[tokio::test]

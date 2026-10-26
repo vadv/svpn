@@ -258,7 +258,7 @@ impl Shared {
         };
         let _ = self
             .events
-            .send(DirectEvent::Closed { id, key: *flow })
+            .send(DirectEvent::Failed { id, key: *flow })
             .await;
         if let Some(abort) = entry.abort {
             abort.abort();
@@ -321,6 +321,17 @@ impl IcmpEngine {
     /// Mapping count — the capacity gauge, bounded by `MAX_FLOWS`.
     pub fn flow_count(&self) -> usize {
         self.shared.state.lock().unwrap().flows.len()
+    }
+
+    /// Whether this exact generation still owns an engine mapping.
+    pub(crate) fn owns(&self, flow: FlowKey, id: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .flows
+            .get(&flow)
+            .is_some_and(|entry| entry.id == id)
     }
 
     /// First echo request of a new direct ICMP flow: validates the request,
