@@ -371,9 +371,7 @@ async fn pending_timeout_frees_the_reservation() {
 
 // ── teardown dwell ──
 
-/// Completes the kernel side over loopback: the local accept validates the
-/// pending nat port, the outbound dial fails (no uplink privilege or a
-/// refused port), and the mapping enters FIN_DWELL.
+/// Complete the loopback kernel side so outbound failure retains the mapping.
 #[tokio::test]
 async fn failed_connect_retains_nat_mapping_for_kernel_fin() {
     let Some(uplink) = loopback_uplink() else {

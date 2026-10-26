@@ -251,7 +251,7 @@ fn recovered_node_does_not_take_the_group_back() {
 
 #[test]
 fn reserve_is_not_recaptured_by_a_recovered_reserve() {
-    // A dies → group on B; B dies → group on C; B recovers → group stays on C.
+    // Failover moves A→B→C and does not snap back when B recovers.
     let mut hub = sticky_hub(&[1, 1, 1]);
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let now = Instant::now();
@@ -441,7 +441,7 @@ fn normal_assignment_is_not_persisted() {
         Some(&id),
         "a failover transition is recorded"
     );
-    // Persistence is batched (spec): pick marks dirty, flush_due / clean stop write.
+    // Pick marks state dirty; flush_due or clean stop writes it.
     assert!(!path.exists(), "batched: no sync write inside pick");
     hub.exit_state.as_mut().unwrap().flush();
     assert!(path.exists(), "flush persists the failover transition");
@@ -627,7 +627,7 @@ fn unassigned_country_keeps_global_asn_selection() {
 
 #[test]
 fn constrained_flow_never_spills_to_non_candidates() {
-    // No DE candidate is Ready while a heavy foreign link is: still no flow.
+    // No ready DE candidate means no flow despite a heavy foreign link.
     let mut hub = selector_hub(
         &[1, 1, 9],
         false,

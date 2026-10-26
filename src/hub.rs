@@ -88,9 +88,8 @@ pub struct DirectStats {
     pub closed: u64,
 }
 
-/// A destination country with assigned servers: the candidates constraint
-/// of spec §3. Country is the constraint, ASN — when covered by the ASN
-/// database — the affinity inside it.
+/// A destination country with assigned servers.
+/// Country constrains candidates; ASN supplies affinity within them.
 struct CountryRoute {
     /// Packed ISO code — the rendezvous key payload.
     packed: u32,
@@ -101,8 +100,7 @@ struct CountryRoute {
 }
 
 impl CountryRoute {
-    /// The typed persistence key (spec §4): a scoped `CC:ASN` key keeps its
-    /// country, a bare country key otherwise.
+    /// Use a scoped `CC:ASN` persistence key when ASN data is available.
     fn exit_key(&self) -> crate::exit_state::ExitKey {
         let code = crate::geo::unpack_country(self.packed);
         match self.asn {
@@ -123,13 +121,13 @@ pub struct Hub {
     pub country: Option<crate::geo::Geo>,
     /// Packed home country for direct admission; None — direct disabled.
     pub home_country: Option<u32>,
-    /// Captured physical uplink (spec §5.1); None — direct disabled.
+    /// Captured physical uplink; None means direct is disabled.
     pub uplink: Option<Uplink>,
-    /// Direct TCP/UDP engine, started at the first Ready with the live TUN
-    /// identity; a TCP/UDP init failure stops startup (spec §2).
+    /// TCP/UDP engine started with the live TUN identity.
+    /// Initialization failure stops startup.
     pub direct: Option<DirectEngine>,
-    /// Direct ICMP sibling (spec §5.4); its init failure is ICMP-only and
-    /// warning-graded — home ICMP never falls back to the VPN.
+    /// ICMP engine; initialization failure disables ICMP only.
+    /// Home ICMP never falls back to the VPN.
     pub icmp: Option<IcmpEngine>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
@@ -165,12 +163,9 @@ pub enum Dispatched {
 }
 
 impl Hub {
-    /// Returns a CLOSED-endpoint reset for unowned or tombstoned TCP traffic.
-    ///
-    /// Dispatch order (spec §5.5): reverse-NAT of kernel listener packets,
-    /// the current owner (remote or direct), retired tuples, and only then
-    /// the classification of a new flow — home country before any VPN
-    /// owner (spec §3.1).
+    /// Return a CLOSED-endpoint reset for unowned TCP traffic.
+    /// Dispatch reverse-NAT, current owner and retired flows before classifying
+    /// a new flow; home country is considered before VPN ownership.
     pub async fn dispatch(
         &mut self,
         bytes: &[u8],
@@ -274,10 +269,8 @@ impl Hub {
         Ok(None)
     }
 
-    /// Opens a home-country flow on the direct engines. The owner table
-    /// gets a `Target::Direct` only when the engine accepted the flow; an
-    /// engine that is unavailable or full drops the packet — the home
-    /// country must never leak into the VPN (spec §3.1).
+    /// Open a home-country flow only when a direct engine accepts it.
+    /// Unavailable or full engines drop the packet; never leak home traffic to VPN.
     async fn open_direct(
         &mut self,
         parsed: &packet::Packet,
@@ -577,9 +570,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    // The direct engines start with the live TUN identity,
-                    // immediately after creation and before user hooks change
-                    // the routing view (spec §5.1).
+                    // Start direct before user hooks can change the routing view.
                     self.start_direct(&name, tun_addr, peer_addr, params.mtu)
                         .await?;
                     hooks.start(name, tun_addr, peer_addr)?;
@@ -685,9 +676,7 @@ impl Hub {
         if let Some(state) = &mut self.exit_state {
             state.flush_due(StdInstant::now());
         }
-        // An assigned country constrains candidates before any ASN
-        // affinity (spec §3): a constrained flow never spills to a
-        // non-candidate exit, even under exit-policy=balance.
+        // Country constrains candidates before ASN affinity, even in balance mode.
         if let Some(route) = self.country_route(key.destination) {
             let group = match route.asn {
                 Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
@@ -699,8 +688,7 @@ impl Hub {
             return self.pool.pick();
         };
         let Some(asn) = geo.lookup(key.destination) else {
-            // Uncovered /32: deterministic stateless rendezvous, never
-            // recorded in exit_owners or persisted (spec: no /32 overrides).
+            // Uncovered /32 uses stateless rendezvous without persisted ownership.
             self.sticky.lookup(false, false);
             return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
                 .into_iter()
@@ -710,10 +698,8 @@ impl Hub {
         self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
     }
 
-    /// The destination's country when servers are assigned to it (spec
-    /// §3): a constraint on candidates. An unassigned country and a
-    /// database miss are no constraint — the global sticky-ASN or balance
-    /// selection applies unchanged.
+    /// Return assigned destination countries as a candidate constraint.
+    /// Unknown or unassigned countries leave normal selection unchanged.
     fn country_route(&self, destination: Ipv4Addr) -> Option<CountryRoute> {
         let packed = self.country.as_ref()?.lookup(destination)?;
         let code = crate::geo::unpack_country(packed);
@@ -736,12 +722,9 @@ impl Hub {
         })
     }
 
-    /// Sticky owner of `group`: an alive owner keeps the group (no
-    /// snap-back), a Checking owner keeps it while a reserve serves new
-    /// flows, a restored owner still connecting holds the group through
-    /// the startup grace, then the group fails over inside `candidates`
-    /// and the deviation is persisted under `key`. `None` candidates —
-    /// every configured link.
+    /// Select a sticky owner without snap-back.
+    /// Checking/restored owners retain their grace period; failover stays
+    /// within candidates and persists the deviation. None means all links.
     fn sticky_epoch(
         &mut self,
         group: u64,
@@ -786,11 +769,8 @@ impl Hub {
         let (link, epoch) = next?;
         if previous != Some(link) {
             self.exit_owners.insert(group, link);
-            // Baseline — first node of the (restricted) rendezvous order —
-            // reproduces itself and needs no disk. Deviations (a failover
-            // transition or a first assignment that skipped an unavailable
-            // primary) do not, so they are persisted; a restart must not
-            // snap back (spec).
+            // The rendezvous baseline needs no state; failover or an unavailable
+            // primary creates a persisted deviation to prevent restart snap-back.
             let deviation = order.first() != Some(&link);
             if previous.is_some() {
                 self.sticky.failover_moves += 1;
@@ -805,11 +785,9 @@ impl Hub {
         Some(epoch)
     }
 
-    /// Starts the direct engines (spec §5): the TCP/UDP engine binds its
-    /// kernel listener on the negotiated client address and ensures the
-    /// `peer/32` return route — both startup-fatal (spec §2). The ICMP
-    /// sibling degrades to a warning: home ICMP never falls back to the
-    /// VPN (spec §5.4).
+    /// Start direct engines after TUN negotiation.
+    /// TCP/UDP listener and return-route failures are fatal; ICMP failure
+    /// disables only ICMP and never enables VPN fallback.
     async fn start_direct(
         &mut self,
         tun_name: &str,
@@ -845,9 +823,8 @@ impl Hub {
         Ok(())
     }
 
-    /// Bounded direct teardown (spec §5.5): the engines stop their tasks
-    /// within the join budget and remove only the return route they
-    /// installed. Runs after the hub tasks and hooks have stopped.
+    /// Stop direct tasks within the join budget and remove only owned routes.
+    /// Runs after hub tasks and hooks stop.
     async fn shutdown_direct(&mut self) -> Result<()> {
         let direct = match self.direct.take() {
             Some(engine) => engine.shutdown().await,
@@ -1113,11 +1090,8 @@ pub struct GeoExits {
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
 
-/// A restored owner's rendezvous group, or `None` to drop it (spec §4):
-/// typed keys map onto disjoint numeric key domains — the persisted
-/// strings are never hashed — and a country or scoped owner restores only
-/// while its node is still a candidate for the country, so the scoped key
-/// keeps its country before the first flow.
+/// Map a persisted typed owner key to its numeric rendezvous group.
+/// Restore only while the owner remains a candidate for its country.
 #[doc(hidden)]
 pub fn restored_group(
     servers: &[LinkParams],

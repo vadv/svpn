@@ -124,12 +124,9 @@ pub fn main_entry() -> ExitCode {
     }
 }
 
-/// Startup loading of the geo exit inputs (spec §2-4): the ASN database
-/// (sticky-asn affinity), the country database (Country constraint and
-/// direct-home) and the one shared owner state file.
+/// Load ASN/country databases and their shared owner state at startup.
 fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
-    // Runtime twin of the parse-time validation (spec §2): home-country or
-    // per-server countries without a country database cannot start.
+    // Keep runtime validation aligned with CLI parsing.
     args.validate_geo()?;
     let asn = match (args.exit_policy, &args.geo_db) {
         (cli::ExitPolicy::Balance, None) => None,
@@ -178,8 +175,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         }
         (None, _) => None,
     };
-    // One state file for every domain (spec §4): the explicit path, else
-    // beside the ASN database, else beside the country database.
+    // Prefer the explicit state path, then a file beside either database.
     let state_path = args
         .exit_state
         .clone()
@@ -194,11 +190,8 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 .map(|path| path.with_extension("state.json"))
         });
     let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
-    // Direct (spec §5.1): with a home country, the physical uplink of the
-    // IPv4 default route is captured now — before the hub runs and before
-    // any user hook can change the routing view. A missing uplink fails
-    // startup: direct has no unbound fallback and must never silently
-    // degrade to the VPN path.
+    // Capture the uplink before hooks can change routing.
+    // Missing uplink is fatal: direct never falls back to unbound VPN routing.
     let uplink = match args.home_country {
         Some(_) => {
             let uplink = crate::direct::discover_uplink()?;

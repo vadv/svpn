@@ -1,15 +1,8 @@
-//! Sticky exit grouping: IPv4 destination → ASN or country, weighted
-//! rendezvous order.
+//! IPv4 destination → ASN/country grouping with weighted rendezvous order.
+//! Rows are parsed once into sorted ranges; lookup happens only for new flows.
+//! Country rows are strict because malformed mappings misroute traffic.
 //!
-//! The parsed table is a sorted array of `(start, end, payload)` — ~4.8 MB of
-//! RAM for DB-IP ASN Lite; the Country Lite loader packs the two-letter code
-//! into the same u32 payload and, unlike the tolerant ASN loader, rejects
-//! malformed rows as startup errors — a wrong country table misroutes flows
-//! instead of merely losing affinity. Parsed once at startup (~0.4 s measured
-//! on the target router); lookup runs only for a new flow, never per packet.
-//!
-//! shortcut: IPv4 only — IPv6 traffic keeps the balance behavior until real
-//! v6 traffic appears in the pool.
+//! shortcut: IPv4 only — IPv6 keeps balance behavior until real v6 traffic appears.
 
 use std::{
     fs::File,
@@ -38,12 +31,9 @@ impl Geo {
         Self::load_ranges(path, asn_row)
     }
 
-    /// Streaming parse of DB-IP Country Lite CSV (`ip_start,ip_end,country`,
-    /// e.g. `8.8.8.0,8.8.8.255,US`). Strict, unlike [`Geo::load`]: a malformed
-    /// row, a malformed IPv4 address, an invalid country code, an inverted
-    /// range or an overlap is a startup error naming the row number and
-    /// category. The only skipped rows are IPv6 — both address fields contain
-    /// `:` — because the table is IPv4-only and they carry no usable data.
+    /// Load strict Country Lite IPv4 ranges (`ip_start,ip_end,country`).
+    /// Reject malformed, inverted or overlapping rows with their row number.
+    /// Skip IPv6 rows, which this IPv4-only table cannot use.
     pub fn load_country(path: &Path) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("country database: {}", path.display()))?;

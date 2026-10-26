@@ -1,22 +1,7 @@
-//! Direct ICMP echo engine (spec §5.4): home-country echo flows leave
-//! through the host stack on the physical uplink instead of the VPN.
-//!
-//! One socket per flow, pinned to the captured uplink and bound to the
-//! uplink's own IPv4 address, so the on-wire source is always the physical
-//! address — the client's tunnel address never leaves the machine, because
-//! a TUN source is not routable back. The original id/seq/payload ride the
-//! request; the reply is rebuilt as the original tuple `destination →
-//! client` with the reply's TTL.
-//!
-//! Linux and macOS use one `SOCK_RAW` ICMP socket per flow: it needs
-//! `CAP_NET_RAW`/root, and a missing privilege is an explicit ICMP-only
-//! error — direct TCP/UDP stay up and there is no VPN fallback. Raw sockets
-//! also see ICMP errors quoting our requests; they are rewritten for the
-//! client (outer destination and embedded original source become client).
-//!
-//! No `IP_HDRINCL` and no `unsafe` (the crate forbids it): the kernel
-//! builds the IPv4 header, and binding to the uplink address pins the
-//! source just as well.
+//! Home-country ICMP echo flows use raw sockets on the physical uplink.
+//! Each flow preserves the original id/seq/payload and rewrites replies
+//! (including quoted ICMP errors) back to the client tuple. Raw sockets
+//! require CAP_NET_RAW/root; failure affects ICMP only, never VPN fallback.
 
 use std::{
     collections::HashMap,
@@ -49,11 +34,9 @@ fn is_icmp_feedback_error(error: &anyhow::Error) -> bool {
     })
 }
 
-// std/tokio have no ICMP socket type; the `UdpSocket` handle drives the
-// identical send/recv syscalls on the ICMP socket behind it.
+// UdpSocket drives send/recv on the raw ICMP socket; std has no ICMP type.
 
-/// A validated ICMP echo message — exactly the fields a direct flow
-/// preserves end to end.
+/// Echo fields preserved by a direct flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Echo {
     pub id: u16,
@@ -61,9 +44,7 @@ pub struct Echo {
     pub payload: Vec<u8>,
 }
 
-/// Parses and validates the client's echo request at the boundary: IPv4,
-/// protocol 1, unfragmented, complete lengths, echo request type/code and
-/// an intact ICMP checksum. Anything else is rejected whole.
+/// Validate a complete, unfragmented ICMP echo request and its checksum.
 pub fn parse_echo_request(bytes: &[u8]) -> Option<Echo> {
     let (header, total) = ipv4_header(bytes)?;
     if total != bytes.len() || bytes[9] != 1 || fragmented(bytes) {
@@ -72,13 +53,8 @@ pub fn parse_echo_request(bytes: &[u8]) -> Option<Echo> {
     echo_message(&bytes[header..total], 8)
 }
 
-/// A validated echo reply read from the flow socket: the buffer carries
-/// the reply's own IPv4 header, so the source address and TTL are the
-/// reply's, never guessed. Raw receive normalization happens before this
-/// parser, so both Linux and Darwin use wire-order lengths here.
-/// `mtu` is the read window bound: a reply longer than the TUN can carry —
-/// including one the kernel truncated to the window, whose all-zero tail
-/// can leave the ICMP checksum valid — is rejected whole (spec §5.4).
+/// Validate a raw echo reply and return its source, TTL and echo fields.
+/// Reject packets beyond the TUN MTU, including truncated packets.
 pub fn parse_echo_reply_ip(bytes: &[u8], mtu: usize) -> Option<(Ipv4Addr, u8, Echo)> {
     let (header, total) = ipv4_header(bytes)?;
     if bytes[9] != 1 {
@@ -96,11 +72,8 @@ pub fn parse_echo_reply_ip(bytes: &[u8], mtu: usize) -> Option<(Ipv4Addr, u8, Ec
     Some((source, bytes[8], echo))
 }
 
-/// Normalize the outer IPv4 header returned by Darwin raw ICMP sockets.
-/// Darwin returns `ip_len` and `ip_off` in host byte order; the quoted IPv4
-/// header inside an ICMP error remains wire order and is deliberately not
-/// touched. The socket receive path calls this only on macOS; keeping the
-/// transformation public makes the platform fixture testable everywhere.
+/// Convert Darwin's host-order outer ip_len/ip_off to wire order.
+/// Quoted headers in ICMP errors remain untouched.
 pub fn normalize_darwin_raw_ip(bytes: &mut [u8]) {
     if bytes.len() < 20 {
         return;
@@ -111,13 +84,9 @@ pub fn normalize_darwin_raw_ip(bytes: &mut [u8]) {
     bytes[6..8].copy_from_slice(&offset.to_be_bytes());
 }
 
-/// Rewrites an ICMP error (unreachable, time exceeded, parameter problem)
-/// that quotes an echo request we sent from `physical` for delivery to the
-/// client: the outer destination and the embedded original source become
-/// the client, and every affected checksum — outer IPv4, outer ICMP,
-/// embedded IPv4 — is recomputed. Returns the original flow the quote
-/// belongs to and the packet. `None` for anything malformed, not an error,
-/// or quoting a request that is not ours.
+/// Rewrite an ICMP error quoting our request for delivery to the client.
+/// Match the physical source and recompute all affected checksums.
+/// Return None for malformed, unrelated or non-error packets.
 pub fn rewrite_icmp_error(
     bytes: &[u8],
     client: Ipv4Addr,
@@ -139,8 +108,8 @@ pub fn rewrite_icmp_error(
     if quote[9] != 1 || quote_total < quote_header + 8 {
         return None;
     }
-    // RFC 792 quotes the IP header plus 8 bytes: the echoed ICMP checksum
-    // covered the full original message and cannot be re-validated here.
+    // RFC 792 quotes only the IP header and 8 bytes; the full checksum
+    // cannot be validated from this prefix.
     let quoted = quote.get(quote_header..quote_header + 8)?;
     if quoted[0] != 8 || quoted[1] != 0 {
         return None;
@@ -171,9 +140,7 @@ pub fn rewrite_icmp_error(
     Some((flow, out))
 }
 
-/// Echo request message for the wire: the client's id/seq/payload with a
-/// freshly computed checksum. Linux sends it verbatim; the Darwin datagram
-/// API rewrites the id and the checksum itself.
+/// Build an echo request with a fresh checksum.
 fn echo_request_message(echo: &Echo) -> Vec<u8> {
     let mut icmp = vec![0u8; 8 + echo.payload.len()];
     icmp[0] = 8;
@@ -185,9 +152,7 @@ fn echo_request_message(echo: &Echo) -> Vec<u8> {
     icmp
 }
 
-/// The reply packet an application expects from the TUN: the original
-/// `destination → client` tuple, the reply's TTL and the app-visible id,
-/// with valid IPv4 and ICMP checksums.
+/// Build an echo reply with the original tuple and valid checksums.
 pub fn echo_reply_packet(source: Ipv4Addr, destination: Ipv4Addr, ttl: u8, echo: &Echo) -> Vec<u8> {
     let icmp_len = 8 + echo.payload.len();
     let total = 20 + icmp_len;
@@ -209,8 +174,7 @@ pub fn echo_reply_packet(source: Ipv4Addr, destination: Ipv4Addr, ttl: u8, echo:
     bytes
 }
 
-/// IPv4 header sanity: version 4, a complete 20+ byte header and a total
-/// length that covers it.
+/// Validate an IPv4 header and return its header and total lengths.
 fn ipv4_header(bytes: &[u8]) -> Option<(usize, usize)> {
     if bytes.len() < 20 || bytes[0] >> 4 != 4 {
         return None;
@@ -224,8 +188,7 @@ fn fragmented(bytes: &[u8]) -> bool {
     u16::from_be_bytes([bytes[6], bytes[7]]) & 0xbfff != 0
 }
 
-/// One ICMP message of `expected_type` (0 reply / 8 request): code 0,
-/// complete echo header, intact checksum.
+/// Validate an echo message of the expected type, code and checksum.
 fn echo_message(icmp: &[u8], expected_type: u8) -> Option<Echo> {
     if icmp.len() < 8 || icmp[0] != expected_type || icmp[1] != 0 {
         return None;
@@ -254,11 +217,9 @@ struct IcmpState {
 
 struct Shared {
     cfg: DirectConfig,
-    /// The uplink's own IPv4 address: the on-wire source of every request.
+    /// Physical source address for requests.
     source: Ipv4Addr,
-    // Lock poisoning is unreachable: a panicking task aborts the process
-    // (see the panic hook in main_entry). The guard covers map operations
-    // only and is never held across an await.
+    // The process aborts on panic; never hold this lock across an await.
     state: Mutex<IcmpState>,
     tasks: AsyncMutex<JoinSet<()>>,
     packets: mpsc::Sender<DirectEvent>,
@@ -296,10 +257,8 @@ impl Shared {
     }
 }
 
-/// Standalone direct ICMP engine, the spec §5.4 sibling of `DirectEngine`:
-/// the Hub feeds client echo packets in, polls events out and writes
-/// returned packets into the TUN. No routes of its own — the `peer/32`
-/// return route stays with `DirectEngine`.
+/// Direct ICMP engine driven by the Hub.
+/// The TCP/UDP engine owns the shared return route.
 pub struct IcmpEngine {
     shared: Arc<Shared>,
     expiry: tokio::task::JoinHandle<()>,
@@ -308,10 +267,8 @@ pub struct IcmpEngine {
 }
 
 impl IcmpEngine {
-    /// Derives the uplink source address and starts the expiry timer. A
-    /// failure (no usable uplink address, missing bind privilege) is an
-    /// explicit ICMP-only condition: the caller keeps direct TCP/UDP up and
-    /// there is no VPN fallback for ICMP (spec §5.4).
+    /// Derive the uplink source and start expiry.
+    /// Initialization failure disables ICMP only; it never enables VPN fallback.
     pub async fn new(config: DirectConfig) -> Result<Self> {
         validate(&config)?;
         let source = uplink_source(&config.uplink)?;
@@ -334,18 +291,17 @@ impl IcmpEngine {
         })
     }
 
-    /// The uplink address every request is sent from — the on-wire source,
-    /// never the client's tunnel address.
+    /// Physical source address used for requests.
     pub fn uplink_source(&self) -> Ipv4Addr {
         self.shared.source
     }
 
-    /// Mapping count — the capacity gauge, bounded by `MAX_FLOWS`.
+    /// Number of live mappings.
     pub fn flow_count(&self) -> usize {
         self.shared.state.lock().unwrap().flows.len()
     }
 
-    /// Whether this exact generation still owns an engine mapping.
+    /// Whether this flow generation still owns a mapping.
     pub(crate) fn owns(&self, flow: FlowKey, id: u64) -> bool {
         self.shared
             .state
@@ -356,10 +312,8 @@ impl IcmpEngine {
             .is_some_and(|entry| entry.id == id)
     }
 
-    /// First echo request of a new direct ICMP flow: validates the request,
-    /// opens the bound socket and sends it. A re-request of an open flow
-    /// reuses its socket. The socket is created before any state exists, so
-    /// a missing privilege or a send error registers no flow.
+    /// Validate and send the first echo request, creating its socket first.
+    /// Repeated requests reuse the socket; failed setup creates no mapping.
     pub async fn open_icmp(&mut self, id: u64, packet: &Packet, bytes: &[u8]) -> Result<()> {
         let cfg = &self.shared.cfg;
         ensure!(packet.flow.protocol == 1, "direct open: not an ICMP flow");
@@ -412,8 +366,7 @@ impl IcmpEngine {
             crate::debug!("direct icmp {flow:?}: ICMP error reply — {error:#}");
         }
         if existing.is_none() {
-            // Insert before spawning: the receive task may finish a broken
-            // flow before its abort handle can be registered.
+            // Register the task before it can finish and report failure.
             self.shared.state.lock().unwrap().flows.insert(
                 flow,
                 IcmpFlow {
@@ -435,15 +388,12 @@ impl IcmpEngine {
             {
                 entry.abort = Some(handle);
             }
-            // Gone or replaced: the task is either exiting after reporting
-            // its own close or has no mapping to serve — aborting it could
-            // cancel an in-flight close report, so it runs out on its own.
+            // Do not abort a task that may still be reporting its close.
         }
         Ok(())
     }
 
-    /// Later echo requests of an open flow: sent through the flow's socket
-    /// with this request's TTL. A send error closes only this flow.
+    /// Send a later echo request with its TTL.
     pub async fn forward_icmp(&self, id: u64, bytes: &[u8]) -> Result<()> {
         let parsed = packet::parse(bytes, true).context("direct icmp forward: bad packet")?;
         ensure!(
@@ -471,15 +421,14 @@ impl IcmpEngine {
                 );
                 return Ok(());
             }
-            // The Hub reconciles its own dispatch failure synchronously;
-            // awaiting the reliable queue here can deadlock the Hub.
+            // The Hub reconciles this close synchronously; do not await its queue.
             self.shared.forget_icmp(&parsed.flow, id);
             return Err(error).context("direct icmp send");
         }
         Ok(())
     }
 
-    /// Non-blocking event poll: reliable events first, then packets.
+    /// Poll events without blocking, reliable events first.
     pub fn poll_event(&mut self) -> Option<DirectEvent> {
         if let Ok(event) = self.events_rx.try_recv() {
             return Some(event);
@@ -487,21 +436,19 @@ impl IcmpEngine {
         self.packets_rx.try_recv().ok()
     }
 
-    /// Blocking event receive for a Hub select loop.
+    /// Receive the next event for a Hub select loop.
     pub async fn recv_event(&mut self) -> DirectEvent {
         if let Some(event) = self.poll_event() {
             return event;
         }
-        // The engine keeps its own senders alive, so neither channel closes.
+        // The engine retains senders, so both channels stay open.
         tokio::select! {
             event = self.events_rx.recv() => event.expect("engine event senders alive"),
             event = self.packets_rx.recv() => event.expect("engine packet senders alive"),
         }
     }
 
-    /// Bounded teardown: the expiry timer and all flow tasks stop within
-    /// the join budget. No owned route exists — that stays with
-    /// `DirectEngine`.
+    /// Stop tasks within the join budget; the TCP/UDP engine owns the route.
     pub async fn shutdown(mut self) -> Result<()> {
         self.expiry.abort();
         let _ = tokio::time::timeout(SHUTDOWN_JOIN, &mut self.expiry).await;
@@ -613,11 +560,8 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
     shared.finish_icmp(&flow, id).await;
 }
 
-/// One received datagram: an echo reply of this flow — matched by source
-/// and id against the original tuple — is rebuilt for the TUN with the
-/// app-visible id and the reply's TTL. An ICMP error quoting this flow's
-/// request is also rewritten for the client. Everything
-/// else — malformed or unrelated — is dropped (spec §5.4).
+/// Accept a matching echo reply or an ICMP error quoting this flow.
+/// Rebuild it for the client; drop malformed or unrelated datagrams.
 fn handle_receive(shared: &Shared, flow: &FlowKey, id: u64, bytes: &[u8]) {
     if let Some((source, ttl, echo)) = parse_echo_reply_ip(bytes, shared.cfg.mtu as usize)
         && source == flow.destination
@@ -646,11 +590,8 @@ fn deliver(shared: &Shared, flow: &FlowKey, id: u64, bytes: Vec<u8>) {
     let _ = shared.packets.try_send(DirectEvent::Packet { id, bytes });
 }
 
-/// Timer-driven expiry: an idle flow (no request, reply or error for
-/// `UDP_IDLE`, the spec §5.5 ICMP budget) dies without new traffic and its
-/// close is reported through the reliable channel. Completed flow tasks
-/// are reaped every cycle: an unreaped JoinSet grows with total historical
-/// flows, not the live table.
+/// Expire idle flows after `UDP_IDLE` and report their close reliably.
+/// Reap completed tasks on every timer pass.
 async fn icmp_expiry_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(EXPIRY_TICK);
     loop {

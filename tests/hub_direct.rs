@@ -1,6 +1,4 @@
-//! Hub direct integration (spec §3.1, §5.5): dispatch decisions of the
-//! direct path against a real DirectEngine over the host's own addresses —
-//! no TUN involved, kernel paths stay unexercised like tests/direct.rs.
+//! Hub direct dispatch with a real engine over host addresses; no TUN.
 
 use std::{net::Ipv4Addr, sync::Arc, time::Instant as StdInstant};
 
@@ -21,8 +19,7 @@ const PEER: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 const HOME_DST: Ipv4Addr = Ipv4Addr::new(1, 0, 0, 5);
 const AWAY_DST: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
 
-/// A real local IPv4 address (UDP connect is a route lookup, no packets):
-/// the engine's client identity must be bindable for the listener.
+/// Return a local IPv4 address that the engine listener can bind.
 fn client() -> Ipv4Addr {
     static LOCAL: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
     *LOCAL.get_or_init(|| {
@@ -70,8 +67,7 @@ fn country_table() -> Geo {
     Geo::from_ranges(vec![(0x0100_0000, 0x0100_00FF, home_country())])
 }
 
-/// A ready two-link hub with direct admitted through a real engine (state
-/// paths only: the fake uplink keeps every socket path out of the test).
+/// Build a ready two-link hub with direct admitted through a real engine.
 async fn direct_hub(direct: Option<DirectEngine>) -> (Hub, mpsc::Receiver<svpn::link_io::Packet>) {
     let (events, incoming) = mpsc::channel(QUEUE);
     let (outgoing, remote) = mpsc::channel(QUEUE);
@@ -282,8 +278,7 @@ async fn direct_close_tombstones_only_the_current_generation() {
         panic!("direct owner expected");
     };
 
-    // The flow is replaced (engine retired and a new generation opened the
-    // same tuple): a late close of the old generation changes nothing.
+    // A late close from a replaced generation changes nothing.
     let replacement = id + 1;
     hub.routes.by_key.insert(key, Target::Direct(replacement));
     hub.handle_direct_event(DirectEvent::Closed { id, key }, &mut None)
@@ -295,7 +290,7 @@ async fn direct_close_tombstones_only_the_current_generation() {
         "a stale close must not tombstone the tuple"
     );
 
-    // The current generation's close forgets the route and tombstones TCP.
+    // The current close forgets the route and tombstones TCP.
     hub.handle_direct_event(
         DirectEvent::Closed {
             id: replacement,
@@ -496,7 +491,7 @@ async fn kernel_listener_packet_maps_back_before_admission() {
             destination_port: 40040,
         }
     );
-    // The original owner stays; the kernel tuple is never an owner itself.
+    // The original owner stays; the kernel tuple is not an owner.
     assert!(matches!(hub.routes.by_key[&key], Target::Direct(_)));
     assert!(remote.try_recv().is_err());
 }

@@ -1,17 +1,11 @@
 //! Sticky exit owner persistence: failover transitions survive restarts.
 //!
-//! Only failover reassignments are stored; plain rendezvous assignments
-//! reproduce themselves and need no disk. Writes are batched (flash wear)
-//! and atomic (tmp + fsync + rename + fsync dir). The file is a hint, not a
-//! trust boundary: corruption or a format version mismatch degrades to an
-//! empty state, never to an error.
+//! Store failover owners; plain rendezvous assignments need no disk.
+//! Writes are batched and atomic. Corrupt or foreign-version state loads empty.
 //!
-//! Version 2 keeps two independent maps in one document: `country` (ISO
-//! code → node) and `asn` (numeric global ASN or `CC:ASN` scoped key →
-//! node). Both maps are always written, empty or not. A version 1 `owners`
-//! map migrates into the global ASN domain only. Queries go through typed
-//! [`ExitKey`]s, so the domain is explicit and never inferred from which
-//! map happens to be nonempty.
+//! Version 2 keeps independent country and ASN maps. Scoped ASN keys retain
+//! their country; v1 `owners` migrates to global ASN only. [`ExitKey`] makes
+//! the domain explicit.
 
 use std::{
     collections::HashMap,
@@ -31,9 +25,7 @@ const FLUSH_EVERY: Duration = Duration::from_secs(5);
 pub enum ExitKey {
     /// Global ASN (`asn` map, numeric key).
     Asn(u32),
-    /// Country-scoped ASN (`asn` map, `CC:ASN` key). The key keeps the
-    /// country, so a restored owner can filter candidates before the first
-    /// flow.
+    /// Country-scoped ASN (`CC:ASN`), including its country for candidate filtering.
     ScopedAsn(String, u32),
     /// Country (`country` map, ISO code key).
     Country(String),

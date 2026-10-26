@@ -1,20 +1,7 @@
-//! Direct System Stack engine (spec §5.2-5.3; the ICMP sibling of spec
-//! §5.4 lives in the `icmp` submodule): home-country TCP/UDP flows
-//! leave through the host stack on the physical uplink instead of the VPN.
-//!
-//! TCP turns the client kernel into the local endpoint: the original tuple
-//! `client:c → dst:d` is NATed to `peer:nat → client:listen`, where a real
-//! kernel listener terminates the connection; an independent outbound
-//! `TcpStream` to the original destination relays bytes with
-//! `copy_bidirectional` (segments preserved byte for byte, no seq offsets,
-//! no synthetic SYN-ACK). UDP gets one connected, uplink-bound socket per
-//! flow; replies are rebuilt with the original tuple.
-//!
-//! Shared state: the mapping tables are touched by this synchronous Hub
-//! entry path (`open_*`/`forward_*`/`rewrite_reverse`) and by the engine's
-//! own tasks (accept loop, relays, UDP flows, expiry timer). `Mutex` guards
-//! short map operations only and is never held across an `.await`; the flow
-//! tasks report back through the packet/event channels instead.
+//! Home-country TCP/UDP flows use the host stack on the physical uplink.
+//! TCP is terminated by a local listener and relayed; UDP uses one bound
+//! socket per flow. Shared maps are locked only for short operations, never
+//! across `.await`.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -40,59 +27,50 @@ use std::num::NonZeroU32;
 
 pub mod icmp;
 
-/// Whole direct table across every stage (spec §5.5).
+/// Maximum simultaneous TCP and UDP mappings.
 pub const MAX_FLOWS: usize = 4096;
-/// Simultaneous unanswered-SYN reservations (accepts/connects in flight).
+/// Maximum unanswered-SYN reservations.
 pub const MAX_PENDING: usize = 64;
-/// Lossy outbound packet queue bound: MTU-sized packets only, so the queue
-/// holds at most `PACKET_QUEUE * MTU` bytes.
+/// Lossy packet queue capacity.
 pub const PACKET_QUEUE: usize = 1024;
-/// Reliable lifecycle events (close/reconciliation), backpressured.
+/// Reliable lifecycle event queue capacity.
 const EVENT_QUEUE: usize = 1024;
-/// Unanswered SYN frees its reservation after this budget.
+/// Reservation lifetime for an unanswered SYN.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
-/// Outbound connect budget per flow.
+/// Outbound connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Idle budget of a UDP flow; refreshed by requests and replies.
+/// UDP idle timeout.
 pub const UDP_IDLE: Duration = Duration::from_secs(60);
-/// Idle budget of a relaying TCP flow, refreshed by packets in both
-/// directions (client side and kernel-listener side).
+/// TCP relay idle timeout.
 pub const TCP_IDLE: Duration = Duration::from_secs(2 * 3600 + 4 * 60);
-/// Mapping dwell after copy/teardown: the local kernel may still emit the
-/// delayed final ACK and FIN retransmissions.
+/// Keep NAT mappings briefly for delayed FIN/ACK packets.
 pub const FIN_DWELL: Duration = Duration::from_secs(4 * 60);
-/// A retired nat port stays out of rotation so stale kernel segments of a
-/// previous connection cannot be rewritten into a new mapping.
+/// Keep retired NAT ports out of rotation while old segments may arrive.
 pub const PORT_RETIRE: Duration = Duration::from_secs(4 * 60);
-/// Expiry runs on its own timer so idle flows die without new traffic.
+/// Expiry timer interval.
 const EXPIRY_TICK: Duration = Duration::from_secs(1);
-/// One-time join budget of the bounded shutdown.
+/// Shutdown join timeout.
 const SHUTDOWN_JOIN: Duration = Duration::from_secs(1);
 
-/// Physical IPv4 default-route interface, captured before user hooks run
-/// (spec §5.1). Every outbound direct socket binds to it before connect or
-/// send; there is no unbound fallback.
+/// Physical uplink captured before hooks can change routing.
+/// Every direct socket must bind to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Uplink {
     pub name: String,
     pub index: u32,
 }
 
-/// Discovers the interface of the IPv4 default route — the physical uplink
-/// the direct engine must pin its sockets to. Call it before `hooks.start`
-/// replaces the routing view. `find_route(0.0.0.0)` is a longest-prefix
-/// match and would happily pick a tunnel's `0.0.0.0/1`, so the default
-/// route itself is selected — the kernel's preference is the lowest
-/// metric, ties keep the first listed.
+/// Find the physical interface of the lowest-metric IPv4 default route.
+/// Call before hooks replace the routing view; a longest-prefix lookup
+/// could otherwise select the tunnel's `0.0.0.0/1`.
 pub fn discover_uplink() -> Result<Uplink> {
     let mut manager = route_manager::RouteManager::new().context("route manager")?;
     let routes = manager.list().context("list routes")?;
     select_uplink(&routes)
 }
 
-/// Select the preferred main-table IPv4 default route. Linux omits a zero
-/// metric in netlink, so an absent metric is the highest priority (zero),
-/// not a reason to prefer a backup with an explicit positive metric.
+/// Select the preferred main-table default route.
+/// Linux omits a zero metric in netlink; treat an absent metric as zero.
 pub fn select_uplink(routes: &[route_manager::Route]) -> Result<Uplink> {
     let route = routes
         .iter()
@@ -110,10 +88,8 @@ pub fn select_uplink(routes: &[route_manager::Route]) -> Result<Uplink> {
     Ok(uplink)
 }
 
-/// Negotiated identity the engine operates on: the tunnel pair confirmed by
-/// the server, the live TUN (name + if index for the return route), its MTU
-/// and the pinned physical uplink. Test configurations may use loopback
-/// addresses so the kernel paths stay drivable without a real TUN.
+/// Live tunnel identity, MTU and physical uplink for a direct engine.
+/// Tests may use loopback instead of a real TUN.
 #[derive(Clone, Debug)]
 pub struct DirectConfig {
     pub client: Ipv4Addr,
@@ -124,46 +100,39 @@ pub struct DirectConfig {
     pub uplink: Uplink,
 }
 
-/// Engine output for the Hub. `Packet` rides the lossy queue (dropped under
-/// pressure, never blocks a flow); terminal events ride the reliable channel
-/// and are never lost to packet-queue pressure. Both are tagged with the flow id.
+/// Engine output for the Hub. Packets are lossy; terminal events are
+/// reliable and tagged with the flow id.
 #[derive(Debug)]
 pub enum DirectEvent {
-    /// Outbound packet to write into the TUN, e.g. a rebuilt UDP reply.
+    /// Packet to write into the TUN.
     Packet { id: u64, bytes: Vec<u8> },
-    /// Flow finished normally (relay done, idle or pending timeout).
-    /// `key` names the original tuple so the Hub reconciles exactly this
-    /// owner; a late close of a replaced generation must not affect it.
+    /// Flow finished normally. The original key prevents a late close from
+    /// removing a replacement owner.
     Closed { id: u64, key: FlowKey },
-    /// A background socket/connect/relay failure terminated this flow.
+    /// Background socket failure terminated this flow.
     Failed { id: u64, key: FlowKey },
 }
 
 #[derive(Debug)]
 enum TcpStage {
-    /// Reservation for a rewritten SYN, waiting for the local accept.
+    /// Rewritten SYN waiting for local accept.
     Pending { deadline: Instant },
-    /// Accepted locally, the outbound connect still unresolved: keeps its
-    /// slot in the MAX_PENDING budget until the connect resolves (spec
-    /// §5.5 counts accepts and connects).
+    /// Locally accepted, with outbound connect still pending.
     Connecting {
         abort: Option<AbortHandle>,
         deadline: Instant,
     },
-    /// Accepted and connected; relays bytes in both directions. The abort
-    /// handle is attached right after the task spawn; the idle sweep uses
-    /// it.
+    /// Connected relay; the idle sweep uses its abort handle.
     Relay { abort: Option<AbortHandle> },
-    /// Copy finished; both forward and reverse mappings live on so kernel
-    /// FIN/ACK/retransmissions keep flowing to the application.
+    /// Relay finished; mappings remain for delayed kernel FIN/ACK packets.
     Dwell { until: Instant },
 }
 
 struct TcpFlow {
     id: u64,
-    /// Local NAT port of the rewritten `peer:nat` source.
+    /// NAT port used for the rewritten peer source.
     nat_port: u16,
-    /// Original tuple; drives the reverse rewrite.
+    /// Original flow tuple used for reverse rewriting.
     flow: FlowKey,
     stage: TcpStage,
     last_seen: Instant,
@@ -180,7 +149,7 @@ struct UdpFlow {
 struct DirectState {
     tcp: HashMap<FlowKey, TcpFlow>,
     udp: HashMap<FlowKey, UdpFlow>,
-    /// Nat ports kept out of rotation after teardown until their deadline.
+    /// Retired NAT ports and their reuse deadlines.
     retired: VecDeque<(u16, Instant)>,
     port_cursor: u16,
 }
@@ -188,9 +157,7 @@ struct DirectState {
 struct Shared {
     cfg: DirectConfig,
     listener_port: u16,
-    // Lock poisoning is unreachable: a panicking task aborts the process
-    // (see the panic hook in main_entry). The guard covers map operations
-    // only and is never held across an await.
+    // The process aborts on panic; never hold this lock across an await.
     state: Mutex<DirectState>,
     tasks: AsyncMutex<JoinSet<()>>,
     packets: mpsc::Sender<DirectEvent>,
@@ -198,9 +165,8 @@ struct Shared {
 }
 
 impl Shared {
-    /// A failed outbound connect/relay still owns an accepted kernel socket:
-    /// retain its NAT mapping through FIN_DWELL so the resulting FIN/RST can
-    /// be rewritten, but notify the Hub promptly with a failure outcome.
+    /// Keep an accepted socket's NAT mapping through FIN_DWELL after failure,
+    /// but report the flow failure to the Hub immediately.
     async fn fail_tcp(&self, flow: FlowKey, id: u64) {
         {
             let mut state = self.state.lock().unwrap();
@@ -225,10 +191,8 @@ impl Shared {
             .await;
     }
 
-    /// Relay teardown enters FIN_DWELL without retiring the Hub owner.
-    /// The expiry sweep emits the one terminal Closed event when both NAT
-    /// mappings are actually removed; delayed ACK/FIN segments can therefore
-    /// still use forward_tcp during the dwell.
+    /// Relay completion enters FIN_DWELL without retiring the Hub owner.
+    /// Expiry emits Closed only after both mappings are removed.
     async fn finish_tcp(&self, flow: FlowKey, id: u64) {
         let mut state = self.state.lock().unwrap();
         if let Some(entry) = state.tcp.get_mut(&flow)
@@ -252,9 +216,8 @@ impl Shared {
         }
     }
 
-    /// Background UDP failure reports through the reliable channel. The
-    /// Hub-originated send-error path uses forget_udp instead: awaiting this
-    /// channel from Hub dispatch could deadlock while the Hub is the drain.
+    /// Background UDP failures use the reliable channel. Hub-originated
+    /// send errors remove the mapping synchronously to avoid a queue deadlock.
     async fn finish_udp(&self, flow: FlowKey, id: u64) {
         let Some(entry) = self.remove_udp(flow, id) else {
             return;
@@ -277,35 +240,30 @@ impl Shared {
     }
 }
 
-/// How the `peer/32` return route came to exist (spec §5.2). Only the
-/// engine-installed variant is ever deleted: a preexisting route — created
-/// by the TUN bring-up or an operator hook, or installed concurrently while
-/// our own add raced to EEXIST — is foreign property for the whole run.
+/// Ownership of the peer return route. Only routes installed by this
+/// engine are removed; preexisting or concurrently added routes are foreign.
 #[derive(Debug)]
 enum RouteBinding {
-    /// Present before the engine ensured it: never removed by us.
+    /// Preexisting route; never removed by this engine.
     Preinstalled,
-    /// Installed and verified by this engine: removed on shutdown.
+    /// Installed by this engine; removed on shutdown.
     Owned(route_manager::Route),
 }
 
-/// Standalone direct TCP+UDP engine. The Hub owns it, feeds client packets
-/// in, polls events out and writes returned packets into the TUN.
+/// Direct TCP/UDP engine driven by the Hub.
 pub struct DirectEngine {
     shared: Arc<Shared>,
     accept: tokio::task::JoinHandle<()>,
     expiry: tokio::task::JoinHandle<()>,
     packets_rx: mpsc::Receiver<DirectEvent>,
     events_rx: mpsc::Receiver<DirectEvent>,
-    /// Ownership state of the `peer/32` return route.
+    /// Return-route ownership.
     route: Option<RouteBinding>,
 }
 
 impl DirectEngine {
-    /// Binds the kernel TCP listener on the negotiated client address (OS
-    /// port) and starts the accept and expiry tasks. A bind failure stops
-    /// SVPN startup (spec §2); uplink binding is applied per outbound socket
-    /// and surfaces as a per-flow error instead.
+    /// Bind the local listener and start accept/expiry tasks.
+    /// Listener bind failure is fatal; outbound bind failure is per-flow.
     pub async fn new(config: DirectConfig) -> Result<Self> {
         validate(&config)?;
         let listener = TcpListener::bind(SocketAddr::from(SocketAddrV4::new(config.client, 0)))
@@ -343,20 +301,18 @@ impl DirectEngine {
         })
     }
 
-    /// Local port the kernel listener actually got.
+    /// Actual local listener port.
     pub fn listen_port(&self) -> u16 {
         self.shared.listener_port
     }
 
-    /// Mapping count across every stage — the capacity gauge.
+    /// Number of live mappings.
     pub fn flow_count(&self) -> usize {
         let state = self.shared.state.lock().unwrap();
         state.tcp.len() + state.udp.len()
     }
 
-    /// Whether this exact generation still owns an engine mapping. Hub
-    /// dispatch uses this to distinguish a rejected packet from a terminal
-    /// socket failure without desynchronizing the two tables.
+    /// Whether this flow generation still owns a mapping.
     pub(crate) fn owns(&self, flow: FlowKey, id: u64) -> bool {
         let state = self.shared.state.lock().unwrap();
         match flow.protocol {
@@ -366,8 +322,7 @@ impl DirectEngine {
         }
     }
 
-    /// Whether a TCP mapping is retaining its NAT state after socket relay
-    /// completion. The Hub must keep its owner until this becomes false.
+    /// Whether TCP NAT state is still retained after relay completion.
     pub fn tcp_in_dwell(&self, flow: FlowKey) -> bool {
         let state = self.shared.state.lock().unwrap();
         matches!(
@@ -376,10 +331,8 @@ impl DirectEngine {
         )
     }
 
-    /// First packet (SYN) of a new direct TCP flow: installs the reservation
-    /// before the Hub writes anything into the TUN, and returns the rewritten
-    /// `peer:nat → client:listen` segment. A retransmitted SYN reuses the
-    /// existing reservation.
+    /// Install a TCP reservation and rewrite its first SYN.
+    /// Retransmitted SYNs reuse the reservation.
     pub fn open_tcp(&mut self, id: u64, packet: &Packet, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         let cfg = &self.shared.cfg;
         ensure!(packet.flow.protocol == 6, "direct open: not a TCP flow");
@@ -448,9 +401,7 @@ impl DirectEngine {
         Ok(Some(rewritten))
     }
 
-    /// Any later client→destination TCP segment of an open direct flow.
-    /// Returns the rewritten segment for the TUN; activity refreshes the
-    /// idle clock of this direction.
+    /// Rewrite a later client TCP segment and refresh its idle timer.
     pub fn forward_tcp(&self, id: u64, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         let cfg = &self.shared.cfg;
         let parsed = packet::parse(bytes, true).context("direct tcp forward: bad packet")?;
@@ -472,11 +423,8 @@ impl DirectEngine {
         .context("direct tcp forward: rewrite")
     }
 
-    /// Reverse direction: a kernel listener packet `client:listen →
-    /// peer:nat` read from the TUN, rewritten back to the original
-    /// `dst:d → client:c` tuple. Synchronous on purpose — the Hub checks
-    /// this before any new-flow classification (spec §5.5), so a reverse
-    /// SYN-ACK never passes unowned admission.
+    /// Rewrite a listener packet back to the original flow tuple.
+    /// This runs before new-flow admission so SYN-ACKs cannot be misclassified.
     pub fn rewrite_reverse(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         let cfg = &self.shared.cfg;
         let parsed = packet::parse(bytes, true)?;
@@ -503,9 +451,7 @@ impl DirectEngine {
         )
     }
 
-    /// First datagram of a new direct UDP flow: allocates the mapping and
-    /// hands the payload to the flow task, which dials the bound, connected
-    /// socket and sends it.
+    /// Allocate a UDP mapping and start its connected-socket task.
     pub async fn open_udp(&mut self, id: u64, packet: &Packet, bytes: &[u8]) -> Result<()> {
         let cfg = &self.shared.cfg;
         ensure!(
@@ -561,9 +507,7 @@ impl DirectEngine {
         Ok(())
     }
 
-    /// Later client→destination datagrams of an open UDP flow: sent through
-    /// the flow's connected socket. A missing socket means the dial is still
-    /// in flight — the datagram is dropped, as UDP may be.
+    /// Send a later UDP datagram; datagrams arriving before connect are dropped.
     pub async fn forward_udp(&self, id: u64, bytes: &[u8]) -> Result<()> {
         let parsed = packet::parse(bytes, true).context("direct udp forward: bad packet")?;
         ensure!(
@@ -599,7 +543,7 @@ impl DirectEngine {
         Ok(())
     }
 
-    /// Non-blocking event poll: reliable events first, then packets.
+    /// Poll events without blocking, reliable events first.
     pub fn poll_event(&mut self) -> Option<DirectEvent> {
         if let Ok(event) = self.events_rx.try_recv() {
             return Some(event);
@@ -607,7 +551,7 @@ impl DirectEngine {
         self.packets_rx.try_recv().ok()
     }
 
-    /// Blocking event receive for a Hub select loop.
+    /// Receive the next event for a Hub select loop.
     pub async fn recv_event(&mut self) -> DirectEvent {
         if let Some(event) = self.poll_event() {
             return event;
@@ -619,13 +563,8 @@ impl DirectEngine {
         }
     }
 
-    /// Installs the one `peer/32 → TUN` return route unless the TUN or a
-    /// hook already provides it (then it is not ours and never deleted).
-    /// Linux: unicast route in the main table (254). Ownership is recorded
-    /// the moment our add succeeds — a failed verification rolls the route
-    /// back instead of orphaning it, and a failed rollback keeps the
-    /// binding so shutdown retries. An EEXIST race converts to preinstalled
-    /// (the route is not ours) but never overwrites a foreign route.
+    /// Ensure the peer/32 return route and record its ownership.
+    /// Roll back failed verification; never delete or overwrite foreign routes.
     pub fn ensure_peer_route(&mut self) -> Result<()> {
         if self.route.is_some() {
             return Ok(());
@@ -690,9 +629,7 @@ impl DirectEngine {
         }
     }
 
-    /// Bounded teardown: the listener, all flow tasks and the expiry timer
-    /// stop within the join budget; the owned return route is deleted even
-    /// when a join times out — and only the one this engine installed.
+    /// Stop tasks within the join budget and delete only our return route.
     pub async fn shutdown(mut self) -> Result<()> {
         self.accept.abort();
         self.expiry.abort();
@@ -720,8 +657,7 @@ impl DirectEngine {
 }
 
 impl TcpFlow {
-    /// The outbound connect resolved: the flow leaves the pending budget
-    /// and becomes a relaying connection.
+    /// Move a connected flow out of the pending budget.
     fn connected(&mut self) {
         if let TcpStage::Connecting { abort, .. } = &self.stage {
             self.stage = TcpStage::Relay {
@@ -732,9 +668,7 @@ impl TcpFlow {
 }
 
 impl DirectState {
-    /// Next free nat port: rotates the whole space from the end of the
-    /// privileged range upward, skipping the listener port, live mappings
-    /// and retired ports.
+    /// Allocate a NAT port, skipping live, retired and listener ports.
     fn allocate_port(&mut self, listener_port: u16) -> Option<u16> {
         for _ in 0..u16::MAX {
             let next = u32::from(self.port_cursor) + 1;
@@ -759,8 +693,7 @@ impl DirectState {
     }
 }
 
-/// Kernel listener loop: every accepted connection must be the tunnel peer
-/// on a port reserved by a pending SYN; anything else is dropped.
+/// Accept only the tunnel peer on ports reserved by pending SYNs.
 async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
     loop {
         let (stream, remote) = match listener.accept().await {
@@ -829,9 +762,8 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
     }
 }
 
-/// Dials the original destination through the bound uplink and relays bytes
-/// in both directions with independent half-close. Whatever the outcome,
-/// the mapping moves to dwell so the local kernel can finish its side.
+/// Connect through the uplink and relay with independent half-close.
+/// Always leave the mapping in dwell afterward.
 async fn relay(shared: Arc<Shared>, id: u64, flow: FlowKey, mut accepted: TcpStream) {
     let destination = SocketAddrV4::new(flow.destination, flow.destination_port);
     let mut outbound = match tcp_connect(&shared.cfg, destination).await {
@@ -860,9 +792,8 @@ async fn relay(shared: Arc<Shared>, id: u64, flow: FlowKey, mut accepted: TcpStr
     }
 }
 
-/// One connected UDP socket per flow; sends the first datagram after the
-/// dial, then pumps replies into the lossy packet queue with the original
-/// tuple rebuilt. Oversized replies are rejected whole, never truncated.
+/// Run one connected UDP socket per flow.
+/// Rebuild replies with the original tuple and reject oversized replies.
 async fn udp_flow(
     shared: Arc<Shared>,
     id: u64,
@@ -929,11 +860,8 @@ async fn udp_flow(
     shared.finish_udp(flow, id).await;
 }
 
-/// Timer-driven expiry: pending reservations and unresolved connects,
-/// dwell ends, idle relays and idle UDP flows; retired ports age out. Works
-/// without incoming traffic. Completed flow tasks are reaped every cycle:
-/// an unreaped JoinSet grows with total historical flows, not the live
-/// table.
+/// Expire pending, idle and dwell flows without incoming traffic.
+/// Reap completed tasks and retired ports on every pass.
 async fn expiry_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(EXPIRY_TICK);
     loop {
@@ -1010,9 +938,8 @@ fn sweep(state: &mut DirectState, now: Instant) -> Vec<(FlowKey, u64)> {
     closed
 }
 
-/// Outbound TCP connect: binds the physical uplink first — an unbound socket
-/// could loop back into the TUN default (spec §5.1) — then connects with a
-/// bounded budget. The in-progress error surfaces later via SO_ERROR.
+/// Bind to the uplink before a bounded TCP connect.
+/// An in-progress error is read later from SO_ERROR.
 async fn tcp_connect(config: &DirectConfig, destination: SocketAddrV4) -> Result<TcpStream> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .context("direct tcp socket")?;
@@ -1033,8 +960,7 @@ async fn tcp_connect(config: &DirectConfig, destination: SocketAddrV4) -> Result
     .context("direct tcp connect timeout")?
 }
 
-/// Outbound UDP dial: same uplink binding, connected to the original
-/// destination so replies are scoped to this flow.
+/// Bind and connect a UDP socket to the original destination.
 fn udp_dial(config: &DirectConfig, destination: SocketAddrV4) -> Result<UdpSocket> {
     let socket =
         Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("direct udp socket")?;
@@ -1051,9 +977,8 @@ fn udp_dial(config: &DirectConfig, destination: SocketAddrV4) -> Result<UdpSocke
     UdpSocket::from_std(socket.into()).context("direct udp register")
 }
 
-/// Errors produced by an ICMP response on a connected UDP/raw socket. They
-/// describe the destination's response, not a dead local mapping. Local
-/// permission, descriptor and socket-state errors intentionally do not match.
+/// ICMP errors report destination feedback, not a dead local mapping.
+/// Do not classify permission, descriptor or socket-state errors as ICMP.
 pub fn is_icmp_feedback(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -1065,9 +990,9 @@ pub fn is_icmp_feedback(error: &io::Error) -> bool {
     )
 }
 
-/// Binds `socket` to the captured physical uplink before any connect or
-/// send. A failed binding is the only fallback: the flow errors out, it is
-/// never sent unbound. Linux `SO_BINDTODEVICE`, macOS `IP_BOUND_IF`.
+/// Bind a socket to the uplink before connect/send.
+/// Failure is per-flow; never send unbound. Linux uses SO_BINDTODEVICE,
+/// macOS uses IP_BOUND_IF.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bind_uplink(socket: &Socket, uplink: &Uplink) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -1114,9 +1039,8 @@ fn validate(config: &DirectConfig) -> Result<()> {
     Ok(())
 }
 
-/// The Hub validated the packet on admission; the engine asserts the tuple
-/// belongs to its own client so a NAT mapping is never created for a foreign
-/// source. Unlike `FlowKey::valid_for`, loopback addresses stay usable.
+/// Assert that the admitted tuple belongs to this client.
+/// Loopback remains allowed for integration tests.
 fn client_flow(flow: &FlowKey, client: Ipv4Addr) -> bool {
     flow.source == client
         && matches!(flow.protocol, 6 | 17)
@@ -1125,11 +1049,8 @@ fn client_flow(flow: &FlowKey, client: Ipv4Addr) -> bool {
         && !flow.destination.is_unspecified()
 }
 
-/// Rewrites the tuple of a parsed IPv4 packet: addresses and ports change,
-/// everything else — IHL, options, TTL, seq/ack, window, flags, payload — is
-/// preserved byte for byte, with the IPv4 header and transport checksums
-/// recomputed. UDP checksums are always computed (a computed zero is sent as
-/// 0xFFFF per RFC 768).
+/// Rewrite addresses and ports, preserving the remaining packet fields.
+/// Recompute IPv4/transport checksums; encode a zero UDP checksum as 0xFFFF.
 fn rewrite_tuple(
     bytes: &[u8],
     source: Ipv4Addr,
@@ -1170,7 +1091,7 @@ fn rewrite_tuple(
     Some(out)
 }
 
-/// Payload of a parsed UDP packet (the caller checked it parses).
+/// Return the payload of an already validated UDP packet.
 fn udp_payload(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.len() < 28 || bytes[0] >> 4 != 4 || bytes[9] != 17 {
         return None;
@@ -1180,8 +1101,7 @@ fn udp_payload(bytes: &[u8]) -> Option<&[u8]> {
     (ihl >= 20 && total == bytes.len() && total >= ihl + 8).then(|| &bytes[ihl + 8..total])
 }
 
-/// IPv4+UDP reply `source → destination` (the original flow tuple): the
-/// packet an application expects to read from the TUN.
+/// Build a UDP reply using the original flow tuple.
 fn udp_packet(source: SocketAddrV4, destination: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
     let total = 28 + payload.len();
     let mut bytes = vec![0u8; total];
@@ -1206,7 +1126,7 @@ fn udp_packet(source: SocketAddrV4, destination: SocketAddrV4, payload: &[u8]) -
     bytes
 }
 
-/// RFC 1071 checksum over the IPv4 pseudo-header plus the transport segment.
+/// Compute the transport checksum with the IPv4 pseudo-header.
 fn transport_checksum(
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -1223,7 +1143,7 @@ fn transport_checksum(
     internet_checksum(&buf)
 }
 
-/// The `peer/32` unicast route via this TUN; main table (254) on Linux.
+/// Build the peer/32 unicast route via this TUN.
 fn peer_route(peer: Ipv4Addr, tun_index: u32) -> route_manager::Route {
     #[cfg(target_os = "linux")]
     {
@@ -1237,7 +1157,7 @@ fn peer_route(peer: Ipv4Addr, tun_index: u32) -> route_manager::Route {
     }
 }
 
-/// Whether the exact `peer/32` route via this TUN interface is present.
+/// Check for the exact peer/32 route via this TUN.
 fn route_present(
     manager: &mut route_manager::RouteManager,
     peer: Ipv4Addr,
@@ -1249,9 +1169,7 @@ fn route_present(
         .any(|route| peer_route_matches(route, peer, tun_index)))
 }
 
-/// The kernel's preference between equal default routes: the lower
-/// metric wins. An absent metric is zero on Linux/Windows; on macOS/BSD
-/// every listed default is equivalent.
+/// Compare default-route metrics; an absent metric is zero on Linux/Windows.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn route_metric(route: &route_manager::Route) -> Option<u32> {
     route.metric()
@@ -1262,8 +1180,7 @@ fn route_metric(_route: &route_manager::Route) -> Option<u32> {
     None
 }
 
-/// Whether `route` is exactly the `peer/32` return route via this TUN
-/// interface (main table on Linux). The ownership notion of spec §5.2.
+/// Check whether a route is our exact peer/32 TUN route.
 pub fn peer_route_matches(route: &route_manager::Route, peer: Ipv4Addr, tun_index: u32) -> bool {
     route.destination() == IpAddr::V4(peer)
         && route.prefix() == 32
@@ -1271,9 +1188,7 @@ pub fn peer_route_matches(route: &route_manager::Route, peer: Ipv4Addr, tun_inde
         && table_is_main(route)
 }
 
-/// Deletes a route this engine owns. A route that already vanished — the
-/// TUN interface was removed first, taking its routes with it — is
-/// success, not an error.
+/// Delete an owned route; an already vanished route is success.
 fn remove_route(
     manager: &mut route_manager::RouteManager,
     route: &route_manager::Route,
@@ -1285,8 +1200,7 @@ fn remove_route(
     }
 }
 
-/// Deletion is idempotent after a down-hook or interface removal. Linux
-/// reports ENOENT; macOS route(4) reports ESRCH for a missing route.
+/// Treat Linux ENOENT and macOS ESRCH as an already deleted route.
 pub fn route_error_is_missing(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(2 | 3))
 }

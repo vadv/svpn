@@ -18,9 +18,8 @@ pub struct Owner {
     pub id: u64,
 }
 
-/// The single owner table entry (spec §5.5): a server link generation or
-/// the direct engine under a flow id. Ids come from one shared space, so a
-/// `Direct` id can never collide with a `Remote` one.
+/// A server generation or direct engine flow id.
+/// Both use one id space, so their ownership cannot collide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Remote(Owner),
@@ -132,10 +131,8 @@ impl Routes {
         }
     }
 
-    /// Removes a direct owner only when it is still the current generation
-    /// (spec §5.5): a late close of a replaced flow leaves the new owner in
-    /// place. Returns whether the removal happened — only then may the
-    /// caller tombstone the tuple.
+    /// Remove a direct owner only if its generation is still current.
+    /// The caller may tombstone the tuple only when removal succeeds.
     pub fn forget_direct(&mut self, key: FlowKey, id: u64) -> bool {
         if self.by_key.get(&key) == Some(&Target::Direct(id)) {
             self.by_key.remove(&key);
