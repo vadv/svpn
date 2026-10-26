@@ -40,7 +40,7 @@ MASQUERADE_RULES = """table inet svpn_masq {
   }
   chain masq {
     type nat hook postrouting priority srcnat; policy accept;
-    ip saddr 10.77.0.0/24 oifname "eth0" masquerade
+    ip saddr 10.77.0.0/24 masquerade
   }
 }
 """
