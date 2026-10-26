@@ -1,6 +1,6 @@
 //! TUN device creation and the busy-name diagnostics of the serve side.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result, ensure};
 use tun_rs::{AsyncDevice, DeviceBuilder};
@@ -44,13 +44,94 @@ pub fn create_tun(
     Ok(tun)
 }
 
-/// TUNSETIFF fails with EBUSY while another process holds the name (the
-/// previous serve inside its heartbeat-shutdown window).
+/// Owned peer return route for a local-exit TUN. The claimed inner pair
+/// makes an existing exact route safe to reclaim after a crash.
+pub struct PeerRoute {
+    route: route_manager::Route,
+}
+
+impl PeerRoute {
+    pub fn install(peer: Ipv4Addr, tun_name: &str) -> Result<Self> {
+        let index = if_index_of(tun_name)?;
+        let route = peer_route(peer, index);
+        let mut manager = route_manager::RouteManager::new().context("route manager")?;
+        match manager.add(&route) {
+            Ok(()) => Ok(Self { route }),
+            Err(error) if error.raw_os_error() == Some(17) => {
+                ensure!(
+                    route_present(&mut manager, peer, index)?,
+                    "foreign route blocks local-exit peer {peer}/32 via {tun_name}"
+                );
+                Ok(Self { route })
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("add local-exit peer route {peer}/32 via {tun_name}")),
+        }
+    }
+}
+
+impl Drop for PeerRoute {
+    fn drop(&mut self) {
+        let Ok(mut manager) = route_manager::RouteManager::new() else {
+            return;
+        };
+        if let Err(error) = manager.delete(&self.route)
+            && !matches!(error.raw_os_error(), Some(2 | 3 | 6))
+        {
+            crate::warn!("local-exit peer route cleanup failed — {error}");
+        }
+    }
+}
+
+fn peer_route(peer: Ipv4Addr, index: u32) -> route_manager::Route {
+    #[cfg(target_os = "linux")]
+    {
+        route_manager::Route::new(IpAddr::V4(peer), 32)
+            .with_if_index(index)
+            .with_table(254)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        route_manager::Route::new(IpAddr::V4(peer), 32).with_if_index(index)
+    }
+}
+
+fn route_present(
+    manager: &mut route_manager::RouteManager,
+    peer: Ipv4Addr,
+    index: u32,
+) -> Result<bool> {
+    Ok(manager.list().context("list routes")?.iter().any(|route| {
+        route.destination() == IpAddr::V4(peer)
+            && route.prefix() == 32
+            && route.if_index() == Some(index)
+            && {
+                #[cfg(target_os = "linux")]
+                {
+                    route.table() == 254
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    true
+                }
+            }
+    }))
+}
+
+/// Detect EBUSY from TUNSETIFF while another process holds the name.
 pub fn is_busy_tun(error: &anyhow::Error) -> bool {
     error
         .root_cause()
         .downcast_ref::<std::io::Error>()
         .is_some_and(|io| io.raw_os_error() == Some(16))
+}
+
+/// Return the TUN interface index used by local-exit return routes.
+pub fn if_index_of(name: &str) -> Result<u32> {
+    let index = nix::net::if_::if_nametoindex(name)
+        .with_context(|| format!("TUN {name} interface index"))?;
+    ensure!(index != 0, "TUN {name} has no interface index");
+    Ok(index)
 }
 
 /// Pids (besides us) holding /dev/net/tun, for the final EBUSY report.

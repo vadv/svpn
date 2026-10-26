@@ -149,6 +149,24 @@ fn hostnames_are_validated_and_normalized_without_dns() {
 }
 
 #[test]
+fn countries_parse_normalize_and_reject_duplicates() {
+    let spec = "203.0.113.1,countries=de+AT".parse::<ServerSpec>().unwrap();
+    assert_eq!(spec.countries(), ["DE", "AT"]);
+    assert_eq!(spec.resolve(&globals()).unwrap().countries, ["DE", "AT"]);
+    for value in [
+        "203.0.113.1,countries=DEU",
+        "203.0.113.1,countries=D1",
+        "203.0.113.1,countries=DE+",
+        "203.0.113.1,countries=",
+    ] {
+        assert!(value.parse::<ServerSpec>().is_err(), "{value}");
+    }
+    // Duplicates inside one server are caught by pool validation.
+    let spec = "203.0.113.1,countries=DE+de".parse::<ServerSpec>().unwrap();
+    assert!(resolve_servers(&[spec], &globals()).is_err());
+}
+
+#[test]
 fn rejects_invalid_keys_values_and_separators() {
     for suffix in [
         "",

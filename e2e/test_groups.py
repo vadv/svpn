@@ -50,6 +50,7 @@ test_recovery_without_alternative_closes_within_budget
 """.split()
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
+test_country_asn_scope test_local_exits_and_vpn
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -108,7 +109,7 @@ def integration_groups():
         "tcp-auto": 10,
         "reselect": 4,
         "recovery": 3,
-        "sticky-asn": 4,
+        "sticky-asn": 6,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -153,6 +154,12 @@ def matrix_groups():
             matrix.main()
         assert called == expected, group
     print("PASS matrix: 8 rows assigned once, original order and dispatch")
+
+
+def reselect_log_patterns():
+    log = "[server] flow_open role=server id=7 generation=1 channel=2 transport=tcp"
+    assert suite_reselect.tcp_flow_ids(log) == {"7"}
+    print("PASS reselect logs: generation-aware TCP flow parsing")
 
 
 def flow_cleanup_statistics():
@@ -277,6 +284,7 @@ if __name__ == "__main__":
     integration_groups()
     matrix_groups()
     matrix_diagnostics()
+    reselect_log_patterns()
     flow_cleanup_statistics()
     invalid_groups()
     shell_groups()

@@ -17,7 +17,7 @@ ARGS = CLIENT + ["--remeasure-interval", "1"]
 def tcp_flow_ids(log):
     return set(
         re.findall(
-            r"flow_open role=server id=(\d+)(?: channel=\d+)? transport=tcp",
+            r"flow_open role=server id=(\d+)(?: generation=\d+)?(?: channel=\d+)? transport=tcp",
             log,
         )
     )
@@ -52,7 +52,7 @@ def test_udp_reselect_after_ban_expiry():
                 tcp_echo(31)
                 until(
                     lambda: re.search(
-                        r"flow_open role=server id=\d+(?: channel=\d+)? "
+                        r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
                         r"transport=(?:mosh|quic|webrtc|obfs)",
                         path.read_text(),
                     ),
@@ -82,7 +82,7 @@ def test_degraded_incumbent_switches_and_drains():
             assert recv_exact(veteran, 6) == b"before"
             until(
                 lambda: re.search(
-                    r"flow_open role=server id=\d+(?: channel=\d+)? "
+                    r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
                     r"transport=(mosh|quic|webrtc|obfs)",
                     path.read_text(),
                 ),
@@ -120,7 +120,8 @@ def test_degraded_incumbent_switches_and_drains():
                 tcp_echo(32)
                 until(
                     lambda: re.search(
-                        r"flow_open role=server id=\d+(?: channel=\d+)? transport=" + winner,
+                        r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
+                        r"transport=" + winner,
                         path.read_text(),
                     ),
                     seconds=15,
@@ -156,7 +157,7 @@ def test_incumbent_drift_ramp_switches():
             assert recv_exact(veteran, 6) == b"before"
             until(
                 lambda: re.search(
-                    r"flow_open role=server id=\d+(?: channel=\d+)? "
+                    r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
                     r"transport=(mosh|quic|webrtc|obfs)",
                     path.read_text(),
                 ),
@@ -191,7 +192,8 @@ def test_incumbent_drift_ramp_switches():
                 tcp_echo(33)
                 until(
                     lambda: re.search(
-                        r"flow_open role=server id=\d+(?: channel=\d+)? transport=" + winner,
+                        r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
+                        r"transport=" + winner,
                         path.read_text(),
                     ),
                     seconds=15,
@@ -212,7 +214,7 @@ def test_symmetric_noise_does_not_switch():
     with session("noise", args=ARGS, env=ENV, ready_timeout=90) as (process, path):
         until(
             lambda: re.search(
-                r"flow_open role=server id=\d+(?: channel=\d+)? "
+                r"flow_open role=server id=\d+(?: generation=\d+)?(?: channel=\d+)? "
                 r"transport=(mosh|quic|webrtc|obfs)",
                 path.read_text(),
             ),

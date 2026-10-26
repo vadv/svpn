@@ -34,7 +34,7 @@ _SEQUENCE = (
     + ("lifecycle-pool",) * 4
     + ("reselect",) * 4
     + ("recovery",) * 3
-    + ("sticky-asn",) * 4
+    + ("sticky-asn",) * 6
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,

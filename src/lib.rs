@@ -25,6 +25,7 @@ pub mod hooks;
 pub mod hub;
 pub mod limits;
 pub mod link_io;
+pub mod local_exit;
 pub mod logging;
 mod mimic;
 pub mod packet;
@@ -60,12 +61,13 @@ use control::{Control, Endpoint, Message, Strategy, VERSION};
 use mimic::{DEFAULT_STRATEGIES, tcp_only_mode};
 use server_spec::{LinkParams, resolve_perf, resolve_servers};
 use tun::{create_tun, stale_tun_holders};
+use tun_rs::AsyncDevice;
 
 pub use cli::{Cli, Mode};
 pub use cmdline::{parse_byte_size, parse_port_range, serve_command, shell_quote};
 pub(crate) use mimic::DEFAULT_PORT_RANGE;
 pub use mimic::{MimicArg, MimicPlan, plan_mimic};
-pub use tun::{is_busy_tun, validate_tun_name};
+pub use tun::{if_index_of, is_busy_tun, validate_tun_name};
 
 /// Binary entry point: parses CLI, sets up logging and the runtime.
 pub fn main_entry() -> ExitCode {
@@ -123,12 +125,15 @@ pub fn main_entry() -> ExitCode {
     }
 }
 
-fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_state::ExitState>)> {
-    match (args.exit_policy, &args.geo_db) {
-        (cli::ExitPolicy::Balance, None) => Ok((None, None)),
+/// Load ASN/country databases and their shared owner state at startup.
+fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
+    // Keep runtime validation aligned with CLI parsing.
+    args.validate_geo()?;
+    let asn = match (args.exit_policy, &args.geo_db) {
+        (cli::ExitPolicy::Balance, None) => None,
         (cli::ExitPolicy::Balance, Some(_)) => {
             crate::warn!("geo-db set without exit-policy sticky-asn — ignoring");
-            Ok((None, None))
+            None
         }
         (cli::ExitPolicy::StickyAsn, None) => {
             anyhow::bail!("exit-policy sticky-asn requires geo-db")
@@ -140,22 +145,69 @@ fn load_geo(args: &cli::ClientArgs) -> Result<(Option<geo::Geo>, Option<exit_sta
                     path.display(),
                     geo.rows()
                 );
-                let state_path = args
-                    .exit_state
-                    .clone()
-                    .unwrap_or_else(|| path.with_extension("state.json"));
-                Ok((
-                    Some(geo),
-                    Some(exit_state::ExitState::load(Some(state_path))),
-                ))
+                Some(geo)
             }
-            // Graceful degradation: a missing/broken database must not stop the VPN.
+            // Graceful degradation: a missing/broken ASN database must not
+            // stop the VPN. The country database below is strict — a wrong
+            // country table misroutes flows instead of losing affinity.
             Err(error) => {
                 crate::error!("{error:#} — falling back to balance");
-                Ok((None, None))
+                None
             }
         },
-    }
+    };
+    let country_routing = args.server.iter().any(|spec| !spec.countries().is_empty());
+    let local_exits = args
+        .local_exits
+        .as_ref()
+        .is_some_and(|codes| !codes.is_empty());
+    let country = match (&args.country_db, country_routing || local_exits) {
+        (Some(path), true) => {
+            let country = geo::Geo::load_country(path)?;
+            crate::info!(
+                "country database {}: {} IPv4 ranges",
+                path.display(),
+                country.rows()
+            );
+            Some(country)
+        }
+        (Some(_), false) => {
+            crate::warn!("country-db set without local-exits or server countries — ignoring");
+            None
+        }
+        (None, _) => None,
+    };
+    // Prefer the explicit state path, then a file beside either database.
+    let state_path = args
+        .exit_state
+        .clone()
+        .or_else(|| {
+            args.geo_db
+                .as_ref()
+                .map(|path| path.with_extension("state.json"))
+        })
+        .or_else(|| {
+            args.country_db
+                .as_ref()
+                .map(|path| path.with_extension("state.json"))
+        });
+    let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
+    let local_exits = args
+        .local_exits
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|code| {
+            geo::pack_country(code)
+                .ok_or_else(|| anyhow::anyhow!("invalid local-exit country {code}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(hub::GeoExits {
+        geo: asn,
+        country,
+        local_exits,
+        exit_state: state,
+    })
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -190,7 +242,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Mode::Client(args) => {
-            let (geo, exit_state) = load_geo(&args)?;
+            let exits = load_geo(&args)?;
             let hooks = args.hooks.resolve()?;
             let servers = resolve_servers(&args.server, &args.globals)?;
             let mut interrupt =
@@ -200,15 +252,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("install SIGTERM handler")?;
             let (stop, shutdown) = tokio::sync::watch::channel(false);
-            let client = hub::run(
-                servers,
-                None,
-                args.stats_interval,
-                hooks,
-                shutdown,
-                geo,
-                exit_state,
-            );
+            let client = hub::run(servers, None, args.stats_interval, hooks, shutdown, exits);
             tokio::pin!(client);
             tokio::select! {
                 result = &mut client => result,
@@ -259,7 +303,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, None, None) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default()) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),
@@ -437,6 +481,7 @@ pub(crate) async fn open_link(
         Some(mode) => session::TransportConfig::Tcp {
             mode,
             listener: None,
+            connect_ip: None,
         },
         None => session::TransportConfig::Client {
             strategies: plan.strategies,
@@ -599,6 +644,32 @@ async fn serve(
         }
     }
     let (server_ip, client_ip, _pair_guard) = (pair.0, pair.1, guard);
+    let tun = open_tun(tun_name, server_ip, client_ip, mtu).await?;
+    perf::spawn(server_ip);
+    let config = match tcp {
+        Some((mode, listener)) => session::TransportConfig::Tcp {
+            mode,
+            listener: Some(listener),
+            connect_ip: None,
+        },
+        None => session::TransportConfig::Server {
+            ports,
+            bind,
+            quic,
+            tcp: tcp_candidate,
+        },
+    };
+    serve_tail(control, tun, server_ip, client_ip, mtu, config).await
+}
+
+/// Create the server TUN: validate the name, then wait out a busy name held
+/// by the previous session's heartbeat window instead of failing fast.
+pub(crate) async fn open_tun(
+    tun_name: Option<&str>,
+    server_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
+    mtu: u16,
+) -> Result<AsyncDevice> {
     let name = match tun_name {
         None | Some("") => None,
         Some(name) => {
@@ -606,14 +677,12 @@ async fn serve(
             Some(name)
         }
     };
-    // A previous session's serve can hold the TUN name for up to its heartbeat
-    // window after the SSH client is gone; wait it out instead of failing fast.
-    let tun = match name {
+    match name {
         Some(name) => {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
                 match create_tun(server_ip, client_ip, mtu, Some(name), false) {
-                    Ok(tun) => break tun,
+                    Ok(tun) => return Ok(tun),
                     Err(error) if is_busy_tun(&error) => {
                         ensure!(
                             tokio::time::Instant::now() < deadline,
@@ -627,14 +696,27 @@ async fn serve(
                 }
             }
         }
-        None => create_tun(server_ip, client_ip, mtu, None, false)?,
-    };
-    perf::spawn(server_ip);
+        None => create_tun(server_ip, client_ip, mtu, None, false),
+    }
+}
+
+/// Shared serve tail after the TUN exists: TunReady, the optional
+/// server-hooks exchange, the server session, then the down hook.
+/// Used by both the remote serve and the local-exit serve.
+pub(crate) async fn serve_tail(
+    mut control: Control,
+    tun: AsyncDevice,
+    server_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
+    mtu: u16,
+    config: session::TransportConfig,
+) -> Result<()> {
+    let tun_name = tun.name().context("TUN name")?.to_owned();
     control.send(Message::TunReady).await?;
-    let (server_down, expect_tun_ready) = match control.recv().await? {
+    let server_down = match control.recv().await? {
         Message::ServerHooks { up, down } => {
             let context = hooks::TunContext {
-                name: tun.name().context("TUN name")?,
+                name: tun_name.clone(),
                 local: server_ip,
                 peer: client_ip,
             };
@@ -662,30 +744,15 @@ async fn serve(
                     })
                     .await?;
             }
-            (down, true)
+            ensure!(
+                matches!(bootstrap(&mut control).await?, Message::TunReady),
+                "client TUN not ready"
+            );
+            down
         }
-        Message::TunReady => (None, false),
+        Message::TunReady => None,
         _ => bail!("expected server_hooks or tun_ready"),
     };
-    if expect_tun_ready {
-        ensure!(
-            matches!(bootstrap(&mut control).await?, Message::TunReady),
-            "client TUN not ready"
-        );
-    }
-    let config = match tcp {
-        Some((mode, listener)) => session::TransportConfig::Tcp {
-            mode,
-            listener: Some(listener),
-        },
-        None => session::TransportConfig::Server {
-            ports,
-            bind,
-            quic,
-            tcp: tcp_candidate,
-        },
-    };
-    let tun_name = tun.name().context("TUN name")?;
     let result = session::run(control, tun, None, client_ip, mtu, config).await;
     if let Some(down) = server_down {
         let context = hooks::TunContext {
@@ -767,7 +834,7 @@ pub fn ssh_server_address(connection: &str) -> Result<Ipv4Addr> {
     Ok(address)
 }
 
-async fn bootstrap(control: &mut Control) -> Result<Message> {
+pub(crate) async fn bootstrap(control: &mut Control) -> Result<Message> {
     timeout(Duration::from_secs(10), control.recv())
         .await
         .context("bootstrap timeout")?

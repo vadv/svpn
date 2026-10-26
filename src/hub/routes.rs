@@ -1,4 +1,4 @@
-//! Flow ownership: which link generation serves which client flow.
+//! Flow ownership: which owner serves which client flow.
 
 use std::{collections::HashMap, net::Ipv4Addr};
 
@@ -18,9 +18,16 @@ pub struct Owner {
     pub id: u64,
 }
 
+/// A remote generation or local-exit flow id; both share one id space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Remote(Owner),
+    Direct(u64),
+}
+
 #[derive(Default)]
 pub struct Routes {
-    pub by_key: HashMap<FlowKey, Owner>,
+    pub by_key: HashMap<FlowKey, Target>,
     pub next: u64,
 }
 
@@ -65,7 +72,17 @@ impl Routes {
             }
         };
         let (owner, fresh) = match self.by_key.get(&parsed.flow) {
-            Some(&owner) if owner.epoch == epoch => (owner, false),
+            Some(Target::Remote(owner)) if owner.epoch == epoch => (*owner, false),
+            // A local-exit-owned flow never spills onto a server link.
+            Some(Target::Direct(_)) | Some(Target::Remote(_)) => {
+                drop_note(
+                    delivery,
+                    links,
+                    Some(epoch.link),
+                    "flow owned by another link or not openable",
+                );
+                return Ok(());
+            }
             None if parsed.can_open => (
                 Owner {
                     epoch,
@@ -73,7 +90,7 @@ impl Routes {
                 },
                 true,
             ),
-            _ => {
+            None => {
                 drop_note(
                     delivery,
                     links,
@@ -88,7 +105,7 @@ impl Routes {
             bytes: bytes.to_vec(),
         }) {
             Ok(()) if fresh => {
-                self.by_key.insert(parsed.flow, owner);
+                self.by_key.insert(parsed.flow, Target::Remote(owner));
             }
             Ok(()) => {}
             // A closed receiver is reported by its task; never fail other links here.
@@ -100,25 +117,37 @@ impl Routes {
     pub fn accepts(&self, epoch: Epoch, packet: &Packet) -> bool {
         packet::parse(&packet.bytes, false).is_some_and(|p| {
             self.by_key.get(&p.flow)
-                == Some(&Owner {
+                == Some(&Target::Remote(Owner {
                     epoch,
                     id: packet.id,
-                })
+                }))
         })
     }
 
     pub fn forget(&mut self, key: FlowKey, owner: Owner) {
-        if self.by_key.get(&key) == Some(&owner) {
+        if self.by_key.get(&key) == Some(&Target::Remote(owner)) {
             self.by_key.remove(&key);
         }
     }
 
-    /// Drops every owner of the epoch and returns the retired keys so the
-    /// caller can tombstone the TCP ones.
+    /// Remove a local-exit owner only if its generation is still current.
+    /// The caller may tombstone the tuple only when removal succeeds.
+    pub fn forget_direct(&mut self, key: FlowKey, id: u64) -> bool {
+        if self.by_key.get(&key) == Some(&Target::Direct(id)) {
+            self.by_key.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drops every remote owner of the epoch and returns the retired keys
+    /// so the caller can tombstone the TCP ones. local-exit owners survive
+    /// failure of an unrelated link.
     pub fn remove_epoch(&mut self, epoch: Epoch) -> Vec<FlowKey> {
         let mut retired = Vec::new();
-        self.by_key.retain(|key, owner| {
-            if owner.epoch == epoch {
+        self.by_key.retain(|key, target| {
+            if matches!(target, Target::Remote(owner) if owner.epoch == epoch) {
                 retired.push(*key);
                 false
             } else {

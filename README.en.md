@@ -322,6 +322,12 @@ privileges. Re-run `setcap` after replacing the binary.
 A ready-made hook set for split VPN: RU sites direct, the rest of the world
 through the tunnel.
 
+### local-exit
+
+`local-exits = ["RU", "BY"]` sends IPv4 packets for these countries through
+a local exit. Other flows use the normal server selection. Configure
+forwarding, NAT and the return route with `server-up` and `server-down` hooks.
+
 ### RU direct, world via VPN (Linux)
 
 Table 100 holds RU subnets via the regular gateway and a default route via

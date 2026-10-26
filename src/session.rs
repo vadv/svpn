@@ -513,11 +513,16 @@ async fn run_io(
                 next_client_flow_id: 1,
             }))
         }
-        TransportConfig::Tcp { mode, listener } => {
+        TransportConfig::Tcp {
+            mode,
+            listener,
+            connect_ip,
+        } => {
             server_listener = listener;
             Plane::Tcp(TcpPlane {
                 mode,
                 server_ip: server,
+                connect_ip,
                 token_index: HashMap::new(),
                 flows: HashMap::new(),
                 by_key: HashMap::new(),

@@ -227,7 +227,16 @@ def check_release(root):
     print("PASS release gate: exact asset set, tag/version, clean commit/run provenance, license and hashes")
 
 
+def check_current_notices():
+    with package.NOTICES.open() as notices:
+        header = notices.readline().rstrip("\n")
+    expected = f"Cargo.lock sha256: {package.digest(package.ROOT / 'Cargo.lock')}"
+    assert header == expected, "THIRD-PARTY-NOTICES is stale for the current Cargo.lock"
+    print("PASS checked-in dependency notices match the current Cargo.lock")
+
+
 def check():
+    check_current_notices()
     with tempfile.TemporaryDirectory(prefix="svpn package ") as temporary:
         root = pathlib.Path(temporary)
         binary = root / "input binary"

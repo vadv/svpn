@@ -105,6 +105,72 @@ fn sticky_asn_is_multi_only() {
     assert_eq!(multi.exit_policy, ExitPolicy::StickyAsn);
 }
 
+// ── geo country flags ──
+
+#[test]
+fn local_exit_flags_parse_and_require_country_db() {
+    let multi = client(&[
+        "multi",
+        "--server",
+        "203.0.113.1,countries=de+AT",
+        "--server",
+        "203.0.113.2",
+        "--country-db",
+        "country.csv",
+        "--local-exits",
+        "ru,by",
+    ]);
+    assert_eq!(
+        multi.local_exits.as_deref(),
+        Some(&[String::from("RU"), String::from("BY")][..])
+    );
+    assert_eq!(
+        multi.country_db.as_deref(),
+        Some(std::path::Path::new("country.csv")),
+        "CLI paths stay cwd-relative, unlike config-relative ones"
+    );
+    assert_eq!(
+        resolve_servers(&multi.server, &multi.globals).unwrap()[0].countries,
+        ["DE", "AT"]
+    );
+    let single = client(&[
+        "--server",
+        "203.0.113.1",
+        "--country-db",
+        "c.csv",
+        "--local-exits",
+        "RU",
+    ]);
+    assert_eq!(
+        single.local_exits.as_deref(),
+        Some(&[String::from("RU")][..])
+    );
+    for args in [
+        vec!["multi", "--server", "203.0.113.1", "--local-exits", "RU"],
+        vec![
+            "multi",
+            "--server",
+            "203.0.113.1,countries=DE",
+            "--server",
+            "203.0.113.2",
+        ],
+        vec!["--server", "203.0.113.1", "--local-exits", "R1"],
+        vec![
+            "--server",
+            "203.0.113.1",
+            "--country-db",
+            "c.csv",
+            "--local-exits",
+            "RU,ru",
+        ],
+    ] {
+        let error = Cli::try_parse_from(["svpn"].into_iter().chain(args.clone()))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{args:?}");
+    }
+}
+
 // ── config exclusivity ──
 
 #[test]

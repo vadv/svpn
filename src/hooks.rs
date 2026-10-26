@@ -21,7 +21,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-const DEADLINE: Duration = Duration::from_secs(10);
+pub const DEADLINE: Duration = Duration::from_secs(10);
 /// Grace for draining hook output pipes after the process is gone: a detached
 /// grandchild (e.g. `setsid daemon &`) inherits them and never closes.
 const READ_GRACE: Duration = Duration::from_secs(1);

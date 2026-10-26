@@ -21,6 +21,7 @@ use crate::{
     control::Stats,
     hooks::Hooks,
     link_io::{Delivery, Epoch, Event, LinkIo, Packet},
+    local_exit::{self, LocalPair, LocalServer},
     packet::{self, FlowKey},
     pool::Pool,
     server_spec::LinkParams,
@@ -29,7 +30,7 @@ use crate::{
 
 mod routes;
 
-pub use routes::{Owner, Routes};
+pub use routes::{Owner, Routes, Target};
 
 // Burst absorber for link/hub queues: holds Packet slot structs, payload memory scales
 // with resident packets only. 1024 absorbs CPU/Wi-Fi jitter without unbounded growth.
@@ -57,13 +58,82 @@ pub struct StickyStats {
     pub lookup_hit: u64,
     pub lookup_miss: u64,
     pub failover_moves: u64,
+    pub country_hit: u64,
+    pub country_miss: u64,
+    pub asn_hit: u64,
+    pub asn_miss: u64,
+}
+
+impl StickyStats {
+    fn lookup(&mut self, country: bool, hit: bool) {
+        if hit {
+            self.lookup_hit += 1;
+        } else {
+            self.lookup_miss += 1;
+        }
+        match (country, hit) {
+            (true, true) => self.country_hit += 1,
+            (true, false) => self.country_miss += 1,
+            (false, true) => self.asn_hit += 1,
+            (false, false) => self.asn_miss += 1,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct LocalStats {
+    pub opened: u64,
+    pub failed: u64,
+    pub closed: u64,
+}
+
+pub struct LocalExitState {
+    pub pair: LocalPair,
+    pub primary_client: Ipv4Addr,
+    pub outgoing: mpsc::Sender<Packet>,
+    pub events: Option<mpsc::Receiver<(Epoch, Event)>>,
+    pub latest: watch::Receiver<Stats>,
+    pub delivery: Arc<Delivery>,
+    pub server: LocalServer,
+    pub ready: bool,
+}
+
+/// A destination country with assigned servers.
+/// Country constrains candidates; ASN supplies affinity within them.
+struct CountryRoute {
+    /// Packed ISO code — the rendezvous key payload.
+    packed: u32,
+    /// Links configured for the country, in configuration order.
+    candidates: Vec<usize>,
+    /// Destination ASN when the ASN database covers it.
+    asn: Option<u32>,
+}
+
+impl CountryRoute {
+    /// Use a scoped `CC:ASN` persistence key when ASN data is available.
+    fn exit_key(&self) -> crate::exit_state::ExitKey {
+        let code = crate::geo::unpack_country(self.packed);
+        match self.asn {
+            Some(asn) => crate::exit_state::ExitKey::ScopedAsn(code, asn),
+            None => crate::exit_state::ExitKey::Country(code),
+        }
+    }
 }
 
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
-    /// Sticky exit: destination grouping; None = weighted balance.
+    /// Sticky exit: ASN grouping under exit-policy sticky-asn;
+    /// None = weighted balance.
     pub geo: Option<crate::geo::Geo>,
+    /// Sticky exit: country table for the destination Country constraint;
+    /// None = no country routing.
+    pub country: Option<crate::geo::Geo>,
+    /// Packed countries whose destinations use local-exit.
+    pub local_exits: Vec<u32>,
+    /// Local serve and client session, started with the live primary TUN.
+    pub local: Option<LocalExitState>,
+    pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
     /// Sticky owners: group key → link index. An alive owner keeps its group
@@ -73,6 +143,7 @@ pub struct Hub {
     pub exit_state: Option<crate::exit_state::ExitState>,
     /// Sticky exit counters, surfaced in the periodic stats report.
     pub sticky: StickyStats,
+    pub local_stats: LocalStats,
     /// Restored owners keep their groups while connecting until this instant.
     pub grace_until: Option<StdInstant>,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
@@ -88,7 +159,9 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Returns a CLOSED-endpoint reset for unowned or tombstoned TCP traffic.
+    /// Return a CLOSED-endpoint reset for unowned TCP traffic.
+    /// Check the current owner and retired flows before classifying a new
+    /// flow; local-exit countries are considered before VPN ownership.
     pub fn dispatch(&mut self, bytes: &[u8], client_ip: Ipv4Addr) -> Result<Option<[u8; 40]>> {
         let parsed = match packet::parse(bytes, true) {
             Some(parsed) if parsed.flow.valid_for(client_ip) => parsed,
@@ -115,25 +188,237 @@ impl Hub {
         if self.tombstones.active(&parsed.flow, now) {
             return Ok(self.tombstones.respond(&parsed.flow, &parsed, now));
         }
-        let epoch = match self.routes.by_key.get(&parsed.flow) {
-            Some(owner) if self.pool.is_serving(owner.epoch) => Some(owner.epoch),
-            Some(_) => None,
-            None if parsed.can_open => self.pick(&parsed.flow),
-            None => return Ok(packet::tcp_reset_for(&parsed)),
+        match self.routes.by_key.get(&parsed.flow) {
+            Some(Target::Direct(id)) => self.forward_local(*id, bytes),
+            Some(Target::Remote(owner)) if self.pool.is_serving(owner.epoch) => {
+                let link = &self.links[owner.epoch.link];
+                let Some(outgoing) = &link.outgoing else {
+                    return Ok(None);
+                };
+                let delivery = link.delivery.clone();
+                self.routes.enqueue(
+                    bytes,
+                    client_ip,
+                    owner.epoch,
+                    outgoing,
+                    &delivery,
+                    &self.links,
+                )?;
+                Ok(None)
+            }
+            // A non-serving owner still owns the flow: no reset, no reassign.
+            Some(Target::Remote(_)) => Ok(None),
+            None if parsed.can_open => self.open_flow(&parsed, bytes, client_ip),
+            None => Ok(packet::tcp_reset_for(&parsed)),
+        }
+    }
+
+    /// A database match in local-exits uses the local path; misses use VPN.
+    fn is_local_exit(&self, destination: Ipv4Addr) -> bool {
+        self.country
+            .as_ref()
+            .and_then(|geo| geo.lookup(destination))
+            .is_some_and(|country| self.local_exits.contains(&country))
+    }
+
+    /// Local-exit traffic never falls back to the VPN; other traffic picks a
+    /// remote owner.
+    fn open_flow(
+        &mut self,
+        parsed: &packet::Packet,
+        bytes: &[u8],
+        client_ip: Ipv4Addr,
+    ) -> Result<Option<[u8; 40]>> {
+        let key = parsed.flow;
+        if self.is_local_exit(key.destination) {
+            return self.open_local(parsed, bytes);
+        }
+        let Some(epoch) = self.pick(&key) else {
+            return Ok(None);
         };
-        let Some(epoch) = epoch else { return Ok(None) };
         let link = &self.links[epoch.link];
-        if let Some(outgoing) = &link.outgoing {
-            self.routes.enqueue(
-                bytes,
-                client_ip,
-                epoch,
-                outgoing,
-                &link.delivery,
-                &self.links,
-            )?;
+        let Some(outgoing) = &link.outgoing else {
+            return Ok(None);
+        };
+        let delivery = link.delivery.clone();
+        self.routes
+            .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?;
+        Ok(None)
+    }
+
+    fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
+        let key = parsed.flow;
+        let Some(local) = &self.local else {
+            self.local_stats.failed += 1;
+            return Ok(None);
+        };
+        if !local.ready {
+            self.local_stats.failed += 1;
+            return Ok(None);
+        }
+        let outgoing = local.outgoing.clone();
+        let primary = local.primary_client;
+        let local_ip = local.pair.client;
+        let delivery = local.delivery.clone();
+        let id = self.routes.allocate()?;
+        let translated = packet::translate_v4(bytes, primary, local_ip)
+            .context("local-exit packet translation")?;
+        match outgoing.try_send(Packet {
+            id,
+            bytes: translated,
+        }) {
+            Ok(()) => {
+                self.local_stats.opened += 1;
+                self.routes.by_key.insert(key, Target::Direct(id));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                delivery.dropped();
+                self.local_stats.failed += 1;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.local_stats.failed += 1;
+            }
         }
         Ok(None)
+    }
+
+    fn forward_local(&mut self, id: u64, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
+        let key = packet::parse(bytes, true).map(|packet| packet.flow);
+        let Some(local) = &self.local else {
+            return Ok(None);
+        };
+        let outgoing = local.outgoing.clone();
+        let primary = local.primary_client;
+        let local_ip = local.pair.client;
+        let delivery = local.delivery.clone();
+        let translated = packet::translate_v4(bytes, primary, local_ip)
+            .context("local-exit packet translation")?;
+        match outgoing.try_send(Packet {
+            id,
+            bytes: translated,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => delivery.dropped(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let Some(key) = key {
+                    self.close_local(id, key, true);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn handle_local_event(
+        &mut self,
+        (_epoch, event): (Epoch, Event),
+        tun: &mut Option<AsyncDevice>,
+    ) -> Result<()> {
+        match event {
+            Event::Ready => {
+                if let Some(local) = &mut self.local {
+                    local.ready = true;
+                    crate::info!("local-exit: ready");
+                }
+            }
+            Event::Checking | Event::RoundFailed => {
+                if let Some(local) = &mut self.local {
+                    local.ready = false;
+                }
+            }
+            Event::Packet(packet) => {
+                let Some(local) = &self.local else {
+                    return Ok(());
+                };
+                let primary = local.primary_client;
+                let local_ip = local.pair.client;
+                let delivery = local.delivery.clone();
+                let bytes = match packet::translate_v4(&packet.bytes, local_ip, primary) {
+                    Some(bytes) => bytes,
+                    None => return Ok(()),
+                };
+                let current = packet::parse(&bytes, false).is_some_and(|parsed| {
+                    matches!(self.routes.by_key.get(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
+                });
+                if !current {
+                    return Ok(());
+                }
+                let tun = tun
+                    .as_ref()
+                    .context("local-exit packet without client TUN")?;
+                let result =
+                    tokio::time::timeout(Duration::from_millis(100), tun.send(&bytes)).await;
+                finish_write(&delivery, bytes.len(), result)?;
+            }
+            Event::Closed { id, key } => {
+                let Some(local) = &self.local else {
+                    return Ok(());
+                };
+                let key = translate_key(key, local.pair.client, local.primary_client);
+                self.close_local(id, key, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_local(&mut self, id: u64, key: FlowKey, failed: bool) {
+        if self.routes.forget_direct(key, id) {
+            self.local_stats.closed += 1;
+            if failed {
+                self.local_stats.failed += 1;
+            }
+            if key.protocol == 6 {
+                self.tombstones.insert(key, StdInstant::now());
+            }
+        }
+    }
+
+    async fn local_stopped(&mut self, reason: String, tun: &mut Option<AsyncDevice>) {
+        crate::error!("local-exit: {reason}");
+        self.local_stats.failed += 1;
+        if let Some(local) = &mut self.local {
+            local.ready = false;
+        }
+        // Deliver terminal packets before dropping the local event channel.
+        loop {
+            let event = self
+                .local
+                .as_mut()
+                .and_then(|local| local.events.as_mut()?.try_recv().ok());
+            let Some(event) = event else { break };
+            if let Err(error) = self.handle_local_event(event, tun).await {
+                crate::warn!("local-exit: terminal event failed — {error:#}");
+                break;
+            }
+        }
+        let Some(local) = self.local.take() else {
+            return;
+        };
+        let mut server = local.server;
+        match tokio::time::timeout(
+            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
+            server.join(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::warn!("local-exit: serve cleanup failed — {error:#}"),
+            Err(_) => crate::warn!("local-exit: serve cleanup timed out"),
+        }
+        let mut retired = Vec::new();
+        self.routes.by_key.retain(|key, target| {
+            if matches!(target, Target::Direct(_)) {
+                retired.push(*key);
+                false
+            } else {
+                true
+            }
+        });
+        for key in retired {
+            self.local_stats.closed += 1;
+            if key.protocol == 6 {
+                self.tombstones.insert(key, StdInstant::now());
+            }
+        }
     }
 
     pub fn stats_report(&mut self, elapsed: Duration) -> String {
@@ -168,10 +453,23 @@ impl Hub {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
         }
-        if self.geo.is_some() {
+        if self.geo.is_some() || self.country.is_some() {
             report.push_str(&format!(
                 "\nsticky: lookup hit {} / miss {} | failover moves {}",
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
+            ));
+            report.push_str(&format!(
+                "\ncountry: lookup hit {} / miss {} | asn: lookup hit {} / miss {}",
+                self.sticky.country_hit,
+                self.sticky.country_miss,
+                self.sticky.asn_hit,
+                self.sticky.asn_miss
+            ));
+        }
+        if !self.local_exits.is_empty() {
+            report.push_str(&format!(
+                "\nlocal-exit: opened {} / failed {} / closed {}",
+                self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
             ));
         }
         for line in per_link {
@@ -233,6 +531,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
+                    self.start_local(tun_addr, peer_addr, params).await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
@@ -332,34 +631,79 @@ impl Hub {
     }
 
     pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
-        let Some(geo) = &self.geo else {
-            return self.pool.pick();
-        };
         // Retry throttled persistence even when no failover follows.
         if let Some(state) = &mut self.exit_state {
             state.flush_due(StdInstant::now());
         }
+        // Country constrains candidates before ASN affinity, even in balance mode.
+        if let Some(route) = self.country_route(key.destination) {
+            let group = match route.asn {
+                Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
+                None => crate::geo::country_key(route.packed),
+            };
+            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key(), true);
+        }
+        let Some(geo) = &self.geo else {
+            return self.pool.pick();
+        };
         let Some(asn) = geo.lookup(key.destination) else {
-            // Uncovered /32: deterministic stateless rendezvous, never
-            // recorded in exit_owners or persisted (spec: no /32 overrides).
-            self.sticky.lookup_miss += 1;
+            // Uncovered /32 uses stateless rendezvous without persisted ownership.
+            self.sticky.lookup(false, false);
             return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
                 .into_iter()
                 .find_map(|link| self.pool.ready_epoch(link));
         };
         let group = crate::geo::asn_key(asn);
+        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
+    }
+
+    /// Return assigned destination countries as a candidate constraint.
+    /// Unknown or unassigned countries leave normal selection unchanged.
+    fn country_route(&self, destination: Ipv4Addr) -> Option<CountryRoute> {
+        let packed = self.country.as_ref()?.lookup(destination)?;
+        let code = crate::geo::unpack_country(packed);
+        let candidates: Vec<usize> = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.params.countries.contains(&code))
+            .map(|(link, _)| link)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(CountryRoute {
+            packed,
+            candidates,
+            // The ASN affinity applies only under exit-policy sticky-asn:
+            // without the ASN database the group is the country itself.
+            asn: self.geo.as_ref().and_then(|geo| geo.lookup(destination)),
+        })
+    }
+
+    /// Select a sticky owner without snap-back.
+    /// Checking/restored owners retain their grace period; failover stays
+    /// within candidates and persists the deviation. None means all links.
+    fn sticky_epoch(
+        &mut self,
+        group: u64,
+        candidates: Option<&[usize]>,
+        key: crate::exit_state::ExitKey,
+        country: bool,
+    ) -> Option<Epoch> {
+        let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
         if let Some(&owner) = self.exit_owners.get(&group) {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
-                self.sticky.lookup_hit += 1;
+                self.sticky.lookup(country, true);
                 return Some(epoch);
             }
             // Checking owner keeps its group: serve new flows from a reserve
             // without migrating (spec: no migration on Checking).
             if self.pool.link_checking(owner) {
-                self.sticky.lookup_hit += 1;
+                self.sticky.lookup(country, true);
                 return crate::geo::rendezvous(group, &self.nodes)
                     .into_iter()
-                    .filter(|&link| link != owner)
+                    .filter(|&link| link != owner && serves(link))
                     .find_map(|link| self.pool.ready_epoch(link));
             }
             // Startup grace: a restored owner still connecting keeps its
@@ -372,19 +716,20 @@ impl Hub {
                 return None;
             }
         }
-        self.sticky.lookup_miss += 1;
+        self.sticky.lookup(country, false);
         let previous = self.exit_owners.get(&group).copied();
-        let order = crate::geo::rendezvous(group, &self.nodes);
+        let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
+            .into_iter()
+            .filter(|&link| serves(link))
+            .collect();
         let next = order
             .iter()
             .find_map(|&link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
         let (link, epoch) = next?;
         if previous != Some(link) {
             self.exit_owners.insert(group, link);
-            // Baseline — first node of the rendezvous order — reproduces
-            // itself and needs no disk. Deviations (a failover transition or
-            // a first assignment that skipped an unavailable primary) do not,
-            // so they are persisted; a restart must not snap back (spec).
+            // The rendezvous baseline needs no state; failover or an unavailable
+            // primary creates a persisted deviation to prevent restart snap-back.
             let deviation = order.first() != Some(&link);
             if previous.is_some() {
                 self.sticky.failover_moves += 1;
@@ -393,10 +738,88 @@ impl Hub {
                 && let Some(state) = &mut self.exit_state
             {
                 // Batched: dirty here, flushed by flush_due / clean stop.
-                state.assign(group, &self.nodes[link].0);
+                state.assign(key, &self.nodes[link].0);
             }
         }
         Some(epoch)
+    }
+
+    async fn start_local(
+        &mut self,
+        client: Ipv4Addr,
+        peer: Ipv4Addr,
+        params: &LinkParams,
+    ) -> Result<()> {
+        if self.local_exits.is_empty() || self.local.is_some() {
+            return Ok(());
+        }
+        let epoch = Epoch {
+            link: usize::MAX,
+            generation: 1,
+        };
+        let local = local_exit::start(
+            epoch,
+            (peer, client),
+            params.mtu,
+            params.server_up.clone(),
+            params.server_down.clone(),
+            None,
+        )
+        .await?;
+        let local_exit::LocalExit {
+            control,
+            config,
+            io,
+            pair,
+            outgoing,
+            events,
+            latest,
+            delivery,
+            server,
+        } = local;
+        let task = tokio::spawn(session::run_link(
+            control,
+            pair.server,
+            pair.client,
+            params.mtu,
+            config,
+            io,
+        ));
+        self.local = Some(LocalExitState {
+            pair,
+            primary_client: client,
+            outgoing,
+            events: Some(events),
+            latest,
+            delivery,
+            server,
+            ready: false,
+        });
+        self.local_task = Some(task);
+        Ok(())
+    }
+
+    async fn shutdown_local(&mut self) -> Result<()> {
+        if let Some(task) = self.local_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let Some(mut local) = self.local.take() else {
+            return Ok(());
+        };
+        drop(local.outgoing);
+        match tokio::time::timeout(
+            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
+            local.server.join(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                local.server.abort();
+                Err(anyhow::anyhow!("local-exit shutdown timeout"))
+            }
+        }
     }
 
     async fn relay(
@@ -432,14 +855,45 @@ impl Hub {
                         (*self.pair.borrow()).map_or(params.tun_addr, |(client, _)| client);
                     if let Some(reset) = self.dispatch(&buffer[..length], local)? {
                         let tun = tun.as_ref().context("TCP reset without client TUN")?;
-                        let result =
-                            tokio::time::timeout(Duration::from_millis(100), tun.send(&reset)).await;
+                        let result = tokio::time::timeout(
+                            Duration::from_millis(100),
+                            tun.send(&reset),
+                        )
+                        .await;
                         finish_write(&self.links[0].delivery, reset.len(), result)?;
                     }
                 }
                 event = self.incoming.recv() => {
                     let (epoch, event) = event.context("server event channel stopped")?;
                     self.handle_event(epoch, event, tun, &params, &mut started, hooks).await?;
+                }
+                event = async {
+                    match &mut self.local {
+                        Some(local) => match &mut local.events {
+                            Some(events) => events.recv().await,
+                            None => std::future::pending().await,
+                        },
+                        None => std::future::pending().await,
+                    }
+                }, if self.local.as_ref().is_some_and(|local| local.events.is_some()) => {
+                    match event {
+                        Some(event) => self.handle_local_event(event, tun).await?,
+                        None => self.local_stopped("event channel closed".to_owned(), tun).await,
+                    }
+                }
+                result = async {
+                    match &mut self.local_task {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.local_task.is_some() => {
+                    self.local_task = None;
+                    let reason = match result {
+                        Ok(Ok(())) => "session ended".to_owned(),
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => format!("local client task: {error}"),
+                    };
+                    self.local_stopped(reason, tun).await;
                 }
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
@@ -527,6 +981,7 @@ impl Hub {
             if let Some(epoch) = rst_of
                 && queued_epoch == epoch
                 && let Event::Packet(packet) = &queued
+                && self.routes.accepts(epoch, packet)
                 && packet::parse(&packet.bytes, false).is_some_and(|p| p.is_rst)
                 && let Some(tun) = tun.as_ref()
             {
@@ -581,15 +1036,59 @@ impl Hub {
     }
 }
 
+/// Geo-driven exit inputs of one client run (spec §2-4): the ASN affinity
+/// table, the country constraint table and the one shared owner state.
+#[derive(Default)]
+pub struct GeoExits {
+    /// ASN database; None — sticky-asn degraded to weighted balance.
+    pub geo: Option<crate::geo::Geo>,
+    /// Country database; None — no country routing.
+    pub country: Option<crate::geo::Geo>,
+    /// Packed countries whose destinations use local-exit.
+    pub local_exits: Vec<u32>,
+    /// Sticky owner persistence; None — nothing sticky is active.
+    pub exit_state: Option<crate::exit_state::ExitState>,
+}
+
+/// Map a persisted typed owner key to its numeric rendezvous group.
+/// Restore only while the owner remains a candidate for its country.
+#[doc(hidden)]
+pub fn restored_group(
+    servers: &[LinkParams],
+    key: crate::exit_state::ExitKey,
+    link: usize,
+) -> Option<u64> {
+    let candidate = |code: &str| {
+        servers
+            .get(link)
+            .is_some_and(|params| params.countries.iter().any(|c| c == code))
+    };
+    match key {
+        crate::exit_state::ExitKey::Asn(asn) => Some(crate::geo::asn_key(asn)),
+        crate::exit_state::ExitKey::Country(code) if candidate(&code) => {
+            Some(crate::geo::country_key(crate::geo::pack_country(&code)?))
+        }
+        crate::exit_state::ExitKey::ScopedAsn(code, asn) if candidate(&code) => Some(
+            crate::geo::scoped_asn_key(crate::geo::pack_country(&code)?, asn),
+        ),
+        _ => None,
+    }
+}
+
 pub async fn run(
     servers: Vec<LinkParams>,
     started: Option<oneshot::Sender<()>>,
     stats_interval: u32,
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
-    geo: Option<crate::geo::Geo>,
-    exit_state: Option<crate::exit_state::ExitState>,
+    exits: GeoExits,
 ) -> Result<()> {
+    let GeoExits {
+        geo,
+        country,
+        local_exits,
+        exit_state,
+    } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
     let pool = Pool::new(servers.iter().map(|s| s.weight));
     // Stable node identity is host:port (spec): a port change is a new node.
@@ -602,7 +1101,13 @@ pub async fn run(
     let exit_owners = match &mut exit_state {
         Some(state) => {
             state.retain_nodes(&ids);
-            state.owner_indices(&ids)
+            state
+                .owner_indices(&ids)
+                .into_iter()
+                .filter_map(|(key, link)| {
+                    restored_group(&servers, key, link).map(|group| (group, link))
+                })
+                .collect()
         }
         None => std::collections::HashMap::new(),
     };
@@ -611,10 +1116,15 @@ pub async fn run(
     let (events, incoming) = mpsc::channel(QUEUE);
     let mut hub = Hub {
         geo,
+        country,
+        local_exits,
+        local: None,
+        local_task: None,
         nodes,
         exit_owners,
         exit_state,
         sticky: StickyStats::default(),
+        local_stats: LocalStats::default(),
         grace_until,
         links: servers
             .into_iter()
@@ -657,15 +1167,19 @@ pub async fn run(
         Ok(()) => hooks.finish().await,
         Err(error) => Err(error),
     };
+    let local = hub.shutdown_local().await;
     drop(tun);
     match result {
         Err(error) => {
             if let Err(cleanup) = cleanup {
                 crate::error!("hook: cleanup failed — {cleanup:#}");
             }
+            if let Err(local) = local {
+                crate::error!("local-exit: shutdown failed — {local:#}");
+            }
             Err(error)
         }
-        Ok(()) => cleanup,
+        Ok(()) => cleanup.and(local),
     }
 }
 
@@ -677,6 +1191,16 @@ pub fn report_timer(seconds: u32) -> Option<tokio::time::Interval> {
     let mut timer = tokio::time::interval_at(Instant::now() + period, period);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     Some(timer)
+}
+
+fn translate_key(mut key: FlowKey, from: Ipv4Addr, to: Ipv4Addr) -> FlowKey {
+    if key.source == from {
+        key.source = to;
+    }
+    if key.destination == from {
+        key.destination = to;
+    }
+    key
 }
 
 /// Every counted loss names its reason in the log (#124).

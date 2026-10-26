@@ -1,6 +1,6 @@
 //! CLI grammar and source selection. No network or TUN side effects.
 
-use crate::server_spec::{Globals, ServerSpec, resolve_perf, resolve_servers};
+use crate::server_spec::{Globals, ServerSpec, parse_country_code, resolve_perf, resolve_servers};
 use crate::{DEFAULT_PORT_RANGE, MimicArg, hooks, logging, parse_byte_size, parse_port_range};
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind, parser::ValueSource,
@@ -36,6 +36,12 @@ pub struct ClientArgs {
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
+    /// DB-IP Country Lite CSV database for country routing and local-exits.
+    #[arg(long, value_name = "FILE")]
+    pub country_db: Option<PathBuf>,
+    /// ISO alpha-2 countries whose destinations use local-exit; comma-separated.
+    #[arg(long, value_delimiter = ',', value_name = "CC", value_parser = parse_country_code)]
+    pub local_exits: Option<Vec<String>>,
     /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.
     #[arg(long, value_name = "FILE")]
     pub exit_state: Option<PathBuf>,
@@ -117,6 +123,31 @@ pub enum Mode {
 
 pub struct Cli {
     pub command: Mode,
+}
+
+impl ClientArgs {
+    /// Geo coupling: local-exits or per-server countries require country-db.
+    /// An unused country-db is ignored at runtime, not here.
+    pub(crate) fn validate_geo(&self) -> anyhow::Result<()> {
+        if let Some(codes) = &self.local_exits {
+            for (index, code) in codes.iter().enumerate() {
+                anyhow::ensure!(
+                    !codes[..index].contains(code),
+                    "duplicate local-exit country {code}"
+                );
+            }
+        }
+        let needs_db = self
+            .local_exits
+            .as_ref()
+            .is_some_and(|codes| !codes.is_empty())
+            || self.server.iter().any(|spec| !spec.countries().is_empty());
+        anyhow::ensure!(
+            !needs_db || self.country_db.is_some(),
+            "local-exits or server countries require country-db"
+        );
+        Ok(())
+    }
 }
 
 impl Cli {
@@ -209,6 +240,7 @@ impl Cli {
                 // Validate every server before the runtime can open the first SSH session.
                 if !from_file {
                     resolve_servers(&client.server, &client.globals).map_err(invalid)?;
+                    client.validate_geo().map_err(invalid)?;
                 }
                 Mode::Client(client)
             }

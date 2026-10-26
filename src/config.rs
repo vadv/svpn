@@ -12,7 +12,7 @@ use crate::{
     MimicArg,
     cli::ClientArgs,
     hooks, logging,
-    server_spec::{Globals, ServerSpec},
+    server_spec::{Globals, ServerSpec, parse_country_code},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -46,6 +46,8 @@ struct FileConfig {
     stats_interval: Option<u32>,
     exit_policy: Option<crate::cli::ExitPolicy>,
     geo_db: Option<PathBuf>,
+    country_db: Option<PathBuf>,
+    local_exits: Option<Vec<String>>,
     exit_state: Option<PathBuf>,
     up_script: Option<PathBuf>,
     down_script: Option<PathBuf>,
@@ -196,16 +198,29 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
             );
         }
     }
-    Ok(ClientArgs {
+    let args = ClientArgs {
         config: None,
         server: servers,
         globals,
         stats_interval: file.stats_interval.unwrap_or(30),
         exit_policy: file.exit_policy.unwrap_or_default(),
         geo_db: file.geo_db.map(|path| base.join(path)),
+        country_db: file.country_db.map(|path| base.join(path)),
+        local_exits: file
+            .local_exits
+            .map(|codes| {
+                codes
+                    .into_iter()
+                    .map(|code| parse_country_code(&code))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
         exit_state: file.exit_state.map(|path| base.join(path)),
         hooks,
-    })
+    };
+    args.validate_geo()?;
+    Ok(args)
 }
 
 pub(crate) fn port_range<'de, D: serde::Deserializer<'de>>(

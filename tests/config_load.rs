@@ -173,8 +173,10 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
          mtu = 1300\nlog-level = 'debug'\nudp-port-range = '60000-60009'\n\
          mimic = ['mosh']\ntcp-port = 0\nstats-interval = 7\n\
          up-command = 'printf up'\ndown-script = 'hooks/down script'\n\
+         exit-policy = 'sticky-asn'\ngeo-db = 'geo db.csv'\n\
+         country-db = 'country db.csv'\nlocal-exits = ['ru', 'by']\n\
          [[servers]]\naddress = 'A.example'\nssh-port = 2222\nweight = 2\n\
-         ssh-identity = 'keys/a'\nudp-port-range = '61000-61009'\n\
+         ssh-identity = 'keys/a'\nudp-port-range = '61000-61009'\ncountries = ['de', 'AT']\n\
          [[servers]]\naddress = 'b.example'\nssh-user = 'other'\n\
          peer-tun-name = 'svpn8'\npeer-addr = '10.88.0.3'\n\
          ssh-remote-bin = '/other/bin'\nmimic = ['quic', 'mosh']\n\
@@ -183,7 +185,7 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
     )
     .unwrap();
     let first = format!(
-        "A.example:2222,weight=2,identity={},udp-ports=61000-61009",
+        "A.example:2222,weight=2,identity={},udp-ports=61000-61009,countries=de+AT",
         base.join("keys/a").display()
     );
     let down = base.join("hooks/down script");
@@ -195,6 +197,9 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
         "--tun-name", "", "--tun-addr", "10.88.0.2", "--peer-addr", "10.88.0.1",
         "--mtu", "1300", "--log-level", "debug", "--udp-port-range", "60000-60009",
         "--mimic", "mosh", "--tcp-port", "0", "--stats-interval", "7",
+        "--exit-policy", "sticky-asn", "--geo-db", base.join("geo db.csv").to_str().unwrap(),
+        "--country-db", base.join("country db.csv").to_str().unwrap(),
+        "--local-exits", "ru,by",
         "--up-command", "printf up", "--down-script", down.to_str().unwrap(),
     ]).unwrap().command else { panic!("expected client") };
     fn resolved(args: &ClientArgs) -> Vec<(String, String)> {
@@ -228,6 +233,10 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
         };
         assert_eq!(resolved(&file), expected);
         assert_eq!(file.stats_interval, cli.stats_interval);
+        assert_eq!(file.exit_policy, cli.exit_policy);
+        assert_eq!(file.geo_db, cli.geo_db);
+        assert_eq!(file.country_db, cli.country_db);
+        assert_eq!(file.local_exits, cli.local_exits);
         assert_eq!(file.hooks.up_command, cli.hooks.up_command);
         assert_eq!(file.hooks.down_script, cli.hooks.down_script);
     }

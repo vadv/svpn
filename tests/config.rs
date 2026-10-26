@@ -239,6 +239,141 @@ fn malformed_values_are_not_echoed_in_errors() {
     }
 }
 
+// ── geo country config ──
+
+#[test]
+fn countries_normalize_and_may_repeat_across_servers() {
+    let args = parse(
+        "country-db = 'country.csv'
+peer-tun-name = 'svpn0'
+\
+         [[servers]]
+address = 'a.example'
+countries = ['de', 'AT']
+\
+         [[servers]]
+address = 'b.example'
+countries = ['DE']
+",
+        Path::new("/configs"),
+        true,
+    )
+    .unwrap();
+    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(
+        params[0].countries,
+        ["DE", "AT"],
+        "codes normalize to uppercase"
+    );
+    assert_eq!(
+        params[1].countries,
+        ["DE"],
+        "the same country may serve two servers"
+    );
+    assert_eq!(
+        args.country_db.as_deref(),
+        Some(Path::new("/configs/country.csv")),
+        "country-db is relative to the config file"
+    );
+}
+
+#[test]
+fn duplicate_countries_within_one_server_are_rejected() {
+    for countries in ["['DE', 'DE']", "['de', 'DE', 'at']"] {
+        let text = format!(
+            "country-db = 'c.csv'
+peer-tun-name = 'svpn0'
+[[servers]]
+address = 'a.example'
+countries = {countries}
+"
+        );
+        assert!(parse(&text, Path::new("."), true).is_err(), "{countries}");
+    }
+}
+
+#[test]
+fn local_exit_country_codes_are_validated() {
+    for field in [
+        "local-exits = ['R']",
+        "local-exits = ['RUS']",
+        "local-exits = ['R1']",
+        "local-exits = ['']",
+    ] {
+        let text = format!(
+            "{SINGLE}country-db = 'c.csv'
+{field}
+"
+        );
+        assert!(parse(&text, Path::new("."), false).is_err(), "{field}");
+    }
+    for countries in ["['DEU']", "['D1']", "['']", "['D']", "'DE'"] {
+        let text = format!(
+            "peer-tun-name = 'svpn0'
+[[servers]]
+address = 'a.example'
+countries = {countries}
+"
+        );
+        assert!(parse(&text, Path::new("."), true).is_err(), "{countries}");
+    }
+    let args = parse(
+        &format!(
+            "{SINGLE}country-db = 'c.csv'
+local-exits = ['ru', 'by']
+"
+        ),
+        Path::new("."),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        args.local_exits,
+        Some(vec![String::from("RU"), String::from("BY")])
+    );
+}
+
+#[test]
+fn local_exits_or_countries_require_country_db() {
+    assert!(
+        parse(
+            &format!(
+                "{SINGLE}local-exits = ['RU']
+"
+            ),
+            Path::new("."),
+            false
+        )
+        .is_err()
+    );
+    let text = "peer-tun-name = 'svpn0'
+[[servers]]
+address = 'a.example'
+countries = ['DE']
+";
+    assert!(parse(text, Path::new("."), true).is_err());
+    // country-db without either consumer parses fine; ignoring it with a
+    // warning is a runtime concern, not a parse error.
+    assert!(
+        parse(
+            &format!(
+                "{SINGLE}country-db = 'c.csv'
+"
+            ),
+            Path::new("."),
+            false
+        )
+        .is_ok()
+    );
+    // An empty countries list carries no constraint.
+    let text = "peer-tun-name = 'svpn0'
+[[servers]]
+address = 'a.example'
+countries = []
+";
+    assert!(parse(text, Path::new("."), true).is_ok());
+}
+
 // ── server hooks ──
 
 #[test]

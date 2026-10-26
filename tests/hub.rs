@@ -22,6 +22,7 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
     LinkParams {
         server: server.to_string(),
         weight: 1,
+        countries: Vec::new(),
         identity: None,
         user: None,
         ssh_port: 22,
@@ -65,10 +66,15 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
             .collect(),
         pool: Pool::new([1, 1]),
         geo: None,
+        country: None,
+        local_exits: Vec::new(),
+        local: None,
+        local_task: None,
         nodes: Vec::new(),
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,
         sticky: StickyStats::default(),
+        local_stats: Default::default(),
         grace_until: None,
         tasks: JoinSet::new(),
         events,
@@ -119,21 +125,25 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
     hub.links[0].outgoing = Some(outgoing);
     hub.routes
         .by_key
-        .insert(parsed.flow, Owner { epoch, id: 41 });
+        .insert(parsed.flow, Target::Remote(Owner { epoch, id: 41 }));
     assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     let forwarded = incoming.try_recv().unwrap();
     assert_eq!(forwarded.id, 41);
     assert_eq!(forwarded.bytes, bytes);
     // A non-serving owner is still owned, not permission to synthesize a reset.
-    hub.routes
-        .by_key
-        .get_mut(&parsed.flow)
-        .unwrap()
-        .epoch
-        .generation = 2;
+    match hub.routes.by_key.get_mut(&parsed.flow) {
+        Some(Target::Remote(owner)) => owner.epoch.generation = 2,
+        _ => panic!("expected a remote owner"),
+    }
     assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     assert!(incoming.try_recv().is_err());
-    assert_eq!(hub.routes.by_key[&parsed.flow].id, 41);
+    assert_eq!(
+        match hub.routes.by_key[&parsed.flow] {
+            Target::Remote(owner) => owner.id,
+            Target::Direct(_) => panic!("expected a remote owner"),
+        },
+        41
+    );
 }
 
 #[tokio::test]
@@ -161,7 +171,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
         epoch: first,
         id: original.id,
     };
-    assert_eq!(hub.routes.by_key[&key], owner);
+    assert_eq!(hub.routes.by_key[&key], Target::Remote(owner));
     assert!(from_second.try_recv().is_err());
 
     let mut ack = syn.clone();
@@ -204,7 +214,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
         epoch: second,
         id: fresh.id,
     };
-    assert_eq!(hub.routes.by_key[&key], fresh_owner);
+    assert_eq!(hub.routes.by_key[&key], Target::Remote(fresh_owner));
     hub.handle_event(
         first,
         Event::Closed { id: owner.id, key },
@@ -215,7 +225,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
     )
     .await
     .unwrap();
-    assert_eq!(hub.routes.by_key[&key], fresh_owner);
+    assert_eq!(hub.routes.by_key[&key], Target::Remote(fresh_owner));
 }
 
 // ── stats reports ──
@@ -387,8 +397,7 @@ async fn parallel_bootstrap_failures_exit_without_creating_a_tun() {
                 0,
                 Hooks::default(),
                 shutdown,
-                None,
-                None
+                GeoExits::default()
             ),
             peer
         );

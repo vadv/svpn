@@ -53,6 +53,7 @@ fn link_session_cap_with(
                 camouflage: svpn::framing::Camouflage::None,
             },
             server_ip,
+            connect_ip: None,
             token_index: HashMap::new(),
             flows: HashMap::new(),
             by_key: HashMap::new(),

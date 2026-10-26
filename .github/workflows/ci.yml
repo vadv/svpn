@@ -109,6 +109,8 @@ jobs:
           - suite: integration
             group: udp
           - suite: integration
+            group: sticky-asn
+          - suite: integration
             group: tcp-auto
           - suite: matrix
             group: udp

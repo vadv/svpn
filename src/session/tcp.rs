@@ -287,7 +287,7 @@ impl Session {
     ) -> Result<tokio::task::JoinHandle<()>> {
         let ip = match &self.plane {
             Plane::Channels(p) => p.server_ip,
-            Plane::Tcp(p) => p.server_ip,
+            Plane::Tcp(p) => p.connect_ip.or(p.server_ip),
         }
         .context("client requires server address")?;
         let remote = SocketAddr::from((ip, port));
