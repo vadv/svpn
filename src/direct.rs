@@ -1042,26 +1042,25 @@ fn udp_dial(config: &DirectConfig, destination: SocketAddrV4) -> Result<UdpSocke
         .set_nonblocking(true)
         .context("direct udp nonblocking")?;
     bind_uplink(&socket, &config.uplink)?;
-    if let Err(error) = socket.connect(&socket2::SockAddr::from(destination)) {
-        if !is_icmp_feedback(&error) {
-            return Err(error).context("direct udp connect");
-        }
-        crate::debug!("direct udp connect {destination}: ICMP error reply — {error}");
-    }
+    // A fresh socket has sent no request, so a connect error is local and
+    // must still fail the flow; only established send/recv errors can be
+    // asynchronous ICMP feedback.
+    socket
+        .connect(&socket2::SockAddr::from(destination))
+        .context("direct udp connect")?;
     UdpSocket::from_std(socket.into()).context("direct udp register")
 }
 
 /// Errors produced by an ICMP response on a connected UDP/raw socket. They
 /// describe the destination's response, not a dead local mapping. Local
 /// permission, descriptor and socket-state errors intentionally do not match.
-pub(crate) fn is_icmp_feedback(error: &io::Error) -> bool {
+pub fn is_icmp_feedback(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::HostUnreachable
             | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::NetworkDown
             | io::ErrorKind::TimedOut
     )
 }

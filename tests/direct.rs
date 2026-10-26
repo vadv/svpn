@@ -3,6 +3,7 @@
 //! peer 127.0.0.1), pure rewrite paths stay packet-level.
 
 use std::{
+    io,
     net::{Ipv4Addr, SocketAddrV4},
     sync::OnceLock,
     time::Duration,
@@ -611,6 +612,22 @@ fn uplink_discovery_pins_the_ipv4_default_route() {
             && route.if_index() == Some(uplink.index)
             && route.if_name().is_some_and(|name| name == &uplink.name)
     }));
+}
+
+#[test]
+fn local_network_down_is_not_icmp_feedback() {
+    assert!(svpn::direct::is_icmp_feedback(&io::Error::from(
+        io::ErrorKind::ConnectionRefused,
+    )));
+    assert!(svpn::direct::is_icmp_feedback(&io::Error::from(
+        io::ErrorKind::HostUnreachable,
+    )));
+    assert!(!svpn::direct::is_icmp_feedback(&io::Error::from(
+        io::ErrorKind::NetworkDown,
+    )));
+    assert!(!svpn::direct::is_icmp_feedback(&io::Error::from(
+        io::ErrorKind::PermissionDenied,
+    )));
 }
 
 #[cfg(target_os = "linux")]
