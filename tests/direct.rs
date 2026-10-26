@@ -665,6 +665,8 @@ fn peer_route_match_requires_exact_prefix_and_interface() {
     use std::net::IpAddr;
     let peer = Ipv4Addr::new(10, 77, 0, 1);
     let route = route_manager::Route::new(IpAddr::V4(peer), 32).with_if_index(3);
+    #[cfg(target_os = "linux")]
+    let route = route.with_table(254);
     assert!(svpn::direct::peer_route_matches(&route, peer, 3));
     assert!(
         !svpn::direct::peer_route_matches(&route, peer, 4),
