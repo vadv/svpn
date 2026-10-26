@@ -19,10 +19,9 @@ use tun_rs::AsyncDevice;
 
 use crate::{
     control::Stats,
-    direct::icmp::IcmpEngine,
-    direct::{DirectConfig, DirectEngine, DirectEvent, Uplink},
     hooks::Hooks,
     link_io::{Delivery, Epoch, Event, LinkIo, Packet},
+    local_exit::{self, LocalPair, LocalServer},
     packet::{self, FlowKey},
     pool::Pool,
     server_spec::LinkParams,
@@ -82,10 +81,21 @@ impl StickyStats {
 }
 
 #[derive(Default)]
-pub struct DirectStats {
+pub struct LocalStats {
     pub opened: u64,
     pub failed: u64,
     pub closed: u64,
+}
+
+pub struct LocalExitState {
+    pub pair: LocalPair,
+    pub primary_client: Ipv4Addr,
+    pub outgoing: mpsc::Sender<Packet>,
+    pub events: Option<mpsc::Receiver<(Epoch, Event)>>,
+    pub latest: watch::Receiver<Stats>,
+    pub delivery: Arc<Delivery>,
+    pub server: LocalServer,
+    pub ready: bool,
 }
 
 /// A destination country with assigned servers.
@@ -119,16 +129,11 @@ pub struct Hub {
     /// Sticky exit: country table for the destination Country constraint;
     /// None = no country routing.
     pub country: Option<crate::geo::Geo>,
-    /// Packed home country for direct admission; None — direct disabled.
+    /// Packed home country for LocalExit admission.
     pub home_country: Option<u32>,
-    /// Captured physical uplink; None means direct is disabled.
-    pub uplink: Option<Uplink>,
-    /// TCP/UDP engine started with the live TUN identity.
-    /// Initialization failure stops startup.
-    pub direct: Option<DirectEngine>,
-    /// ICMP engine; initialization failure disables ICMP only.
-    /// Home ICMP never falls back to the VPN.
-    pub icmp: Option<IcmpEngine>,
+    /// Local serve and client session, started with the live primary TUN.
+    pub local: Option<LocalExitState>,
+    pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
     /// Sticky owners: group key → link index. An alive owner keeps its group
@@ -138,7 +143,7 @@ pub struct Hub {
     pub exit_state: Option<crate::exit_state::ExitState>,
     /// Sticky exit counters, surfaced in the periodic stats report.
     pub sticky: StickyStats,
-    pub direct_stats: DirectStats,
+    pub local_stats: LocalStats,
     /// Restored owners keep their groups while connecting until this instant.
     pub grace_until: Option<StdInstant>,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
@@ -153,13 +158,10 @@ pub struct Hub {
     pub pair: watch::Sender<Option<(Ipv4Addr, Ipv4Addr)>>,
 }
 
-/// What dispatching one client packet produced for the TUN: a synthesized
-/// CLOSED reset for an unowned TCP tuple, or a direct-engine packet (a
-/// rewritten segment or a rebuilt reply).
+/// What dispatching one client packet produced for the TUN.
 #[derive(Debug, PartialEq)]
 pub enum Dispatched {
     Reset([u8; 40]),
-    Direct(Vec<u8>),
 }
 
 impl Hub {
@@ -192,14 +194,6 @@ impl Hub {
                 return Ok(None);
             }
         };
-        // Kernel listener packets of the direct NAT (spec §5.2) map back to
-        // the original tuple before any admission: a reverse SYN-ACK never
-        // reaches unowned flow classification.
-        if let Some(engine) = &self.direct
-            && let Some(rewritten) = engine.rewrite_reverse(bytes)
-        {
-            return Ok(Some(Dispatched::Direct(rewritten)));
-        }
         let now = StdInstant::now();
         if self.tombstones.active(&parsed.flow, now) {
             return Ok(self
@@ -208,7 +202,7 @@ impl Hub {
                 .map(Dispatched::Reset));
         }
         match self.routes.by_key.get(&parsed.flow) {
-            Some(Target::Direct(id)) => self.forward_direct(*id, parsed.flow, bytes).await,
+            Some(Target::Direct(id)) => self.forward_local(*id, bytes),
             Some(Target::Remote(owner)) if self.pool.is_serving(owner.epoch) => {
                 let link = &self.links[owner.epoch.link];
                 let Some(outgoing) = &link.outgoing else {
@@ -243,9 +237,8 @@ impl Hub {
         })
     }
 
-    /// Classification of a new flow: a home-country destination opens a
-    /// direct flow and never falls back to the VPN; everything else picks
-    /// the remote owner exactly as before.
+    /// Classification of a new flow: home traffic uses LocalExit and never
+    /// falls back to the VPN; everything else picks the remote owner.
     async fn open_flow(
         &mut self,
         parsed: &packet::Packet,
@@ -254,7 +247,7 @@ impl Hub {
     ) -> Result<Option<Dispatched>> {
         let key = parsed.flow;
         if self.is_home(key.destination) {
-            return self.open_direct(parsed, bytes).await;
+            return self.open_local(parsed, bytes);
         }
         let Some(epoch) = self.pick(&key) else {
             return Ok(None);
@@ -269,191 +262,151 @@ impl Hub {
         Ok(None)
     }
 
-    /// Open a home-country flow only when a direct engine accepts it.
-    /// Unavailable or full engines drop the packet; never leak home traffic to VPN.
-    async fn open_direct(
-        &mut self,
-        parsed: &packet::Packet,
-        bytes: &[u8],
-    ) -> Result<Option<Dispatched>> {
+    fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<Dispatched>> {
         let key = parsed.flow;
-        let direct_flows = self.direct.as_ref().map_or(0, DirectEngine::flow_count)
-            + self.icmp.as_ref().map_or(0, IcmpEngine::flow_count);
-        if direct_flows >= crate::direct::MAX_FLOWS {
-            self.direct_stats.failed += 1;
-            crate::warn!("vpn: dropped packet — direct flow capacity exhausted");
+        let Some(local) = &self.local else {
+            self.local_stats.failed += 1;
+            return Ok(None);
+        };
+        if !local.ready {
+            self.local_stats.failed += 1;
             return Ok(None);
         }
+        let outgoing = local.outgoing.clone();
+        let primary = local.primary_client;
+        let local_ip = local.pair.client;
+        let delivery = local.delivery.clone();
         let id = self.routes.allocate()?;
-        let (accepted, rewritten) = match key.protocol {
-            6 => match &mut self.direct {
-                Some(engine) => match engine.open_tcp(id, parsed, bytes) {
-                    Ok(rewritten) => (true, rewritten),
-                    Err(error) => {
-                        crate::error!("vpn: dropped packet — direct open: {error:#}");
-                        (false, None)
-                    }
-                },
-                None => {
-                    crate::error!(
-                        "vpn: dropped packet — direct TCP engine unavailable, no VPN fallback"
-                    );
-                    (false, None)
-                }
-            },
-            17 => match &mut self.direct {
-                Some(engine) => match engine.open_udp(id, parsed, bytes).await {
-                    Ok(()) => (true, None),
-                    Err(error) => {
-                        crate::error!("vpn: dropped packet — direct open: {error:#}");
-                        (false, None)
-                    }
-                },
-                None => {
-                    crate::error!(
-                        "vpn: dropped packet — direct UDP engine unavailable, no VPN fallback"
-                    );
-                    (false, None)
-                }
-            },
-            // ICMP raw sockets need a privilege the startup may not have:
-            // ICMP-only degradation, never a VPN fallback (spec §5.4).
-            _ => match &mut self.icmp {
-                Some(engine) => match engine.open_icmp(id, parsed, bytes).await {
-                    Ok(()) => (true, None),
-                    Err(error) => {
-                        crate::error!("vpn: dropped packet — direct icmp open: {error:#}");
-                        (false, None)
-                    }
-                },
-                None => {
-                    crate::error!("vpn: dropped packet — direct icmp unavailable, no VPN fallback");
-                    (false, None)
-                }
-            },
-        };
-        if accepted {
-            self.direct_stats.opened += 1;
-            self.routes.by_key.insert(key, Target::Direct(id));
-        } else {
-            self.direct_stats.failed += 1;
-        }
-        Ok(rewritten.map(Dispatched::Direct))
-    }
-
-    /// An established direct flow: later packets go to the engine. A
-    /// network error closes only this flow and is reconciled here, without
-    /// waiting for the reliable event queue that this Hub itself drains.
-    async fn forward_direct(
-        &mut self,
-        id: u64,
-        key: FlowKey,
-        bytes: &[u8],
-    ) -> Result<Option<Dispatched>> {
-        let result: Result<Option<Vec<u8>>> = match key.protocol {
-            6 => match self.direct.as_mut() {
-                Some(engine) => engine.forward_tcp(id, bytes),
-                None => Err(anyhow::anyhow!(
-                    "direct engine missing for an established TCP flow"
-                )),
-            },
-            17 => match self.direct.as_mut() {
-                Some(engine) => engine.forward_udp(id, bytes).await.map(|()| None),
-                None => Err(anyhow::anyhow!(
-                    "direct engine missing for an established UDP flow"
-                )),
-            },
-            _ => match self.icmp.as_mut() {
-                Some(engine) => engine.forward_icmp(id, bytes).await.map(|()| None),
-                None => Err(anyhow::anyhow!(
-                    "direct icmp engine missing for an established ICMP flow"
-                )),
-            },
-        };
-        match result {
-            Ok(rewritten) => Ok(rewritten.map(Dispatched::Direct)),
-            Err(error) => {
-                // Validation/rejection errors leave the engine mapping in
-                // place. Only a mapping actually removed by the engine is a
-                // terminal flow failure; otherwise the next valid packet
-                // must still use this same generation.
-                let retained = match key.protocol {
-                    6 | 17 => self
-                        .direct
-                        .as_ref()
-                        .is_some_and(|engine| engine.owns(key, id)),
-                    1 => self
-                        .icmp
-                        .as_ref()
-                        .is_some_and(|engine| engine.owns(key, id)),
-                    _ => false,
-                };
-                if retained {
-                    crate::debug!("vpn: rejected direct packet, retained flow {key:?}: {error:#}");
-                    return Ok(None);
-                }
-                self.direct_stats.failed += 1;
-                if self.routes.forget_direct(key, id) {
-                    self.direct_stats.closed += 1;
-                    if key.protocol == 6 {
-                        self.tombstones.insert(key, StdInstant::now());
-                    }
-                }
-                crate::error!("vpn: dropped packet — direct flow {key:?}: {error:#}");
-                Ok(None)
+        let translated = packet::translate_v4(bytes, primary, local_ip)
+            .context("local-exit packet translation")?;
+        match outgoing.try_send(Packet {
+            id,
+            bytes: translated,
+        }) {
+            Ok(()) => {
+                self.local_stats.opened += 1;
+                self.routes.by_key.insert(key, Target::Direct(id));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                delivery.dropped();
+                self.local_stats.failed += 1;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.local_stats.failed += 1;
             }
         }
+        Ok(None)
     }
 
-    /// One event from the direct engines: returned packets are written into
-    /// the TUN; a close reconciles the owner table — only the still-current
-    /// generation may tombstone the tuple (spec §5.5).
-    pub async fn handle_direct_event(
+    fn forward_local(&mut self, id: u64, bytes: &[u8]) -> Result<Option<Dispatched>> {
+        let key = packet::parse(bytes, true).map(|packet| packet.flow);
+        let Some(local) = &self.local else {
+            return Ok(None);
+        };
+        let outgoing = local.outgoing.clone();
+        let primary = local.primary_client;
+        let local_ip = local.pair.client;
+        let delivery = local.delivery.clone();
+        let translated = packet::translate_v4(bytes, primary, local_ip)
+            .context("local-exit packet translation")?;
+        match outgoing.try_send(Packet {
+            id,
+            bytes: translated,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => delivery.dropped(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.local_stats.failed += 1;
+                if let Some(key) = key {
+                    self.close_local(id, key, true);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn handle_local_event(
         &mut self,
-        event: DirectEvent,
+        (_epoch, event): (Epoch, Event),
         tun: &mut Option<AsyncDevice>,
     ) -> Result<()> {
         match event {
-            DirectEvent::Packet { id, bytes } => {
-                // A queued reply from an old generation must not be written
-                // into a replacement flow (or after its close).
-                let current = packet::parse(&bytes, false).is_some_and(|packet| {
-                    matches!(self.routes.by_key.get(&packet.flow), Some(Target::Direct(current)) if *current == id)
+            Event::Ready => {
+                if let Some(local) = &mut self.local {
+                    local.ready = true;
+                    crate::info!("local-exit: ready");
+                }
+            }
+            Event::Checking | Event::RoundFailed => {
+                if let Some(local) = &mut self.local {
+                    local.ready = false;
+                }
+            }
+            Event::Packet(packet) => {
+                let Some(local) = &self.local else {
+                    return Ok(());
+                };
+                let primary = local.primary_client;
+                let local_ip = local.pair.client;
+                let delivery = local.delivery.clone();
+                let bytes = match packet::translate_v4(&packet.bytes, local_ip, primary) {
+                    Some(bytes) => bytes,
+                    None => return Ok(()),
+                };
+                let current = packet::parse(&bytes, false).is_some_and(|parsed| {
+                    matches!(self.routes.by_key.get(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
                 });
                 if !current {
                     return Ok(());
                 }
-                let tun = tun.as_ref().context("direct packet without client TUN")?;
+                let tun = tun
+                    .as_ref()
+                    .context("local-exit packet without client TUN")?;
                 let result =
                     tokio::time::timeout(Duration::from_millis(100), tun.send(&bytes)).await;
-                match result {
-                    Ok(Ok(written)) if written == bytes.len() => {}
-                    Err(_) => {
-                        crate::error!("vpn: dropped packet — client TUN write timeout")
-                    }
-                    Ok(result) => {
-                        crate::error!("vpn: dropped packet — failed client TUN write");
-                        ensure!(
-                            result.context("write client TUN")? == bytes.len(),
-                            "short client TUN write"
-                        );
-                    }
-                }
+                finish_write(&delivery, bytes.len(), result)?;
             }
-            DirectEvent::Closed { id, key } => self.close_direct_event(id, key, false),
-            DirectEvent::Failed { id, key } => self.close_direct_event(id, key, true),
+            Event::Closed { id, key } => {
+                let Some(local) = &self.local else {
+                    return Ok(());
+                };
+                let key = translate_key(key, local.pair.client, local.primary_client);
+                self.close_local(id, key, false);
+            }
         }
         Ok(())
     }
 
-    fn close_direct_event(&mut self, id: u64, key: FlowKey, failed: bool) {
-        // Only TCP tuples get a CLOSED-endpoint reply; UDP and ICMP flows
-        // just vanish (same as a retired remote epoch).
+    fn close_local(&mut self, id: u64, key: FlowKey, failed: bool) {
         if self.routes.forget_direct(key, id) {
-            self.direct_stats.closed += 1;
+            self.local_stats.closed += 1;
             if failed {
-                self.direct_stats.failed += 1;
+                self.local_stats.failed += 1;
             }
+            if key.protocol == 6 {
+                self.tombstones.insert(key, StdInstant::now());
+            }
+        }
+    }
+
+    fn local_stopped(&mut self, reason: String) {
+        crate::error!("local-exit: {reason}");
+        if let Some(local) = &mut self.local {
+            local.ready = false;
+            local.events = None;
+            local.server.abort();
+        }
+        let mut retired = Vec::new();
+        self.routes.by_key.retain(|key, target| {
+            if matches!(target, Target::Direct(_)) {
+                retired.push(*key);
+                false
+            } else {
+                true
+            }
+        });
+        for key in retired {
+            self.local_stats.closed += 1;
             if key.protocol == 6 {
                 self.tombstones.insert(key, StdInstant::now());
             }
@@ -507,8 +460,8 @@ impl Hub {
         }
         if self.home_country.is_some() {
             report.push_str(&format!(
-                "\ndirect: opened {} / failed {} / closed {}",
-                self.direct_stats.opened, self.direct_stats.failed, self.direct_stats.closed
+                "\nlocal-exit: opened {} / failed {} / closed {}",
+                self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
             ));
         }
         for line in per_link {
@@ -570,9 +523,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    // Start direct before user hooks can change the routing view.
-                    self.start_direct(&name, tun_addr, peer_addr, params.mtu)
-                        .await?;
+                    self.start_local(tun_addr, peer_addr, &params).await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
@@ -785,62 +736,76 @@ impl Hub {
         Some(epoch)
     }
 
-    /// Start direct engines after TUN negotiation.
-    /// TCP/UDP listener and return-route failures are fatal; ICMP failure
-    /// disables only ICMP and never enables VPN fallback.
-    async fn start_direct(
+    async fn start_local(
         &mut self,
-        tun_name: &str,
         client: Ipv4Addr,
         peer: Ipv4Addr,
-        mtu: u16,
+        params: &LinkParams,
     ) -> Result<()> {
-        let Some(uplink) = self.uplink.clone() else {
+        if self.home_country.is_none() || self.local.is_some() {
             return Ok(());
-        };
-        let config = DirectConfig {
-            client,
-            peer,
-            tun_index: crate::tun::if_index_of(tun_name)?,
-            tun_name: tun_name.to_owned(),
-            mtu,
-            uplink,
-        };
-        let mut engine = DirectEngine::new(config.clone()).await?;
-        if let Err(error) = engine.ensure_peer_route() {
-            if let Err(cleanup) = engine.shutdown().await {
-                crate::warn!("direct: cleanup after route setup failure failed — {cleanup:#}");
-            }
-            return Err(error);
         }
-        self.direct = Some(engine);
-        match IcmpEngine::new(config).await {
-            Ok(engine) => self.icmp = Some(engine),
-            Err(error) => {
-                crate::warn!("direct icmp unavailable — home ICMP has no VPN fallback — {error:#}")
-            }
-        }
+        let epoch = Epoch {
+            link: usize::MAX,
+            generation: 1,
+        };
+        let local = local_exit::start(
+            epoch,
+            (peer, client),
+            params.mtu,
+            params.server_up.clone(),
+            params.server_down.clone(),
+            None,
+        )
+        .await?;
+        let local_exit::LocalExit {
+            control,
+            config,
+            io,
+            pair,
+            outgoing,
+            events,
+            latest,
+            delivery,
+            server,
+        } = local;
+        let task = tokio::spawn(session::run_link(
+            control,
+            pair.server,
+            pair.client,
+            params.mtu,
+            config,
+            io,
+        ));
+        self.local = Some(LocalExitState {
+            pair,
+            primary_client: client,
+            outgoing,
+            events: Some(events),
+            latest,
+            delivery,
+            server,
+            ready: false,
+        });
+        self.local_task = Some(task);
         Ok(())
     }
 
-    /// Stop direct tasks within the join budget and remove only owned routes.
-    /// Runs after hub tasks and hooks stop.
-    async fn shutdown_direct(&mut self) -> Result<()> {
-        let direct = match self.direct.take() {
-            Some(engine) => engine.shutdown().await,
-            None => Ok(()),
+    async fn shutdown_local(&mut self) -> Result<()> {
+        if let Some(task) = self.local_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let Some(mut local) = self.local.take() else {
+            return Ok(());
         };
-        let icmp = match self.icmp.take() {
-            Some(engine) => engine.shutdown().await,
-            None => Ok(()),
-        };
-        match (direct, icmp) {
-            (Err(error), Err(icmp_error)) => {
-                crate::warn!("direct icmp: shutdown failed — {icmp_error:#}");
-                Err(error)
+        drop(local.outgoing);
+        match tokio::time::timeout(Duration::from_secs(2), local.server.join()).await {
+            Ok(result) => result,
+            Err(_) => {
+                local.server.abort();
+                Err(anyhow::anyhow!("local-exit shutdown timeout"))
             }
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -885,29 +850,6 @@ impl Hub {
                             .await;
                             finish_write(&self.links[0].delivery, reset.len(), result)?;
                         }
-                        Some(Dispatched::Direct(bytes)) => {
-                            // A direct-engine packet has no per-link delivery
-                            // accounting; a loss is logged, never silent.
-                            let tun = tun.as_ref().context("direct packet without client TUN")?;
-                            let result = tokio::time::timeout(
-                                Duration::from_millis(100),
-                                tun.send(&bytes),
-                            )
-                            .await;
-                            match result {
-                                Ok(Ok(written)) if written == bytes.len() => {}
-                                Err(_) => {
-                                    crate::error!("vpn: dropped packet — client TUN write timeout")
-                                }
-                                Ok(result) => {
-                                    crate::error!("vpn: dropped packet — failed client TUN write");
-                                    ensure!(
-                                        result.context("write client TUN")? == bytes.len(),
-                                        "short client TUN write"
-                                    );
-                                }
-                            }
-                        }
                         None => {}
                     }
                 }
@@ -916,20 +858,32 @@ impl Hub {
                     self.handle_event(epoch, event, tun, &params, &mut started, hooks).await?;
                 }
                 event = async {
-                    match self.direct.as_mut() {
-                        Some(engine) => engine.recv_event().await,
-                        None => std::future::pending::<DirectEvent>().await,
+                    match &mut self.local {
+                        Some(local) => match &mut local.events {
+                            Some(events) => events.recv().await,
+                            None => std::future::pending().await,
+                        },
+                        None => std::future::pending().await,
                     }
-                }, if self.direct.is_some() => {
-                    self.handle_direct_event(event, tun).await?;
+                }, if self.local.as_ref().is_some_and(|local| local.events.is_some()) => {
+                    match event {
+                        Some(event) => self.handle_local_event(event, tun).await?,
+                        None => self.local_stopped("event channel closed".to_owned()),
+                    }
                 }
-                event = async {
-                    match self.icmp.as_mut() {
-                        Some(engine) => engine.recv_event().await,
-                        None => std::future::pending::<DirectEvent>().await,
+                result = async {
+                    match &mut self.local_task {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
                     }
-                }, if self.icmp.is_some() => {
-                    self.handle_direct_event(event, tun).await?;
+                }, if self.local_task.is_some() => {
+                    self.local_task = None;
+                    let reason = match result {
+                        Ok(Ok(())) => "session ended".to_owned(),
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => format!("local client task: {error}"),
+                    };
+                    self.local_stopped(reason);
                 }
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
@@ -1080,12 +1034,8 @@ pub struct GeoExits {
     pub geo: Option<crate::geo::Geo>,
     /// Country database; None — no country routing.
     pub country: Option<crate::geo::Geo>,
-    /// Packed home country for direct admission; None — direct disabled.
+    /// Packed home country for LocalExit admission.
     pub home_country: Option<u32>,
-    /// Physical uplink of the IPv4 default route, captured before the hub
-    /// runs — before any user hook can change the routing view (spec §5.1);
-    /// None — direct disabled.
-    pub uplink: Option<Uplink>,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
@@ -1127,7 +1077,6 @@ pub async fn run(
         geo,
         country,
         home_country,
-        uplink,
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
@@ -1159,14 +1108,13 @@ pub async fn run(
         geo,
         country,
         home_country,
-        uplink,
-        direct: None,
-        icmp: None,
+        local: None,
+        local_task: None,
         nodes,
         exit_owners,
         exit_state,
         sticky: StickyStats::default(),
-        direct_stats: DirectStats::default(),
+        local_stats: LocalStats::default(),
         grace_until,
         links: servers
             .into_iter()
@@ -1209,22 +1157,19 @@ pub async fn run(
         Ok(()) => hooks.finish().await,
         Err(error) => Err(error),
     };
-    // Direct teardown after the hub tasks and hooks stopped: flow tasks
-    // join bounded and the owned return route is removed even on a failed
-    // exit (spec §5.5).
-    let direct = hub.shutdown_direct().await;
+    let local = hub.shutdown_local().await;
     drop(tun);
     match result {
         Err(error) => {
             if let Err(cleanup) = cleanup {
                 crate::error!("hook: cleanup failed — {cleanup:#}");
             }
-            if let Err(direct) = direct {
-                crate::error!("direct: shutdown failed — {direct:#}");
+            if let Err(local) = local {
+                crate::error!("local-exit: shutdown failed — {local:#}");
             }
             Err(error)
         }
-        Ok(()) => cleanup.and(direct),
+        Ok(()) => cleanup.and(local),
     }
 }
 
@@ -1236,6 +1181,16 @@ pub fn report_timer(seconds: u32) -> Option<tokio::time::Interval> {
     let mut timer = tokio::time::interval_at(Instant::now() + period, period);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     Some(timer)
+}
+
+fn translate_key(mut key: FlowKey, from: Ipv4Addr, to: Ipv4Addr) -> FlowKey {
+    if key.source == from {
+        key.source = to;
+    }
+    if key.destination == from {
+        key.destination = to;
+    }
+    key
 }
 
 /// Every counted loss names its reason in the log (#124).

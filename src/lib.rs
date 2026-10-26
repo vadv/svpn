@@ -17,7 +17,6 @@ mod cmdline;
 pub mod config;
 pub mod control;
 pub mod crypto;
-pub mod direct;
 pub mod drivers;
 pub mod exit_state;
 pub mod framing;
@@ -192,25 +191,10 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 .map(|path| path.with_extension("state.json"))
         });
     let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
-    // Capture the uplink before hooks can change routing.
-    // Missing uplink is fatal: direct never falls back to unbound VPN routing.
-    let uplink = match args.home_country {
-        Some(_) => {
-            let uplink = crate::direct::discover_uplink()?;
-            crate::info!(
-                "direct uplink: {} (interface index {})",
-                uplink.name,
-                uplink.index
-            );
-            Some(uplink)
-        }
-        None => None,
-    };
     Ok(hub::GeoExits {
         geo: asn,
         country,
         home_country: args.home_country.as_deref().and_then(geo::pack_country),
-        uplink,
         exit_state: state,
     })
 }
