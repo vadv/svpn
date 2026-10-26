@@ -335,3 +335,134 @@ fn icmp_checksum_ok(icmp: &[u8]) -> bool {
     // A valid checksum is its own complement: summing with it in place yields 0.
     internet_checksum(icmp) == 0
 }
+
+/// Stateless fixed 1:1 IPv4 address translation (local-exit boundary):
+/// every occurrence of `from` — source, destination, or an address inside
+/// the datagram quoted by an ICMP error — becomes `to`. Checksums are
+/// updated incrementally (RFC 1624), so fragmented datagrams need no
+/// reassembly: only the first fragment carries a transport header, and its
+/// checksum field covers the whole reassembled segment. This is address
+/// mapping only, not per-flow NAT. Returns None for malformed packets;
+/// packets without the address return unchanged.
+pub fn translate_v4(bytes: &[u8], from: Ipv4Addr, to: Ipv4Addr) -> Option<Vec<u8>> {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = usize::from(bytes[0] & 15) * 4;
+    let total = usize::from(word(bytes, 2)?);
+    if ihl < 20 || total < ihl || total > bytes.len() {
+        return None;
+    }
+    let mut out = bytes.to_vec();
+    let protocol = out[9];
+    let mut deltas = Vec::new();
+    for offset in [12usize, 16] {
+        let address = Ipv4Addr::new(
+            out[offset],
+            out[offset + 1],
+            out[offset + 2],
+            out[offset + 3],
+        );
+        if address == from {
+            out[offset..offset + 4].copy_from_slice(&to.octets());
+            deltas.extend(address_deltas(from, to));
+        }
+    }
+    if deltas.is_empty() {
+        return Some(out);
+    }
+    // Non-first fragments carry no transport header; their payload bytes
+    // belong to a checksum already fixed on the first fragment.
+    if word(&out, 6)? & 0x1fff == 0 {
+        match protocol {
+            6 if out.len() >= ihl + 20 => {
+                let checksum = adjust_checksum(word(&out, ihl + 16)?, &deltas);
+                out[ihl + 16..ihl + 18].copy_from_slice(&checksum.to_be_bytes());
+            }
+            17 if out.len() >= ihl + 8 => {
+                // A zero UDP checksum means the sender computed none; keep it.
+                let checksum = word(&out, ihl + 6)?;
+                if checksum != 0 {
+                    let mut adjusted = adjust_checksum(checksum, &deltas);
+                    if adjusted == 0 {
+                        adjusted = u16::MAX;
+                    }
+                    out[ihl + 6..ihl + 8].copy_from_slice(&adjusted.to_be_bytes());
+                }
+            }
+            1 => translate_icmp_quote(&mut out, ihl, from, to),
+            _ => {}
+        }
+    }
+    out[10..12].fill(0);
+    let header = internet_checksum(&out[..ihl]);
+    out[10..12].copy_from_slice(&header.to_be_bytes());
+    Some(out)
+}
+
+/// Rewrite the quoted datagram of an ICMP error (RFC 5508): its embedded
+/// addresses, the embedded IPv4 header checksum, and — because the ICMP
+/// checksum covers the quote — the outer ICMP checksum. The quote must be
+/// complete enough to hold the embedded header; an ICMP error fragmented
+/// before the embedded addresses is left as-is.
+fn translate_icmp_quote(out: &mut [u8], ihl: usize, from: Ipv4Addr, to: Ipv4Addr) {
+    // Error types carry the offending datagram; informational types (echo,
+    // timestamp) quote nothing.
+    if ihl + 28 > out.len() || !matches!(out[ihl], 3 | 4 | 5 | 11 | 12) {
+        return;
+    }
+    let quote = ihl + 8; // start of the quoted IPv4 header
+    let mut deltas = Vec::new();
+    for offset in [quote + 12, quote + 16] {
+        let address = Ipv4Addr::new(
+            out[offset],
+            out[offset + 1],
+            out[offset + 2],
+            out[offset + 3],
+        );
+        if address == from {
+            out[offset..offset + 4].copy_from_slice(&to.octets());
+            deltas.extend(address_deltas(from, to));
+        }
+    }
+    if deltas.is_empty() {
+        return;
+    }
+    let embedded_old = u16::from_be_bytes([out[quote + 10], out[quote + 11]]);
+    let embedded_new = adjust_checksum(embedded_old, &deltas);
+    out[quote + 10..quote + 12].copy_from_slice(&embedded_new.to_be_bytes());
+    // The embedded checksum field sits inside the quoted bytes the outer
+    // ICMP checksum covers: fold its own delta into that adjustment too.
+    deltas.push((embedded_old, embedded_new));
+    let outer = adjust_checksum(u16::from_be_bytes([out[ihl + 2], out[ihl + 3]]), &deltas);
+    out[ihl + 2..ihl + 4].copy_from_slice(&outer.to_be_bytes());
+}
+
+/// RFC 1624 incremental checksum update: fold the word deltas (~old + new)
+/// into an existing checksum without recomputing it over the whole packet.
+fn adjust_checksum(checksum: u16, deltas: &[(u16, u16)]) -> u16 {
+    let mut sum = u32::from(!checksum);
+    for (old, new) in deltas {
+        sum = sum.wrapping_add(u32::from(!old));
+        sum = sum.wrapping_add(u32::from(*new));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// 16-bit wire-order word pairs of an address rewrite.
+fn address_deltas(from: Ipv4Addr, to: Ipv4Addr) -> [(u16, u16); 2] {
+    let (from, to) = (from.octets(), to.octets());
+    [
+        (
+            u16::from_be_bytes([from[0], from[1]]),
+            u16::from_be_bytes([to[0], to[1]]),
+        ),
+        (
+            u16::from_be_bytes([from[2], from[3]]),
+            u16::from_be_bytes([to[2], to[3]]),
+        ),
+    ]
+}
