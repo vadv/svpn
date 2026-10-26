@@ -325,8 +325,16 @@ through the tunnel.
 ### local-exit
 
 `local-exits = ["RU", "BY"]` sends IPv4 packets for these countries through
-a local exit. Other flows use the normal server selection. Configure
-forwarding, NAT and the return route with `server-up` and `server-down` hooks.
+a local exit. Other flows use the normal server selection. A Country Lite DB
+and its path are required:
+
+```toml
+country-db = "/etc/svpn/country.csv"
+local-exits = ["RU", "BY"]
+```
+
+Configure forwarding, NAT and the return route with `server-up` and
+`server-down` hooks (see the full `vpn.toml` example above).
 
 ### RU direct, world via VPN (Linux)
 

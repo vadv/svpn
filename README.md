@@ -333,9 +333,17 @@ sudo setcap cap_net_admin=ep /usr/local/bin/svpn
 ### local-exit
 
 `local-exits = ["RU", "BY"]` направляет IPv4-пакеты этих стран через
-локальный выход. Остальные потоки используют обычный выбор сервера. Для
-локального выхода нужны `server-up` и `server-down`, настраивающие forwarding,
-NAT и обратный маршрут.
+локальный выход. Остальные потоки используют обычный выбор сервера. Нужна
+Country Lite DB и путь к ней в конфиге:
+
+```toml
+country-db = "/etc/svpn/country.csv"
+local-exits = ["RU", "BY"]
+```
+
+Для локального выхода нужны `server-up` и `server-down`, настраивающие
+forwarding, NAT и обратный маршрут (полный пример — в разделе «Напишите
+vpn.toml»).
 
 ### RU напрямую, мир через VPN (Linux)
 

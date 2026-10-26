@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.5
+
+Geo exit and local-exit release.
+
+- `multi` supports per-server `countries = ["NL", "DE"]`, Country Lite
+  lookup and scoped sticky ASN ownership. Country constraints are applied
+  before ASN selection; failover state is restored without snap-back.
+- `local-exits = ["RU", "BY"]` sends matching IPv4 destinations through a
+  local exit while other traffic uses the selected VPN server. TCP, UDP and
+  ICMP use the existing SVPN packet path; no application TCP proxy is added.
+- Local-exit has independent `server-up`/`server-down` hooks and SIGKILL
+  recovery coverage: Linux sockets and TUN disappear, and new direct
+  connections do not need a dead process.
+- Added Country+ASN and local-exit Docker acceptance tests, including RU+BY,
+  TCP/UDP/ICMP, restart and crash lifecycle. README documents the required
+  Country DB and server hooks in Russian and English.
+
 ## v0.9.0
 
 Sticky exit release.

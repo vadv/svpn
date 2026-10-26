@@ -259,4 +259,4 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --dir dist/downloaded
           RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 build/release.py \
             dist/downloaded "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest=true
