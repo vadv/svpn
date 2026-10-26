@@ -36,10 +36,10 @@ pub struct ClientArgs {
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
-    /// DB-IP Country Lite CSV database for country exits and home direct.
+    /// DB-IP Country Lite CSV database for country exits and LocalExit.
     #[arg(long, value_name = "FILE")]
     pub country_db: Option<PathBuf>,
-    /// Two-letter home country; its destinations bypass VPN exits (direct).
+    /// Two-letter home country; matching destinations use LocalExit.
     #[arg(long, value_name = "CC", value_parser = parse_country_code)]
     pub home_country: Option<String>,
     /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.

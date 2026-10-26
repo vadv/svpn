@@ -88,7 +88,7 @@ impl Drop for PeerRoute {
             return;
         };
         if let Err(error) = manager.delete(&self.route)
-            && !matches!(error.raw_os_error(), Some(2 | 3))
+            && !matches!(error.raw_os_error(), Some(2 | 3 | 6))
         {
             crate::warn!("local-exit peer route cleanup failed — {error}");
         }
@@ -138,7 +138,7 @@ pub fn is_busy_tun(error: &anyhow::Error) -> bool {
         .is_some_and(|io| io.raw_os_error() == Some(16))
 }
 
-/// Return the TUN interface index used by direct return routes.
+/// Return the TUN interface index used by local-exit return routes.
 pub fn if_index_of(name: &str) -> Result<u32> {
     let index = nix::net::if_::if_nametoindex(name)
         .with_context(|| format!("TUN {name} interface index"))?;

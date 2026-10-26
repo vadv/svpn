@@ -35,6 +35,13 @@ fn default_pair_accepted_against_distinct_primary() {
 }
 
 #[test]
+fn claimed_pairs_are_unique_and_owned() {
+    let (first, _first_guard) = LocalPair::claim(PRIMARY_SERVER, PRIMARY_CLIENT).unwrap();
+    let (second, _second_guard) = LocalPair::claim(PRIMARY_SERVER, PRIMARY_CLIENT).unwrap();
+    assert_ne!(first, second);
+}
+
+#[test]
 fn pair_rejected_on_any_primary_collision() {
     for (server, client) in [
         (LOCAL_SERVER, LOCAL_CLIENT),

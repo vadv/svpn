@@ -166,8 +166,8 @@ pub enum Dispatched {
 
 impl Hub {
     /// Return a CLOSED-endpoint reset for unowned TCP traffic.
-    /// Dispatch reverse-NAT, current owner and retired flows before classifying
-    /// a new flow; home country is considered before VPN ownership.
+    /// Check the current owner and retired flows before classifying a new
+    /// flow; home country is considered before VPN ownership.
     pub async fn dispatch(
         &mut self,
         bytes: &[u8],
@@ -391,6 +391,7 @@ impl Hub {
 
     fn local_stopped(&mut self, reason: String) {
         crate::error!("local-exit: {reason}");
+        self.local_stats.failed += 1;
         if let Some(local) = &mut self.local {
             local.ready = false;
             local.events = None;
@@ -523,7 +524,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    self.start_local(tun_addr, peer_addr, &params).await?;
+                    self.start_local(tun_addr, peer_addr, params).await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);

@@ -4,6 +4,7 @@ import ipaddress
 import json
 import pathlib
 import re
+import signal
 import socket
 
 from _lib import (
@@ -40,6 +41,36 @@ MASQUERADE_RULES = """table inet svpn_masq {
     ip saddr 10.77.0.0/24 oifname "eth0" masquerade
   }
 }
+"""
+
+# One policy table and one NAT table per claimed inner pair. The same hook
+# configures a remote serve and the local serve; neither uses country routes.
+LOCAL_EGRESS_UP = r"""
+set -eu
+n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
+table=$((100 + n))
+name=svpn_egress_$n
+ip rule del pref "$table" 2>/dev/null || true
+ip route flush table "$table" 2>/dev/null || true
+nft delete table inet "$name" 2>/dev/null || true
+test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
+ip rule add pref "$table" from "$SVPN_PEER_ADDR" table "$table"
+ip route replace default dev eth0 table "$table"
+nft add table inet "$name"
+nft "add chain inet $name forward { type filter hook forward priority 0; policy accept; }"
+nft add rule inet "$name" forward iifname "$SVPN_TUN_NAME" ip saddr "$SVPN_PEER_ADDR" oifname eth0 accept
+nft add rule inet "$name" forward ip daddr "$SVPN_PEER_ADDR" \
+  oifname "$SVPN_TUN_NAME" ct state established,related accept
+nft "add chain inet $name postrouting { type nat hook postrouting priority srcnat; policy accept; }"
+nft add rule inet "$name" postrouting iifname "$SVPN_TUN_NAME" \
+  ip saddr "$SVPN_PEER_ADDR" oifname eth0 masquerade
+"""
+LOCAL_EGRESS_DOWN = r"""
+n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
+table=$((100 + n))
+ip rule del pref "$table" 2>/dev/null || true
+ip route flush table "$table" 2>/dev/null || true
+nft delete table inet "svpn_egress_$n" 2>/dev/null || true
 """
 
 _geo_asn = None
@@ -114,7 +145,14 @@ def country_args(home=False):
         "1",
     ]
     if home:
-        args += ["--home-country", "RU"]
+        args += [
+            "--home-country",
+            "RU",
+            "--server-up",
+            LOCAL_EGRESS_UP,
+            "--server-down",
+            LOCAL_EGRESS_DOWN,
+        ]
     return args
 
 
@@ -301,7 +339,7 @@ def test_restart_restore():
 
 
 def direct_opened(path):
-    found = re.findall(r"direct: opened (\d+) / failed (\d+) / closed (\d+)", path.read_text())
+    found = re.findall(r"local-exit: opened (\d+) / failed (\d+) / closed (\d+)", path.read_text())
     return tuple(int(value) for value in found[-1]) if found else None
 
 
@@ -352,13 +390,12 @@ def test_country_asn_scope():
 def test_direct_home_and_vpn():
     fresh_state()
     # The internal Compose network intentionally has no default route. Give
-    # direct a physical test uplink; ordinary connected routes remain intact.
+    # LocalExit a physical test uplink; connected routes remain intact.
     command(["ip", "route", "replace", "default", "dev", "eth0"])
-    with session("direct-home", args=country_args(home=True), server_hosts=HOSTS, ready_timeout=20) as (
-        process,
-        path,
-    ):
+    args = country_args(home=True)
+    with session("direct-home", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
         command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
         command(["ip", "route", "replace", f"{PEER}/32", "dev", "svpn0"])
         baseline = opened(path)
@@ -369,8 +406,29 @@ def test_direct_home_and_vpn():
         tcp_echo(3, peer=PEER)
         until(lambda: direct_opened(path) == (3, 0, 0), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
+        local_tuns = {
+            item["ifname"]
+            for item in json.loads(command(["ip", "-j", "link", "show"]).stdout)
+            if item["ifname"] in {"svpn0", "tun0"}
+        }
+        assert local_tuns == {"svpn0", "tun0"}, local_tuns
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=5)
+        until(
+            lambda: not local_tuns
+            & {item["ifname"] for item in json.loads(command(["ip", "-j", "link", "show"]).stdout)},
+            seconds=10,
+        )
+        # SIGKILL skips down hooks; the owned rule remains for the next up hook.
+        assert "svpn_egress_" in command(["nft", "list", "tables"]).stdout
     cleanup_verified(process, server_hosts=HOSTS)
-    print("PASS direct+VPN: home TCP/UDP/ICMP bypass servers while DE traffic uses scoped VPN")
+
+    with session("local-restart", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
+        until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
+        command(["ping", "-n", "-c", "1", "-W", "2", TARGET])
+    cleanup_verified(process, server_hosts=HOSTS)
+    assert "svpn_egress_" not in command(["nft", "list", "tables"]).stdout
+    print("PASS direct+VPN: home TCP/UDP/ICMP bypass servers; SIGKILL restart works")
 
 
 TESTS = [

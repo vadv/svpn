@@ -24,10 +24,9 @@ use crate::link_io::{Delivery, Epoch, Event, LinkIo, Packet};
 use crate::session::TransportConfig;
 use crate::tcp::Mode;
 
-/// Default dedicated inner pair: the last pool index, reserved for the local
-/// path so a normal pool scan never reaches it in practice. The primary and
-/// local TUNs must never share an address: duplicate point-to-point
-/// addresses on different TUNs silently misroute instead of failing.
+/// Preferred inner pair for the local path. The primary and local TUNs must
+/// never share an address: duplicate point-to-point addresses silently
+/// misroute instead of failing.
 pub const LOCAL_PAIR: (Ipv4Addr, Ipv4Addr) =
     (Ipv4Addr::new(10, 77, 254, 1), Ipv4Addr::new(10, 77, 254, 2));
 
@@ -35,7 +34,7 @@ pub const LOCAL_PAIR: (Ipv4Addr, Ipv4Addr) =
 /// line plus slack, matching `control::MAX_LINE`.
 const CONTROL_BUFFER: usize = 8192;
 
-/// Fixed inner pair of the local exit, validated against the primary pair.
+/// Claimed inner pair of the local exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalPair {
     /// TUN-local address of the local serve.

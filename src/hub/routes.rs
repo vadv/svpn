@@ -18,8 +18,7 @@ pub struct Owner {
     pub id: u64,
 }
 
-/// A server generation or direct engine flow id.
-/// Both use one id space, so their ownership cannot collide.
+/// A remote generation or LocalExit flow id; both share one id space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Remote(Owner),
@@ -74,7 +73,7 @@ impl Routes {
         };
         let (owner, fresh) = match self.by_key.get(&parsed.flow) {
             Some(Target::Remote(owner)) if owner.epoch == epoch => (*owner, false),
-            // A direct-owned flow never spills onto a server link.
+            // A LocalExit-owned flow never spills onto a server link.
             Some(Target::Direct(_)) | Some(Target::Remote(_)) => {
                 drop_note(
                     delivery,
@@ -131,7 +130,7 @@ impl Routes {
         }
     }
 
-    /// Remove a direct owner only if its generation is still current.
+    /// Remove a LocalExit owner only if its generation is still current.
     /// The caller may tombstone the tuple only when removal succeeds.
     pub fn forget_direct(&mut self, key: FlowKey, id: u64) -> bool {
         if self.by_key.get(&key) == Some(&Target::Direct(id)) {
@@ -143,7 +142,7 @@ impl Routes {
     }
 
     /// Drops every remote owner of the epoch and returns the retired keys
-    /// so the caller can tombstone the TCP ones. Direct owners survive the
+    /// so the caller can tombstone the TCP ones. LocalExit owners survive
     /// failure of an unrelated link.
     pub fn remove_epoch(&mut self, epoch: Epoch) -> Vec<FlowKey> {
         let mut retired = Vec::new();
