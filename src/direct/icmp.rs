@@ -519,33 +519,23 @@ impl IcmpEngine {
     }
 }
 
-/// The uplink's own IPv4 address: a device-bound UDP socket performs the
-/// route lookup of `connect` without sending anything and reports the
-/// source the kernel would use. The physical uplink carries the default
-/// route, so TEST-NET-1 resolves on it; a loopback test uplink resolves on
-/// 127/8 instead. Every direct ICMP request is sent from the result — the
-/// client's tunnel address must never appear on the physical network.
+/// The uplink's own IPv4 address comes from the interface, not from a
+/// UDP route probe: Linux can report another interface's source for a
+/// device-bound socket when the probed destination has no route. Every
+/// direct ICMP request is sent from this address — the client's tunnel
+/// address must never appear on the physical network.
 fn uplink_source(uplink: &Uplink) -> Result<Ipv4Addr> {
-    for target in [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::LOCALHOST] {
-        let Ok(probe) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) else {
+    let interfaces = nix::ifaddrs::getifaddrs().context("enumerate direct uplink addresses")?;
+    for interface in interfaces.filter(|interface| interface.interface_name == uplink.name) {
+        let Some(address) = interface.address else {
             continue;
         };
-        if bind_uplink(&probe, uplink).is_err() {
-            continue;
-        }
-        if probe
-            .connect(&socket2::SockAddr::from(SocketAddrV4::new(target, 9)))
-            .is_err()
-        {
-            continue;
-        }
-        let Ok(local) = probe.local_addr() else {
+        let Some(address) = address.as_sockaddr_in() else {
             continue;
         };
-        if let Some(std::net::SocketAddr::V4(local)) = local.as_socket()
-            && !local.ip().is_unspecified()
-        {
-            return Ok(*local.ip());
+        let ip = address.ip();
+        if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast() {
+            return Ok(ip);
         }
     }
     bail!("the direct uplink has no usable IPv4 source address")
