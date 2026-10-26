@@ -486,6 +486,7 @@ pub(crate) async fn open_link(
         Some(mode) => session::TransportConfig::Tcp {
             mode,
             listener: None,
+            connect_ip: None,
         },
         None => session::TransportConfig::Client {
             strategies: plan.strategies,
@@ -654,6 +655,7 @@ async fn serve(
         Some((mode, listener)) => session::TransportConfig::Tcp {
             mode,
             listener: Some(listener),
+            connect_ip: None,
         },
         None => session::TransportConfig::Server {
             ports,

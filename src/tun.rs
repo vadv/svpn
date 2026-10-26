@@ -1,6 +1,6 @@
 //! TUN device creation and the busy-name diagnostics of the serve side.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result, ensure};
 use tun_rs::{AsyncDevice, DeviceBuilder};
@@ -42,6 +42,92 @@ pub fn create_tun(
         crate::info!("tun: {} ready — {}, MTU {}", tun.name()?, local, mtu);
     }
     Ok(tun)
+}
+
+/// Owned peer return route for a local-exit TUN. The claimed inner pair
+/// makes an existing exact route safe to reclaim after a crash.
+pub struct PeerRoute {
+    route: route_manager::Route,
+}
+
+impl PeerRoute {
+    pub fn install(peer: Ipv4Addr, tun_name: &str) -> Result<Self> {
+        let index = if_index_of(tun_name)?;
+        let route = peer_route(peer, index);
+        let mut manager = route_manager::RouteManager::new().context("route manager")?;
+        let binding = Self { route };
+        if route_present(&mut manager, peer, index)? {
+            return Ok(binding);
+        }
+        match manager.add(&binding.route) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(17) => {
+                ensure!(
+                    route_present(&mut manager, peer, index)?,
+                    "foreign route blocks local-exit peer {peer}/32 via {tun_name}"
+                );
+                return Ok(binding);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("add local-exit peer route {peer}/32 via {tun_name}")
+                });
+            }
+        }
+        ensure!(
+            route_present(&mut manager, peer, index)?,
+            "local-exit peer route {peer}/32 via {tun_name} did not install"
+        );
+        Ok(binding)
+    }
+}
+
+impl Drop for PeerRoute {
+    fn drop(&mut self) {
+        let Ok(mut manager) = route_manager::RouteManager::new() else {
+            return;
+        };
+        if let Err(error) = manager.delete(&self.route)
+            && !matches!(error.raw_os_error(), Some(2 | 3))
+        {
+            crate::warn!("local-exit peer route cleanup failed — {error}");
+        }
+    }
+}
+
+fn peer_route(peer: Ipv4Addr, index: u32) -> route_manager::Route {
+    #[cfg(target_os = "linux")]
+    {
+        route_manager::Route::new(IpAddr::V4(peer), 32)
+            .with_if_index(index)
+            .with_table(254)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        route_manager::Route::new(IpAddr::V4(peer), 32).with_if_index(index)
+    }
+}
+
+fn route_present(
+    manager: &mut route_manager::RouteManager,
+    peer: Ipv4Addr,
+    index: u32,
+) -> Result<bool> {
+    Ok(manager.list().context("list routes")?.iter().any(|route| {
+        route.destination() == IpAddr::V4(peer)
+            && route.prefix() == 32
+            && route.if_index() == Some(index)
+            && {
+                #[cfg(target_os = "linux")]
+                {
+                    route.table() == 254
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    true
+                }
+            }
+    }))
 }
 
 /// Detect EBUSY from TUNSETIFF while another process holds the name.

@@ -139,6 +139,8 @@ pub enum TransportConfig {
     Tcp {
         mode: crate::tcp::Mode,
         listener: Option<tokio::net::TcpListener>,
+        /// Packet-flow TCP endpoint; None uses the logical server address.
+        connect_ip: Option<Ipv4Addr>,
     },
 }
 
@@ -417,6 +419,7 @@ impl Drop for TcpFlow {
 pub struct TcpPlane {
     pub mode: crate::tcp::Mode,
     pub server_ip: Option<Ipv4Addr>,
+    pub connect_ip: Option<Ipv4Addr>,
     pub token_index: HashMap<[u8; 16], (u64, u64)>,
     pub flows: HashMap<u64, TcpFlow>,
     pub by_key: HashMap<FlowKey, u64>,

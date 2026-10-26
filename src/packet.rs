@@ -368,18 +368,18 @@ pub fn translate_v4(bytes: &[u8], from: Ipv4Addr, to: Ipv4Addr) -> Option<Vec<u8
             deltas.extend(address_deltas(from, to));
         }
     }
-    if deltas.is_empty() {
+    if deltas.is_empty() && protocol != 1 {
         return Some(out);
     }
     // Non-first fragments carry no transport header; their payload bytes
     // belong to a checksum already fixed on the first fragment.
     if word(&out, 6)? & 0x1fff == 0 {
         match protocol {
-            6 if out.len() >= ihl + 20 => {
+            6 if !deltas.is_empty() && out.len() >= ihl + 20 => {
                 let checksum = adjust_checksum(word(&out, ihl + 16)?, &deltas);
                 out[ihl + 16..ihl + 18].copy_from_slice(&checksum.to_be_bytes());
             }
-            17 if out.len() >= ihl + 8 => {
+            17 if !deltas.is_empty() && out.len() >= ihl + 8 => {
                 // A zero UDP checksum means the sender computed none; keep it.
                 let checksum = word(&out, ihl + 6)?;
                 if checksum != 0 {
@@ -431,9 +431,33 @@ fn translate_icmp_quote(out: &mut [u8], ihl: usize, from: Ipv4Addr, to: Ipv4Addr
     let embedded_old = u16::from_be_bytes([out[quote + 10], out[quote + 11]]);
     let embedded_new = adjust_checksum(embedded_old, &deltas);
     out[quote + 10..quote + 12].copy_from_slice(&embedded_new.to_be_bytes());
-    // The embedded checksum field sits inside the quoted bytes the outer
-    // ICMP checksum covers: fold its own delta into that adjustment too.
     deltas.push((embedded_old, embedded_new));
+
+    let embedded_ihl = usize::from(out[quote] & 15) * 4;
+    let embedded_offset = u16::from_be_bytes([out[quote + 6], out[quote + 7]]) & 0x1fff;
+    let embedded_protocol = out[quote + 9];
+    let checksum_at = match (embedded_protocol, embedded_offset) {
+        (6, 0) => Some(16),
+        (17, 0) => Some(6),
+        _ => None,
+    };
+    if embedded_ihl >= 20
+        && quote + embedded_ihl <= out.len()
+        && let Some(checksum_at) = checksum_at
+        && quote + embedded_ihl + checksum_at + 2 <= out.len()
+    {
+        let at = quote + embedded_ihl + checksum_at;
+        let old = u16::from_be_bytes([out[at], out[at + 1]]);
+        if embedded_protocol != 17 || old != 0 {
+            let mut new = adjust_checksum(old, &deltas[..deltas.len() - 1]);
+            if embedded_protocol == 17 && new == 0 {
+                new = u16::MAX;
+            }
+            out[at..at + 2].copy_from_slice(&new.to_be_bytes());
+            deltas.push((old, new));
+        }
+    }
+    // The outer ICMP checksum covers every changed quoted field.
     let outer = adjust_checksum(u16::from_be_bytes([out[ihl + 2], out[ihl + 3]]), &deltas);
     out[ihl + 2..ihl + 4].copy_from_slice(&outer.to_be_bytes());
 }

@@ -234,11 +234,20 @@ fn icmp_error_quotes_the_translated_datagram() {
     // Outer IPv4 and ICMP checksums, and the quoted header checksum, verify.
     assert!(checksums_ok(&translated));
     assert!(internet_checksum(&translated[28..48]) == 0);
+    assert!(transport_checksum(PRIMARY_CLIENT, REMOTE, 17, &translated[48..]) == 0);
     // Round trip restores the exact original error.
     assert_eq!(
         translate_v4(&translated, PRIMARY_CLIENT, LOCAL_CLIENT).unwrap(),
         original
     );
+    let quote_only = icmp_error(
+        REMOTE,
+        PRIMARY_SERVER,
+        &udp_datagram(LOCAL_CLIENT, REMOTE, false),
+    );
+    let translated = translate_v4(&quote_only, LOCAL_CLIENT, PRIMARY_CLIENT).unwrap();
+    assert_eq!(source_ip(&translated[28..]), PRIMARY_CLIENT);
+    assert!(checksums_ok(&translated));
 }
 
 #[test]

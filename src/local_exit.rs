@@ -59,6 +59,30 @@ impl LocalPair {
         );
         Ok(Self { server, client })
     }
+
+    /// Claim a distinct pool pair for both local TUNs. The port token also
+    /// prevents another SVPN process from reusing the addresses.
+    pub fn claim(
+        primary_server: Ipv4Addr,
+        primary_client: Ipv4Addr,
+    ) -> Result<(Self, crate::addrpool::PairGuard)> {
+        let mut start = 254;
+        for _ in 0..crate::addrpool::POOL_SIZE {
+            let (guard, server, client) = crate::addrpool::claim(start)?;
+            let pair = Self { server, client };
+            start = crate::addrpool::pool_index(server, client).map_or(0, |n| n + 1);
+            if server == primary_server
+                || server == primary_client
+                || client == primary_server
+                || client == primary_client
+            {
+                drop(guard);
+                continue;
+            }
+            return Ok((pair, guard));
+        }
+        bail!("no free local-exit address pair")
+    }
 }
 
 /// Local serve task: aborted on drop, joinable for a clean stop.
@@ -96,7 +120,7 @@ impl Drop for LocalServer {
 }
 
 /// Everything the Hub needs to spawn and own the local client session:
-/// `session::run_link(control, connect_ip, pair.client, mtu, config, io)`,
+/// `session::run_link(control, pair.server, pair.client, mtu, config, io)`,
 /// with `outgoing`/`events` as the packet ports of that session.
 pub struct LocalExit {
     /// Control channel of the local client session (handshake complete).
@@ -109,9 +133,6 @@ pub struct LocalExit {
     pub io: LinkIo,
     /// Fixed inner pair of the local exit.
     pub pair: LocalPair,
-    /// `run_link` server argument: the TCP transport connect address. The
-    /// data listener binds loopback only — NOT the TUN-side `pair.server`.
-    pub connect_ip: Ipv4Addr,
     /// Send translated client-TUN packets into the local client session.
     pub outgoing: mpsc::Sender<Packet>,
     /// Events of the local client session: packets to translate back into
@@ -138,7 +159,7 @@ pub async fn start(
     server_down: Option<String>,
     tun_name: Option<String>,
 ) -> Result<LocalExit> {
-    let pair = LocalPair::new(primary.0, primary.1)?;
+    let (pair, pair_guard) = LocalPair::claim(primary.0, primary.1)?;
     crate::validate_addresses(pair.server, pair.client, mtu)?;
     let (client_stream, server_stream) = tokio::io::duplex(CONTROL_BUFFER);
     let (server_read, server_write) = split(server_stream);
@@ -147,7 +168,7 @@ pub async fn start(
     let mut client_control = Control::new(client_read, client_write);
     let (result_tx, result_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let result = serve_local(server_control, pair, mtu, tun_name.as_deref()).await;
+        let result = serve_local(server_control, pair, pair_guard, mtu, tun_name.as_deref()).await;
         // The serve task ends only after its result is handed over; the
         // server session and its TUN are gone by the time the send returns.
         let _ = result_tx.send(result);
@@ -194,10 +215,10 @@ pub async fn start(
                 camouflage: Camouflage::None,
             },
             listener: None,
+            connect_ip: Some(Ipv4Addr::LOCALHOST),
         },
         io,
         pair,
-        connect_ip: Ipv4Addr::LOCALHOST,
         outgoing,
         events: returned,
         latest,
@@ -212,9 +233,11 @@ pub async fn start(
 async fn serve_local(
     mut control: Control,
     pair: LocalPair,
+    pair_guard: crate::addrpool::PairGuard,
     mtu: u16,
     tun_name: Option<&str>,
 ) -> Result<()> {
+    let _pair_guard = pair_guard;
     let Message::Hello {
         version,
         client_ip,
@@ -268,12 +291,15 @@ async fn serve_local(
     // The REAL second TUN: the server session must run unchanged so the
     // host kernel forwarding/conntrack/NAT owns the egress.
     let tun = crate::open_tun(tun_name, pair.server, pair.client, mtu).await?;
+    let tun_name = tun.name().context("local-exit TUN name")?;
+    let _peer_route = crate::tun::PeerRoute::install(pair.client, &tun_name)?;
     let config = TransportConfig::Tcp {
         mode: Mode {
             port,
             camouflage: Camouflage::None,
         },
         listener: Some(listener),
+        connect_ip: None,
     };
     crate::serve_tail(control, tun, pair.server, pair.client, mtu, config).await
 }
