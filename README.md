@@ -129,6 +129,8 @@ sysctl -qw net.ipv4.ip_forward=1
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
 table=svpn_egress_$n
+owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
+rm -f "$owner.rule" "$owner.route" "$owner.nat"
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
 if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
@@ -139,23 +141,38 @@ if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -
     echo "svpn: policy table $table_id is already in use" >&2
     exit 1
 fi
-ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
+    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
+fi
+: > "$owner.rule"
 ip route replace default via "$gateway" dev "$wan" table "$table_id"
+: > "$owner.route"
 nft delete table inet "$table" 2>/dev/null || true
 nft -f - <<EOF
 add table inet $table
 add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
 add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
 EOF
+: > "$owner.nat"
 '''
 server-down = '''
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
+owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-nft delete table inet "svpn_egress_$n" 2>/dev/null || true
+if [ -f "$owner.rule" ]; then
+    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+    rm -f "$owner.rule"
+fi
+if [ -f "$owner.route" ]; then
+    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
+    rm -f "$owner.route"
+fi
+if [ -f "$owner.nat" ]; then
+    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
+    rm -f "$owner.nat"
+fi
 '''
 
 [[servers]]

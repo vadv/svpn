@@ -5,6 +5,7 @@ import contextlib
 import io
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -179,6 +180,36 @@ def local_exit_full_tunnel_guard():
     print("PASS local-exit routes: legacy Ready hooks cannot overwrite full-tunnel routes")
 
 
+def local_exit_cleanup_requires_ownership():
+    source = pathlib.Path("README.md").read_text()
+    script = re.search(r"server-down = '''\n(.*?)\n'''", source, re.S).group(1)
+    with tempfile.TemporaryDirectory(prefix="svpn-cleanup-test-") as directory:
+        root = pathlib.Path(directory)
+        log = root / "ip.log"
+        fake_ip = root / "ip"
+        fake_ip.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" >> "$IP_LOG"\n'
+            'if [ "$1 $2 $3 $4" = "-4 route show default" ]; then\n'
+            "    echo 'default via 192.0.2.1 dev eth0'\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        fake_ip.chmod(0o700)
+        env = os.environ.copy()
+        env.update(
+            PATH=f"{root}:{env['PATH']}",
+            IP_LOG=str(log),
+            SVPN_PEER_ADDR="10.77.0.2",
+            SVPN_SESSION_ID=f"cleanup-test-{os.getpid()}",
+        )
+        result = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        calls = log.read_text()
+        assert "rule del" not in calls and "route del" not in calls, calls
+    print("PASS local-exit cleanup: rejected startup cannot delete foreign routes")
+
+
 def flow_cleanup_statistics():
     def snapshot(server, opened, closed, active=0, failed=0):
         prefix = "[server] " if server else ""
@@ -303,6 +334,7 @@ if __name__ == "__main__":
     matrix_diagnostics()
     reselect_log_patterns()
     local_exit_full_tunnel_guard()
+    local_exit_cleanup_requires_ownership()
     flow_cleanup_statistics()
     invalid_groups()
     shell_groups()

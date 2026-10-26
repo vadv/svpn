@@ -265,6 +265,8 @@ fn readme_multi_examples_parse_with_all_exit_features() {
             "ip rule del pref \"$table_id\" from \"$SVPN_PEER_ADDR\" table \"$table_id\""
         ));
         assert!(example.contains("exit-state = \"/etc/svpn/exits.json\""));
+        assert!(example.contains("owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id"));
+        assert!(example.contains("if [ -f \"$owner.route\" ]; then"));
         std::fs::write(&path, example).unwrap();
         let args = load(&path, true).unwrap();
         assert_eq!(
