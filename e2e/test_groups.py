@@ -156,6 +156,12 @@ def matrix_groups():
     print("PASS matrix: 8 rows assigned once, original order and dispatch")
 
 
+def reselect_log_patterns():
+    log = "[server] flow_open role=server id=7 generation=1 channel=2 transport=tcp"
+    assert suite_reselect.tcp_flow_ids(log) == {"7"}
+    print("PASS reselect logs: generation-aware TCP flow parsing")
+
+
 def flow_cleanup_statistics():
     def snapshot(server, opened, closed, active=0, failed=0):
         prefix = "[server] " if server else ""
@@ -278,6 +284,7 @@ if __name__ == "__main__":
     integration_groups()
     matrix_groups()
     matrix_diagnostics()
+    reselect_log_patterns()
     flow_cleanup_statistics()
     invalid_groups()
     shell_groups()
