@@ -70,6 +70,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         local_exits: Vec::new(),
         local: None,
         local_task: None,
+        local_cleanup: None,
         nodes: Vec::new(),
         exit_owners: std::collections::HashMap::new(),
         exit_state: None,

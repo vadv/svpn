@@ -69,6 +69,21 @@ impl LocalServer {
             Err(error) => bail!("local serve task: {error}"),
         }
     }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        match tokio::time::timeout(
+            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
+            self.join(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.abort();
+                bail!("local-exit shutdown timeout")
+            }
+        }
+    }
 }
 
 impl Drop for LocalServer {
@@ -94,6 +109,7 @@ pub struct LocalExit {
 pub async fn start(
     epoch: Epoch,
     primary: (Ipv4Addr, Ipv4Addr),
+    primary_tun: &str,
     mtu: u16,
     server_up: Option<String>,
     server_down: Option<String>,
@@ -101,13 +117,23 @@ pub async fn start(
 ) -> Result<LocalExit> {
     let (pair, pair_guard) = LocalPair::claim(primary.0, primary.1)?;
     crate::validate_addresses(pair.server, pair.client, mtu)?;
+    let primary_tun = primary_tun.to_owned();
     let (client_stream, server_stream) = tokio::io::duplex(CONTROL_BUFFER);
     let (server_read, server_write) = split(server_stream);
     let (client_read, client_write) = split(client_stream);
     let server_control = Control::new(server_read, server_write);
     let mut client_control = Control::new(client_read, client_write);
     let task = tokio::spawn(async move {
-        serve_local(server_control, pair, pair_guard, mtu, tun_name.as_deref()).await
+        serve_local(
+            server_control,
+            pair,
+            pair_guard,
+            mtu,
+            tun_name.as_deref(),
+            primary.1,
+            &primary_tun,
+        )
+        .await
     });
     let mut server = LocalServer { task };
     let port = match client_handshake(&mut client_control, pair, mtu, server_up, server_down).await
@@ -165,6 +191,8 @@ async fn serve_local(
     pair_guard: crate::addrpool::PairGuard,
     mtu: u16,
     tun_name: Option<&str>,
+    primary_client: Ipv4Addr,
+    primary_tun: &str,
 ) -> Result<()> {
     let _pair_guard = pair_guard;
     let Message::Hello {
@@ -218,6 +246,8 @@ async fn serve_local(
     let tun = crate::open_tun(tun_name, pair.server, pair.client, mtu).await?;
     let tun_name = tun.name().context("local-exit TUN name")?;
     let _peer_route = crate::tun::PeerRoute::install(pair.client, &tun_name)?;
+    let _local_policy =
+        crate::tun::LocalPolicy::install(pair.client, &tun_name, primary_client, primary_tun)?;
     let config = TransportConfig::Tcp {
         mode: Mode {
             port,

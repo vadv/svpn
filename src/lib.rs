@@ -713,47 +713,51 @@ pub(crate) async fn serve_tail(
 ) -> Result<()> {
     let tun_name = tun.name().context("TUN name")?.to_owned();
     control.send(Message::TunReady).await?;
-    let server_down = match control.recv().await? {
-        Message::ServerHooks { up, down } => {
-            let context = hooks::TunContext {
-                name: tun_name.clone(),
-                local: server_ip,
-                peer: client_ip,
-            };
-            if let Some(up) = up {
-                let hook = hooks::Hook::Command(up);
-                let (ok, stdout, stderr) =
-                    match hooks::run_with_capture(&hook, "up", &context).await {
-                        Ok((stdout, stderr)) => (true, stdout, stderr),
-                        Err(error) => {
-                            let message = format!("{error:#}");
-                            crate::error!("hook: up failed — {message}");
-                            (false, String::new(), message)
-                        }
-                    };
-                control
-                    .send(Message::HookResult { ok, stdout, stderr })
-                    .await?;
-                ensure!(ok, "server up hook failed");
-            } else {
-                control
-                    .send(Message::HookResult {
-                        ok: true,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    })
-                    .await?;
+    let mut server_down = None;
+    let result = async {
+        match control.recv().await? {
+            Message::ServerHooks { up, down } => {
+                server_down = down;
+                let context = hooks::TunContext {
+                    name: tun_name.clone(),
+                    local: server_ip,
+                    peer: client_ip,
+                };
+                if let Some(up) = up {
+                    let hook = hooks::Hook::Command(up);
+                    let (ok, stdout, stderr) =
+                        match hooks::run_with_capture(&hook, "up", &context).await {
+                            Ok((stdout, stderr)) => (true, stdout, stderr),
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                crate::error!("hook: up failed — {message}");
+                                (false, String::new(), message)
+                            }
+                        };
+                    control
+                        .send(Message::HookResult { ok, stdout, stderr })
+                        .await?;
+                    ensure!(ok, "server up hook failed");
+                } else {
+                    control
+                        .send(Message::HookResult {
+                            ok: true,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        })
+                        .await?;
+                }
+                ensure!(
+                    matches!(bootstrap(&mut control).await?, Message::TunReady),
+                    "client TUN not ready"
+                );
             }
-            ensure!(
-                matches!(bootstrap(&mut control).await?, Message::TunReady),
-                "client TUN not ready"
-            );
-            down
+            Message::TunReady => {}
+            _ => bail!("expected server_hooks or tun_ready"),
         }
-        Message::TunReady => None,
-        _ => bail!("expected server_hooks or tun_ready"),
-    };
-    let result = session::run(control, tun, None, client_ip, mtu, config).await;
+        session::run(control, tun, None, client_ip, mtu, config).await
+    }
+    .await;
     if let Some(down) = server_down {
         let context = hooks::TunContext {
             name: tun_name,

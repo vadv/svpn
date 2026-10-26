@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.6
+
+Local-exit correctness and setup documentation release.
+
+- Fixed local-exit with full-tunnel routes. Linux uses native TUN routing and
+  macOS owns a scoped default route. Peer route deletion checks ownership.
+- Bounded pending TCP accepts and camouflage binding time. Local-exit shutdown
+  now completes its hooks on startup failure and normal shutdown.
+- Reworked the README quickstart around local-exits, sticky ASN and multiple
+  VPN exits. Added database, SSH, routing and verification instructions.
+- Fixed the ASN updater row-count validation and added README configuration
+  regression coverage.
+
 ## v0.9.5
 
 Geo exit and local-exit release.

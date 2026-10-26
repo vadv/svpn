@@ -1,9 +1,13 @@
 //! TUN device creation and the busy-name diagnostics of the serve side.
 
+mod local_policy;
+
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Context, Result, ensure};
 use tun_rs::{AsyncDevice, DeviceBuilder};
+
+pub use local_policy::LocalPolicy;
 
 pub fn validate_tun_name(name: &str) -> Result<()> {
     let bytes = name.as_bytes();
@@ -75,6 +79,21 @@ impl Drop for PeerRoute {
         let Ok(mut manager) = route_manager::RouteManager::new() else {
             return;
         };
+        let peer = match self.route.destination() {
+            IpAddr::V4(peer) => peer,
+            IpAddr::V6(_) => return,
+        };
+        let Some(index) = self.route.if_index() else {
+            return;
+        };
+        match route_present(&mut manager, peer, index) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                crate::warn!("local-exit peer route check failed — {error:#}");
+                return;
+            }
+        }
         if let Err(error) = manager.delete(&self.route)
             && !matches!(error.raw_os_error(), Some(2 | 3 | 6))
         {
@@ -90,7 +109,13 @@ fn peer_route(peer: Ipv4Addr, index: u32) -> route_manager::Route {
             .with_if_index(index)
             .with_table(254)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        route_manager::Route::new(IpAddr::V4(peer), 32)
+            .with_if_index(index)
+            .with_if_scope(true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         route_manager::Route::new(IpAddr::V4(peer), 32).with_if_index(index)
     }
@@ -110,7 +135,11 @@ fn route_present(
                 {
                     route.table() == 254
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
+                {
+                    route.if_scope()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     true
                 }

@@ -89,6 +89,9 @@ fn link_session_cap_with(
             mtu: 1400,
             plane,
             tcp_listener: None,
+            tcp_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                svpn::tcp::TCP_PENDING_LIMIT,
+            )),
             tasks: JoinSet::new(),
             task_events: mpsc::channel(64),
             incoming: mpsc::channel(CHANNEL_QUEUE),

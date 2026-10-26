@@ -162,6 +162,23 @@ def reselect_log_patterns():
     print("PASS reselect logs: generation-aware TCP flow parsing")
 
 
+def local_exit_full_tunnel_guard():
+    path = pathlib.Path(suite_sticky_asn.__file__).parent / "config" / "geo-up.sh"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                suite_sticky_asn.install_full_tunnel_routes()
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("route hook guard did not reject local-exit")
+    finally:
+        path.unlink()
+    print("PASS local-exit routes: legacy Ready hooks cannot overwrite full-tunnel routes")
+
+
 def flow_cleanup_statistics():
     def snapshot(server, opened, closed, active=0, failed=0):
         prefix = "[server] " if server else ""
@@ -285,6 +302,7 @@ if __name__ == "__main__":
     matrix_groups()
     matrix_diagnostics()
     reselect_log_patterns()
+    local_exit_full_tunnel_guard()
     flow_cleanup_statistics()
     invalid_groups()
     shell_groups()

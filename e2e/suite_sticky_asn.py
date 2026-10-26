@@ -26,6 +26,8 @@ CSV = pathlib.Path("/tmp/e2e-asn.csv")
 COUNTRY_CSV = pathlib.Path("/tmp/e2e-country.csv")
 STATE = pathlib.Path("/var/lib/svpn/exit-state.json")
 TARGET = "172.30.77.4"
+LOCAL_TARGET = "172.31.77.4"
+BY_TARGET = "172.31.77.5"
 # One /17 block per row: 131072 synthetic rows pass Geo::load's 100k-row floor and give
 # every subnet a distinct ASN, so rendezvous picks differ across destination groups.
 HOST_BITS = 15
@@ -98,12 +100,13 @@ def write_country():
     global _country_ready
     if _country_ready:
         return
-    target_row = int(ipaddress.IPv4Address(TARGET)) >> HOST_BITS
+    local_rows = {int(ipaddress.IPv4Address(address)) >> HOST_BITS for address in (TARGET, LOCAL_TARGET)}
+    by_row = int(ipaddress.IPv4Address(BY_TARGET)) >> HOST_BITS
     mask = (1 << HOST_BITS) - 1
     with COUNTRY_CSV.open("w") as out:
         for row in range(ROWS):
             start = row << HOST_BITS
-            country = "RU" if row == target_row else "DE"
+            country = "RU" if row in local_rows else "BY" if row == by_row else "DE"
             out.write(f'"{_dotted(start)}","{_dotted(start | mask)}",{country}\n')
     _country_ready = True
 
@@ -148,7 +151,7 @@ def country_args(local_exit=False):
             "--local-exits",
             "RU,BY",
             "--server-up",
-            LOCAL_EGRESS_UP,
+            LOCAL_EGRESS_UP + '\nip route replace 172.31.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n',
             "--server-down",
             LOCAL_EGRESS_DOWN,
         ]
@@ -346,9 +349,25 @@ def ping_local(destination):
     command(["ping", "-n", "-c", "1", "-W", "2", destination])
 
 
-def target_tcp_echo(index, timeout=15):
+def install_full_tunnel_routes():
+    if (pathlib.Path(__file__).parent / "config" / "geo-up.sh").exists():
+        raise AssertionError("legacy geo-up hook must not override local-exit routes")
+    for host in HOSTS:
+        command(["ip", "route", "replace", f"{host}/32", "dev", "eth0"])
+    for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
+        command(["ip", "route", "replace", prefix, "dev", "svpn0"])
+
+
+def remove_full_tunnel_routes():
+    for prefix in ("0.0.0.0/1", "128.0.0.0/1"):
+        command(["ip", "route", "del", prefix], check=False)
+    for host in HOSTS:
+        command(["ip", "route", "del", f"{host}/32"], check=False)
+
+
+def target_tcp_echo(index, destination=TARGET, timeout=15):
     payload = bytes([index]) * 65536
-    with socket.create_connection((TARGET, 9000), timeout=timeout) as stream:
+    with socket.create_connection((destination, 9000), timeout=timeout) as stream:
         stream.settimeout(timeout)
         reader = stream.makefile("rb")
         source = reader.readline().strip().decode()
@@ -392,22 +411,25 @@ def test_country_asn_scope():
 
 def test_local_exits_and_vpn():
     fresh_state()
-    # The internal Compose network intentionally has no default route. Give
-    # Use the physical test uplink for local-exit; connected routes remain intact.
+    # The internal Compose network has no default route; use its physical uplink.
     command(["ip", "route", "replace", "default", "dev", "eth0"])
     args = country_args(local_exit=True)
     with session("local-exit", args=args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
         until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
-        command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
-        command(["ip", "route", "replace", f"{PEER}/32", "dev", "svpn0"])
+        install_full_tunnel_routes()
+        routes = command(["ip", "-4", "route", "show"]).stdout
+        assert "0.0.0.0/1 dev svpn0" in routes, routes
+        assert "128.0.0.0/1 dev svpn0" in routes, routes
         baseline = opened(path)
-        source = target_tcp_echo(2)
+        source = target_tcp_echo(2, LOCAL_TARGET)
         assert source == "172.30.77.3", source
-        udp_echo(TARGET)
-        command(["ping", "-n", "-c", "1", "-W", "2", TARGET])
+        udp_echo(LOCAL_TARGET)
+        command(["ping", "-n", "-c", "1", "-W", "2", LOCAL_TARGET])
+        by_source = target_tcp_echo(4, BY_TARGET)
+        assert by_source == "172.30.77.3", by_source
         tcp_echo(3, peer=PEER)
-        until(lambda: local_opened(path) == (3, 0, 0), seconds=20)
+        until(lambda: local_opened(path) == (4, 0, 0), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
         local_tuns = {
             item["ifname"]
@@ -422,8 +444,9 @@ def test_local_exits_and_vpn():
             & {item["ifname"] for item in json.loads(command(["ip", "-j", "link", "show"]).stdout)},
             seconds=10,
         )
-        # SIGKILL skips down hooks; the owned rule remains for the next up hook.
+        # SIGKILL skips down hooks; the next start reclaims the policy state.
         assert "svpn_egress_" in command(["nft", "list", "tables"]).stdout
+        ping_local(TARGET)
     cleanup_verified(process, server_hosts=HOSTS)
 
     restart_args = list(args)
@@ -433,12 +456,13 @@ def test_local_exits_and_vpn():
         until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
         until(lambda: local_opened(path) is not None, seconds=10)
         baseline = local_opened(path)
-        command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
-        ping_local(TARGET)
+        install_full_tunnel_routes()
+        ping_local(LOCAL_TARGET)
         until(lambda: local_opened(path)[0] == baseline[0] + 1, seconds=20)
     cleanup_verified(process, server_hosts=HOSTS)
+    remove_full_tunnel_routes()
     assert "svpn_egress_" not in command(["nft", "list", "tables"]).stdout
-    print("PASS local-exit+VPN: local TCP/UDP/ICMP and restart work")
+    print("PASS local-exit+VPN: full-tunnel TCP/UDP/ICMP and restart work")
 
 
 TESTS = [

@@ -295,10 +295,7 @@ fn unrelated_and_malformed_packets() {
 
 #[tokio::test]
 async fn failed_tun_name_surfaces_the_server_error_and_ends_the_task() {
-    // A too-long TUN name fails validation before any interface is touched,
-    // on every platform and without privileges. The client handshake runs
-    // for real up to the address exchange, then unwinds with the server-side
-    // cause and no leaked serve task.
+    // Invalid TUN names must surface the server error without leaking its task.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         start(
@@ -307,6 +304,7 @@ async fn failed_tun_name_surfaces_the_server_error_and_ends_the_task() {
                 generation: 1,
             },
             (PRIMARY_SERVER, PRIMARY_CLIENT),
+            "svpn-test-primary",
             1400,
             None,
             None,

@@ -134,6 +134,7 @@ pub struct Hub {
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    pub local_cleanup: Option<LocalServer>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
     /// Sticky owners: group key → link index. An alive owner keeps its group
@@ -372,7 +373,7 @@ impl Hub {
         }
     }
 
-    async fn local_stopped(&mut self, reason: String, tun: &mut Option<AsyncDevice>) {
+    async fn local_stopped(&mut self, reason: String, tun: &mut Option<AsyncDevice>) -> Result<()> {
         crate::error!("local-exit: {reason}");
         self.local_stats.failed += 1;
         if let Some(local) = &mut self.local {
@@ -391,19 +392,10 @@ impl Hub {
             }
         }
         let Some(local) = self.local.take() else {
-            return;
+            return Err(anyhow::anyhow!(reason));
         };
-        let mut server = local.server;
-        match tokio::time::timeout(
-            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
-            server.join(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => crate::warn!("local-exit: serve cleanup failed — {error:#}"),
-            Err(_) => crate::warn!("local-exit: serve cleanup timed out"),
-        }
+        drop(local.outgoing);
+        self.local_cleanup = Some(local.server);
         let mut retired = Vec::new();
         self.routes.by_key.retain(|key, target| {
             if matches!(target, Target::Direct(_)) {
@@ -419,6 +411,7 @@ impl Hub {
                 self.tombstones.insert(key, StdInstant::now());
             }
         }
+        Err(anyhow::anyhow!(reason))
     }
 
     pub fn stats_report(&mut self, elapsed: Duration) -> String {
@@ -531,7 +524,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    self.start_local(tun_addr, peer_addr, params).await?;
+                    self.start_local(tun_addr, peer_addr, &name, params).await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
@@ -748,6 +741,7 @@ impl Hub {
         &mut self,
         client: Ipv4Addr,
         peer: Ipv4Addr,
+        primary_tun: &str,
         params: &LinkParams,
     ) -> Result<()> {
         if self.local_exits.is_empty() || self.local.is_some() {
@@ -760,6 +754,7 @@ impl Hub {
         let local = local_exit::start(
             epoch,
             (peer, client),
+            primary_tun,
             params.mtu,
             params.server_up.clone(),
             params.server_down.clone(),
@@ -799,27 +794,19 @@ impl Hub {
         Ok(())
     }
 
-    async fn shutdown_local(&mut self) -> Result<()> {
+    pub async fn shutdown_local(&mut self) -> Result<()> {
         if let Some(task) = self.local_task.take() {
             task.abort();
             let _ = task.await;
         }
-        let Some(mut local) = self.local.take() else {
+        if let Some(server) = self.local_cleanup.take() {
+            server.shutdown().await?;
+        }
+        let Some(local) = self.local.take() else {
             return Ok(());
         };
         drop(local.outgoing);
-        match tokio::time::timeout(
-            crate::hooks::DEADLINE + crate::session::HEARTBEAT_TIMEOUT,
-            local.server.join(),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                local.server.abort();
-                Err(anyhow::anyhow!("local-exit shutdown timeout"))
-            }
-        }
+        local.server.shutdown().await
     }
 
     async fn relay(
@@ -878,7 +865,7 @@ impl Hub {
                 }, if self.local.as_ref().is_some_and(|local| local.events.is_some()) => {
                     match event {
                         Some(event) => self.handle_local_event(event, tun).await?,
-                        None => self.local_stopped("event channel closed".to_owned(), tun).await,
+                        None => self.local_stopped("event channel closed".to_owned(), tun).await?,
                     }
                 }
                 result = async {
@@ -893,7 +880,7 @@ impl Hub {
                         Ok(Err(error)) => format!("{error:#}"),
                         Err(error) => format!("local client task: {error}"),
                     };
-                    self.local_stopped(reason, tun).await;
+                    self.local_stopped(reason, tun).await?;
                 }
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
@@ -1120,6 +1107,7 @@ pub async fn run(
         local_exits,
         local: None,
         local_task: None,
+        local_cleanup: None,
         nodes,
         exit_owners,
         exit_state,

@@ -1,474 +1,358 @@
 # SVPN
 
-[English](README.en.md)
+SVPN — это клиент и сервер в одном исполняемом файле. Он поднимает защищённый
+IPv4-туннель через SSH.
 
-SVPN — зашифрованный IPv4-туннель до вашего Linux-сервера. Серверная часть —
-тот же бинарник: клиент запускает его через SSH, и он живёт, пока живо
-подключение. Ни демона, ни сертификатов, ни конфига на сервере. В сети туннель
-выглядит как QUIC, WebRTC или mosh, а где UDP заблокирован — как SSH по TCP.
+Это руководство начинается с одного законченного сценария. В нём включены сразу
+три функции:
 
-## Что вы получаете
+- адреса **России и Беларуси** идут через `local-exit`;
+- адреса **Нидерландов и Германии** распределяются между двумя VPN-серверами;
+- остальные IPv4-адреса используют оба VPN-сервера с учётом ASN и весов.
 
-- **Сервер — это один файл.** Скопировали `svpn` на сервер, добавили его адрес
-  в TOML на клиенте — сервер в строю. На сервере нет ни демона, ни конфига,
-  ни состояния: процесс запускается вашей SSH-сессией и умирает вместе с ней.
-- **Один интерфейс — сколько угодно серверов.** Пул прячется за одним TUN на
-  клиенте. Новый сервер — это три строки в конфиге, а не новый VPN.
-- **Веса вместо балансировщика.** `weight` сервера задаёт его долю новых
-  соединений.
-- **Смерть сервера — штатное событие, а не авария.** Каждый сервер — конечный
-  автомат: подключение, работа, проверка, backoff. Пять секунд молчания —
-  сервер вне пула, трафик уходит на живых, а упавший переподнимается сам
-  (1→2→4…→60 с). VPN останавливается, только когда не осталось ни одного
-  живого сервера.
-- **Маскировка подбирается под сеть.** `auto` пробует транспорты от быстрого
-  к живучему — QUIC → WebRTC → obfs → mosh → SSH/TCP — и останавливается на
-  первом, который реально заработал. Выбор не застывает: примерно раз в
-  10 минут фоновый замер сравнивает транспорты по задержке и потерям, и
-  заметно более быстрый получает новые соединения.
+Беларусь обозначается кодом `BY`, Россия — `RU`.
 
-```text
-┌──────────────────┐        ┌──────────┐
-│ клиент: один TUN │───────▶│ сервер A │  вес 3 — несёт трафик
-│                  │───────▶│ сервер B │  вес 1 — несёт трафик
-│                  │────╳   │ сервер C │  лежит — поднимется сам
-└──────────────────┘        └──────────┘
-   C упал — VPN работает: новые соединения уходят на A и B
-```
+> **Платформа примера: Linux.** Ниже описаны Linux-клиент и два Linux-сервера.
+> Не копируйте hooks на macOS. Для macOS нужны отдельные команды маршрутизации,
+> forwarding и NAT.
 
-## Требования
+## 1. Подготовьте машины
 
-- Сервер: Linux с TUN и nftables (Debian 12 / Ubuntu 24.04 из коробки),
-  вход root по SSH-ключу, без UFW/firewalld.
-- Клиент: Linux или macOS, процессор с AES-NI или ARMv8 crypto.
+| Машина | Что нужно |
+|---|---|
+| Linux-клиент | root для этого примера, TUN, `iproute2`, `nftables`, `curl`, `gzip` и обычный default route через физический интерфейс |
+| Каждый из двух VPS | Linux, TUN, `iproute2`, `nftables`, root SSH и выход в Интернет |
+| Сеть | Разрешите SSH, TCP `41020` и UDP `60000–60009` до VPS |
 
-## 1. Установите svpn
+На VPS firewall должен разрешать forwarding между TUN и физическим выходом.
+NAT из примера не изменяет существующую политику firewall. Не отключайте
+firewall целиком.
 
-Скачайте из [Releases](https://github.com/vadv/svpn/releases) архив и его
-`.sha256` **на сервер и на клиент** — файл один и тот же:
+Используйте одну версию SVPN на всех машинах. Для каждой машины скачайте сборку
+её ОС и архитектуры. Клиент и сервер — это роли одной программы, а не один
+файл для разных платформ.
 
-- `linux-x86_64-gnu` — сервер и клиент Linux (glibc 2.36+)
-- `openwrt-aarch64` — клиент на роутере OpenWrt ARM64 (`cp svpn /usr/bin/svpn`)
-- `macos-arm64` — клиент macOS на Apple Silicon (сумма: `shasum -a 256 -c`)
+## 2. Установите SVPN
 
-```sh
-sha256sum -c svpn-*.tar.gz.sha256
-tar -xzf svpn-*.tar.gz
+Откройте [релизы](https://github.com/vadv/svpn/releases) и скачайте один архив
+для каждой машины:
+
+- `svpn-<version>-linux-x86_64-gnu.tar.gz` — Linux x86_64;
+- `svpn-<version>-macos-arm64.tar.gz` — macOS Apple Silicon;
+- `svpn-<version>-openwrt-aarch64.tar.gz` — OpenWrt aarch64.
+
+Для Linux x86_64 установка выглядит так. Выполните команды на клиенте и на
+каждом VPS, подставив версию релиза:
+
+```bash
+VERSION=0.9.6
+curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
+tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 sudo install -m 755 svpn /usr/local/bin/svpn
+svpn --version
 ```
 
-Клиент запускает сервер по пути `/usr/local/bin/svpn`
-(изменяется ключом `ssh-remote-bin`). Больше на сервере ничего настраивать не
-нужно: маршрутизацию включит server hook из конфига ниже.
+Не распаковывайте несколько архивов в один каталог. Сначала выберите архив,
+затем установите содержащийся в нём `svpn`.
 
-## 2. Напишите vpn.toml и запустите
+## 3. Загрузите базы стран и ASN
 
-Создайте файл `vpn.toml` и впишите в него адрес своего сервера и путь к
-ключу:
+Обе базы нужны на **клиенте**, а не на VPS. Каталог и файлы доступны только
+root:
+
+```bash
+sudo install -d -m 700 /etc/svpn
+YEAR_MONTH=$(date +%Y-%m)
+
+curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
+gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+
+curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
+gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
+sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
+```
+
+Country Lite определяет страну назначения. ASN Lite нужен для `sticky-asn`.
+Для периодического обновления ASN можно использовать
+`scripts/update-asn-db.sh` из исходного дерева. Для первой установки исходники
+не нужны.
+
+## 4. Проверьте SSH
+
+На клиенте должен быть закрытый ключ. Его открытая часть должна быть
+разрешена для `root` на обоих VPS. Проверьте вход заранее:
+
+```bash
+ssh -i /полный/путь/к/ключу root@nl.example.com
+ssh -i /полный/путь/к/ключу root@de.example.com
+```
+
+Используйте абсолютный путь к ключу. Если ключ защищён passphrase, загрузите
+его в `ssh-agent` заранее. При запуске через `sudo -E` сохранение agent зависит
+от политики sudo.
+
+Без `hostkey` SVPN использует TOFU и сохраняет fingerprint в своём
+known-hosts файле. Для строгой проверки получите fingerprint у провайдера и
+добавьте `hostkey = "SHA256:..."` к каждому серверу. Пустой `hostkey` не
+нужен.
+
+## 5. Создайте один конфиг
+
+Сохраните файл командой `sudoedit /etc/svpn/vpn.toml`. Замените `nl.example.com` и
+`de.example.com` на IPv4-адреса серверов в блоках `servers` **и в hooks**. Замените
+путь к ключу.
 
 ```toml
-server = "vpn.example.com"
+mode = "multi"
+exit-policy = "sticky-asn"
+country-db = "/etc/svpn/country.csv"
+geo-db = "/etc/svpn/asn.csv"
+exit-state = "/var/lib/svpn/exits.json"
+local-exits = ["RU", "BY"]
+
 ssh-user = "root"
-ssh-identity = "/path/to/id_ed25519"
+ssh-identity = "/полный/путь/к/ключу"
+ssh-port = 22
+ssh-remote-bin = "/usr/local/bin/svpn"
+mimic = ["ssh"]
 tcp-port = 41020
+udp-port-range = "60000-60009"
 
-# All traffic goes through the tunnel: two /1 routes override the default
-# route. Routes to the servers themselves stay direct — they carry the
-# tunnel's own traffic. The hook finds server addresses via the client's
-# open SSH connections (Linux).
-up-command = '''
-GW=$(ip route show default | awk '{print $3; exit}')
-DEV=$(ip route show default | awk '{print $5; exit}')
-ss -Htnp 2>/dev/null | grep '"svpn"' | awk '{print $5}' | sed 's/:[0-9]*$//' | grep -E '^[0-9.]+$' | sort -u > /tmp/svpn-direct
-while read -r ip; do ip route replace "$ip" via "$GW" dev "$DEV"; done < /tmp/svpn-direct
-ip route add 0.0.0.0/1 dev "$SVPN_TUN_NAME"
-ip route add 128.0.0.0/1 dev "$SVPN_TUN_NAME"
-'''
-down-command = '''
-ip route del 0.0.0.0/1 dev "$SVPN_TUN_NAME"
-ip route del 128.0.0.0/1 dev "$SVPN_TUN_NAME"
-while read -r ip; do ip route del "$ip" 2>/dev/null || true; done < /tmp/svpn-direct
-rm -f /tmp/svpn-direct
-'''
+# Защита адресов VPS при перехвате default route. Для этих адресов не должно
+# быть заранее настроенных host routes.
+up-command = "wan=$(ip route show default | awk 'NR==1{print $5}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
+down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
 
-# Runs ON THE SERVER: enables forwarding and masquerades tunnel clients.
+# Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
 server-up = '''
-sysctl -q net.ipv4.ip_forward=1 || exit 1
-EGRESS=$(ip -4 route show default | awk '{print $5; exit}')
-nft -f - <<NFT
-table ip svpn { set peers { type ipv4_addr; } chain post { type nat hook postrouting priority srcnat; policy accept; } }
-flush chain ip svpn post
-add rule ip svpn post ip saddr @peers oifname "$EGRESS" masquerade
-NFT
-nft add element ip svpn peers "{ $SVPN_PEER_ADDR }"
+sysctl -qw net.ipv4.ip_forward=1
+n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
+table_id=$((100 + n))
+table=svpn_egress_$n
+wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+ip route replace default dev "$wan" table "$table_id"
+nft delete table inet "$table" 2>/dev/null || true
+nft -f - <<EOF
+add table inet $table
+add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
+add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
+EOF
 '''
-server-down = 'nft delete element ip svpn peers "{ $SVPN_PEER_ADDR }" || true'
-```
-
-Запустите:
-
-```sh
-sudo svpn --config vpn.toml
-```
-
-Если `ssh-identity` не задан, ключи берутся из ssh-agent (так работает и
-ключ с паролем) — тогда запускайте с `sudo -E`, чтобы агент был виден под
-sudo.
-
-В другом терминале:
-
-```sh
-ping -c 3 1.1.1.1
-```
-
-Ответы пришли — весь трафик уже идёт через сервер.
-**Ctrl+C** останавливает: down hooks убирают маршруты на клиенте и маскарад
-на сервере. Чтобы через туннель шёл только зарубежный трафик, а российский —
-напрямую, смотрите раздел «Сценарии маршрутизации» ниже.
-
-Что происходит при запуске: клиент поднимает SSH-сессию и запускает на
-сервере `svpn serve`. Сервер создаёт свой TUN и выполняет `server-up`,
-возвращая код и вывод. Ошибка прерывает подключение сразу, до создания
-клиентского TUN. Затем варианты транспорта соревнуются, побеждает первый
-ответивший, и идут данные.
-
-Если у VPS файрвол в панели провайдера, откройте UDP 60000–60009 и TCP 41020.
-
-Имя TUN и адреса туннеля назначаются автоматически: ядро выбирает свободное
-имя (tun0, utun4, …), а адреса выделяются из пула 10.77.0.0/16 — hooks видят
-фактические значения в $SVPN_TUN_NAME, $SVPN_TUN_ADDR и $SVPN_PEER_ADDR.
-Зафиксировать можно вручную: `peer-tun-name = "svpn0"`, а адреса — парой
-`tun-addr` + `peer-addr` (только вместе).
-
-## 3. Несколько серверов
-
-Пул серверов с балансировкой по весам — команда `multi` и секции `[[servers]]`
-в том же TOML. Поля сервера переопределяют корневые только для этого сервера:
-
-```toml
-ssh-user = "root"
-ssh-identity = "/path/to/id_ed25519"
-tcp-port = 41020
-# up-command / down-command / server-up / server-down — as in step 2.
-# Root server-up and server-down apply to every server.
+server-down = '''
+n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
+table_id=$((100 + n))
+ip rule del pref "$table_id" 2>/dev/null || true
+ip route flush table "$table_id" 2>/dev/null || true
+nft delete table inet "svpn_egress_$n" 2>/dev/null || true
+'''
 
 [[servers]]
-address = "a.example.com"
+address = "nl.example.com"
 weight = 3
+countries = ["NL", "DE"]
 
 [[servers]]
-address = "b.example.com"
+address = "de.example.com"
 weight = 1
-server-up = "..."     # a custom variant for b only
+countries = ["NL", "DE"]
 ```
 
-```sh
-sudo env SSH_AUTH_SOCK="$SSH_AUTH_SOCK" /usr/local/bin/svpn multi --config vpn.toml
+`weight = 3` и `weight = 1` означают примерное распределение 3:1. При
+`sticky-asn` адреса одной сети сохраняют выбранный выход, пока он работает.
+Веса влияют на выбор владельца, а не на каждый пакет.
+
+### Как выбирается путь
+
+| Назначение | Путь |
+|---|---|
+| `RU` или `BY` | `local-exit` через локальный сервер SVPN и физический выход |
+| `NL` или `DE` | Только серверы, у которых эта страна указана в `countries` |
+| Другая страна или адрес вне Country DB | Оба сервера из примера, с учётом ASN и весов |
+
+Для одной страны можно указать несколько серверов. `countries` ограничивает
+выбор для этой страны, но не исключает сервер из общего списка для остальных
+стран. Сервер без `countries` также участвует в обычном выборе.
+
+`local-exit` не является TCP-прокси. SVPN передаёт IPv4-пакеты через свой
+локальный сервер. Для этого нужны `server-up` и `server-down`. Обратные
+маршруты SVPN настраивает автоматически. Hook направляет пакеты с source
+`SVPN_PEER_ADDR` через физический uplink, не возвращая их в основной TUN.
+
+Пример `server-up` включает IPv4 forwarding и не возвращает прежнее значение
+при остановке. Он рассчитан на отсутствие заранее заданных host routes до
+`nl.example.com` и `de.example.com`. Если такие маршруты уже есть, сначала сохраните их и
+добавьте восстановление в свой `down-command`.
+
+## 6. Запустите и проверьте
+
+Сначала запустите в foreground:
+
+```bash
+sudo -E svpn multi --config /etc/svpn/vpn.toml
 ```
 
-Потерянный сервер переподнимается с backoff, его TCP-потоки сбрасываются,
-трафик уходит на оставшиеся. Клиентский TUN создаётся после первого готового
-сервера.
+Дождитесь готовности двух удалённых серверов и `local-exit: ready`. Проверка
+должна отвечать на четыре вопроса:
 
-## Sticky-ASN: стабильный выходной IP
+1. **Есть ли связь?** Проверьте отвечающий IPv4-адрес через `ping` или `curl`.
+2. **Работает ли local-exit?** Выберите отвечающий адрес из диапазона `RU` или
+   `BY` в `/etc/svpn/country.csv`. В статистике должен расти `local: opened`.
+3. **Работает ли VPN?** Адрес `NL` или `DE` должен открыть поток на одном из
+   VPS. Адрес другой страны также использует один из двух VPS.
+4. **Сохраняется ли владелец?** Повторные потоки к адресам одной сети должны
+   использовать тот же сервер. При отключении владельца новые потоки
+   перейдут на резервный сервер. Восстановление старого сервера не вызывает
+   snap-back.
 
-Антифрод банит клиентов, чей внешний IP меняется от соединения к
-соединению. Режим `exit-policy = "sticky-asn"` в `multi` закрепляет каждую
-группу адресов назначения (ASN) за одним сервером пула: сервис видит клиента
-с одного IP, пока сервер-владелец жив. Оживает старый владелец — ничего не
-меняется: исправный текущий выход важнее порядка предпочтений.
+Один `ping 1.1.1.1` не проверяет Geo и sticky ASN. Используйте адреса,
+которые действительно есть в установленной Country DB и отвечают на выбранный
+протокол.
 
-Нужна база ASN — **DB-IP ASN Lite**
-(<https://download.db-ip.com/free/>, лицензия CC BY 4.0, ~400 тыс. IPv4-диапазонов,
-обновляется ежемесячно). Скачайте её скриптом `scripts/update-asn-db.sh`
-(скопируйте на роутер, например в `/usr/local/bin/`); путь базы обязан
-совпадать с `geo-db` в конфиге. Скрипт по умолчанию кладёт базу в
-`/etc/svpn/asn.csv` (переопределяется переменной `SVPN_ASN_DB`):
+После проверки остановите foreground-команду через `Ctrl-C` и включите сервис:
+
+```bash
+sudo install -d -m 700 /etc/systemd/system
+sudo tee /etc/systemd/system/svpn.service >/dev/null <<'EOF'
+[Unit]
+Description=SVPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/svpn multi --config /etc/svpn/vpn.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now svpn
+systemctl status svpn
+journalctl -u svpn -f
+```
+
+## 7. Если нужна только часть функций
+
+Только VPN между клиентом и сервером:
+
+```bash
+sudo svpn root@nl.example.com
+```
+
+Только sticky ASN без local-exit:
 
 ```toml
+mode = "multi"
 exit-policy = "sticky-asn"
 geo-db = "/etc/svpn/asn.csv"
-# exit-state = "…"   # по умолчанию — geo-db с суффиксом .state.json:
-                     # /etc/svpn/asn.state.json (failover-переходы)
 ```
 
-Файлы: `asn.csv` — база (~40 МБ, права 600, предыдущая рабочая версия
-сохраняется рядом как `asn.csv.prev`), `asn.state.json` — закрепления
-владельцев. База читается при старте, hot reload нет — после обновления
-скрипт сам перезапускает `svpn.service` через systemd; без systemd
-(OpenWrt/procd) перезапустите сервис вручную. Обновляйте раз в месяц —
-cron (`0 4 2 * * root SVPN_ASN_DB=/etc/svpn/asn.csv /usr/local/bin/update-asn-db.sh`)
-или systemd-таймер.
-
-Нюансы:
-
-- Стабильный сервер ≠ стабильный публичный IP: на каждом сервере пула должен
-  быть свой фиксированный egress-IPv4.
-- База IPv4-only: dual-stack сервисы увидят клиента напрямую по IPv6 —
-  заблокируйте IPv6 (см. «Ограничения»).
-- Ежемесячная смена классификации IP→ASN разово пересаживает часть групп —
-  это свойство данных, не сбой. Адрес вне базы получает стабильный выход
-  по хэшу адреса, без записи состояния.
-- Битый или отсутствующий файл базы — не авария: svpn пишет предупреждение
-  в журнал и работает как обычный `balance`.
-
-## Hooks подробно
-
-Все hooks — shell-команды через `/bin/sh -c`, лимит 10 секунд. Для
-исполняемых файлов вместо строк есть `up-script` / `down-script` (пути
-относительны каталогу конфига).
-
-**Клиентские** `up-command` / `down-command`: после настройки клиентского TUN
-и перед его закрытием. Окружение: `SVPN_TUN_NAME`, `SVPN_TUN_ADDR`,
-`SVPN_PEER_ADDR`, `SVPN_EVENT`. Ошибка `up-command` прерывает подключение,
-`down-command` всё равно выполнится.
-
-**Серверные** `server-up` / `server-down`: после серверного TUN и перед
-выходом серверного процесса. Окружение: `SVPN_PEER_ADDR` (адрес клиента в
-туннеле) и те же `SVPN_*`. Команда — до 1500 символов. Сервер возвращает код
-возврата и по 600 байт stdout/stderr — этого хватает для диагностики, логи
-пишите на сервере в файл. Ошибка `server-up` прерывает подключение до
-создания клиентского TUN.
-
-## Выбор mimic
-
-По умолчанию работает **auto**: четыре UDP-варианта и TCP с камуфляжем `ssh`
-стартуют одновременно, через каждый сервер пингуется, побеждает первый
-ответивший. Начинайте с auto. Фиксируйте список, только когда знаете свою
-сеть: `mimic = ['quic', 'mosh']` в TOML или повторный `--mimic` в CLI.
-
-Auto не застревает на первом победителе. Каждый кандидат (включая активный)
-пингуется в среднем раз в `remeasure-interval` (по умолчанию 60 с, с
-джиттером ±50%; 0 — отключить фоновые замеры). Решение принимается по сглаженным
-оценкам — EWMA p90 с полосой разброса за последние ~10 замеров, а не по
-одному замеру: кандидат получает новые соединения, только если его полоса
-не пересекается с полосой действующего канала и он быстрее минимум на 10%
-(но не меньше 5 мс). После переключения 5 минут действует запрет нового —
-защита от пинг-понга. Медленный дрейф обеих сторон переключения не
-вызывает; резкий спайк или ≥ 3 потерянных эха из 10 — вызывает. Старые
-соединения доживают на прежнем канале.
-
-| Значение | Выглядит как | Когда выбрать |
-|----------|--------------|---------------|
-| `quic`   | HTTP/3 (настоящий QUIC/TLS 1.3, CONNECT-UDP) | повседневный выбор |
-| `webrtc` | видеозвонок WebRTC (ICE/DTLS/SCTP) | QUIC режут, звонки проходят |
-| `mosh`   | UDP удалённого терминала mosh | мелкие редкие датаграммы |
-| `obfs`   | равномерно случайные байты | сигнатура протокола нежелательна |
-| `ssh`    | полный SSH-handshake поверх TCP | UDP заблокирован (нужен `tcp-port`) |
-| `banner` | строка-приветствие SSH поверх TCP | TCP, минимум церемоний |
-| `none`   | обычный TCP | только отладка |
-
-Победитель работает до отказа (5 секунд без данных или обрыв), затем гонка
-повторяется. При общем провале — через 1, 2, 4, 8, 16 и далее 30 секунд.
-Не поднявшийся вариант отдыхает: бан 10 минут, при повторе
-удваивается до 2 часов с разбросом ±20%, затем вариант снова допускается
-к гонке. Открытые соединения
-на новый канал не переносятся: TCP получает RST, приложения переподключаются.
-
-Маскировка воспроизводит формат протокола на проводе, но не гарантирует
-проходимость через конкретный фильтр — измеряйте через `svpn perf`.
-
-## Файрвол сервера без hooks
-
-Если server hooks не подходят, настройте сервер один раз вручную от root
-(iptables — эквивалент на nftables в примере `server-up` выше):
-
-```sh
-printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-svpn.conf
-sysctl -p /etc/sysctl.d/90-svpn.conf
-
-iptables -I INPUT -p udp --dport 60000:60009 -j ACCEPT
-iptables -I INPUT -p tcp --dport 41020 -j ACCEPT
-iptables -I FORWARD -i svpn0 -s 10.77.0.0/24 -j ACCEPT
-iptables -I FORWARD -o svpn0 -d 10.77.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o svpn0 -j MASQUERADE
-```
-
-Сохраните через `iptables-persistent`, чтобы пережить перезагрузку. Сервер
-вручную не запускают — клиент запускает его через SSH.
-
-## Ограничения
-
-- Только IPv4: IPv6 не переносится и не защищается — отключите его на
-  клиенте, если утечка важна.
-- SVPN не меняет DNS: если резолвер — LAN-адрес роутера, запросы пойдут
-  мимо туннеля.
-- Фрагментированные IPv4-пакеты отбрасываются. MTU по умолчанию — 1280.
-- LAN за клиентом требует SNAT в адрес клиента в туннеле (`10.77.0.2`).
-- Первый SSH-ключ сервера запоминается при первом подключении. Для явной
-  проверки задайте `ssh-host-key = "SHA256:…"`.
-- `svpn serve` отказывается работать вне SSH-сессии.
-- Таймаут бездействия TCP — 2 ч 4 мин, UDP/ICMP — 60 с. Одиночный FIN
-  не закрывает поток; после подтверждённых FIN обеих сторон состояние
-  хранится ещё 4 минуты без трафика. Доставленный RST клиента закрывает поток.
-- При потере текущего UDP-пути в живой сессии SVPN пробует переждать данные
-  потока на другой проверенный путь (rebind) в пределах 10-секундного бюджета
-  с момента обнаружения: установленное TCP-соединение продолжается без
-  нового сокета к сервису, байты не теряются и не дублируются. Возобновление
-  подтверждается только фактической доставкой пакета в TUN — в журнале это
-  `flow_recovery_restored … stage=peer_packet`; для потока, который после
-  смены пути молчит (нет данных и keepalive), доказательством служит
-  round-trip проба на новой привязке (`stage=probe`), чтобы живое тихое
-  соединение не закрывалось бюджетом; окончательный отказ —
-  `flow_recovery_abandoned`. Если альтернативного пути нет, поток закрывается
-  в том же бюджете, сессия продолжает работать. Неподтверждённые UDP-датаграммы
-  повторно не отправляются (RFC 8085 §3.3).
-- На сессию — до 4096 записей потоков и 16 резервных для проверок связи.
-  При заполнении новые открытия отклоняются, существующие не вытесняются.
-
-## Запуск клиента без root (Linux)
-
-```sh
-sudo setcap cap_net_admin=ep /usr/local/bin/svpn
-```
-
-Права не распространяются на hooks: командам маршрутизации понадобятся
-собственные привилегии. Повторяйте `setcap` после замены бинарника.
-
-## Сценарии маршрутизации
-
-Готовый набор hooks для split VPN: российские сайты напрямую, остальной
-мир — через туннель.
-
-### local-exit
-
-`local-exits = ["RU", "BY"]` направляет IPv4-пакеты этих стран через
-локальный выход. Остальные потоки используют обычный выбор сервера. Нужна
-Country Lite DB и путь к ней в конфиге:
+Только выбор по стране без local-exit:
 
 ```toml
+mode = "multi"
 country-db = "/etc/svpn/country.csv"
-local-exits = ["RU", "BY"]
+
+[[servers]]
+address = "nl.example.com"
+countries = ["NL"]
+
+[[servers]]
+address = "de.example.com"
+countries = ["DE"]
 ```
 
-Для локального выхода нужны `server-up` и `server-down`, настраивающие
-forwarding, NAT и обратный маршрут (полный пример — в разделе «Напишите
-vpn.toml»).
+`local-exits` и `countries` требуют `country-db`. `sticky-asn` требует `multi`
+и `geo-db`. Не добавляйте в конфиг поля, которые не нужны вашему сценарию.
 
-### RU напрямую, мир через VPN (Linux)
+## 8. Обновление баз
 
-Таблица 100 содержит подсети РФ через обычный шлюз и default через туннель;
-правило 100 направляет в неё весь трафик, правило 99 обслуживает локальные
-сети раньше. Список подсетей (~9000 сетей) скачивается с ipdeny один раз и
-кэшируется в `/etc/svpn-ru.zone`. Адреса серверов скрипт берёт из открытых
-SSH-соединений клиента. Туннель упал — трафик идёт напрямую (fail-open).
+SVPN загружает CSV при запуске и не перечитывает его на лету. Обновите файлы,
+затем перезапустите сервис:
 
-Нужны iproute2 и curl. Сохраните оба скрипта рядом с `vpn.toml` (`chmod +x`)
-и подключите: `up-script = "geo-up.sh"`, `down-script = "geo-down.sh"`.
-
-`geo-up.sh`:
-
-```sh
-#!/bin/sh
-set -e
-
-TABLE=100
-ZONE=/tmp/svpn-ru.zone
-CACHE=/etc/svpn-ru.zone
-URL=https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone
-
-valid() {
-    awk '/^[[:space:]]*(#|$)/ { next }
-        { if ($0 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) bad = 1
-          split($0, a, /[.\/]/)
-          for (i = 1; i <= 4; i++) if (a[i] > 255) bad = 1
-          if (a[5] > 32) bad = 1
-          n++ }
-        END { exit (bad || n < 100) ? 1 : 0 }' "$1" 2>/dev/null
-}
-
-if ! valid "$ZONE"; then
-    if curl -fsS -m 8 -o "$ZONE.new" "$URL" && valid "$ZONE.new"; then
-        mv "$ZONE.new" "$ZONE"
-        cp "$ZONE" "$CACHE"
-    elif valid "$CACHE"; then
-        cp "$CACHE" "$ZONE"
-    else
-        echo "svpn georoute: no valid RU zone" >&2
-        exit 1
-    fi
-    rm -f "$ZONE.new"
-fi
-
-GW=$(ip route show default | awk '{print $3; exit}')
-DEV=$(ip route show default | awk '{print $5; exit}')
-
-ip rule del priority 99 2>/dev/null || true
-ip rule del priority 100 2>/dev/null || true
-ip rule add priority 99 table main suppress_prefixlength 0
-ip rule add priority 100 table "$TABLE"
-
-awk -v gw="$GW" -v dev="$DEV" -v t="$TABLE" \
-    '/^[0-9]/ { printf "route replace %s via %s dev %s table %s\n", $1, gw, dev, t }' \
-    "$ZONE" | ip -batch -
-
-ss -Htnp 2>/dev/null | grep '"svpn"' | awk '{print $5}' | sed 's/:[0-9]*$//' | \
-    grep -E '^[0-9.]+$' | sort -u | \
-    while read -r ip; do
-        ip route replace "$ip" via "$GW" dev "$DEV" table "$TABLE"
-    done
-
-ip route replace default dev "$SVPN_TUN_NAME" table "$TABLE"
+```bash
+sudo systemctl restart svpn
 ```
 
-`geo-down.sh`:
+Для ASN доступен `scripts/update-asn-db.sh`. Он скачивает новую базу,
+проверяет её и сохраняет предыдущую как `asn.csv.prev`. Скрипт находится в
+исходном дереве, а не в бинарном архиве.
 
-```sh
-#!/bin/sh
-ip rule del priority 99 2>/dev/null
-ip rule del priority 100 2>/dev/null
-ip route flush table 100 2>/dev/null
-exit 0
+## 9. Коротко о настройках
+
+### Транспорт
+
+По умолчанию используется SSH camouflage и UDP для переноса пакетов. SSH
+управляет соединением. Если UDP заблокирован, задайте `mimic = "ssh"` и
+`tcp-port`. UDP-порты задаются парой значений `udp-ports = [60000, 60009]`.
+
+| `mimic` | Когда использовать |
+|---|---|
+| `ssh` | SSH camouflage, UDP или TCP transport |
+| `mosh` | Mosh camouflage для UDP |
+| `webrtc` | WebRTC-like camouflage для UDP |
+| `quic` | QUIC camouflage для UDP |
+
+### Hooks
+
+`up-command` и `down-command` выполняются на клиенте. `server-up` и
+`server-down` выполняются на VPS и у local-exit. Команды получают переменные
+`SVPN_TUN_NAME`, `SVPN_PEER_ADDR`, `SVPN_PEER_MTU`, `SVPN_REMOTE_BIN` и
+`SVPN_EVENT`. Timeout — 10 секунд.
+
+`up-script`, `down-script`, `server-up-script` и `server-down-script`
+позволяют вынести команды в файлы. Относительные пути считаются от каталога
+конфигурации. Клиентские скрипты обязаны вызывать `/usr/local/bin/svpn
+--tun-up` или `--tun-down`.
+
+### Проверка состояния
+
+`svpn --probe` с `SVPN=1` возвращает 0 только при готовом канале. Повторные
+запуски одинаковых конфигураций занимают пары адресов из пула
+`10.77.0.0/16`. При конфликте проверьте занятые адреса через `ip addr`.
+
+### Владельцы ASN
+
+`exit-state` хранит выбранных владельцев. По умолчанию используется путь рядом
+с `geo-db` с суффиксом `.state.json`. Состояние сохраняется между
+перезапусками. Snap-back не выполняется.
+
+### Ограничения
+
+- Туннелируется только IPv4. IPv6 не защищается этим конфигом.
+- DNS не меняется автоматически. Выберите DNS отдельно.
+- Country и ASN базы не классифицируют домены. Решение принимается по IP
+  назначения после разрешения имени.
+- Полный Linux-пример использует TUN, root, `iproute2` и `nftables`.
+- При `SIGKILL` клиентские hooks не выполняются. TUN и сокеты закрывает ядро.
+  Следующий запуск должен восстановить свои маршруты и правила. Не используйте
+  hooks для чужих необратимых изменений.
+
+## Дополнительно
+
+- `svpn --help` — краткая справка по всем командам.
+- `svpn root@server --dry-run` — команды удалённого SSH без изменений.
+- [CHANGELOG](CHANGELOG.md) — история версий.
+- [Протокол](docs/PROTOCOL.md) — техническое описание transport.
+- [English README](README.en.md).
+
+## Сборка
+
+```bash
+cargo build --release --target x86_64-unknown-linux-gnu
+cargo test --workspace
 ```
 
-Чтобы обновить список РФ, удалите `/tmp/svpn-ru.zone` и перезапустите клиента.
-Для fail-closed (нет туннеля — нет интернета) добавьте в конец `geo-up.sh`:
-`ip route replace unreachable default table 100 metric 4278198272`. В `multi`
-сервер, не успевший подключиться к моменту up hook, позже может пойти
-транспортом через туннель: работать будет, просто медленнее.
+Проверки перед pull request:
 
-Маскарад из server hook уже покрывает всю подсеть туннеля, а маршруты /1 и
-прямые маршруты до серверов — в hooks из шага 2.
-
-### Весь трафик на macOS
-
-Клиентские up/down для macOS (server hooks те же, что в шаге 2):
-
-```toml
-up-command = '''
-GW=$(route -n get default | awk '/gateway/ {print $2}')
-lsof -nP -iTCP -a -c svpn 2>/dev/null | awk -F'->' 'NF > 1 { split($2, a, ":"); print a[1] }' | grep -E '^[0-9.]+$' | sort -u > /tmp/svpn-direct
-while read -r ip; do route -n add -host "$ip" "$GW"; done < /tmp/svpn-direct
-route -n add -net 0.0.0.0/1 -interface "$SVPN_TUN_NAME"
-route -n add -net 128.0.0.0/1 -interface "$SVPN_TUN_NAME"
-'''
-down-command = '''
-route -n delete -net 0.0.0.0/1 -interface "$SVPN_TUN_NAME" 2>/dev/null
-route -n delete -net 128.0.0.0/1 -interface "$SVPN_TUN_NAME" 2>/dev/null
-if [ -f /tmp/svpn-direct ]; then
-    while read -r ip; do route -n delete -host "$ip" 2>/dev/null || true; done < /tmp/svpn-direct
-    rm -f /tmp/svpn-direct
-fi
-'''
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+uvx ruff@0.14.3 check
+uvx ruff@0.14.3 format --check
+python3 e2e/test_artifacts.py
+python3 e2e/test_groups.py
+python3 e2e/test_package.py
 ```
-
-## Дальше
-
-- `svpn perf --help` — замер скорости через туннель в стиле iperf3.
-- `svpn multi --help` — пул серверов, `[[servers]]` в TOML.
-- `svpn --help` — каждый флаг CLI зеркалит ключ TOML. Конфиг и CLI
-  взаимоисключающие.
-
-## Разработка
-
-Установите Rust 1.89+ и C-компилятор:
-
-```sh
-cargo build --locked
-cargo test --locked --workspace
-```
-
-## Лицензия
-
-MIT — см. [LICENSE](LICENSE). Лицензии зависимостей — в
-[THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).

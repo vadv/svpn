@@ -242,3 +242,37 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
     }
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn readme_multi_examples_parse_with_all_exit_features() {
+    for (index, source) in [
+        include_str!("../README.md"),
+        include_str!("../README.en.md"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = source.find("exit-policy = \"sticky-asn\"").unwrap();
+        let end = source[start..].find("\n```").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "svpn-readme-multi-{}-{index}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, &source[start..start + end]).unwrap();
+        let args = load(&path, true).unwrap();
+        assert_eq!(
+            args.local_exits.as_deref(),
+            Some(&["RU".into(), "BY".into()][..])
+        );
+        assert!(args.geo_db.is_some());
+        assert!(args.country_db.is_some());
+        let servers = resolve_servers(&args.server, &args.globals).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.countries == ["NL", "DE"])
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+}

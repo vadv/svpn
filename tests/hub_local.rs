@@ -80,6 +80,7 @@ fn local_hub() -> Hub {
         ],
         local: None,
         local_task: None,
+        local_cleanup: None,
         nodes: Vec::new(),
         exit_owners: Default::default(),
         exit_state: None,
@@ -118,6 +119,17 @@ async fn every_local_exit_country_uses_local_path() {
         assert!(result.is_none());
     }
     assert_eq!(hub.local_stats.failed, 2);
+}
+
+#[tokio::test]
+async fn shutdown_without_local_exit_does_not_start_one() {
+    let mut hub = local_hub();
+    hub.local_exits.clear();
+    assert!(hub.local.is_none());
+    assert!(hub.local_cleanup.is_none());
+    hub.shutdown_local().await.unwrap();
+    assert!(hub.local.is_none());
+    assert!(hub.local_cleanup.is_none());
 }
 
 #[test]

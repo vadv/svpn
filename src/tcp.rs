@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, mpsc, oneshot},
 };
 
 use crate::crypto::Cipher;
@@ -18,6 +18,8 @@ use crate::link_io::is_probe_flow;
 use crate::udp::Incoming;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const BIND_TIMEOUT: Duration = Duration::from_secs(10);
+pub const TCP_PENDING_LIMIT: usize = 64;
 const READ_CHUNK: usize = 4096;
 /// Periodic small L2 frame while the flow is idle.
 const SSH_KEEPALIVE: Duration = Duration::from_secs(30);
@@ -94,42 +96,63 @@ pub async fn accept(
 
 /// Server side of a connection: camouflage hello, binding frame, packet pump.
 pub async fn serve(
-    mut stream: TcpStream,
+    stream: TcpStream,
     camouflage: Camouflage,
     events: mpsc::Sender<Event>,
 ) -> Result<()> {
-    // Interactive mimic: Nagle would delay probe answers and fragment pacing
-    // the same way it delays an SSH keystroke.
+    serve_inner(stream, camouflage, events, None).await
+}
+
+pub async fn serve_with_permit(
+    stream: TcpStream,
+    camouflage: Camouflage,
+    events: mpsc::Sender<Event>,
+    permit: OwnedSemaphorePermit,
+) -> Result<()> {
+    serve_inner(stream, camouflage, events, Some(permit)).await
+}
+
+async fn serve_inner(
+    mut stream: TcpStream,
+    camouflage: Camouflage,
+    events: mpsc::Sender<Event>,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<()> {
     stream.set_nodelay(true).context("set TCP_NODELAY")?;
     let mut decoder = decoder(camouflage, true);
     write_hello(&mut stream, camouflage, true).await?;
-    // Exactly one frame is allowed before token matching — the binding frame.
-    let payload = loop {
-        if let Some(payload) = decoder.next(None)? {
-            break payload;
-        }
-        let mut chunk = [0u8; READ_CHUNK];
-        let read = stream
-            .read(&mut chunk)
+    let (mut bound, payload) = tokio::time::timeout(BIND_TIMEOUT, async {
+        let payload = loop {
+            if let Some(payload) = decoder.next(None)? {
+                break payload;
+            }
+            let mut chunk = [0u8; READ_CHUNK];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .context("read TCP binding frame")?;
+            ensure!(read != 0, "TCP connection closed before binding frame");
+            decoder.push(&chunk[..read]);
+        };
+        let (token, _) = framing::split_binding(&payload)?;
+        let token: [u8; TOKEN_BYTES] = token.try_into().expect("split_binding yields 16 bytes");
+        let (reply, resolve) = oneshot::channel();
+        events
+            .send(Event::Bound { token, conn: reply })
             .await
-            .context("read TCP binding frame")?;
-        ensure!(read != 0, "TCP connection closed before binding frame");
-        decoder.push(&chunk[..read]);
-    };
-    let (token, first) = framing::split_binding(&payload)?;
-    let token: [u8; TOKEN_BYTES] = token.try_into().expect("split_binding yields 16 bytes");
-    let (reply, resolve) = oneshot::channel();
-    events
-        .send(Event::Bound { token, conn: reply })
-        .await
-        .context("session stopped while binding TCP connection")?;
-    let mut bound = resolve
-        .await
-        .context("session dropped TCP binding resolver")??;
+            .context("session stopped while binding TCP connection")?;
+        let bound = resolve
+            .await
+            .context("session dropped TCP binding resolver")??;
+        Ok::<(Bound, Vec<u8>), anyhow::Error>((bound, payload))
+    })
+    .await
+    .context("TCP binding timed out")??;
+    let (_, first) = framing::split_binding(&payload)?;
     let (id, generation) = (bound.id, bound.generation);
     let cancel = bound.cancel.take();
     let result = tokio::select! {
-        result = serve_bound(stream, camouflage, decoder, first, bound, events.clone()) => result,
+        result = serve_bound(stream, camouflage, decoder, first, bound, permit, events.clone()) => result,
         _ = async {
             match cancel {
                 Some(cancel) => { let _ = cancel.await; }
@@ -149,12 +172,14 @@ async fn serve_bound(
     decoder: framing::Decoder,
     first: &[u8],
     bound: Bound,
+    permit: Option<OwnedSemaphorePermit>,
     events: mpsc::Sender<Event>,
 ) -> Result<()> {
     let mut cipher = Cipher::new(bound.key, bound.id, false);
     let packet = cipher
         .open(first)
         .context("TCP binding frame authentication failed")?;
+    drop(permit);
     if camouflage == Camouflage::Ssh {
         // kex-reply/NEWKEYS/auth frames mean "kex complete"; AEAD-lookalike frames follow.
         stream.write_all(&framing::ssh_server_tail()).await?;

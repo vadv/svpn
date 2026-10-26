@@ -1,6 +1,7 @@
 //! TCP transport: fixed-port rebind, frame pump, preflight, and flow binding.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use svpn::crypto::{Cipher, random};
@@ -10,7 +11,7 @@ use svpn::tcp::*;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 const FLOW_TEST_QUEUE: usize = 8;
@@ -27,6 +28,28 @@ async fn spawn_serve(camouflage: Camouflage) -> (SocketAddr, mpsc::Receiver<Even
 }
 
 // ── listener ──
+
+#[tokio::test]
+async fn idle_binding_times_out_and_releases_permit() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (events, _incoming) = mpsc::channel(1);
+    let admission = Arc::new(Semaphore::new(1));
+    let permit = admission.clone().acquire_owned().await.unwrap();
+    let task =
+        tokio::spawn(
+            async move { serve_with_permit(stream, Camouflage::None, events, permit).await },
+        );
+    let result = timeout(Duration::from_secs(12), task)
+        .await
+        .expect("idle binding must time out")
+        .unwrap();
+    assert!(result.is_err());
+    assert_eq!(admission.available_permits(), 1);
+    drop(client);
+}
 
 #[tokio::test]
 async fn fixed_port_rebinds_despite_time_wait() {

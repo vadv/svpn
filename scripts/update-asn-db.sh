@@ -7,7 +7,7 @@
 # dash-compatible (/bin/sh on Debian/Ubuntu): no pipefail.
 set -eu
 
-TARGET=${SVPN_ASN_DB:-/etc/svpn/asn.csv}
+TARGET=${1:-${SVPN_ASN_DB:-/etc/svpn/asn.csv}}
 URL=${SVPN_ASN_URL:-https://download.db-ip.com/free/dbip-asn-lite-$(date +%Y-%m).csv.gz}
 UA='Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0'
 MIN_ROWS=100000
@@ -47,7 +47,8 @@ rows=$(awk -F, '
         prev = to
         n++
     }
-    END { print (bad > 0 ? -bad : n) }' "$csv")[ "$rows" -ge "$MIN_ROWS" ] ||
+    END { print (bad > 0 ? -bad : n) }' "$csv")
+[ "$rows" -ge "$MIN_ROWS" ] ||
     { echo "update-asn-db: $URL: invalid or too few IPv4 rows ($rows, need >= $MIN_ROWS), keeping $TARGET" >&2
       exit 1; }
 chmod 600 "$csv"
@@ -65,4 +66,6 @@ mv -f "$staging" "$TARGET"
 staging=""
 
 echo "update-asn-db: $TARGET: $rows IPv4 rows (previous base: $TARGET.prev)"
-systemctl try-reload-or-restart svpn.service || true
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl try-reload-or-restart svpn.service || true
+fi

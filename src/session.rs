@@ -18,11 +18,16 @@
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
+    sync::Arc,
     time::{Duration, Instant as StdInstant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+    time::MissedTickBehavior,
+};
 use tun_rs::AsyncDevice;
 
 use crate::control::{Control, Message, Stats, Strategy};
@@ -91,6 +96,7 @@ pub struct Session {
     /// Listener and owned TCP/QUIC tasks live outside `plane` so
     /// `select!` arms borrow different struct fields.
     pub tcp_listener: Option<tokio::net::TcpListener>,
+    pub tcp_admission: Arc<Semaphore>,
     pub tasks: JoinSet<()>,
     /// Shared event stream of channel tasks.
     pub task_events: (mpsc::Sender<TaskEvent>, mpsc::Receiver<TaskEvent>),
@@ -227,24 +233,26 @@ impl Session {
                         }
                     }
                     accepted = crate::tcp::accept(self.tcp_listener.as_mut()),
-                            if self.tcp_listener.is_some() => {
+                            if self.tcp_listener.is_some() && self.tcp_admission.available_permits() > 0 => {
                         let (stream, peer) = accepted.context("accept TCP flow connection")?;
                         crate::debug!("tcp_accept peer={peer}");
-                        let events = self.tcp_events.0.clone();
-                        let tag = self.tag().to_owned();
-                        let camouflage = match &self.plane {
-                            Plane::Tcp(plane) => plane.mode.camouflage,
-                            // The channel-mode TCP candidate always uses SSH camouflage.
-                            Plane::Channels(_) => crate::framing::Camouflage::Ssh,
-                        };
-                        self.tasks.spawn(async move {
-                            if let Err(error) = crate::tcp::serve(stream, camouflage, events).await {
-                                crate::error!(
-                                    "{} tcp accept from {peer} failed — {error:#}",
-                                    prefixed(&tag, "flow")
-                                );
-                            }
-                        });
+                        if let Ok(permit) = self.tcp_admission.clone().try_acquire_owned() {
+                            let events = self.tcp_events.0.clone();
+                            let tag = self.tag().to_owned();
+                            let camouflage = match &self.plane {
+                                Plane::Tcp(plane) => plane.mode.camouflage,
+                                // The channel-mode TCP candidate always uses SSH camouflage.
+                                Plane::Channels(_) => crate::framing::Camouflage::Ssh,
+                            };
+                            self.tasks.spawn(async move {
+                                if let Err(error) = crate::tcp::serve_with_permit(stream, camouflage, events, permit).await {
+                                    crate::error!(
+                                        "{} tcp accept from {peer} failed — {error:#}",
+                                        prefixed(&tag, "flow")
+                                    );
+                                }
+                            });
+                        }
                     }
                     Some(result) = self.tasks.join_next(), if !self.tasks.is_empty() => {
                         if let Err(error) = result {
@@ -553,6 +561,7 @@ async fn run_io(
         mtu,
         plane,
         tcp_listener,
+        tcp_admission: Arc::new(Semaphore::new(crate::tcp::TCP_PENDING_LIMIT)),
         tasks: JoinSet::new(),
         task_events: mpsc::channel(64),
         incoming: mpsc::channel(CHANNEL_QUEUE),

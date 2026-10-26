@@ -110,6 +110,7 @@ fn selector_hub(
         local_exits: Vec::new(),
         local: None,
         local_task: None,
+        local_cleanup: None,
         nodes: servers
             .iter()
             .enumerate()

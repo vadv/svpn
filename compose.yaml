@@ -24,6 +24,8 @@ services:
     networks:
       test:
         ipv4_address: 172.30.77.2
+      zdirect:
+        ipv4_address: 172.31.77.2
     depends_on:
       keys:
         condition: service_completed_successfully
@@ -55,6 +57,16 @@ services:
       timeout: 2s
       retries: 15
 
+  target_by:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /e2e/target.py]
+    networks:
+      test:
+        ipv4_address: 172.30.77.6
+      zdirect:
+        ipv4_address: 172.31.77.5
+
   client:
     image: svpn-test:local
     init: true
@@ -83,6 +95,8 @@ services:
     networks:
       test:
         ipv4_address: 172.30.77.4
+      zdirect:
+        ipv4_address: 172.31.77.4
 
 volumes:
   keys:
@@ -93,3 +107,8 @@ networks:
     ipam:
       config:
         - subnet: 172.30.77.0/24
+  zdirect:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.77.0/24
