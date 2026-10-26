@@ -309,6 +309,40 @@ async fn flow_table_capacity_is_bounded() {
 // ── full TCP relay ──
 
 #[tokio::test]
+async fn udp_icmp_error_reply_keeps_the_flow_alive() {
+    let Some(uplink) = loopback_uplink() else {
+        eprintln!("skipping: cannot bind sockets to loopback (needs CAP_NET_RAW on Linux)");
+        return;
+    };
+    let mut engine = engine(&uplink).await;
+    // A closed loopback UDP port produces ICMP port-unreachable on systems
+    // that report it through connected sockets. The assertion is valid on
+    // systems that silently drop it too: neither behavior may kill the flow.
+    let closed = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let flow = FlowKey {
+        protocol: 17,
+        source: client(),
+        destination: Ipv4Addr::LOCALHOST,
+        source_port: 50998,
+        destination_port: port,
+    };
+    let request = udp_packet(&flow, b"unreachable");
+    let parsed = packet::parse(&request, true).unwrap();
+    engine.open_udp(76, &parsed, &request).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(engine.flow_count(), 1, "ICMP feedback must not close UDP");
+    assert!(
+        engine.poll_event().is_none(),
+        "unexpected UDP failure event"
+    );
+    engine.forward_udp(76, &request).await.unwrap();
+    assert_eq!(engine.flow_count(), 1);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_udp_dial_cannot_leave_an_untracked_flow() {
     let uplink = Uplink {
         name: "svpn-invalid0".to_owned(),

@@ -20,6 +20,7 @@
 
 use std::{
     collections::HashMap,
+    io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
@@ -37,8 +38,16 @@ use crate::packet::{self, FlowKey, Packet, internet_checksum};
 
 use super::{
     DirectConfig, DirectEvent, EVENT_QUEUE, EXPIRY_TICK, MAX_FLOWS, PACKET_QUEUE, SHUTDOWN_JOIN,
-    UDP_IDLE, Uplink, bind_uplink, validate,
+    UDP_IDLE, Uplink, bind_uplink, is_icmp_feedback, validate,
 };
+
+fn is_icmp_feedback_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(is_icmp_feedback)
+    })
+}
 
 // std/tokio have no ICMP socket type; the `UdpSocket` handle drives the
 // identical send/recv syscalls on the ICMP socket behind it.
@@ -396,7 +405,12 @@ impl IcmpEngine {
             None => Arc::new(icmp_socket(&cfg.uplink, self.shared.source)?),
         };
         let message = echo_request_message(&echo);
-        send_request(&socket, flow.destination, ttl, &message).await?;
+        if let Err(error) = send_request(&socket, flow.destination, ttl, &message).await {
+            if !is_icmp_feedback_error(&error) {
+                return Err(error);
+            }
+            crate::debug!("direct icmp {flow:?}: ICMP error reply — {error:#}");
+        }
         if existing.is_none() {
             // Insert before spawning: the receive task may finish a broken
             // flow before its abort handle can be registered.
@@ -450,6 +464,13 @@ impl IcmpEngine {
         };
         let message = echo_request_message(&echo);
         if let Err(error) = send_request(&socket, parsed.flow.destination, ttl, &message).await {
+            if is_icmp_feedback_error(&error) {
+                crate::debug!(
+                    "direct icmp {:?}: ICMP error reply — {error:#}",
+                    parsed.flow
+                );
+                return Ok(());
+            }
             // The Hub reconciles its own dispatch failure synchronously;
             // awaiting the reliable queue here can deadlock the Hub.
             self.shared.forget_icmp(&parsed.flow, id);
@@ -581,6 +602,10 @@ async fn icmp_flow(shared: Arc<Shared>, id: u64, flow: FlowKey, socket: Arc<UdpS
         let received = socket.recv_from(&mut buf).await.map(|(len, _)| len);
         let len = match received {
             Ok(len) => len,
+            Err(error) if is_icmp_feedback(&error) => {
+                crate::debug!("direct icmp {flow:?}: ICMP error reply — {error}");
+                continue;
+            }
             Err(error) => {
                 crate::debug!("direct icmp {flow:?}: recv — {error}");
                 break;

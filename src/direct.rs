@@ -18,6 +18,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
     time::Duration,
@@ -583,6 +584,13 @@ impl DirectEngine {
         if let Some(socket) = socket
             && let Err(error) = socket.send(payload).await
         {
+            // An ICMP error reply is destination feedback, not a broken
+            // local socket. Keep the mapping so the application can see the
+            // error and continue using the original tuple.
+            if is_icmp_feedback(&error) {
+                crate::debug!("direct udp {:?}: ICMP error reply — {error}", parsed.flow);
+                return Ok(());
+            }
             // Hub dispatch reconciles the close synchronously; never await
             // the reliable queue while the Hub itself is its drain.
             self.shared.forget_udp(parsed.flow, id);
@@ -870,8 +878,11 @@ async fn udp_flow(
         }
     };
     if let Err(error) = socket.send(&first).await {
-        crate::debug!("direct udp {flow:?}: send — {error:#}");
-        return shared.finish_udp(flow, id).await;
+        if !is_icmp_feedback(&error) {
+            crate::debug!("direct udp {flow:?}: send — {error:#}");
+            return shared.finish_udp(flow, id).await;
+        }
+        crate::debug!("direct udp {flow:?}: ICMP error reply — {error}");
     }
     {
         let mut state = shared.state.lock().unwrap();
@@ -890,6 +901,12 @@ async fn udp_flow(
     loop {
         let len = match socket.recv(&mut buf).await {
             Ok(len) => len,
+            Err(error) if is_icmp_feedback(&error) => {
+                // Unreachable/refused is an ICMP response for the app, not
+                // a reason to tear down this flow's mapping.
+                crate::debug!("direct udp {flow:?}: ICMP error reply — {error}");
+                continue;
+            }
             Err(error) => {
                 crate::debug!("direct udp {flow:?}: recv — {error:#}");
                 break;
@@ -1025,10 +1042,28 @@ fn udp_dial(config: &DirectConfig, destination: SocketAddrV4) -> Result<UdpSocke
         .set_nonblocking(true)
         .context("direct udp nonblocking")?;
     bind_uplink(&socket, &config.uplink)?;
-    socket
-        .connect(&socket2::SockAddr::from(destination))
-        .context("direct udp connect")?;
+    if let Err(error) = socket.connect(&socket2::SockAddr::from(destination)) {
+        if !is_icmp_feedback(&error) {
+            return Err(error).context("direct udp connect");
+        }
+        crate::debug!("direct udp connect {destination}: ICMP error reply — {error}");
+    }
     UdpSocket::from_std(socket.into()).context("direct udp register")
+}
+
+/// Errors produced by an ICMP response on a connected UDP/raw socket. They
+/// describe the destination's response, not a dead local mapping. Local
+/// permission, descriptor and socket-state errors intentionally do not match.
+pub(crate) fn is_icmp_feedback(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::TimedOut
+    )
 }
 
 /// Binds `socket` to the captured physical uplink before any connect or
