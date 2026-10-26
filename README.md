@@ -91,10 +91,10 @@ ssh -i /полный/путь/к/ключу root@de.example.com
 его в `ssh-agent` заранее. При запуске через `sudo -E` сохранение agent зависит
 от политики sudo.
 
-Без `hostkey` SVPN использует TOFU и сохраняет fingerprint в своём
+Без `ssh-host-key` SVPN использует TOFU и сохраняет fingerprint в своём
 known-hosts файле. Для строгой проверки получите fingerprint у провайдера и
-добавьте `hostkey = "SHA256:..."` к каждому серверу. Пустой `hostkey` не
-нужен.
+добавьте `ssh-host-key = "SHA256:..."` к каждому серверу. Пустое значение не
+нужно.
 
 ## 5. Создайте один конфиг
 
@@ -106,7 +106,7 @@ known-hosts файле. Для строгой проверки получите 
 exit-policy = "sticky-asn"
 country-db = "/etc/svpn/country.csv"
 geo-db = "/etc/svpn/asn.csv"
-exit-state = "/var/lib/svpn/exits.json"
+exit-state = "/etc/svpn/exits.json"
 local-exits = ["RU", "BY"]
 
 ssh-user = "root"
@@ -124,12 +124,21 @@ down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/3
 
 # Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
 server-up = '''
+set -e
 sysctl -qw net.ipv4.ip_forward=1
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((100 + n))
+table_id=$((10000 + n))
 table=svpn_egress_$n
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
+    echo "svpn: policy priority $table_id is already in use" >&2
+    exit 1
+fi
+if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
+    echo "svpn: policy table $table_id is already in use" >&2
+    exit 1
+fi
 ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
 ip route replace default via "$gateway" dev "$wan" table "$table_id"
 nft delete table inet "$table" 2>/dev/null || true
@@ -141,9 +150,11 @@ EOF
 '''
 server-down = '''
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((100 + n))
-ip rule del pref "$table_id" 2>/dev/null || true
-ip route flush table "$table_id" 2>/dev/null || true
+table_id=$((10000 + n))
+wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
 nft delete table inet "svpn_egress_$n" 2>/dev/null || true
 '''
 
@@ -179,8 +190,9 @@ countries = ["NL", "DE"]
 маршруты SVPN настраивает автоматически. Hook направляет пакеты с source
 `SVPN_PEER_ADDR` через физический uplink, не возвращая их в основной TUN.
 
-Пример `server-up` включает IPv4 forwarding и не возвращает прежнее значение
-при остановке. Он рассчитан на отсутствие заранее заданных host routes до
+Пример `server-up` включает IPv4 forwarding и использует policy table
+`10000+n`. Чужие rule и table он отклоняет. При остановке прежнее значение
+forwarding не восстанавливается. Он рассчитан на отсутствие заранее заданных host routes до
 `nl.example.com` и `de.example.com`. Если такие маршруты уже есть, сначала сохраните их и
 добавьте восстановление в свой `down-command`.
 
@@ -282,34 +294,24 @@ sudo systemctl restart svpn
 
 ### Транспорт
 
-По умолчанию используется SSH camouflage и UDP для переноса пакетов. SSH
-управляет соединением. Если UDP заблокирован, задайте `mimic = "ssh"` и
-`tcp-port`. UDP-порты задаются парой значений `udp-ports = [60000, 60009]`.
-
-| `mimic` | Когда использовать |
-|---|---|
-| `ssh` | SSH camouflage, UDP или TCP transport |
-| `mosh` | Mosh camouflage для UDP |
-| `webrtc` | WebRTC-like camouflage для UDP |
-| `quic` | QUIC camouflage для UDP |
+По умолчанию используется SSH camouflage и UDP. Если UDP заблокирован,
+задайте `mimic = ["ssh"]` и `tcp-port = 41020`. Диапазон UDP-портов задаётся
+строкой `udp-port-range = "60000-60009"`.
 
 ### Hooks
 
 `up-command` и `down-command` выполняются на клиенте. `server-up` и
-`server-down` выполняются на VPS и у local-exit. Команды получают переменные
-`SVPN_TUN_NAME`, `SVPN_PEER_ADDR`, `SVPN_PEER_MTU`, `SVPN_REMOTE_BIN` и
-`SVPN_EVENT`. Timeout — 10 секунд.
-
-`up-script`, `down-script`, `server-up-script` и `server-down-script`
-позволяют вынести команды в файлы. Относительные пути считаются от каталога
-конфигурации. Клиентские скрипты обязаны вызывать `/usr/local/bin/svpn
---tun-up` или `--tun-down`.
+`server-down` выполняются на VPS и у local-exit. Для клиентских команд можно
+использовать `up-script` и `down-script`. Команды получают `SVPN_EVENT`,
+`SVPN_TUN_NAME`, `SVPN_TUN_ADDR`, `SVPN_PEER_ADDR` и `SVPN_SESSION_ID`.
+Timeout — 10 секунд.
 
 ### Проверка состояния
 
-`svpn --probe` с `SVPN=1` возвращает 0 только при готовом канале. Повторные
-запуски одинаковых конфигураций занимают пары адресов из пула
-`10.77.0.0/16`. При конфликте проверьте занятые адреса через `ip addr`.
+В foreground смотрите строки `serving` и `local-exit: ready`. Для systemd
+используйте `journalctl -u svpn -f`. Повторные запуски одинаковых
+конфигураций занимают пары адресов из пула `10.77.0.0/16`. При конфликте
+проверьте занятые адреса через `ip addr`.
 
 ### Владельцы ASN
 
@@ -331,7 +333,6 @@ sudo systemctl restart svpn
 ## Дополнительно
 
 - `svpn --help` — краткая справка по всем командам.
-- `svpn root@server --dry-run` — команды удалённого SSH без изменений.
 - [CHANGELOG](CHANGELOG.md) — история версий.
 - [Протокол](docs/PROTOCOL.md) — техническое описание transport.
 - [English README](README.en.md).

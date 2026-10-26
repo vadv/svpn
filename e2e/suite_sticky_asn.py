@@ -111,13 +111,16 @@ def write_country():
     _country_ready = True
 
 
-def enable_target_masquerade():
+def enable_target_masquerade(host=SERVER):
     # Remote exits need the administrator-provided NAT fixture; unlike the
     # tunnel peer, the external target has no route back to 10.77.0.0/24.
-    ssh(
-        "mkdir -p /etc/nftables.d && cat > /etc/nftables.d/svpn.nft <<'NFT'\n"
-        + MASQUERADE_RULES
-        + "NFT\nnft -f /etc/nftables.d/svpn.nft"
+    command(
+        ssh_to(host)
+        + [
+            "mkdir -p /etc/nftables.d && cat > /etc/nftables.d/svpn.nft <<'NFT'\n"
+            + MASQUERADE_RULES
+            + "NFT\nnft -f /etc/nftables.d/svpn.nft"
+        ]
     )
 
 
@@ -389,6 +392,15 @@ def udp_echo(peer, payload=b"direct-udp"):
     assert data == payload
 
 
+def shared_country_args():
+    return [
+        f"{value.split(',', 1)[0]},user=root,identity=/keys/client,countries=RU"
+        if value.startswith((f"{SERVER},", f"{SERVER2},"))
+        else value
+        for value in country_args()
+    ]
+
+
 def test_country_asn_scope():
     fresh_state()
     enable_target_masquerade()
@@ -408,7 +420,31 @@ def test_country_asn_scope():
         cleanup_verified(process, server_hosts=HOSTS)
     finally:
         ssh("nft delete table inet svpn_masq", check=False)
-    print("PASS country+ASN: RU target and DE tunnel peer stay on their scoped servers")
+    fresh_state()
+    enable_target_masquerade()
+    enable_target_masquerade(SERVER2)
+    try:
+        with session(
+            "country-asn-shared", args=shared_country_args(), server_hosts=HOSTS, ready_timeout=20
+        ) as (
+            process,
+            path,
+        ):
+            until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+            command(["ip", "route", "replace", f"{TARGET}/32", "dev", "svpn0"])
+            owner = target_tcp_echo(10)
+            for index in range(11, 16):
+                assert target_tcp_echo(index) == owner
+            spare = SERVER2 if owner == SERVER else SERVER
+            steady = kill_and_degrade(process, path, owner)
+            assert target_tcp_echo(16) == spare
+            wait_rejoined(path, steady)
+            assert target_tcp_echo(17) == spare
+        cleanup_verified(process, server_hosts=HOSTS)
+    finally:
+        ssh("nft delete table inet svpn_masq", check=False)
+        command(ssh_to(SERVER2) + ["nft delete table inet svpn_masq"], check=False)
+    print("PASS country+ASN: shared-country owner and constrained failover stay stable")
 
 
 def test_local_exits_and_vpn():

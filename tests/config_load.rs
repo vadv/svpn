@@ -258,7 +258,14 @@ fn readme_multi_examples_parse_with_all_exit_features() {
             "svpn-readme-multi-{}-{index}.toml",
             std::process::id()
         ));
-        std::fs::write(&path, &source[start..start + end]).unwrap();
+        let example = &source[start..start + end];
+        assert!(example.contains("table_id=$((10000 + n))"));
+        assert!(!example.contains("ip route flush table"));
+        assert!(example.contains(
+            "ip rule del pref \"$table_id\" from \"$SVPN_PEER_ADDR\" table \"$table_id\""
+        ));
+        assert!(example.contains("exit-state = \"/etc/svpn/exits.json\""));
+        std::fs::write(&path, example).unwrap();
         let args = load(&path, true).unwrap();
         assert_eq!(
             args.local_exits.as_deref(),

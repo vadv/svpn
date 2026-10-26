@@ -89,10 +89,10 @@ Use an absolute key path. Load passphrase-protected keys into `ssh-agent`
 before starting. When using `sudo -E`, agent preservation depends on the sudo
 policy.
 
-Without `hostkey`, SVPN uses TOFU and stores the fingerprint in its own
+Without `ssh-host-key`, SVPN uses TOFU and stores the fingerprint in its own
 known-hosts file. For strict verification, obtain the fingerprint from your
-provider and add `hostkey = "SHA256:..."` to each server. Do not add an empty
-`hostkey` value.
+provider and add `ssh-host-key = "SHA256:..."` to each server. Do not add an
+empty value.
 
 ## 5. Create one configuration
 
@@ -104,7 +104,7 @@ path.
 exit-policy = "sticky-asn"
 country-db = "/etc/svpn/country.csv"
 geo-db = "/etc/svpn/asn.csv"
-exit-state = "/var/lib/svpn/exits.json"
+exit-state = "/etc/svpn/exits.json"
 local-exits = ["RU", "BY"]
 
 ssh-user = "root"
@@ -124,10 +124,18 @@ down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/3
 server-up = '''
 sysctl -qw net.ipv4.ip_forward=1
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((100 + n))
+table_id=$((10000 + n))
 table=svpn_egress_$n
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
+    echo "svpn: policy priority $table_id is already in use" >&2
+    exit 1
+fi
+if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
+    echo "svpn: policy table $table_id is already in use" >&2
+    exit 1
+fi
 ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
 ip route replace default via "$gateway" dev "$wan" table "$table_id"
 nft delete table inet "$table" 2>/dev/null || true
@@ -139,9 +147,11 @@ EOF
 '''
 server-down = '''
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((100 + n))
-ip rule del pref "$table_id" 2>/dev/null || true
-ip route flush table "$table_id" 2>/dev/null || true
+table_id=$((10000 + n))
+wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
 nft delete table inet "svpn_egress_$n" 2>/dev/null || true
 '''
 
@@ -178,8 +188,9 @@ server. It needs `server-up` and `server-down`. Return routes are managed by
 SVPN automatically. The hook sends packets sourced from `SVPN_PEER_ADDR`
 through the physical uplink instead of back into the primary TUN.
 
-The example `server-up` enables IPv4 forwarding and does not restore its
-previous value on shutdown. It assumes no pre-existing host routes to
+The example `server-up` enables IPv4 forwarding and uses policy table
+`10000+n`. It rejects foreign rules and tables. It does not restore the
+previous forwarding value on shutdown. It assumes no pre-existing host routes to
 `nl.example.com` or `de.example.com`. If you already have such routes, save them and add
 restoration to your own `down-command`.
 
@@ -280,34 +291,24 @@ not in the binary archive.
 
 ### Transport
 
-The default is SSH camouflage with UDP packet transport. SSH manages the
-connection. If UDP is blocked, set `mimic = "ssh"` and `tcp-port`. UDP ports
-are configured as a pair in `udp-ports = [60000, 60009]`.
-
-| `mimic` | Use |
-|---|---|
-| `ssh` | SSH camouflage with UDP or TCP transport |
-| `mosh` | Mosh camouflage over UDP |
-| `webrtc` | WebRTC-like camouflage over UDP |
-| `quic` | QUIC camouflage over UDP |
+The default is SSH camouflage with UDP. If UDP is blocked, set
+`mimic = ["ssh"]` and `tcp-port = 41020`. Set the UDP range with
+`udp-port-range = "60000-60009"`.
 
 ### Hooks
 
 `up-command` and `down-command` run on the client. `server-up` and
-`server-down` run on VPSs and at the local-exit. Hooks receive
-`SVPN_TUN_NAME`, `SVPN_PEER_ADDR`, `SVPN_PEER_MTU`, `SVPN_REMOTE_BIN` and
-`SVPN_EVENT`. The timeout is 10 seconds.
-
-Use `up-script`, `down-script`, `server-up-script` and
-`server-down-script` to move commands into files. Relative paths are based on
-the configuration directory. Client scripts must invoke
-`/usr/local/bin/svpn --tun-up` or `--tun-down`.
+`server-down` run on VPSs and at the local-exit. Client commands can use
+`up-script` and `down-script`. Hooks receive `SVPN_EVENT`, `SVPN_TUN_NAME`,
+`SVPN_TUN_ADDR`, `SVPN_PEER_ADDR` and `SVPN_SESSION_ID`. The timeout is 10
+seconds.
 
 ### Readiness
 
-`svpn --probe` with `SVPN=1` returns 0 only when the channel is ready. Repeated
-runs with the same configuration use address pairs from `10.77.0.0/16`. If a
-pair conflicts, inspect addresses with `ip addr`.
+In foreground, look for `serving` and `local-exit: ready`. With systemd, use
+`journalctl -u svpn -f`. Repeated runs of the same configuration use address
+pairs from `10.77.0.0/16`. If a pair conflicts, inspect addresses with
+`ip addr`.
 
 ### ASN owners
 
@@ -329,7 +330,6 @@ not performed.
 ## More information
 
 - `svpn --help` — command reference.
-- `svpn root@server --dry-run` — remote SSH commands without changes.
 - [CHANGELOG](CHANGELOG.md) — version history.
 - [Protocol](docs/PROTOCOL.md) — transport details.
 - [Russian README](README.md).
