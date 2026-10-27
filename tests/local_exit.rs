@@ -306,8 +306,7 @@ async fn failed_tun_name_surfaces_the_server_error_and_ends_the_task() {
             (PRIMARY_SERVER, PRIMARY_CLIENT),
             "svpn-test-primary",
             1400,
-            None,
-            None,
+            svpn::hooks::Hooks::default(),
             Some("a_tun_name_way_too_long".to_owned()),
         ),
     )

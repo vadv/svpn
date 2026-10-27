@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+[ "${SVPN_HOOK_ROLE:-server}" = server ]
+uplink=$1
+peer=$SVPN_PEER_ADDR
+peer_id=$(printf '%s' "$peer" | tr '.-' '_')
+table="svpn_server_exit_${peer_id}"
+
+nft delete table inet "$table" 2>/dev/null || true
+nft add table inet "$table"
+nft add chain inet "$table" forward '{ type filter hook forward priority 0; policy accept; }'
+nft add chain inet "$table" postrouting '{ type nat hook postrouting priority 100; }'
+nft add rule inet "$table" postrouting oifname "$uplink" ip saddr "$peer" masquerade
+nft add rule inet "$table" forward iifname "$SVPN_TUN_NAME" oifname "$uplink" accept
+nft add rule inet "$table" forward iifname "$uplink" oifname "$SVPN_TUN_NAME" ct state established,related accept

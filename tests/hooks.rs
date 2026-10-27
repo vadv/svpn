@@ -23,6 +23,7 @@ fn context() -> TunContext {
         name: "utun$(false); literal".into(),
         local: Ipv4Addr::new(10, 77, 0, 2),
         peer: Ipv4Addr::new(10, 77, 0, 1),
+        role: "test",
     }
 }
 
@@ -215,6 +216,40 @@ async fn failed_down_is_not_retried_and_never_runs_before_tun() {
     assert!(!hooks.starting());
     assert!(hooks.finish().await.is_err());
     hooks.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn separate_tunnels_reuse_hooks_with_independent_contexts() {
+    let dir = temporary_dir();
+    let path = dir.join("events");
+    let mut primary = Args {
+        up_command: Some(format!(
+            "printf '%s %s %s\\n' \"$SVPN_EVENT\" \"$SVPN_HOOK_ROLE\" \"$SVPN_TUN_NAME\" >> '{}'",
+            path.display()
+        )),
+        ..Args::default()
+    }
+    .resolve()
+    .unwrap();
+    let mut local = primary.for_tunnel();
+    primary
+        .start("svpn0".into(), context().local, context().peer)
+        .unwrap();
+    local
+        .start("tun0".into(), context().local, context().peer)
+        .unwrap();
+    primary.wait_up().await.unwrap();
+    local.wait_up().await.unwrap();
+    let mut events = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    assert_eq!(events, ["up local-exit tun0", "up primary svpn0"]);
+    primary.finish().await.unwrap();
+    local.finish().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

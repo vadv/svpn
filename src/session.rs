@@ -87,6 +87,7 @@ pub const TOMBSTONE_CAP: usize = 4096;
 pub struct Session {
     pub control: Control,
     pub io: PacketIo,
+    pub down: Option<crate::hooks::Hooks>,
     /// Hub IDs increase within an epoch, including rejected admissions.
     pub last_link_id: u64,
     pub readiness: Option<Readiness>,
@@ -174,6 +175,15 @@ impl Session {
     }
 
     async fn event_loop(mut self) -> Result<()> {
+        let result = self.event_loop_inner().await;
+        let down = match self.down.take() {
+            Some(mut hooks) => hooks.finish().await,
+            None => Ok(()),
+        };
+        result.and(down)
+    }
+
+    async fn event_loop_inner(&mut self) -> Result<()> {
         let started = tokio::time::Instant::now();
         // None after the first Ready: later Checking rounds have no startup
         // budget — the link retries while the control channel lives (N3).
@@ -378,15 +388,33 @@ pub async fn run(
     mtu: u16,
     config: TransportConfig,
 ) -> Result<()> {
-    run_io(
+    run_with_down(control, tun, server, client_ip, mtu, config, None).await
+}
+
+pub async fn run_with_down(
+    control: Control,
+    tun: AsyncDevice,
+    server: Option<Ipv4Addr>,
+    client_ip: Ipv4Addr,
+    mtu: u16,
+    config: TransportConfig,
+    down: Option<crate::hooks::Hooks>,
+) -> Result<()> {
+    let mut down = down;
+    let result = run_io(
         control,
         PacketIo::Device(tun),
         server,
         client_ip,
         mtu,
         config,
+        &mut down,
     )
-    .await
+    .await;
+    match down.take() {
+        Some(mut hooks) => result.and(hooks.finish().await),
+        None => result,
+    }
 }
 
 pub async fn run_link(
@@ -397,6 +425,7 @@ pub async fn run_link(
     config: TransportConfig,
     io: LinkIo,
 ) -> Result<()> {
+    let mut down = None;
     run_io(
         control,
         PacketIo::Link(io),
@@ -404,6 +433,7 @@ pub async fn run_link(
         client_ip,
         mtu,
         config,
+        &mut down,
     )
     .await
 }
@@ -415,6 +445,7 @@ async fn run_io(
     client_ip: Ipv4Addr,
     mtu: u16,
     config: TransportConfig,
+    down: &mut Option<crate::hooks::Hooks>,
 ) -> Result<()> {
     let mut server_listener: Option<tokio::net::TcpListener> = None;
     let mut remeasure_interval = None;
@@ -555,6 +586,7 @@ async fn run_io(
     Session {
         control,
         io,
+        down: down.take(),
         last_link_id: 0,
         readiness: None,
         client_ip,

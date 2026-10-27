@@ -12,6 +12,7 @@ use tokio::{
 
 use crate::control::{Control, Message, Stats, VERSION};
 use crate::framing::Camouflage;
+use crate::hooks::Hooks;
 use crate::link_io::{Delivery, Epoch, Event, LinkIo, Packet};
 use crate::session::TransportConfig;
 use crate::tcp::Mode;
@@ -111,8 +112,7 @@ pub async fn start(
     primary: (Ipv4Addr, Ipv4Addr),
     primary_tun: &str,
     mtu: u16,
-    server_up: Option<String>,
-    server_down: Option<String>,
+    client_hooks: Hooks,
     tun_name: Option<String>,
 ) -> Result<LocalExit> {
     let (pair, pair_guard) = LocalPair::claim(primary.0, primary.1)?;
@@ -129,15 +129,17 @@ pub async fn start(
             pair,
             pair_guard,
             mtu,
+            client_hooks,
             tun_name.as_deref(),
-            primary.1,
-            &primary_tun,
+            PrimaryTunnel {
+                client: primary.1,
+                name: &primary_tun,
+            },
         )
         .await
     });
     let mut server = LocalServer { task };
-    let port = match client_handshake(&mut client_control, pair, mtu, server_up, server_down).await
-    {
+    let port = match client_handshake(&mut client_control, pair, mtu).await {
         Ok(port) => port,
         Err(client_error) => {
             // Closing control lets the serve close its TUN and run down hooks.
@@ -184,15 +186,20 @@ pub async fn start(
     })
 }
 
+struct PrimaryTunnel<'a> {
+    client: Ipv4Addr,
+    name: &'a str,
+}
+
 /// Run the server handshake and session without SSH or UDP strategies.
 async fn serve_local(
     mut control: Control,
     pair: LocalPair,
     pair_guard: crate::addrpool::PairGuard,
     mtu: u16,
+    mut client_hooks: Hooks,
     tun_name: Option<&str>,
-    primary_client: Ipv4Addr,
-    primary_tun: &str,
+    primary: PrimaryTunnel<'_>,
 ) -> Result<()> {
     let _pair_guard = pair_guard;
     let Message::Hello {
@@ -247,7 +254,7 @@ async fn serve_local(
     let tun_name = tun.name().context("local-exit TUN name")?;
     let _peer_route = crate::tun::PeerRoute::install(pair.client, &tun_name)?;
     let _local_policy =
-        crate::tun::LocalPolicy::install(pair.client, &tun_name, primary_client, primary_tun)?;
+        crate::tun::LocalPolicy::install(pair.client, &tun_name, primary.client, primary.name)?;
     let config = TransportConfig::Tcp {
         mode: Mode {
             port,
@@ -256,17 +263,32 @@ async fn serve_local(
         listener: Some(listener),
         connect_ip: None,
     };
-    crate::serve_tail(control, tun, pair.server, pair.client, mtu, config).await
+    let startup = async {
+        client_hooks.start(tun_name.to_owned(), pair.server, pair.client)?;
+        if client_hooks.starting() {
+            client_hooks.wait_up().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = startup {
+        let down = client_hooks.finish().await;
+        return Err::<(), anyhow::Error>(error).and(down);
+    }
+    crate::serve_tail_with_down(
+        control,
+        tun,
+        pair.server,
+        pair.client,
+        mtu,
+        config,
+        Some(client_hooks),
+    )
+    .await
 }
 
 /// Complete the client handshake and return the loopback TCP port.
-async fn client_handshake(
-    control: &mut Control,
-    pair: LocalPair,
-    mtu: u16,
-    server_up: Option<String>,
-    server_down: Option<String>,
-) -> Result<u16> {
+async fn client_handshake(control: &mut Control, pair: LocalPair, mtu: u16) -> Result<u16> {
     control
         .send(Message::Hello {
             version: VERSION,
@@ -306,24 +328,6 @@ async fn client_handshake(
         matches!(crate::bootstrap(control).await?, Message::TunReady),
         "local server TUN not ready"
     );
-    if server_up.is_some() || server_down.is_some() {
-        control
-            .send(Message::ServerHooks {
-                up: server_up,
-                down: server_down,
-            })
-            .await?;
-        let Message::HookResult { ok, stdout, stderr } = crate::bootstrap(control).await? else {
-            bail!("expected hook_result");
-        };
-        if !stdout.is_empty() {
-            crate::info!("local hook stdout: {stdout}");
-        }
-        if !stderr.is_empty() {
-            crate::info!("local hook stderr: {stderr}");
-        }
-        ensure!(ok, "local server up hook failed");
-    }
     control.send(Message::TunReady).await?;
     Ok(port)
 }

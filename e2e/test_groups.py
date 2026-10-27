@@ -5,7 +5,6 @@ import contextlib
 import io
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -51,7 +50,8 @@ test_recovery_without_alternative_closes_within_budget
 """.split()
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
-test_country_asn_scope test_local_exits_and_vpn
+test_country_asn_scope test_local_exits_hook_optional test_local_exits_and_vpn
+test_hook_ownership_and_nondefault_pairs
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -110,7 +110,7 @@ def integration_groups():
         "tcp-auto": 10,
         "reselect": 4,
         "recovery": 3,
-        "sticky-asn": 6,
+        "sticky-asn": 8,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -164,50 +164,14 @@ def reselect_log_patterns():
 
 
 def local_exit_full_tunnel_guard():
-    path = pathlib.Path(suite_sticky_asn.__file__).parent / "config" / "geo-up.sh"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n", encoding="utf-8")
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            try:
-                suite_sticky_asn.install_full_tunnel_routes()
-            except AssertionError:
-                pass
-            else:
-                raise AssertionError("route hook guard did not reject local-exit")
-    finally:
-        path.unlink()
-    print("PASS local-exit routes: legacy Ready hooks cannot overwrite full-tunnel routes")
-
-
-def local_exit_cleanup_requires_ownership():
-    source = pathlib.Path("README.md").read_text()
-    script = re.search(r"server-down = '''\n(.*?)\n'''", source, re.S).group(1)
-    with tempfile.TemporaryDirectory(prefix="svpn-cleanup-test-") as directory:
-        root = pathlib.Path(directory)
-        log = root / "ip.log"
-        fake_ip = root / "ip"
-        fake_ip.write_text(
-            "#!/bin/sh\n"
-            'echo "$@" >> "$IP_LOG"\n'
-            'if [ "$1 $2 $3 $4" = "-4 route show default" ]; then\n'
-            "    echo 'default via 192.0.2.1 dev eth0'\n"
-            "fi\n",
-            encoding="utf-8",
-        )
-        fake_ip.chmod(0o700)
-        env = os.environ.copy()
-        env.update(
-            PATH=f"{root}:{env['PATH']}",
-            IP_LOG=str(log),
-            SVPN_PEER_ADDR="10.77.0.2",
-            SVPN_SESSION_ID=f"cleanup-test-{os.getpid()}",
-        )
-        result = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        calls = log.read_text()
-        assert "rule del" not in calls and "route del" not in calls, calls
-    print("PASS local-exit cleanup: rejected startup cannot delete foreign routes")
+    assert not hasattr(suite_sticky_asn, "install_full_tunnel_routes")
+    args = suite_sticky_asn.country_args(local_exit=True)
+    assert "/hooks/server-up eth0" in args
+    assert "/hooks/server-down" in args
+    source = pathlib.Path(suite_sticky_asn.__file__).read_text()
+    assert source.count("client_route=False") >= 3
+    assert source.count("server_route=False") >= 3
+    print("PASS local-exit routes: supplied hooks own full-tunnel setup without fixture routes")
 
 
 def flow_cleanup_statistics():
@@ -334,7 +298,6 @@ if __name__ == "__main__":
     matrix_diagnostics()
     reselect_log_patterns()
     local_exit_full_tunnel_guard()
-    local_exit_cleanup_requires_ownership()
     flow_cleanup_statistics()
     invalid_groups()
     shell_groups()

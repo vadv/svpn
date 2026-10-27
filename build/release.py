@@ -8,7 +8,7 @@ import pathlib
 import subprocess
 import tarfile
 
-from package import NOTICES, ROOT, TARGETS, command, digest
+from package import HOOKS, NOTICES, ROOT, TARGETS, command, digest
 
 
 def validate(directory, tag, commit, run_id, version):
@@ -28,11 +28,11 @@ def validate(directory, tag, commit, run_id, version):
             raise ValueError(f"archive checksum mismatch: {archive.name}")
         with tarfile.open(archive) as tar:
             members = tar.getmembers()
-            names = ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES"]
+            names = ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES", *HOOKS]
             if (
                 [m.name for m in members] != names
                 or not all(m.isfile() and m.uid == m.gid == 0 for m in members)
-                or [m.mode for m in members] != [0o755, 0o644, 0o644, 0o644]
+                or [m.mode for m in members] != [0o755, 0o644, 0o644, 0o644, *([0o755] * len(HOOKS))]
             ):
                 raise ValueError(f"unexpected archive contents or permissions: {archive.name}")
             if tar.getmember("build-info.json").size > 65536:
@@ -61,6 +61,9 @@ def validate(directory, tag, commit, run_id, version):
                     binary_hash.update(chunk)
             if info.get("binary_sha256") != binary_hash.hexdigest():
                 raise ValueError(f"binary checksum mismatch: {archive.name}")
+            for filename in HOOKS:
+                if tar.extractfile(filename).read() != (ROOT / filename).read_bytes():
+                    raise ValueError(f"hook content mismatch: {archive.name}: {filename}")
             license_bytes = (ROOT / "LICENSE").read_bytes()
             if (
                 tar.getmember("LICENSE").size != len(license_bytes)

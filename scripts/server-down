@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+peer_id=$(printf '%s' "$SVPN_PEER_ADDR" | tr '.-' '_')
+nft delete table inet "svpn_server_exit_${peer_id}" 2>/dev/null || true

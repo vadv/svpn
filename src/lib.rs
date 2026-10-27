@@ -700,21 +700,38 @@ pub(crate) async fn open_tun(
     }
 }
 
-/// Shared serve tail after the TUN exists: TunReady, the optional
-/// server-hooks exchange, the server session, then the down hook.
-/// Used by both the remote serve and the local-exit serve.
+/// Shared serve tail after the TUN exists. Remote serve handles server hooks
+/// here; local-exit has already started its client hooks.
 pub(crate) async fn serve_tail(
-    mut control: Control,
+    control: Control,
     tun: AsyncDevice,
     server_ip: Ipv4Addr,
     client_ip: Ipv4Addr,
     mtu: u16,
     config: session::TransportConfig,
 ) -> Result<()> {
+    serve_tail_with_down(control, tun, server_ip, client_ip, mtu, config, None).await
+}
+
+pub(crate) async fn serve_tail_with_down(
+    mut control: Control,
+    tun: AsyncDevice,
+    server_ip: Ipv4Addr,
+    client_ip: Ipv4Addr,
+    mtu: u16,
+    config: session::TransportConfig,
+    mut client_hooks: Option<hooks::Hooks>,
+) -> Result<()> {
     let tun_name = tun.name().context("TUN name")?.to_owned();
-    control.send(Message::TunReady).await?;
+    if let Err(error) = control.send(Message::TunReady).await {
+        let down = match client_hooks.take() {
+            Some(mut hooks) => hooks.finish().await,
+            None => Ok(()),
+        };
+        return Err::<(), anyhow::Error>(error).and(down);
+    }
     let mut server_down = None;
-    let result = async {
+    let bootstrap_result = async {
         match control.recv().await? {
             Message::ServerHooks { up, down } => {
                 server_down = down;
@@ -722,6 +739,7 @@ pub(crate) async fn serve_tail(
                     name: tun_name.clone(),
                     local: server_ip,
                     peer: client_ip,
+                    role: "server",
                 };
                 if let Some(up) = up {
                     let hook = hooks::Hook::Command(up);
@@ -755,14 +773,27 @@ pub(crate) async fn serve_tail(
             Message::TunReady => {}
             _ => bail!("expected server_hooks or tun_ready"),
         }
-        session::run(control, tun, None, client_ip, mtu, config).await
+        Ok::<(), anyhow::Error>(())
     }
     .await;
+    let result = match bootstrap_result {
+        Ok(()) => {
+            session::run_with_down(control, tun, None, client_ip, mtu, config, client_hooks).await
+        }
+        Err(error) => {
+            let down = match client_hooks.take() {
+                Some(mut hooks) => hooks.finish().await,
+                None => Ok(()),
+            };
+            Err::<(), anyhow::Error>(error).and(down)
+        }
+    };
     if let Some(down) = server_down {
         let context = hooks::TunContext {
             name: tun_name,
             local: server_ip,
             peer: client_ip,
+            role: "server",
         };
         let hook = hooks::Hook::Command(down);
         if let Err(error) = hooks::run_with_capture(&hook, "down", &context).await {
