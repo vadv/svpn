@@ -83,7 +83,7 @@ trap 'interrupt 143' TERM
 
 run "$SVPN_TEST_ARTIFACTS/preflight.log" "${compose[@]}" down --volumes --remove-orphans
 run "$SVPN_TEST_ARTIFACTS/build.log" "${compose[@]}" build
-run "$SVPN_TEST_ARTIFACTS/startup.log" "${compose[@]}" up -d --wait server server2 target target_by
+run "$SVPN_TEST_ARTIFACTS/startup.log" "${compose[@]}" up -d --wait server server2 target target_by target_off
 if (( matrix )); then
     run "$SVPN_TEST_ARTIFACTS/runner.log" "${compose[@]}" run --rm --no-deps -T client \
         python3 -u /e2e/matrix.py --group "$SVPN_TEST_GROUP"

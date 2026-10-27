@@ -17,3 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /run/sshd
 COPY --from=build /svpn /usr/local/bin/svpn
 COPY e2e /e2e
+COPY client-hooks /hooks
+COPY scripts/server-up /hooks/server-up
+COPY scripts/server-down /hooks/server-down

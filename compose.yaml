@@ -100,6 +100,15 @@ services:
       zdirect:
         ipv4_address: 172.31.77.4
 
+  target_off:
+    image: svpn-test:local
+    init: true
+    cap_add: [NET_ADMIN]
+    command: [sh, -c, "ip route add default via 172.31.77.2 dev eth0 && exec python3 -u /e2e/target.py"]
+    networks:
+      zdirect:
+        ipv4_address: 172.31.77.5
+
 volumes:
   keys:
 

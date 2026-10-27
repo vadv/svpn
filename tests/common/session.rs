@@ -82,6 +82,7 @@ fn link_session_cap_with(
                 stats: tokio::sync::watch::channel(Stats::default()).0,
                 delivery: std::sync::Arc::default(),
             }),
+            down: None,
             last_link_id: 0,
             readiness: None,
             client_ip: Ipv4Addr::new(10, 77, 0, 2),

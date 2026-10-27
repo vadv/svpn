@@ -199,6 +199,7 @@ def check_release(root):
         "wrong-notices",
         "wrong-license",
         "changed-binary",
+        "bad-hook",
     ):
         with tarfile.open(archive, "w:gz") as tar:
             for original_member, original_content in members:
@@ -209,6 +210,8 @@ def check_release(root):
                     member.mode = 0o4755
                 if member.name == "svpn" and defect == "changed-binary":
                     content += b"changed"
+                if member.name == "client-hooks/client-up" and defect == "bad-hook":
+                    content = b"wrong hook"
                 if member.name == "LICENSE" and defect == "wrong-license":
                     content = b"wrong license"
                 if member.name == "THIRD-PARTY-NOTICES" and defect == "empty-notices":
@@ -275,12 +278,21 @@ def check():
                     hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n"
                 )
                 with tarfile.open(archive) as tar:
-                    assert tar.getnames() == ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES"]
+                    assert tar.getnames() == [
+                        "svpn",
+                        "build-info.json",
+                        "LICENSE",
+                        "THIRD-PARTY-NOTICES",
+                        *package.HOOKS,
+                    ]
                     assert tar.extractfile("LICENSE").read() == (package.ROOT / "LICENSE").read_bytes()
                     assert tar.extractfile("THIRD-PARTY-NOTICES").read() == notices.read_bytes()
                     assert all(member.isfile() and member.uid == member.gid == 0 for member in tar)
                     assert tar.getmember("svpn").mode == 0o755, "do not retain setuid bits"
                     assert tar.getmember("build-info.json").mode == 0o644
+                    for filename in package.HOOKS:
+                        assert tar.getmember(filename).mode == 0o755
+                        assert tar.extractfile(filename).read() == (package.ROOT / filename).read_bytes()
                     assert all(member.mtime == 1600000000 for member in tar)
                     assert tar.extractfile("svpn").read() == payload
                     info = json.load(tar.extractfile("build-info.json"))

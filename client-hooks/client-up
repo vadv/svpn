@@ -1,0 +1,156 @@
+#!/bin/sh
+set -eu
+
+uplink=$1
+requested_uplink=$uplink
+shift
+gateway=${SVPN_UPLINK_GATEWAY:-}
+if [ -z "$gateway" ]; then
+    gateway=$(ip -4 route show default dev "$uplink" | awk '$1 == "default" { for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit } }')
+fi
+primary_state=/run/svpn/primary.route
+primary_lock=/run/svpn/primary.lock
+
+primary_cleanup() {
+    [ -f "$primary_state" ] || return 0
+    owner=
+    . "$primary_state"
+    ip -4 rule del pref 10000 from "$tun_addr" 2>/dev/null || true
+    ip -4 rule del pref 10001 from "$tun_addr" 2>/dev/null || true
+    ip -4 route del default table 10002 2>/dev/null || true
+    ip -4 route del 0.0.0.0/1 dev "$tun_name" 2>/dev/null || true
+    ip -4 route del 128.0.0.0/1 dev "$tun_name" 2>/dev/null || true
+    for server in $servers; do
+        ip -4 route del "$server/32" dev "$uplink" 2>/dev/null || true
+    done
+    rm -f "$primary_state"
+}
+
+case ${SVPN_HOOK_ROLE:-primary} in
+primary)
+    mkdir -p /run/svpn
+    exec 9>"$primary_lock"
+    flock -x 9
+    if [ -f "$primary_state" ]; then
+        owner=
+        . "$primary_state"
+        if [ -n "$owner" ] && [ "$owner" != "$SVPN_SESSION_ID" ] && [ -d "/proc/$owner" ]; then
+            echo "client-up: another SVPN session owns primary routes" >&2
+            exit 1
+        fi
+        primary_cleanup
+    fi
+    uplink=$requested_uplink
+    for pref in 10000 10001; do
+        if ip -4 rule show pref "$pref" | grep -q .; then
+            echo "client-up: policy rule $pref already exists" >&2
+            exit 1
+        fi
+    done
+    if ip -4 route show table 10002 | grep -q .; then
+        echo "client-up: policy table 10002 is already in use" >&2
+        exit 1
+    fi
+    for server in "$@"; do
+        if ip -4 route show "$server/32" | grep -q .; then
+            echo "client-up: route to $server already exists" >&2
+            exit 1
+        fi
+    done
+    for prefix in 0.0.0.0/1 128.0.0.0/1; do
+        if ip -4 route show "$prefix" | grep -q .; then
+            echo "client-up: split-default route $prefix already exists" >&2
+            exit 1
+        fi
+    done
+    mkdir -p /run/svpn
+    state_tmp="${primary_state}.$$"
+    printf 'owner=%s\ntun_addr=%s\ntun_name=%s\nuplink=%s\nservers="%s"\n' \
+        "$SVPN_SESSION_ID" "$SVPN_TUN_ADDR" "$SVPN_TUN_NAME" "$uplink" "$*" > "$state_tmp"
+    mv -f "$state_tmp" "$primary_state"
+    ip -4 rule add pref 10000 from "$SVPN_TUN_ADDR" lookup main suppress_prefixlength 0
+    ip -4 rule add pref 10001 from "$SVPN_TUN_ADDR" lookup 10002
+    if [ -n "$gateway" ]; then
+        ip -4 route add default via "$gateway" dev "$uplink" table 10002
+    else
+        ip -4 route add default dev "$uplink" table 10002
+    fi
+    for server in "$@"; do
+        if [ -n "$gateway" ] && [ "$gateway" != "$server" ]; then
+            ip -4 route add "$server/32" via "$gateway" dev "$uplink"
+        else
+            ip -4 route add "$server/32" dev "$uplink"
+        fi
+    done
+    ip -4 route add 0.0.0.0/1 dev "$SVPN_TUN_NAME"
+    ip -4 route add 128.0.0.0/1 dev "$SVPN_TUN_NAME"
+    ;;
+local-exit)
+    peer=$SVPN_PEER_ADDR
+    peer_id=$(printf '%s' "$peer" | tr '.-' '_')
+    third=$(printf '%s' "$peer" | awk -F. '{print $3}')
+    local_table=$((10003 + 254 - third))
+    current_table=$local_table
+    route_state="/run/svpn/local-exit.${peer_id}.route"
+    mkdir -p /run/svpn
+    for old_state in /run/svpn/local-exit.*.route; do
+        [ -f "$old_state" ] || continue
+        [ "$old_state" = "$route_state" ] && continue
+        owner=
+        local_peer=
+        local_table=10003
+        . "$old_state"
+        old_owner=${owner:-}
+        old_peer=${local_peer:-}
+        old_table=${local_table:-10003}
+        if [ -n "$old_owner" ] && [ -d "/proc/$old_owner" ]; then
+            continue
+        fi
+        if [ -n "$old_peer" ]; then
+            while ip -4 rule del pref "$old_table" from "$old_peer" lookup "$old_table" 2>/dev/null; do :; done
+            ip -4 route flush table "$old_table" 2>/dev/null || true
+            old_peer_id=$(printf '%s' "$old_peer" | tr '.-' '_')
+            nft delete table inet "svpn_local_exit_${old_peer_id}" 2>/dev/null || true
+        fi
+        rm -f "$old_state"
+    done
+    local_table=$current_table
+    table="svpn_local_exit_${peer_id}"
+    if [ -f "$route_state" ]; then
+        owner=
+        . "$route_state"
+        if [ -n "$owner" ] && [ "$owner" != "$SVPN_SESSION_ID" ] && [ -d "/proc/$owner" ]; then
+            echo "client-up: another SVPN session owns local-exit $peer" >&2
+            exit 1
+        fi
+        while ip -4 rule del pref "$local_table" from "$peer" lookup "$local_table" 2>/dev/null; do :; done
+        ip -4 route flush table "$local_table" 2>/dev/null || true
+        nft delete table inet "$table" 2>/dev/null || true
+    else
+        if ip -4 route show table "$local_table" | grep -q . || ip -4 rule show pref "$local_table" | grep -q . || nft list table inet "$table" >/dev/null 2>&1; then
+            echo "client-up: local-exit resources for $peer are already in use" >&2
+            exit 1
+        fi
+    fi
+    local_table=$current_table
+    route_tmp="${route_state}.$$"
+    printf 'owner=%s\nlocal_table=%s\nlocal_peer=%s\n' "$SVPN_SESSION_ID" "$local_table" "$peer" > "$route_tmp"
+    mv -f "$route_tmp" "$route_state"
+    if [ -n "$gateway" ]; then
+        ip -4 route replace default via "$gateway" dev "$uplink" table "$local_table"
+    else
+        ip -4 route replace default dev "$uplink" table "$local_table"
+    fi
+    ip -4 rule add pref "$local_table" from "$peer" lookup "$local_table"
+    nft add table inet "$table"
+    nft add chain inet "$table" forward '{ type filter hook forward priority 0; policy accept; }'
+    nft add chain inet "$table" postrouting '{ type nat hook postrouting priority 100; }'
+    nft add rule inet "$table" postrouting oifname "$uplink" ip saddr "$peer" masquerade
+    nft add rule inet "$table" forward iifname "$SVPN_TUN_NAME" oifname "$uplink" accept
+    nft add rule inet "$table" forward iifname "$uplink" oifname "$SVPN_TUN_NAME" ct state established,related accept
+    ;;
+*)
+    echo "client-up: unexpected role ${SVPN_HOOK_ROLE:-}" >&2
+    exit 1
+    ;;
+esac

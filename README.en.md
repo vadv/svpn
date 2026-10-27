@@ -5,11 +5,9 @@ tunnel over SSH.
 
 This guide starts with one complete setup that enables all three features:
 
-- destinations in **Russia and Belarus** use `local-exit`;
-- destinations in **the Netherlands and Germany** use two VPN exits;
+- destinations in `local-exits` use the local exit.
+- destinations in selected countries use two VPN exits.
 - all other IPv4 destinations use both VPN exits with ASN affinity and weights.
-
-Belarus uses the ISO code `BY`, Russia uses `RU`.
 
 > **Platform: Linux.** This complete recipe uses a Linux client and two Linux
 > servers. Do not copy its hooks to macOS. A macOS local-exit setup needs
@@ -19,13 +17,20 @@ Belarus uses the ISO code `BY`, Russia uses `RU`.
 
 | Machine | Requirements |
 |---|---|
-| Linux client | Root for this recipe, TUN, `iproute2`, `nftables`, `curl`, `gzip` and a default route through the physical interface and gateway |
+| Linux client | Root for this recipe, TUN, `iproute2`, `nftables`, `flock`, `curl`, `gzip` and a default route through the physical interface and gateway |
 | Each of the two VPSs | Linux, TUN, `iproute2`, `nftables`, root SSH and working Internet egress |
 | Network | Permit SSH, TCP `41020` and UDP `60000–60009` to each VPS |
 
+Enable forwarding on the client and on every VPS. SVPN does not change this
+shared setting or restore it on exit:
+
+```bash
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/90-svpn.conf
+sudo sysctl --system
+```
+
 The VPS firewall must permit forwarding between TUN and the physical egress
-interface. The NAT example does not change the existing firewall policy. Do
-not disable the firewall.
+interface. Configure NAT without disabling the firewall.
 
 Use the same SVPN version everywhere. Download the build for each machine's OS
 and CPU architecture. Client and server are roles of one program, not a reason
@@ -36,15 +41,15 @@ to copy one platform-specific binary to every machine.
 Open [releases](https://github.com/vadv/svpn/releases) and download one
 matching archive per machine:
 
-- `svpn-<version>-linux-x86_64-gnu.tar.gz` for Linux x86_64;
-- `svpn-<version>-macos-arm64.tar.gz` for macOS Apple Silicon;
+- `svpn-<version>-linux-x86_64-gnu.tar.gz` for Linux x86_64.
+- `svpn-<version>-macos-arm64.tar.gz` for macOS Apple Silicon.
 - `svpn-<version>-openwrt-aarch64.tar.gz` for OpenWrt aarch64.
 
 For Linux x86_64, run this on the client and each VPS. Replace the release
 version first:
 
 ```bash
-VERSION=0.9.6
+VERSION=0.9.7
 curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 sudo install -m 755 svpn /usr/local/bin/svpn
@@ -73,7 +78,27 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 
 Country Lite maps destination addresses to countries. ASN Lite enables
 `sticky-asn`. You can use `scripts/update-asn-db.sh` from the source tree for
-later ASN updates. A source checkout is not needed for the initial download.
+later ASN updates.
+
+The hooks are already in the extracted archive for the same version. Run these
+commands on the client:
+
+```bash
+sudo install -d -m 755 /usr/local/lib/svpn
+sudo install -m 755 client-hooks/client-up /usr/local/lib/svpn/client-up
+sudo install -m 755 client-hooks/client-down /usr/local/lib/svpn/client-down
+```
+
+Install the server hooks from the archive on each VPS:
+
+```bash
+sudo install -d -m 700 /etc/svpn
+sudo install -m 755 scripts/server-up /etc/svpn/server-up
+sudo install -m 755 scripts/server-down /etc/svpn/server-down
+```
+
+You do not need to start `svpn serve` manually on a VPS. The client starts it
+over SSH. `server-up` and `server-down` belong only to those remote processes.
 
 ## 4. Check SSH
 
@@ -98,7 +123,7 @@ empty value.
 
 Run `sudoedit /etc/svpn/vpn.toml`. Replace `nl.example.com` and `de.example.com` with the
 servers' IPv4 addresses in `servers` **and in the hooks**. Replace the key
-path.
+path and replace `eth0` with the physical uplink name on each machine.
 
 ```toml
 exit-policy = "sticky-asn"
@@ -115,62 +140,13 @@ mimic = ["ssh"]
 tcp-port = 41020
 udp-port-range = "60000-60009"
 
-# Protect the VPS addresses before replacing the default route. This assumes
-# no pre-existing host routes for these addresses.
-up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
-down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
+# Regular client hooks for the primary TUN and local-exit.
+up-command = "/usr/local/lib/svpn/client-up eth0 nl.example.com de.example.com"
+down-command = "/usr/local/lib/svpn/client-down eth0 nl.example.com de.example.com"
 
-# These server hooks run on each VPS and at the local-exit on the client.
-server-up = '''
-sysctl -qw net.ipv4.ip_forward=1
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-table=svpn_egress_$n
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
-    echo "svpn: policy priority $table_id is already in use" >&2
-    exit 1
-fi
-if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
-    echo "svpn: policy table $table_id is already in use" >&2
-    exit 1
-fi
-if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
-    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
-fi
-: > "$owner.rule"
-ip route replace default via "$gateway" dev "$wan" table "$table_id"
-: > "$owner.route"
-nft delete table inet "$table" 2>/dev/null || true
-nft -f - <<EOF
-add table inet $table
-add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
-add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
-EOF
-: > "$owner.nat"
-'''
-server-down = '''
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if [ -f "$owner.rule" ]; then
-    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.rule"
-fi
-if [ -f "$owner.route" ]; then
-    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.route"
-fi
-if [ -f "$owner.nat" ]; then
-    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
-    rm -f "$owner.nat"
-fi
-'''
+# Only for remote VPN servers. local-exit never receives them.
+server-up = "/etc/svpn/server-up eth0"
+server-down = "/etc/svpn/server-down"
 
 [[servers]]
 address = "nl.example.com"
@@ -191,7 +167,7 @@ Weights affect owner selection, not every individual packet.
 
 | Destination | Path |
 |---|---|
-| `RU` or `BY` | `local-exit` through the local SVPN server and physical egress |
+| A country in `local-exits` | `local-exit` through the local SVPN server and physical egress |
 | `NL` or `DE` | Only servers listing that country in `countries` |
 | Any other country or an address outside Country DB | Both example servers, using ASN affinity and weights |
 
@@ -201,15 +177,11 @@ countries. A server without `countries` also participates in ordinary
 selection.
 
 `local-exit` is not a TCP proxy. SVPN forwards IPv4 packets through its local
-server. It needs `server-up` and `server-down`. Return routes are managed by
-SVPN automatically. The hook sends packets sourced from `SVPN_PEER_ADDR`
-through the physical uplink instead of back into the primary TUN.
-
-The example `server-up` enables IPv4 forwarding and uses policy table
-`10000+n`. It rejects foreign rules and tables. It does not restore the
-previous forwarding value on shutdown. It assumes no pre-existing host routes to
-`nl.example.com` or `de.example.com`. If you already have such routes, save them and add
-restoration to your own `down-command`.
+server and uses the regular client `up-command` and `down-command`. For the
+primary TUN, hooks protect the VPS routes and send other traffic through the
+VPN. For local-exit, they enable forwarding and NAT on the physical interface.
+Each TUN receives its own environment variables.
+`server-up` and `server-down` belong only to VPS servers.
 
 ## 6. Start and verify
 
@@ -222,8 +194,8 @@ sudo -E svpn multi --config /etc/svpn/vpn.toml
 Wait for both remote exits and `local-exit: ready`. Verify four things:
 
 1. **Connectivity.** Check a responding IPv4 address with `ping` or `curl`.
-2. **local-exit.** Choose a responding address from a `RU` or `BY` range in
-   `/etc/svpn/country.csv`. The `local: opened` counter should increase.
+2. **local-exit.** Choose a responding address from a country in `local-exits`
+   in `/etc/svpn/country.csv`. The `local: opened` counter should increase.
 3. **VPN.** An `NL` or `DE` address should open a flow on one VPS. An address
    in another country should also use one of the two VPSs.
 4. **Stable ownership.** Repeated flows to addresses in one network should use
@@ -314,8 +286,8 @@ The default is SSH camouflage with UDP. If UDP is blocked, set
 
 ### Hooks
 
-`up-command` and `down-command` run on the client. `server-up` and
-`server-down` run on VPSs and at the local-exit. Client commands can use
+`up-command` and `down-command` run on the client for the primary TUN and
+local-exit. `server-up` and `server-down` run only on VPSs. Client commands can use
 `up-script` and `down-script`. Hooks receive `SVPN_EVENT`, `SVPN_TUN_NAME`,
 `SVPN_TUN_ADDR`, `SVPN_PEER_ADDR` and `SVPN_SESSION_ID`. The timeout is 10
 seconds.

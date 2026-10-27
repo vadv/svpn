@@ -5,6 +5,10 @@
 !Cargo.lock
 !README.md
 !README.en.md
+!client-hooks/
+!client-hooks/**
+!scripts/server-up
+!scripts/server-down
 !src/
 !src/**
 !tests/stderr.rs

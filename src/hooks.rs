@@ -46,6 +46,7 @@ pub struct Args {
     pub down_command: Option<String>,
 }
 
+#[derive(Clone)]
 pub enum Hook {
     Script(PathBuf),
     Command(String),
@@ -55,14 +56,27 @@ pub struct TunContext {
     pub name: String,
     pub local: Ipv4Addr,
     pub peer: Ipv4Addr,
+    pub role: &'static str,
 }
 
-#[derive(Default)]
 pub struct Hooks {
     up: Option<Hook>,
     down: Option<Hook>,
+    role: &'static str,
     pub context: Option<TunContext>,
     pub running: Option<Running>,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            up: None,
+            down: None,
+            role: "primary",
+            context: None,
+            running: None,
+        }
+    }
 }
 
 pub struct Running {
@@ -78,6 +92,7 @@ impl Args {
         Ok(Hooks {
             up: resolve(self.up_script, self.up_command)?,
             down: resolve(self.down_script, self.down_command)?,
+            role: "primary",
             context: None,
             running: None,
         })
@@ -85,9 +100,24 @@ impl Args {
 }
 
 impl Hooks {
+    pub fn for_tunnel(&self) -> Self {
+        Self {
+            up: self.up.clone(),
+            down: self.down.clone(),
+            role: "local-exit",
+            context: None,
+            running: None,
+        }
+    }
+
     pub fn start(&mut self, name: String, local: Ipv4Addr, peer: Ipv4Addr) -> Result<()> {
         ensure!(self.context.is_none(), "TUN hooks already started");
-        self.context = Some(TunContext { name, local, peer });
+        self.context = Some(TunContext {
+            name,
+            local,
+            peer,
+            role: self.role,
+        });
         if let Some(up) = &self.up {
             let context = self.context.as_ref().context("missing TUN hook context")?;
             self.running = Some(Running::spawn(up, "up", context)?);
@@ -148,6 +178,7 @@ impl Running {
         command.as_std_mut().process_group(0);
         command
             .env("SVPN_EVENT", event)
+            .env("SVPN_HOOK_ROLE", context.role)
             .env("SVPN_TUN_NAME", &context.name)
             .env("SVPN_TUN_ADDR", context.local.to_string())
             .env("SVPN_PEER_ADDR", context.peer.to_string())

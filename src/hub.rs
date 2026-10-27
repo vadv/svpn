@@ -166,7 +166,12 @@ impl Hub {
     pub fn dispatch(&mut self, bytes: &[u8], client_ip: Ipv4Addr) -> Result<Option<[u8; 40]>> {
         let parsed = match packet::parse(bytes, true) {
             Some(parsed) if parsed.flow.valid_for(client_ip) => parsed,
-            Some(_) => {
+            Some(parsed) => {
+                crate::debug!(
+                    "vpn: foreign packet src={} dst={} expected_client={client_ip}",
+                    parsed.flow.source,
+                    parsed.flow.destination
+                );
                 drop_note(
                     &self.links[0].delivery,
                     &self.links,
@@ -524,7 +529,8 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    self.start_local(tun_addr, peer_addr, &name, params).await?;
+                    self.start_local(tun_addr, peer_addr, &name, params, hooks)
+                        .await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
@@ -743,6 +749,7 @@ impl Hub {
         peer: Ipv4Addr,
         primary_tun: &str,
         params: &LinkParams,
+        primary_hooks: &Hooks,
     ) -> Result<()> {
         if self.local_exits.is_empty() || self.local.is_some() {
             return Ok(());
@@ -756,8 +763,7 @@ impl Hub {
             (peer, client),
             primary_tun,
             params.mtu,
-            params.server_up.clone(),
-            params.server_down.clone(),
+            primary_hooks.for_tunnel(),
             None,
         )
         .await?;

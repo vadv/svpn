@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.7
+
+Local-exit setup and lifecycle correction.
+
+- Local-exit uses client `up`/`down` hooks with independent TUN context.
+  Server hooks run only on VPS servers.
+- Hooks now use physical gateways, reclaim interrupted policy state and clean
+  up after bootstrap failures. NAT and policy resources are scoped to the
+  negotiated peer. Foreign primary routes are preserved.
+- Release archives include the same-version client and server hooks. The
+  quickstart covers local-exits, sticky ASN and two VPN exits.
+
 ## v0.9.6
 
 Local-exit correctness and setup documentation release.

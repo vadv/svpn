@@ -19,6 +19,12 @@ TARGETS = {
     "openwrt-aarch64": ("aarch64-unknown-linux-musl", "musl, statically linked"),
     "macos-arm64": ("aarch64-apple-darwin", "libSystem"),
 }
+HOOKS = (
+    "client-hooks/client-up",
+    "client-hooks/client-down",
+    "scripts/server-up",
+    "scripts/server-down",
+)
 
 
 def command(*args):
@@ -111,6 +117,13 @@ def pack(binary, target, output):
                         member = tarfile.TarInfo(filename)
                         member.size = len(content)
                         member.mode = 0o644
+                        member.mtime = epoch
+                        tar.addfile(member, io.BytesIO(content))
+                    for filename in HOOKS:
+                        content = (ROOT / filename).read_bytes()
+                        member = tarfile.TarInfo(filename)
+                        member.size = len(content)
+                        member.mode = 0o755
                         member.mtime = epoch
                         tar.addfile(member, io.BytesIO(content))
         after = binary.stat()
