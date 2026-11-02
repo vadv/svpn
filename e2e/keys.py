@@ -10,7 +10,9 @@ for name in ("host", "client", "wrong"):
     if not path.exists():
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)], check=True)
 public_host = (root / "host.pub").read_text().split()
-(root / "known_hosts").write_text("172.30.77.2,172.30.77.4,172.30.77.5 " + " ".join(public_host[:2]) + "\n")
+(root / "known_hosts").write_text(
+    "172.30.77.2,172.30.77.4,172.30.77.5,172.30.88.2 " + " ".join(public_host[:2]) + "\n"
+)
 wrong_host = (root / "wrong.pub").read_text().split()
 (root / "wrong_known_hosts").write_text("172.30.77.2 " + " ".join(wrong_host[:2]) + "\n")
 print("Disposable keys ready; host key pinned.")

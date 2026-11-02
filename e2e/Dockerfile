@@ -4,6 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY README.md README.en.md ./
 COPY .cargo ./.cargo
 COPY src ./src
+COPY scripts ./scripts
 COPY tests/stderr.rs ./tests/stderr.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
@@ -16,4 +17,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 COPY --from=build /svpn /usr/local/bin/svpn
+COPY scripts /scripts
 COPY e2e /e2e
