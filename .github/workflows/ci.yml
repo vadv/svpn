@@ -116,6 +116,8 @@ jobs:
             group: udp
           - suite: matrix
             group: tcp-auto
+          - suite: setup
+            group: setup
     env:
       TEST_SUITE: ${{ matrix.suite }}
       TEST_GROUP: ${{ matrix.group }}
@@ -162,6 +164,12 @@ jobs:
             platform: linux/amd64
             recipe: build/x86_64.Dockerfile
             binary: svpn-x86_64-gnu
+          - target: linux-aarch64-gnu
+            os: ubuntu-24.04-arm
+            arch: aarch64
+            platform: linux/arm64
+            recipe: build/aarch64.Dockerfile
+            binary: svpn-aarch64-gnu
           - target: openwrt-aarch64
             os: ubuntu-24.04-arm
             arch: aarch64

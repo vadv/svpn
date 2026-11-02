@@ -19,7 +19,7 @@ def validate(directory, tag, commit, run_id, version):
         f"svpn-{version}-{target}.tar.gz{suffix}" for target in TARGETS for suffix in ("", ".sha256")
     }
     if len(files) != len(expected_names) or {p.name for p in files} != expected_names:
-        raise ValueError("expected exactly three platform archives and their checksums")
+        raise ValueError("expected exactly four platform archives and their checksums")
     notices = NOTICES.read_bytes()
     for archive in (path for path in files if path.name.endswith(".tar.gz")):
         target = archive.name[len(f"svpn-{version}-") : -len(".tar.gz")]
@@ -47,6 +47,8 @@ def validate(directory, tag, commit, run_id, version):
                 "rust_target": TARGETS[target][0],
                 "libc": TARGETS[target][1],
                 "cpu_requirement": "hardware AES",
+                "control_version": 3,
+                "server_hooks": 1,
                 "license": "MIT",
             }
             if (

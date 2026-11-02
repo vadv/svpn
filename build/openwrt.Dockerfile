@@ -12,6 +12,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY README.md README.en.md ./
 COPY .cargo ./.cargo
 COPY src ./src
+COPY scripts ./scripts
 COPY tests/stderr.rs ./tests/stderr.rs
 RUN --mount=type=cache,id=svpn-router-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=svpn-router-target,target=/src/target \
