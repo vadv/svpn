@@ -194,18 +194,24 @@ svpn_setup_release() {
         return 1
     }
     members=$(tar -tzf "$SVPN_STAGE/$SVPN_ASSET")
-    expected_members='svpn
+    # Current releases ship the hook scripts; releases up to 0.9.6 did not.
+    # Both layouts are safe: setup always deploys the embedded hooks, never
+    # the archive copies.
+    legacy_members='svpn
 build-info.json
 LICENSE
 THIRD-PARTY-NOTICES'
-    [ "$members" = "$expected_members" ] || {
+    expected_members="$legacy_members
+scripts/server-up
+scripts/server-down"
+    [ "$members" = "$expected_members" ] || [ "$members" = "$legacy_members" ] || {
         echo "svpn setup: unexpected release archive members" >&2
         return 1
     }
     mkdir "$SVPN_STAGE/extract"
     tar -xzf "$SVPN_STAGE/$SVPN_ASSET" -C "$SVPN_STAGE/extract" \
         --no-same-owner --no-same-permissions
-    for member in svpn build-info.json LICENSE THIRD-PARTY-NOTICES; do
+    for member in $members; do
         [ -f "$SVPN_STAGE/extract/$member" ] && [ ! -L "$SVPN_STAGE/extract/$member" ] || {
             echo "svpn setup: release member is not a regular file: $member" >&2
             return 1

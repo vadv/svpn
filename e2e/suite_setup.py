@@ -57,6 +57,8 @@ def build_asset(path, version, platform="linux-x86_64-gnu", meta=True, extra=(),
         add_file(tar, "build-info.json", json.dumps(info, indent=2).encode())
         add_file(tar, "LICENSE", b"MIT")
         add_file(tar, "THIRD-PARTY-NOTICES", b"none")
+        add_file(tar, "scripts/server-up", b"#!/bin/sh\\n")
+        add_file(tar, "scripts/server-down", b"#!/bin/sh\\n")
         for name in extra:
             add_file(tar, name, b"x")
 

@@ -8,7 +8,7 @@ import pathlib
 import subprocess
 import tarfile
 
-from package import NOTICES, ROOT, TARGETS, command, digest
+from package import HOOKS, NOTICES, ROOT, TARGETS, command, digest
 
 
 def validate(directory, tag, commit, run_id, version):
@@ -28,13 +28,17 @@ def validate(directory, tag, commit, run_id, version):
             raise ValueError(f"archive checksum mismatch: {archive.name}")
         with tarfile.open(archive) as tar:
             members = tar.getmembers()
-            names = ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES"]
+            names = ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES", *HOOKS]
+            modes = [0o755, 0o644, 0o644, 0o644] + [0o755] * len(HOOKS)
             if (
                 [m.name for m in members] != names
                 or not all(m.isfile() and m.uid == m.gid == 0 for m in members)
-                or [m.mode for m in members] != [0o755, 0o644, 0o644, 0o644]
+                or [m.mode for m in members] != modes
             ):
                 raise ValueError(f"unexpected archive contents or permissions: {archive.name}")
+            for hook in HOOKS:
+                if tar.extractfile(hook).read() != (ROOT / hook).read_bytes():
+                    raise ValueError(f"shipped hook does not match the source: {archive.name}: {hook}")
             if tar.getmember("build-info.json").size > 65536:
                 raise ValueError("oversized build metadata")
             info = json.load(tar.extractfile("build-info.json"))

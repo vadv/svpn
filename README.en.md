@@ -55,6 +55,11 @@ svpn --version
 Extract one selected archive at a time. Install the `svpn` file from that
 archive rather than mixing files from different builds.
 
+Besides the binary, every archive carries `scripts/server-up` and
+`scripts/server-down` — the same hooks `svpn setup` deploys. For a manual
+install without `svpn setup` (for example on OpenWrt) take them from the
+archive.
+
 ## 3. Download country and ASN databases
 
 Both databases belong on the **client**, not on the VPSs. The directory and
