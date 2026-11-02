@@ -1,215 +1,10 @@
 # SVPN
 
-SVPN — это клиент и сервер в одном исполняемом файле. Он поднимает защищённый
-IPv4-туннель через SSH.
+SVPN — это VPN-клиент и VPN-сервер в одном исполняемом файле. Клиент сам
+запускает сервер на VPS по SSH на время сессии: на VPS не нужен демон,
+systemd-сервис или отдельный конфиг.
 
-Это руководство начинается с одного законченного сценария. В нём включены сразу
-три функции:
-
-- адреса **России и Беларуси** идут через `local-exit`;
-- адреса **Нидерландов и Германии** распределяются между двумя VPN-серверами;
-- остальные IPv4-адреса используют оба VPN-сервера с учётом ASN и весов.
-
-Беларусь обозначается кодом `BY`, Россия — `RU`.
-
-> **Платформа примера: Linux.** Ниже описаны Linux-клиент и два Linux-сервера.
-> Не копируйте hooks на macOS. Для macOS нужны отдельные команды маршрутизации,
-> forwarding и NAT.
-
-## Быстрый старт
-
-```bash
-# /etc/svpn/vpn.toml уже создан — см. раздел 5
-sudo svpn setup --config /etc/svpn/vpn.toml   # один раз: VPS, бинарник и хуки
-sudo svpn multi --config /etc/svpn/vpn.toml   # запуск туннеля
-```
-
-## 1. Подготовьте машины
-
-| Машина | Что нужно |
-|---|---|
-| Linux-клиент | root для этого примера, TUN, `iproute2`, `nftables`, `curl`, `gzip` и default route через физический интерфейс и gateway |
-| Каждый из двух VPS | Linux, TUN, `iproute2`, `nftables`, root SSH и выход в Интернет |
-| Сеть | Разрешите SSH, TCP `41020` и UDP `60000–60009` до VPS |
-
-На VPS firewall должен разрешать forwarding между TUN и физическим выходом.
-NAT из примера не изменяет существующую политику firewall. Не отключайте
-firewall целиком.
-
-Используйте одну версию SVPN на всех машинах. Для каждой машины скачайте сборку
-её ОС и архитектуры. Клиент и сервер — это роли одной программы, а не один
-файл для разных платформ.
-
-## 2. Установите SVPN
-
-Откройте [релизы](https://github.com/vadv/svpn/releases) и скачайте один архив
-для каждой машины:
-
-- `svpn-<version>-linux-x86_64-gnu.tar.gz` — GNU Linux x86_64;
-- `svpn-<version>-linux-aarch64-gnu.tar.gz` — GNU Linux aarch64;
-- `svpn-<version>-macos-arm64.tar.gz` — macOS Apple Silicon;
-- `svpn-<version>-openwrt-aarch64.tar.gz` — OpenWrt aarch64.
-
-Для Linux x86_64 установка выглядит так. Выполните команды на клиенте и на
-каждом VPS, подставив версию релиза:
-
-```bash
-VERSION=0.9.6
-curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
-tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
-sudo install -m 755 svpn /usr/local/bin/svpn
-svpn --version
-```
-
-Не распаковывайте несколько архивов в один каталог. Сначала выберите архив,
-затем установите содержащийся в нём `svpn`.
-
-Кроме бинарника, в архив входят `scripts/server-up` и `scripts/server-down` —
-те же хуки, которые разворачивает `svpn setup`. Для ручной установки без
-`svpn setup` (например, на OpenWrt) возьмите их из архива.
-
-## 3. Загрузите базы стран и ASN
-
-Обе базы нужны на **клиенте**, а не на VPS. Каталог и файлы доступны только
-root:
-
-```bash
-sudo install -d -m 700 /etc/svpn
-YEAR_MONTH=$(date +%Y-%m)
-
-curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
-gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
-
-curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
-gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
-sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
-```
-
-Country Lite определяет страну назначения. ASN Lite нужен для `sticky-asn`.
-Для периодического обновления ASN можно использовать
-`scripts/update-asn-db.sh` из исходного дерева. Для первой установки исходники
-не нужны.
-
-## 4. Проверьте SSH
-
-На клиенте должен быть закрытый ключ. Его открытая часть должна быть
-разрешена для `root` на обоих VPS. Проверьте вход заранее:
-
-```bash
-ssh -i /полный/путь/к/ключу root@nl.example.com
-ssh -i /полный/путь/к/ключу root@de.example.com
-```
-
-Используйте абсолютный путь к ключу. Если ключ защищён passphrase, загрузите
-его в `ssh-agent` заранее. При запуске через `sudo -E` сохранение agent зависит
-от политики sudo.
-
-Без `ssh-host-key` SVPN использует TOFU и сохраняет fingerprint в своём
-known-hosts файле. Для строгой проверки получите fingerprint у провайдера и
-добавьте `ssh-host-key = "SHA256:..."` к каждому серверу. Пустое значение не
-нужно.
-
-## 5. Создайте один конфиг
-
-Сохраните файл командой `sudoedit /etc/svpn/vpn.toml`. Замените `nl.example.com` и
-`de.example.com` на IPv4-адреса серверов в блоках `servers` **и в hooks**. Замените
-путь к ключу.
-
-```toml
-exit-policy = "sticky-asn"
-country-db = "/etc/svpn/country.csv"
-geo-db = "/etc/svpn/asn.csv"
-exit-state = "/etc/svpn/exits.json"
-local-exits = ["RU", "BY"]
-
-ssh-user = "root"
-ssh-identity = "/полный/путь/к/ключу"
-ssh-port = 22
-ssh-remote-bin = "/usr/local/bin/svpn"
-mimic = ["ssh"]
-tcp-port = 41020
-udp-port-range = "60000-60009"
-
-# Защита адресов VPS при перехвате default route. Для этих адресов не должно
-# быть заранее настроенных host routes.
-up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
-down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
-
-# Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
-server-up = '''
-set -e
-sysctl -qw net.ipv4.ip_forward=1
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-table=svpn_egress_$n
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
-    echo "svpn: policy priority $table_id is already in use" >&2
-    exit 1
-fi
-if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
-    echo "svpn: policy table $table_id is already in use" >&2
-    exit 1
-fi
-if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
-    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
-fi
-: > "$owner.rule"
-ip route replace default via "$gateway" dev "$wan" table "$table_id"
-: > "$owner.route"
-nft delete table inet "$table" 2>/dev/null || true
-nft -f - <<EOF
-add table inet $table
-add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
-add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
-EOF
-: > "$owner.nat"
-'''
-server-down = '''
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if [ -f "$owner.rule" ]; then
-    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.rule"
-fi
-if [ -f "$owner.route" ]; then
-    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.route"
-fi
-if [ -f "$owner.nat" ]; then
-    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
-    rm -f "$owner.nat"
-fi
-'''
-
-[[servers]]
-address = "nl.example.com"
-weight = 3
-countries = ["NL", "DE"]
-
-[[servers]]
-address = "de.example.com"
-weight = 1
-countries = ["NL", "DE"]
-```
-
-`weight = 3` и `weight = 1` означают примерное распределение 3:1. При
-`sticky-asn` адреса одной сети сохраняют выбранный выход, пока он работает.
-Веса влияют на выбор владельца, а не на каждый пакет.
-
-### Как выбирается путь
-
-| Назначение | Путь |
-|---|---|
-| `RU` или `BY` | `local-exit` через локальный сервер SVPN и физический выход |
-| `NL` или `DE` | Только серверы, у которых эта страна указана в `countries` |
-| Другая страна или адрес вне Country DB | Оба сервера из примера, с учётом ASN и весов |
+## Как это работает
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
@@ -234,208 +29,104 @@ flowchart TD
     class home,via edge
 ```
 
-Пути различаются не только маршрутом, но и внешним адресом. `local-exit` выходит
-через провайдера клиента, поэтому сайт видит домашний IP. VPN-ветка закрепляет
-каждый ASN назначения за одним VPS, пока тот жив: сервис видит стабильный IP этого
-сервера. При отказе VPS группа ASN переезжает на следующий сервер пула.
+Клиент выбирает путь до шифрования. Адреса из `local-exits` (например, RU и BY)
+идут через локальный выход — сайт видит ваш домашний IP. Остальные адреса
+шифруются и уходят на VPS — сайт видит IP сервера. В режиме нескольких VPS
+`sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
+видел стабильный внешний IP.
 
-Для одной страны можно указать несколько серверов. `countries` ограничивает
-выбор для этой страны, но не исключает сервер из общего списка для остальных
-стран. Сервер без `countries` также участвует в обычном выборе.
+## Быстрый старт
 
-`local-exit` не является TCP-прокси. SVPN передаёт IPv4-пакеты через свой
-локальный сервер. Для этого нужны `server-up` и `server-down`. Обратные
-маршруты SVPN настраивает автоматически. Hook направляет пакеты с source
-`SVPN_PEER_ADDR` через физический uplink, не возвращая их в основной TUN.
+Понадобится Linux-клиент и один Linux-VPS с root SSH. На клиенте нужны TUN,
+`iproute2` и `nftables`. На VPS откройте SSH, TCP `41020` и UDP `60000–60009`.
 
-Пример `server-up` включает IPv4 forwarding и использует policy table
-`10000+n`. Чужие rule и table он отклоняет. При остановке прежнее значение
-forwarding не восстанавливается. Он рассчитан на отсутствие заранее заданных host routes до
-`nl.example.com` и `de.example.com`. Если такие маршруты уже есть, сначала сохраните их и
-добавьте восстановление в свой `down-command`.
-
-## 6. Запустите и проверьте
-
-Сначала запустите в foreground:
+### 1. Установите SVPN на клиент
 
 ```bash
-sudo -E svpn multi --config /etc/svpn/vpn.toml
+VERSION=0.9.6
+curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
+tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
+sudo install -m 755 svpn /usr/local/bin/svpn
+svpn --version
 ```
 
-Дождитесь готовности двух удалённых серверов и `local-exit: ready`. Проверка
-должна отвечать на четыре вопроса:
+Для aarch64 возьмите архив `linux-aarch64-gnu`. В архиве, кроме бинарника, лежат
+`scripts/server-up` и `scripts/server-down` — hooks для сервера.
 
-1. **Есть ли связь?** Проверьте отвечающий IPv4-адрес через `ping` или `curl`.
-2. **Работает ли local-exit?** Выберите отвечающий адрес из диапазона `RU` или
-   `BY` в `/etc/svpn/country.csv`. В статистике должен расти `local: opened`.
-3. **Работает ли VPN?** Адрес `NL` или `DE` должен открыть поток на одном из
-   VPS. Адрес другой страны также использует один из двух VPS.
-4. **Сохраняется ли владелец?** Повторные потоки к адресам одной сети должны
-   использовать тот же сервер. При отключении владельца новые потоки
-   перейдут на резервный сервер. Восстановление старого сервера не вызывает
-   snap-back.
-
-Один `ping 1.1.1.1` не проверяет Geo и sticky ASN. Используйте адреса,
-которые действительно есть в установленной Country DB и отвечают на выбранный
-протокол.
-
-После проверки остановите foreground-команду через `Ctrl-C` и включите сервис:
+### 2. Проверьте SSH до VPS
 
 ```bash
-sudo install -d -m 700 /etc/systemd/system
-sudo tee /etc/systemd/system/svpn.service >/dev/null <<'EOF'
-[Unit]
-Description=SVPN
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/svpn multi --config /etc/svpn/vpn.toml
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now svpn
-systemctl status svpn
-journalctl -u svpn -f
+ssh -i /полный/путь/к/ключу root@203.0.113.10
 ```
 
-## 7. Если нужна только часть функций
+Если ключ защищён passphrase, загрузите его в `ssh-agent` заранее. Вместо root
+можно использовать обычного пользователя с безпарольным `sudo -n`.
 
-Только VPN между клиентом и сервером:
+### 3. Создайте конфиг
 
 ```bash
-sudo svpn root@nl.example.com
+sudo install -d -m 700 /etc/svpn
+sudoedit /etc/svpn/vpn.toml
 ```
-
-Только sticky ASN без local-exit:
 
 ```toml
-exit-policy = "sticky-asn"
-geo-db = "/etc/svpn/asn.csv"
+# Адрес вашего VPS и SSH-ключ.
+server = "203.0.113.10"
+ssh-user = "root"
+ssh-identity = "/полный/путь/к/ключу"
+tcp-port = 41020   # TCP-fallback, если UDP заблокирован
+
+# Хуки на VPS: их установит svpn setup. Настраивают NAT и выход в Интернет.
+server-up = "/usr/local/lib/svpn/server-up"
+server-down = "/usr/local/lib/svpn/server-down"
+
+# Маршруты на клиенте: весь IPv4 идёт в туннель, дорога до VPS — напрямую.
+up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gw=$(ip -4 route show default | awk 'NR==1{print $3}'); ip route replace 203.0.113.10/32 via \"$gw\" dev \"$wan\"; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
+down-command = "ip route del 203.0.113.10/32 2>/dev/null || true; ip route del 0.0.0.0/1 2>/dev/null || true; ip route del 128.0.0.0/1 2>/dev/null || true"
 ```
 
-Только выбор по стране без local-exit:
+Замените адрес VPS и путь к ключу. Тот же адрес уже стоит в `up-command` и
+`down-command` — если меняете его, поменяйте и там.
 
-```toml
-country-db = "/etc/svpn/country.csv"
-
-[[servers]]
-address = "nl.example.com"
-countries = ["NL"]
-
-[[servers]]
-address = "de.example.com"
-countries = ["DE"]
-```
-
-`local-exits` и `countries` требуют `country-db`. `sticky-asn` требует `multi`
-и `geo-db`. Не добавляйте в конфиг поля, которые не нужны вашему сценарию.
-
-## 8. Обновление баз
-
-SVPN загружает CSV при запуске и не перечитывает его на лету. Обновите файлы,
-затем перезапустите сервис:
-
-```bash
-sudo systemctl restart svpn
-```
-
-Для ASN доступен `scripts/update-asn-db.sh`. Он скачивает новую базу,
-проверяет её и сохраняет предыдущую как `asn.csv.prev`. Скрипт находится в
-исходном дереве, а не в бинарном архиве.
-
-## 9. Коротко о настройках
-
-### Транспорт
-
-По умолчанию используется SSH camouflage и UDP. Если UDP заблокирован,
-задайте `mimic = ["ssh"]` и `tcp-port = 41020`. Диапазон UDP-портов задаётся
-строкой `udp-port-range = "60000-60009"`.
-
-### Hooks
-
-`up-command` и `down-command` выполняются на клиенте. `server-up` и
-`server-down` выполняются на VPS и у local-exit. Для клиентских команд можно
-использовать `up-script` и `down-script`. Команды получают `SVPN_EVENT`,
-`SVPN_TUN_NAME`, `SVPN_TUN_ADDR`, `SVPN_PEER_ADDR` и `SVPN_SESSION_ID`.
-Timeout — 10 секунд.
-
-### Проверка состояния
-
-В foreground смотрите строки `serving` и `local-exit: ready`. Для systemd
-используйте `journalctl -u svpn -f`. Повторные запуски одинаковых
-конфигураций занимают пары адресов из пула `10.77.0.0/16`. При конфликте
-проверьте занятые адреса через `ip addr`.
-
-### Владельцы ASN
-
-`exit-state` хранит выбранных владельцев. По умолчанию используется путь рядом
-с `geo-db` с суффиксом `.state.json`. Состояние сохраняется между
-перезапусками. Snap-back не выполняется.
-
-### Ограничения
-
-- Туннелируется только IPv4. IPv6 не защищается этим конфигом.
-- DNS не меняется автоматически. Выберите DNS отдельно.
-- Country и ASN базы не классифицируют домены. Решение принимается по IP
-  назначения после разрешения имени.
-- Полный Linux-пример использует TUN, root, `iproute2` и `nftables`.
-- При `SIGKILL` клиентские hooks не выполняются. TUN и сокеты закрывает ядро.
-  Следующий запуск должен восстановить свои маршруты и правила. Не используйте
-  hooks для чужих необратимых изменений.
-
-## 10. Подготовка VPS одной командой: `svpn setup`
+### 4. Подготовьте VPS
 
 ```bash
 sudo svpn setup --config /etc/svpn/vpn.toml
 ```
 
-Команда подготавливает каждый VPS из существующего конфига: определяет
-окружение, ставит недостающие проверенные пакеты (`curl`, `tar`, `gzip`,
-`awk`, `ip`, `nft`, `sysctl`, CA-сертификаты), скачивает релиз SVPN с
-GitHub прямо на VPS и устанавливает `server-up`/`server-down`, встроенные
-в бинарник клиента. Конфиг не изменяется.
+Команда скачает релиз SVPN прямо на VPS, установит бинарник и hooks и проверит
+установку. Конфиг она не меняет. Поддерживаются Debian 12 и Rocky 10 на x86_64
+и aarch64.
 
-Поддерживаемые окружения: Debian 12 и Rocky 10 (GNU libc) на x86_64 и
-aarch64 с аппаратным AES. Вход по SSH — `root` или обычный пользователь с
-безпарольным `sudo -n`; пароли и интерактивный sudo не поддерживаются.
-OpenWrt, Alpine и musl команда не обслуживает.
+### 5. Запустите
 
-Повторные запуски и версии:
+```bash
+sudo -E svpn --config /etc/svpn/vpn.toml
+```
 
-- Перезаписываются только управляемые файлы: `/usr/local/bin/svpn`,
-  `/usr/local/lib/svpn/server-up`, `/usr/local/lib/svpn/server-down`.
-  Замена каждого файла атомарна, набор в целом — нет; отчёт честно
-  показывает `partial`.
-- Предпочитается версия клиента. Если её релиз или архив под платформу
-  недоступны, выбирается последний стабильный релиз с совместимыми
-  control/hook метаданными, и причина сообщается. Ошибка контрольной
-  суммы — это ошибка, а не переход на другой релиз.
-- Выбранная более старая версия может заменить установленную новую — это
-  сообщается явно полем `downgrade=`.
+Остановить — `Ctrl-C`. Для автозапуска через systemd см. [ADVANCED.md](ADVANCED.md).
 
-После установки проверяются хеши, права и версия бинарника. Setup не
-запускает SVPN и не выполняет хуки: команда не активирует маршруты, NAT,
-DNS и firewall, не создаёт сервисы и не трогает `local-exit`. Пути хуков
-должны уже быть в клиентском конфиге — setup их не добавляет.
+### 6. Проверьте
 
-Хосты обрабатываются по порядку конфига; сбой одного не останавливает
-остальные. Каждому хосту печатается строка
-`SETUP host=… status=success|failed|partial|unknown|not-attempted` с
-выбранной версией, полем `downgrade=` и списком `changed=`. Итоговый код
-отличен от нуля при любом сбое. Прерывание (Ctrl+C, SIGTERM) останавливает
-новые хосты: активный получает `unknown`, оставшиеся — `not-attempted`.
+```bash
+curl -4 https://ifconfig.me   # должен показать IP вашего VPS
+ping -c1 1.1.1.1
+```
 
-## Дополнительно
+Если `ifconfig.me` показывает IP VPS, трафик идёт через туннель.
 
-- `svpn --help` — краткая справка по всем командам.
-- [CHANGELOG](CHANGELOG.md) — история версий.
-- [Протокол](docs/PROTOCOL.md) — техническое описание transport.
-- [English README](README.en.md).
+## Что дальше
+
+Всё, что сложнее одного сервера, описано в [ADVANCED.md](ADVANCED.md):
+
+- несколько VPS и распределение по весам;
+- выбор по странам и `local-exit` для RU/BY;
+- `sticky-asn` — стабильный внешний IP на ASN;
+- базы Country и ASN, их обновление;
+- hooks и переменные окружения;
+- транспорт: mimic, TCP fallback, диапазон UDP-портов;
+- systemd и проверка состояния;
+- детали `svpn setup`: окружения, fallback, downgrade, статусы.
 
 ## Сборка
 
@@ -455,3 +146,10 @@ python3 e2e/test_artifacts.py
 python3 e2e/test_groups.py
 python3 e2e/test_package.py
 ```
+
+## Дополнительно
+
+- [ADVANCED.md](ADVANCED.md) — расширенные настройки.
+- [CHANGELOG](CHANGELOG.md) — история версий.
+- [English README](README.en.md).
+- `svpn --help` — справка по командам.
