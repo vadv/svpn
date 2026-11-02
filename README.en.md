@@ -210,6 +210,7 @@ Weights affect owner selection, not every individual packet.
 | Any other country or an address outside Country DB | Both example servers, using ASN affinity and weights |
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
     tun --> brain("🧠 Path selection<br/>country · ASN<br/>local-exit")

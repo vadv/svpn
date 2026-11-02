@@ -212,6 +212,7 @@ countries = ["NL", "DE"]
 | Другая страна или адрес вне Country DB | Оба сервера из примера, с учётом ASN и весов |
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
     tun --> brain("🧠 Выбор пути<br/>country · ASN<br/>local-exit")
