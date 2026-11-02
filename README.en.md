@@ -212,13 +212,13 @@ Weights affect owner selection, not every individual packet.
 ```mermaid
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
-    tun --> brain("🧠 Path selection<br/>country.csv · ASN<br/>local-exit")
-    brain -->|"RU / BY"| local["🏠 Local exit on the client<br/>NAT → ISP WAN"]
-    brain -->|"NL / DE / others"| asn["🎯 sticky-ASN<br/>destination ASN is pinned<br/>to one VPS"]
+    tun --> brain("🧠 Path selection<br/>country · ASN<br/>local-exit")
+    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
+    brain -->|"NL / DE / others"| asn["🎯 sticky-ASN<br/>ASN → one VPS"]
     asn --> enc["🔒 Encryption<br/>UDP 60000–60009<br/>or TCP 41020"]
-    enc --> vps["🖥️ VPS A or VPS B<br/>decrypt → TUN → masquerade"]
-    local --> home["🌍 Internet<br/>the site sees the home IP"]
-    vps --> via["🌍 Internet<br/>the site sees this VPS IP"]
+    enc --> vps["🖥️ VPS A or B<br/>decrypt → TUN<br/>masquerade"]
+    local --> home["🌍 Internet<br/>home IP is visible"]
+    vps --> via["🌍 Internet<br/>VPS IP is visible"]
     classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
     classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037

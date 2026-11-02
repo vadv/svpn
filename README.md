@@ -214,13 +214,13 @@ countries = ["NL", "DE"]
 ```mermaid
 flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
-    tun --> brain("🧠 Выбор пути<br/>country.csv · ASN<br/>local-exit")
-    brain -->|"RU / BY"| local["🏠 Local exit на клиенте<br/>NAT → WAN провайдера"]
-    brain -->|"NL / DE / остальные"| asn["🎯 sticky-ASN<br/>ASN назначения закреплён<br/>за одним VPS"]
+    tun --> brain("🧠 Выбор пути<br/>country · ASN<br/>local-exit")
+    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
+    brain -->|"NL / DE / остальные"| asn["🎯 sticky-ASN<br/>ASN → один VPS"]
     asn --> enc["🔒 Шифрование<br/>UDP 60000–60009<br/>или TCP 41020"]
-    enc --> vps["🖥️ VPS A или VPS B<br/>decrypt → TUN → masquerade"]
-    local --> home["🌍 Интернет<br/>сайт видит домашний IP"]
-    vps --> via["🌍 Интернет<br/>сайт видит IP этого VPS"]
+    enc --> vps["🖥️ VPS A или B<br/>decrypt → TUN<br/>masquerade"]
+    local --> home["🌍 Интернет<br/>виден домашний IP"]
+    vps --> via["🌍 Интернет<br/>виден IP VPS"]
     classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
     classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
