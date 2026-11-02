@@ -16,6 +16,65 @@ IPv4-туннель через SSH.
 > Не копируйте hooks на macOS. Для macOS нужны отдельные команды маршрутизации,
 > forwarding и NAT.
 
+## Как это работает
+
+### Путь пакета
+
+```mermaid
+flowchart TD
+    app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
+    tun --> brain("🧠 Выбор пути<br/>country.csv · ASN<br/>local-exit")
+    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN → Интернет"]
+    brain -->|"NL / DE / остальные"| enc["🔒 Шифрование<br/>пакет SVPN"]
+    enc --> udp["UDP 60000–60009<br/>или TCP 41020<br/>camouflage"]
+    udp --> vps["🖥️ VPS<br/>decrypt → TUN 10.77.0.1<br/>server-up: masquerade"]
+    local --> net["🌍 Интернет"]
+    vps --> net
+    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+    classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
+    classDef edge fill:#fff8e1,stroke:#ffb300,color:#5d4037
+    class brain brain
+    class local local
+    class enc,udp,vps vpn
+    class net edge
+```
+
+Клиент выбирает путь до шифрования. Адреса RU/BY идут через local-exit, остальные —
+через выбранный VPS. Снаружи виден либо домашний IP, либо IP сервера; ответ идёт
+тем же путём навстречу.
+
+### Установка и запуск
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as 🧑‍💻 Клиент
+    participant V as 🖥️ VPS
+    participant G as 🐙 GitHub
+
+    A->>G: скачать релизный архив
+    G-->>A: svpn + scripts/server-up|down
+    Note over A: country.csv, asn.csv<br/>SSH-ключ, /etc/svpn/vpn.toml
+    A->>V: SSH · svpn setup --config vpn.toml
+    rect rgba(46, 160, 67, 0.12)
+        V->>V: preflight без изменений<br/>Debian 12 / Rocky 10 · AES · root или sudo -n
+        V->>G: скачать релиз на VPS · sha256
+        V->>V: пакеты → атомарная установка → verify
+    end
+    V-->>A: ✅ status=success version=0.9.6
+    A->>V: SSH · svpn multi --config
+    rect rgba(31, 111, 235, 0.12)
+        V->>V: exec svpn serve<br/>server-up: policy table + masquerade
+    end
+    V-->>A: control JSONL · UDP-ключи · TUN ready
+    Note over A,V: 💡 пакеты идут напрямую UDP/TCP — не через SSH<br/>сервер живёт одну сессию: демона и systemd нет
+```
+
+На VPS нет демона: клиент запускает `svpn serve` по SSH на время сессии, получает
+ключи по control-каналу и поднимает туннель. Данные идут напрямую по UDP/TCP,
+не внутри SSH.
+
 ## 1. Подготовьте машины
 
 | Машина | Что нужно |
