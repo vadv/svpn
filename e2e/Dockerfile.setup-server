@@ -1,0 +1,7 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server iproute2 python3 iptables nftables procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+COPY e2e/server.py /e2e/server.py
+CMD ["python3", "-u", "/e2e/server.py"]

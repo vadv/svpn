@@ -6,6 +6,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
+COPY scripts ./scripts
 RUN --mount=type=cache,id=svpn-x86-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=svpn-x86-target,target=/src/target \
     cargo build --locked --release \

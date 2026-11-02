@@ -36,7 +36,8 @@ to copy one platform-specific binary to every machine.
 Open [releases](https://github.com/vadv/svpn/releases) and download one
 matching archive per machine:
 
-- `svpn-<version>-linux-x86_64-gnu.tar.gz` for Linux x86_64;
+- `svpn-<version>-linux-x86_64-gnu.tar.gz` for GNU Linux x86_64;
+- `svpn-<version>-linux-aarch64-gnu.tar.gz` for GNU Linux aarch64;
 - `svpn-<version>-macos-arm64.tar.gz` for macOS Apple Silicon;
 - `svpn-<version>-openwrt-aarch64.tar.gz` for OpenWrt aarch64.
 
@@ -53,6 +54,11 @@ svpn --version
 
 Extract one selected archive at a time. Install the `svpn` file from that
 archive rather than mixing files from different builds.
+
+Besides the binary, every archive carries `scripts/server-up` and
+`scripts/server-down` — the same hooks `svpn setup` deploys. For a manual
+install without `svpn setup` (for example on OpenWrt) take them from the
+archive.
 
 ## 3. Download country and ASN databases
 
@@ -343,6 +349,51 @@ not performed.
 - Client hooks do not run after `SIGKILL`. The kernel closes TUN and sockets.
   The next start must restore its routes and rules. Do not use hooks for
   irreversible changes to resources you do not own.
+
+## 10. Provision the VPSs with one command: `svpn setup`
+
+```bash
+sudo svpn setup --config /etc/svpn/vpn.toml
+```
+
+The command prepares every VPS from the existing configuration: it
+detects the environment, installs the missing approved packages (`curl`,
+`tar`, `gzip`, `awk`, `ip`, `nft`, `sysctl`, CA certificates), downloads
+the SVPN release from GitHub on the VPS itself and installs the
+`server-up`/`server-down` hooks embedded in the client binary. The
+configuration file is never modified.
+
+Supported environments: Debian 12 and Rocky 10 (GNU libc) on x86_64 and
+aarch64 with hardware AES. SSH access as `root` or as a regular user with
+passwordless `sudo -n`; passwords and interactive sudo are not supported.
+OpenWrt, Alpine and musl are not covered.
+
+Repeat runs and versions:
+
+- Only the managed files are overwritten: `/usr/local/bin/svpn`,
+  `/usr/local/lib/svpn/server-up`, `/usr/local/lib/svpn/server-down`.
+  Each replacement is atomic; the set as a whole is not, and the report
+  shows `partial` honestly.
+- The client's exact version is preferred. If its release or platform
+  archive is unavailable, the latest stable release with compatible
+  control/hook metadata is selected and the reason is reported. A
+  checksum failure is an error, never a switch to another release.
+- A selected older version may replace a newer installation; setup
+  reports this explicitly in a `downgrade=` field.
+
+After installation the hashes, modes and the binary version are verified.
+Setup never starts SVPN and never executes the hooks: it activates no
+routes, NAT, DNS or firewall, creates no services and does not touch
+local-exit. The hook paths must already be present in the client
+configuration — setup does not add them.
+
+Hosts are processed in configuration order; one failing host does not
+stop the others. Every host prints a
+`SETUP host=… status=success|failed|partial|unknown|not-attempted` line
+with the selected version, a `downgrade=` field and the `changed=` list.
+The aggregate exit code is nonzero after any failure. Interruption
+(Ctrl+C, SIGTERM) stops new hosts: the active host is reported `unknown`,
+the remaining ones `not-attempted`.
 
 ## More information
 

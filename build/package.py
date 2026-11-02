@@ -16,9 +16,15 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 NOTICES = ROOT / "THIRD-PARTY-NOTICES"
 TARGETS = {
     "linux-x86_64-gnu": ("x86_64-unknown-linux-gnu", "glibc, dynamically linked"),
+    "linux-aarch64-gnu": ("aarch64-unknown-linux-gnu", "glibc, dynamically linked"),
     "openwrt-aarch64": ("aarch64-unknown-linux-musl", "musl, statically linked"),
     "macos-arm64": ("aarch64-apple-darwin", "libSystem"),
 }
+# Shipped hook scripts: the same bytes svpn setup embeds, for manual installs (e.g. OpenWrt).
+HOOKS = (
+    "scripts/server-up",
+    "scripts/server-down",
+)
 
 
 def command(*args):
@@ -42,6 +48,10 @@ def pack(binary, target, output):
     if target == "linux-x86_64-gnu":
         valid = all(
             text in description for text in ("ELF 64-bit LSB", "x86-64", "/lib64/ld-linux-x86-64.so.2")
+        )
+    elif target == "linux-aarch64-gnu":
+        valid = all(
+            text in description for text in ("ELF 64-bit LSB", "ARM aarch64", "/lib/ld-linux-aarch64.so.1")
         )
     elif target == "openwrt-aarch64":
         valid = (
@@ -71,6 +81,8 @@ def pack(binary, target, output):
         "rust_target": TARGETS[target][0],
         "libc": TARGETS[target][1],
         "cpu_requirement": "hardware AES",
+        "control_version": 3,
+        "server_hooks": 1,
         "binary_sha256": digest(binary),
         "license": package.get("license"),
         "ci_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -111,6 +123,13 @@ def pack(binary, target, output):
                         member = tarfile.TarInfo(filename)
                         member.size = len(content)
                         member.mode = 0o644
+                        member.mtime = epoch
+                        tar.addfile(member, io.BytesIO(content))
+                    for filename in HOOKS:
+                        content = (ROOT / filename).read_bytes()
+                        member = tarfile.TarInfo(filename)
+                        member.size = len(content)
+                        member.mode = 0o755
                         member.mtime = epoch
                         tar.addfile(member, io.BytesIO(content))
         after = binary.stat()

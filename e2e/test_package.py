@@ -19,6 +19,9 @@ import release
 
 DESCRIPTIONS = {
     "linux-x86_64-gnu": "ELF 64-bit LSB pie executable, x86-64, interpreter /lib64/ld-linux-x86-64.so.2",
+    "linux-aarch64-gnu": (
+        "ELF 64-bit LSB pie executable, ARM aarch64, interpreter /lib/ld-linux-aarch64.so.1"
+    ),
     "openwrt-aarch64": "ELF 64-bit LSB executable, ARM aarch64, statically linked",
     "macos-arm64": "Mach-O 64-bit executable arm64",
 }
@@ -145,7 +148,7 @@ def check_release(root):
         for path in (root / target).iterdir():
             shutil.copyfile(path, directory / path.name)
     args = (directory, "v0.3.0", "a" * 40, "12345", "0.3.0")
-    assert len(release.validate(*args)) == 6
+    assert len(release.validate(*args)) == 8
 
     def rejected(arguments=args):
         try:
@@ -198,6 +201,7 @@ def check_release(root):
         "empty-notices",
         "wrong-notices",
         "wrong-license",
+        "changed-hook",
         "changed-binary",
     ):
         with tarfile.open(archive, "w:gz") as tar:
@@ -207,6 +211,8 @@ def check_release(root):
                 content = original_content
                 if member.name == "svpn" and defect == "bad-mode":
                     member.mode = 0o4755
+                if member.name == "scripts/server-up" and defect == "changed-hook":
+                    content += b"changed"
                 if member.name == "svpn" and defect == "changed-binary":
                     content += b"changed"
                 if member.name == "LICENSE" and defect == "wrong-license":
@@ -223,7 +229,7 @@ def check_release(root):
         rejected()
     archive.write_bytes(original)
     checksum.write_bytes(original_checksum)
-    assert len(release.validate(*args)) == 6
+    assert len(release.validate(*args)) == 8
     print("PASS release gate: exact asset set, tag/version, clean commit/run provenance, license and hashes")
 
 
@@ -275,12 +281,21 @@ def check():
                     hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n"
                 )
                 with tarfile.open(archive) as tar:
-                    assert tar.getnames() == ["svpn", "build-info.json", "LICENSE", "THIRD-PARTY-NOTICES"]
+                    assert tar.getnames() == [
+                        "svpn",
+                        "build-info.json",
+                        "LICENSE",
+                        "THIRD-PARTY-NOTICES",
+                        *package.HOOKS,
+                    ]
                     assert tar.extractfile("LICENSE").read() == (package.ROOT / "LICENSE").read_bytes()
                     assert tar.extractfile("THIRD-PARTY-NOTICES").read() == notices.read_bytes()
+                    for hook in package.HOOKS:
+                        assert tar.extractfile(hook).read() == (package.ROOT / hook).read_bytes()
                     assert all(member.isfile() and member.uid == member.gid == 0 for member in tar)
                     assert tar.getmember("svpn").mode == 0o755, "do not retain setuid bits"
                     assert tar.getmember("build-info.json").mode == 0o644
+                    assert all(tar.getmember(hook).mode == 0o755 for hook in package.HOOKS)
                     assert all(member.mtime == 1600000000 for member in tar)
                     assert tar.extractfile("svpn").read() == payload
                     info = json.load(tar.extractfile("build-info.json"))
@@ -290,6 +305,7 @@ def check():
                 assert archive.name == f"svpn-0.3.0-{target}.tar.gz"
                 assert info["platform"] == target and info["rust_target"] == package.TARGETS[target][0]
                 assert info["cpu_requirement"] == "hardware AES"
+                assert info["control_version"] == 3 and info["server_hooks"] == 1
                 before = archive.read_bytes()
                 try:
                     package.pack(binary, target, archive.parent)
@@ -304,12 +320,13 @@ def check():
             )
             package.pack(binary, "openwrt-aarch64", root / "static-pie")
             print(
-                "PASS archive contents, three target labels, checksums, deterministic bytes, "
+                "PASS archive contents, four target labels, checksums, deterministic bytes, "
                 "safe modes and no overwrite"
             )
 
             for target, description in [
                 ("linux-x86_64-gnu", DESCRIPTIONS["macos-arm64"]),
+                ("linux-aarch64-gnu", "ELF 64-bit LSB executable, ARM aarch64, statically linked"),
                 ("openwrt-aarch64", "ELF 64-bit LSB executable, ARM aarch64, dynamically linked"),
             ]:
                 replies[("file", "--brief", str(binary.resolve()))] = description

@@ -1,0 +1,337 @@
+#!/bin/sh
+# Provision the fixed SVPN server artifacts. Never starts SVPN or its hooks.
+set -eu
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+
+svpn_setup_preflight() {
+    [ "$(uname -s)" = Linux ] || {
+        echo "svpn setup: only GNU Linux is supported" >&2
+        return 1
+    }
+    [ -r /etc/os-release ] || {
+        echo "svpn setup: /etc/os-release is missing" >&2
+        return 1
+    }
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "$ID:$VERSION_ID" in
+        debian:12|debian:12.*|rocky:10|rocky:10.*) ;;
+        *)
+            echo "svpn setup: unsupported OS: $PRETTY_NAME" >&2
+            return 1
+            ;;
+    esac
+    case "$(uname -m)" in
+        x86_64)
+            SVPN_ARCH=x86_64
+            [ -e /lib64/ld-linux-x86-64.so.2 ] || {
+                echo "svpn setup: GNU x86_64 loader is missing" >&2
+                return 1
+            }
+            grep -Eqm1 '^flags.*[[:space:]]aes([[:space:]]|$)' /proc/cpuinfo || {
+                echo "svpn setup: x86_64 CPU AES support is required" >&2
+                return 1
+            }
+            ;;
+        aarch64)
+            SVPN_ARCH=aarch64
+            [ -e /lib/ld-linux-aarch64.so.1 ] || {
+                echo "svpn setup: GNU aarch64 loader is missing" >&2
+                return 1
+            }
+            grep -Eqm1 '^Features.*[[:space:]]aes([[:space:]]|$)' /proc/cpuinfo || {
+                echo "svpn setup: aarch64 CPU AES support is required" >&2
+                return 1
+            }
+            ;;
+        *)
+            echo "svpn setup: unsupported architecture: $(uname -m)" >&2
+            return 1
+            ;;
+    esac
+    getconf GNU_LIBC_VERSION >/dev/null 2>&1 || {
+        echo "svpn setup: GNU libc is required (musl is unsupported)" >&2
+        return 1
+    }
+    if [ "$(id -u)" -ne 0 ]; then
+        sudo -n true || {
+            echo "svpn setup: root or passwordless sudo -n is required" >&2
+            return 1
+        }
+    fi
+    for path in /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/svpn; do
+        [ ! -e "$path" ] || [ -d "$path" ] || {
+            echo "svpn setup: managed parent must be a directory: $path" >&2
+            return 1
+        }
+        [ ! -L "$path" ] || {
+            echo "svpn setup: managed path must not be a symlink: $path" >&2
+            return 1
+        }
+    done
+    for path in /usr/local/bin/svpn /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down; do
+        [ ! -e "$path" ] || [ -f "$path" ] || {
+            echo "svpn setup: managed destination must be a regular file: $path" >&2
+            return 1
+        }
+        [ ! -L "$path" ] || {
+            echo "svpn setup: managed path must not be a symlink: $path" >&2
+            return 1
+        }
+    done
+    printf 'SVPN_SETUP_OS=%s\nSVPN_SETUP_ARCH=%s\n' "$ID:$VERSION_ID" "$SVPN_ARCH"
+}
+
+svpn_setup_packages() {
+    packages=
+    for tool in curl tar gzip sha256sum awk grep ip nft sysctl; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            case "$ID:$tool" in
+                debian:curl) packages="$packages curl" ;;
+                debian:tar) packages="$packages tar" ;;
+                debian:gzip) packages="$packages gzip" ;;
+                debian:sha256sum) packages="$packages coreutils" ;;
+                debian:awk) packages="$packages gawk" ;;
+                debian:grep) packages="$packages grep" ;;
+                debian:ip) packages="$packages iproute2" ;;
+                debian:nft) packages="$packages nftables" ;;
+                debian:sysctl) packages="$packages procps" ;;
+                rocky:curl) packages="$packages curl" ;;
+                rocky:tar) packages="$packages tar" ;;
+                rocky:gzip) packages="$packages gzip" ;;
+                rocky:sha256sum) packages="$packages coreutils-single" ;;
+                rocky:awk) packages="$packages gawk" ;;
+                rocky:grep) packages="$packages grep" ;;
+                rocky:ip) packages="$packages iproute" ;;
+                rocky:nft) packages="$packages nftables" ;;
+                rocky:sysctl) packages="$packages procps-ng" ;;
+            esac
+        fi
+    done
+    case "$ID" in
+        debian) [ -r /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-certificates" ;;
+        rocky) [ -r /etc/pki/tls/certs/ca-bundle.crt ] || packages="$packages ca-certificates" ;;
+    esac
+    if [ -n "$packages" ]; then
+        case "$ID" in
+            debian)
+                export DEBIAN_FRONTEND=noninteractive
+                as_root apt-get update
+                # packages contains only fixed names selected above.
+                # shellcheck disable=SC2086
+                as_root apt-get install -y --no-install-recommends $packages
+                ;;
+            rocky)
+                # shellcheck disable=SC2086
+                as_root dnf install -y $packages
+                ;;
+        esac
+    fi
+    for tool in curl tar gzip sha256sum awk grep ip nft sysctl; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            echo "svpn setup: required tool is still missing: $tool" >&2
+            return 1
+        }
+    done
+}
+
+svpn_setup_download_pair() {
+    rm -f "$SVPN_STAGE/$SVPN_ASSET" "$SVPN_STAGE/$SVPN_ASSET.sha256"
+    curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 180 --max-filesize 83886080 \
+        "https://github.com/vadv/svpn/releases/download/$SVPN_TAG/$SVPN_ASSET" \
+        -o "$SVPN_STAGE/$SVPN_ASSET" || return 1
+    curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 --max-filesize 4096 \
+        "https://github.com/vadv/svpn/releases/download/$SVPN_TAG/$SVPN_ASSET.sha256" \
+        -o "$SVPN_STAGE/$SVPN_ASSET.sha256" || return 1
+}
+
+svpn_setup_release() {
+    SVPN_TAG="v$SVPN_CLIENT_VERSION"
+    SVPN_ASSET="svpn-$SVPN_CLIENT_VERSION-linux-$SVPN_ARCH-gnu.tar.gz"
+    SVPN_FALLBACK=0
+    if ! svpn_setup_download_pair; then
+        echo "svpn setup: exact release v$SVPN_CLIENT_VERSION or its $SVPN_ARCH asset is unavailable; using latest stable" >&2
+        curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+            https://api.github.com/repos/vadv/svpn/releases/latest \
+            -o "$SVPN_STAGE/release.json"
+        SVPN_TAG=$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\(v[0-9][0-9A-Za-z._-]*\)".*/\1/p' \
+            "$SVPN_STAGE/release.json" | head -n 1)
+        case "$SVPN_TAG" in
+            v[0-9]*) ;;
+            *)
+                echo "svpn setup: cannot select latest stable release" >&2
+                return 1
+                ;;
+        esac
+        SVPN_CLIENT_VERSION=${SVPN_TAG#v}
+        SVPN_ASSET="svpn-$SVPN_CLIENT_VERSION-linux-$SVPN_ARCH-gnu.tar.gz"
+        SVPN_FALLBACK=1
+        svpn_setup_download_pair
+    fi
+    [ "$(wc -c < "$SVPN_STAGE/$SVPN_ASSET")" -le 83886080 ] || {
+        echo "svpn setup: release archive exceeds 80 MiB" >&2
+        return 1
+    }
+    checksum=$(cat "$SVPN_STAGE/$SVPN_ASSET.sha256")
+    expected=${checksum%% *}
+    case "$expected" in
+        *[!0-9a-f]*|'') ;;
+        *) [ "${#expected}" -eq 64 ] || expected=invalid ;;
+    esac
+    actual=$(sha256sum "$SVPN_STAGE/$SVPN_ASSET" | awk '{print $1}')
+    [ "$expected" = "$actual" ] && [ "$checksum" = "$expected  $SVPN_ASSET" ] || {
+        echo "svpn setup: release checksum or filename mismatch" >&2
+        return 1
+    }
+    members=$(tar -tzf "$SVPN_STAGE/$SVPN_ASSET")
+    # Current releases ship the hook scripts; releases up to 0.9.6 did not.
+    # Both layouts are safe: setup always deploys the embedded hooks, never
+    # the archive copies.
+    legacy_members='svpn
+build-info.json
+LICENSE
+THIRD-PARTY-NOTICES'
+    expected_members="$legacy_members
+scripts/server-up
+scripts/server-down"
+    [ "$members" = "$expected_members" ] || [ "$members" = "$legacy_members" ] || {
+        echo "svpn setup: unexpected release archive members" >&2
+        return 1
+    }
+    mkdir "$SVPN_STAGE/extract"
+    tar -xzf "$SVPN_STAGE/$SVPN_ASSET" -C "$SVPN_STAGE/extract" \
+        --no-same-owner --no-same-permissions
+    for member in $members; do
+        [ -f "$SVPN_STAGE/extract/$member" ] && [ ! -L "$SVPN_STAGE/extract/$member" ] || {
+            echo "svpn setup: release member is not a regular file: $member" >&2
+            return 1
+        }
+    done
+    grep -q "\"version\": \"$SVPN_CLIENT_VERSION\"" "$SVPN_STAGE/extract/build-info.json" || {
+        echo "svpn setup: release metadata version mismatch" >&2
+        return 1
+    }
+    grep -q "\"platform\": \"linux-$SVPN_ARCH-gnu\"" "$SVPN_STAGE/extract/build-info.json" || {
+        echo "svpn setup: release metadata platform mismatch" >&2
+        return 1
+    }
+    if [ "$SVPN_FALLBACK" -eq 1 ]; then
+        grep -q '"control_version": 3' "$SVPN_STAGE/extract/build-info.json" &&
+            grep -q '"server_hooks": 1' "$SVPN_STAGE/extract/build-info.json" || {
+            echo "svpn setup: fallback release lacks compatible control/hook metadata" >&2
+            return 1
+        }
+    fi
+    printf 'SVPN_SETUP_SELECTED=%s\n' "$SVPN_CLIENT_VERSION"
+}
+
+svpn_setup_downgrade() {
+    # Report only: the client's preferred release may intentionally be older.
+    [ -x /usr/local/bin/svpn ] || return 0
+    installed=$(/usr/local/bin/svpn --version 2>/dev/null | awk '{print $NF}') || return 0
+    case "$installed" in
+        ''|*[!0-9.]*) return 0 ;;
+    esac
+    [ "$installed" != "$SVPN_CLIENT_VERSION" ] || return 0
+    lesser=$(printf '%s\n%s\n' "$installed" "$SVPN_CLIENT_VERSION" | sort -V | sed -n '1p')
+    [ "$lesser" = "$SVPN_CLIENT_VERSION" ] || return 0
+    printf 'SVPN_SETUP_DOWNGRADE=%s->%s\n' "$installed" "$SVPN_CLIENT_VERSION"
+}
+
+svpn_setup_payload() {
+    umask 077
+    SVPN_STAGE=$(mktemp -d /tmp/svpn-setup.XXXXXX)
+    trap 'rm -rf "$SVPN_STAGE"; as_root rm -f /usr/local/bin/.svpn.setup.$$ /usr/local/lib/svpn/.server-up.setup.$$ /usr/local/lib/svpn/.server-down.setup.$$' EXIT
+    # An abrupt disconnect (SIGHUP) must not skip the staged-file cleanup.
+    trap 'exit 129' HUP INT
+    trap 'exit 143' TERM
+    for hook in server-up server-down; do
+        read -r name expected bytes
+        [ "$name" = "$hook" ] || {
+            echo "svpn setup: invalid embedded payload" >&2
+            return 1
+        }
+        case "$bytes" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$bytes" -le 65536 ] || {
+            echo "svpn setup: embedded hook exceeds 64 KiB" >&2
+            return 1
+        }
+        dd bs=1 count="$bytes" of="$SVPN_STAGE/$hook" 2>/dev/null
+        [ "$(wc -c < "$SVPN_STAGE/$hook")" -eq "$bytes" ] || {
+            echo "svpn setup: truncated embedded hook" >&2
+            return 1
+        }
+        actual=$(sha256sum "$SVPN_STAGE/$hook" | awk '{print $1}')
+        [ "$actual" = "$expected" ] || {
+            echo "svpn setup: embedded hook checksum mismatch" >&2
+            return 1
+        }
+        /bin/sh -n "$SVPN_STAGE/$hook"
+    done
+}
+
+svpn_setup_verify() {
+    # Contract: verify installed hashes, modes and the binary version.
+    for pair in \
+        "/usr/local/bin/svpn $SVPN_STAGE/extract/svpn" \
+        "/usr/local/lib/svpn/server-up $SVPN_STAGE/server-up" \
+        "/usr/local/lib/svpn/server-down $SVPN_STAGE/server-down"
+    do
+        # shellcheck disable=SC2086
+        set -- $pair
+        [ "$(stat -c %a "$1")" = 755 ] || {
+            echo "svpn setup: installed mode is not 755: $1" >&2
+            return 1
+        }
+        [ "$(sha256sum "$1" | awk '{print $1}')" = "$(sha256sum "$2" | awk '{print $1}')" ] || {
+            echo "svpn setup: installed file differs from the staged one: $1" >&2
+            return 1
+        }
+    done
+    version=$(/usr/local/bin/svpn --version | awk '{print $NF}')
+    [ "$version" = "$SVPN_CLIENT_VERSION" ] || {
+        echo "svpn setup: installed version is $version, expected $SVPN_CLIENT_VERSION" >&2
+        return 1
+    }
+    printf 'SVPN_SETUP_VERIFIED=hashes,modes,version\n'
+}
+
+svpn_setup_install() {
+    svpn_setup_preflight
+    # Read the framed hooks before any package tooling can touch stdin.
+    svpn_setup_payload
+    svpn_setup_packages
+    svpn_setup_release
+    svpn_setup_downgrade
+    # Existing directories keep their mode; new ones are created 755.
+    for path in /usr/local/bin /usr/local/lib/svpn; do
+        [ -d "$path" ] || as_root install -d -m 755 "$path"
+    done
+    up_tmp=/usr/local/lib/svpn/.server-up.setup.$$
+    down_tmp=/usr/local/lib/svpn/.server-down.setup.$$
+    bin_tmp=/usr/local/bin/.svpn.setup.$$
+    # Scripts first, binary last. Each rename is atomic; the set is not
+    # transactional: CHANGED is reported per file as soon as it is replaced.
+    as_root install -m 755 "$SVPN_STAGE/server-up" "$up_tmp"
+    as_root install -m 755 "$SVPN_STAGE/server-down" "$down_tmp"
+    as_root install -m 755 "$SVPN_STAGE/extract/svpn" "$bin_tmp"
+    as_root mv -f "$up_tmp" /usr/local/lib/svpn/server-up
+    printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/lib/svpn/server-up
+    as_root mv -f "$down_tmp" /usr/local/lib/svpn/server-down
+    printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/lib/svpn/server-down
+    as_root mv -f "$bin_tmp" /usr/local/bin/svpn
+    printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/bin/svpn
+    svpn_setup_verify
+}

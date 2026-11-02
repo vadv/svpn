@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 usage() {
-    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|udp|tcp-auto|reselect|recovery|sticky-asn]"
+    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|setup|udp|tcp-auto|reselect|recovery|sticky-asn]"
     echo "Matrix groups: all, udp, tcp-auto. Run groups sequentially on a local Docker host."
 }
 matrix=0
@@ -17,12 +17,20 @@ export SVPN_TEST_GROUP=${1-all}
 case "$SVPN_TEST_GROUP" in
     -h|--help) usage; exit 0 ;;
     all|udp|tcp-auto) ;;
-    bootstrap|lifecycle-pool|reselect|recovery|sticky-asn)
+    bootstrap|lifecycle-pool|setup|reselect|recovery|sticky-asn)
         if (( matrix )); then usage >&2; exit 2; fi ;;
     *) usage >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
-compose=(docker compose -f "$PWD/compose.yaml" -p svpn-test)
+compose_file=$PWD/compose.yaml
+compose_project=svpn-test
+startup=(server server2 target target_by)
+if [[ $SVPN_TEST_GROUP == setup ]]; then
+    compose_file=$PWD/e2e/compose.setup.yaml
+    compose_project=svpn-setup-test
+    startup=(server)
+fi
+compose=(docker compose -f "$compose_file" -p "$compose_project")
 mkdir -p e2e/.work/artifacts
 export SVPN_TEST_ARTIFACTS
 SVPN_TEST_ARTIFACTS=$(mktemp -d "$PWD/e2e/.work/artifacts/run.XXXXXX")
@@ -83,7 +91,7 @@ trap 'interrupt 143' TERM
 
 run "$SVPN_TEST_ARTIFACTS/preflight.log" "${compose[@]}" down --volumes --remove-orphans
 run "$SVPN_TEST_ARTIFACTS/build.log" "${compose[@]}" build
-run "$SVPN_TEST_ARTIFACTS/startup.log" "${compose[@]}" up -d --wait server server2 target target_by
+run "$SVPN_TEST_ARTIFACTS/startup.log" "${compose[@]}" up -d --wait "${startup[@]}"
 if (( matrix )); then
     run "$SVPN_TEST_ARTIFACTS/runner.log" "${compose[@]}" run --rm --no-deps -T client \
         python3 -u /e2e/matrix.py --group "$SVPN_TEST_GROUP"

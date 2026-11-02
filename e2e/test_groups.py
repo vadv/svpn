@@ -19,6 +19,7 @@ import suite_bootstrap
 import suite_pool
 import suite_recovery
 import suite_reselect
+import suite_setup
 import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
@@ -129,6 +130,18 @@ def integration_groups():
                 integration.main()
             assert called == expected, (group, args)
     print(f"PASS integration: {len(tests)} cases assigned once, CLI/env selection and original order")
+
+
+# The setup suite runs on its own compose rig, outside the integration registry.
+SETUP_BASELINE = ("fresh-overwrite", "multi-isolation", "cancellation", "fake-installer")
+
+
+def setup_suite_groups():
+    names = tuple(name for name, _ in suite_setup.CASES)
+    assert names == SETUP_BASELINE, "setup suite case set or order changed"
+    assert len(names) == len(set(names)), "a setup case is listed twice"
+    assert all(callable(case) for _, case in suite_setup.CASES)
+    print(f"PASS setup suite: {len(SETUP_BASELINE)} cases pinned in order")
 
 
 def matrix_groups():
@@ -330,6 +343,7 @@ def shell_groups():
 
 if __name__ == "__main__":
     integration_groups()
+    setup_suite_groups()
     matrix_groups()
     matrix_diagnostics()
     reselect_log_patterns()

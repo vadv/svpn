@@ -69,6 +69,12 @@ pub enum Mode {
     /// Connect to one or more servers sharing a client TUN.
     #[command(name = "multi")]
     Client(ClientArgs),
+    /// Install the server binary and embedded hooks on configured GNU Linux VPSs.
+    Setup {
+        /// Existing single-server or multi-server client TOML; it is never modified.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
         /// Exactly one server, using the client syntax but without weight.
@@ -186,7 +192,7 @@ impl Cli {
                 if raw.client.config.is_some() {
                     return Err(clap::Error::raw(
                         ErrorKind::ArgumentConflict,
-                        "perf and serve do not accept --config",
+                        "perf, serve and setup require their own arguments",
                     ));
                 }
                 mode
