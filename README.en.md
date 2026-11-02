@@ -15,64 +15,13 @@ Belarus uses the ISO code `BY`, Russia uses `RU`.
 > servers. Do not copy its hooks to macOS. A macOS local-exit setup needs
 > separate routing, forwarding and NAT commands.
 
-## How it works
+## Quick start
 
-### Packet path
-
-```mermaid
-flowchart TD
-    app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
-    tun --> brain("🧠 Path selection<br/>country.csv · ASN<br/>local-exit")
-    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN → Internet"]
-    brain -->|"NL / DE / others"| enc["🔒 Encryption<br/>SVPN packet"]
-    enc --> udp["UDP 60000–60009<br/>or TCP 41020<br/>camouflage"]
-    udp --> vps["🖥️ VPS<br/>decrypt → TUN 10.77.0.1<br/>server-up: masquerade"]
-    local --> net["🌍 Internet"]
-    vps --> net
-    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
-    classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
-    classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
-    classDef edge fill:#fff8e1,stroke:#ffb300,color:#5d4037
-    class brain brain
-    class local local
-    class enc,udp,vps vpn
-    class net edge
+```bash
+# /etc/svpn/vpn.toml already exists — see section 5
+sudo svpn setup --config /etc/svpn/vpn.toml   # once: VPS, binary and hooks
+sudo svpn multi --config /etc/svpn/vpn.toml   # start the tunnel
 ```
-
-The client picks the path before encryption. RU/BY addresses leave through the
-local exit, everything else through the selected VPS. The outside world sees
-either the home IP or the server IP; replies follow the same path back.
-
-### Install and start
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor A as 🧑‍💻 Client
-    participant V as 🖥️ VPS
-    participant G as 🐙 GitHub
-
-    A->>G: download the release archive
-    G-->>A: svpn + scripts/server-up|down
-    Note over A: country.csv, asn.csv<br/>SSH key, /etc/svpn/vpn.toml
-    A->>V: SSH · svpn setup --config vpn.toml
-    rect rgba(46, 160, 67, 0.12)
-        V->>V: read-only preflight<br/>Debian 12 / Rocky 10 · AES · root or sudo -n
-        V->>G: download the release on the VPS · sha256
-        V->>V: packages → atomic install → verify
-    end
-    V-->>A: ✅ status=success version=0.9.6
-    A->>V: SSH · svpn multi --config
-    rect rgba(31, 111, 235, 0.12)
-        V->>V: exec svpn serve<br/>server-up: policy table + masquerade
-    end
-    V-->>A: control JSONL · UDP keys · TUN ready
-    Note over A,V: 💡 packets flow directly over UDP/TCP — not inside SSH<br/>the server lives for one session: no daemon, no systemd
-```
-
-There is no daemon on the VPS: the client starts `svpn serve` over SSH for the
-session, receives keys on the control channel and brings the tunnel up. Data
-flows directly over UDP/TCP, not inside SSH.
 
 ## 1. Prepare the machines
 
@@ -259,6 +208,33 @@ Weights affect owner selection, not every individual packet.
 | `RU` or `BY` | `local-exit` through the local SVPN server and physical egress |
 | `NL` or `DE` | Only servers listing that country in `countries` |
 | Any other country or an address outside Country DB | Both example servers, using ASN affinity and weights |
+
+```mermaid
+flowchart TD
+    app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
+    tun --> brain("🧠 Path selection<br/>country.csv · ASN<br/>local-exit")
+    brain -->|"RU / BY"| local["🏠 Local exit on the client<br/>NAT → ISP WAN"]
+    brain -->|"NL / DE / others"| asn["🎯 sticky-ASN<br/>destination ASN is pinned<br/>to one VPS"]
+    asn --> enc["🔒 Encryption<br/>UDP 60000–60009<br/>or TCP 41020"]
+    enc --> vps["🖥️ VPS A or VPS B<br/>decrypt → TUN → masquerade"]
+    local --> home["🌍 Internet<br/>the site sees the home IP"]
+    vps --> via["🌍 Internet<br/>the site sees this VPS IP"]
+    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+    classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
+    classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
+    class brain brain
+    class local local
+    class asn asn
+    class enc,vps vpn
+    class home,via edge
+```
+
+The paths differ not only in route but in the visible address. `local-exit` leaves
+through the client's ISP, so the site sees the home IP. The VPN branch pins every
+destination ASN to one VPS while it is alive: a service sees that server's stable
+IP. If the VPS fails, the ASN group moves to the next server in the pool.
 
 One country can have several servers. `countries` restricts selection for that
 country but does not remove the server from the general pool for other
