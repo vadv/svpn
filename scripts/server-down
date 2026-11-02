@@ -1,0 +1,18 @@
+#!/bin/sh
+n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
+table_id=$((10000 + n))
+owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
+wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+if [ -f "$owner.rule" ]; then
+    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
+    rm -f "$owner.rule"
+fi
+if [ -f "$owner.route" ]; then
+    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
+    rm -f "$owner.route"
+fi
+if [ -f "$owner.nat" ]; then
+    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
+    rm -f "$owner.nat"
+fi

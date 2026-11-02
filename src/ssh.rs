@@ -100,6 +100,14 @@ pub struct SshTail {
     pub handle: Handle<HostKeyCheck>,
 }
 
+/// Bounded result of one noninteractive remote command.
+#[derive(Debug)]
+pub struct ExecOutput {
+    pub status: u32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 /// Channel pump event: Control input or an SSH channel message.
 enum PumpEvent {
     Stdin(usize),
@@ -211,15 +219,12 @@ impl Drop for SshTail {
     }
 }
 
-/// Connects, authenticates, and runs `command` on the server.
-/// Returns a pair of streams for `Control::new`. `tag` names the pool link
-/// in log lines; empty for a single server.
-pub async fn connect<A: ToSocketAddrs>(
+/// Connects and authenticates without opening a channel or starting a command.
+pub async fn connect_handle<A: ToSocketAddrs>(
     target: &SshTarget,
     addr: A,
-    command: &str,
     tag: &str,
-) -> Result<SshSession> {
+) -> Result<Handle<HostKeyCheck>> {
     let seen = Arc::new(Mutex::new(None));
     let handler = HostKeyCheck {
         expected: target.host_key,
@@ -281,15 +286,6 @@ pub async fn connect<A: ToSocketAddrs>(
     .await
     .map_err(|_| anyhow::anyhow!("authentication timeout"))??;
 
-    let channel = tokio::time::timeout(CONNECT_TIMEOUT, handle.channel_open_session())
-        .await
-        .map_err(|_| anyhow::anyhow!("channel open timeout"))?
-        .context("opening the channel")?;
-    channel
-        .exec(true, command)
-        .await
-        .context("starting the command on the server")?;
-
     let fingerprint = seen
         .lock()
         .expect("host key lock")
@@ -305,6 +301,27 @@ pub async fn connect<A: ToSocketAddrs>(
         prefixed(tag, "ssh")
     );
 
+    Ok(handle)
+}
+
+/// Connects, authenticates, and runs `command` on the server.
+/// Returns a pair of streams for `Control::new`. `tag` names the pool link
+/// in log lines; empty for a single server.
+pub async fn connect<A: ToSocketAddrs>(
+    target: &SshTarget,
+    addr: A,
+    command: &str,
+    tag: &str,
+) -> Result<SshSession> {
+    let handle = connect_handle(target, addr, tag).await?;
+    let channel = tokio::time::timeout(CONNECT_TIMEOUT, handle.channel_open_session())
+        .await
+        .map_err(|_| anyhow::anyhow!("channel open timeout"))?
+        .context("opening the channel")?;
+    channel
+        .exec(true, command)
+        .await
+        .context("starting the command on the server")?;
     let (stdin_writer, stdin_reader) = duplex(STDIN_BUF);
     let (stdout_writer, stdout_reader) = duplex(STDOUT_BUF);
     let pump = tokio::spawn(pump_channel(
@@ -313,12 +330,99 @@ pub async fn connect<A: ToSocketAddrs>(
         stdout_writer,
         tag.to_string(),
     ));
-
     Ok(SshSession {
         stdin: stdin_writer,
         stdout: stdout_reader,
         tail: SshTail { pump, handle },
     })
+}
+
+/// Run one bounded command on an authenticated connection. Stdin is sent
+/// concurrently with output collection; success requires exit status and close.
+pub async fn exec(
+    handle: &Handle<HostKeyCheck>,
+    command: &str,
+    input: &[u8],
+    max_output: usize,
+    bound: Duration,
+) -> Result<ExecOutput> {
+    tokio::time::timeout(bound, exec_inner(handle, command, input, max_output))
+        .await
+        .map_err(|_| anyhow::anyhow!("remote command timed out after {bound:?}"))?
+}
+
+async fn exec_inner(
+    handle: &Handle<HostKeyCheck>,
+    command: &str,
+    input: &[u8],
+    max_output: usize,
+) -> Result<ExecOutput> {
+    let channel = handle.channel_open_session().await?;
+    channel.exec(true, command).await?;
+    let (mut reader, writer) = channel.split();
+    let bytes = input.to_vec();
+    let mut sender = tokio::spawn(async move {
+        writer.data(std::io::Cursor::new(bytes)).await?;
+        writer.eof().await
+    });
+    let _abort_sender = AbortTask(sender.abort_handle());
+    let mut sender_done = false;
+    let mut status = None;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        let message = tokio::select! {
+            result = &mut sender, if !sender_done => {
+                sender_done = true;
+                result.context("SSH stdin task")??;
+                continue;
+            }
+            message = reader.wait() => message,
+        };
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => {
+                ensure_output(stdout.len() + stderr.len(), data.len(), max_output)?;
+                stdout.extend_from_slice(&data);
+            }
+            Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                ensure_output(stdout.len() + stderr.len(), data.len(), max_output)?;
+                stderr.extend_from_slice(&data);
+            }
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+            Some(russh::ChannelMsg::ExitSignal { signal_name, .. }) => {
+                bail!("remote command terminated by {signal_name:?}")
+            }
+            Some(russh::ChannelMsg::Close) => break,
+            Some(russh::ChannelMsg::Eof) => {}
+            Some(_) => {}
+            None => bail!("SSH channel ended without close"),
+        }
+    }
+    if !sender_done {
+        sender.await.context("SSH stdin task")??;
+    }
+    let status = status.context("remote command closed without exit status")?;
+    Ok(ExecOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+struct AbortTask(tokio::task::AbortHandle);
+
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn ensure_output(current: usize, incoming: usize, limit: usize) -> Result<()> {
+    ensure!(
+        current.checked_add(incoming).is_some_and(|n| n <= limit),
+        "remote output exceeds {limit} bytes"
+    );
+    Ok(())
 }
 
 pub async fn authenticate(

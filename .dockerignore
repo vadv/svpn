@@ -5,6 +5,8 @@
 !Cargo.lock
 !README.md
 !README.en.md
+!scripts/
+!scripts/**
 !src/
 !src/**
 !tests/stderr.rs
