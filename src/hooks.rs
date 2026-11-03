@@ -112,7 +112,7 @@ impl Hooks {
         let up = match &self.up {
             Some(hook) => hook,
             None => {
-                auto_up = Hook::Command(crate::client_routing::SCRIPT.to_owned());
+                auto_up = Hook::Command(crate::client_routing::UP.to_owned());
                 &auto_up
             }
         };
@@ -157,7 +157,7 @@ impl Hooks {
             let down = match &self.down {
                 Some(hook) => hook,
                 None => {
-                    auto_down = Hook::Command(crate::client_routing::SCRIPT.to_owned());
+                    auto_down = Hook::Command(crate::client_routing::DOWN.to_owned());
                     &auto_down
                 }
             };

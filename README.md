@@ -77,11 +77,12 @@ sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /полны
 
 Setup также оставляет примеры `server-up` и `server-down` в
 `/usr/local/lib/svpn/`. По умолчанию они не запускаются: в auto выполняются
-встроенные `scripts/client-route`, `scripts/server-up` и `scripts/server-down`
+встроенные `scripts/client-up`, `scripts/client-down`, `scripts/server-up` и `scripts/server-down`
 из текущего бинарника. Точный текст этих скриптов можно посмотреть до запуска:
 
 ```bash
-svpn example client-route
+svpn example client-up
+svpn example client-down
 svpn example server-up
 svpn example server-down
 ```

@@ -36,11 +36,12 @@ fn absent_server_hooks_use_embedded_defaults_and_custom_commands_override() {
 
 #[test]
 fn example_command_prints_the_embedded_hook_text() {
-    let cli = Cli::try_parse_from(["svpn", "example", "client-route"]).unwrap();
+    let cli = Cli::try_parse_from(["svpn", "example", "client-up"]).unwrap();
     assert!(matches!(cli.command, Mode::Example { .. }));
+    assert_eq!(setup::example("client-up"), Some(svpn::client_routing::UP));
     assert_eq!(
-        setup::example("client-route"),
-        Some(svpn::client_routing::SCRIPT)
+        setup::example("client-down"),
+        Some(svpn::client_routing::DOWN)
     );
     assert_eq!(setup::example("server-up"), Some(setup::SERVER_UP));
     assert_eq!(setup::example("server-down"), Some(setup::SERVER_DOWN));

@@ -76,7 +76,7 @@ pub enum Mode {
     },
     /// Print an embedded hook example to stdout.
     Example {
-        /// Hook example name: client-route, server-up or server-down.
+        /// Hook example name: client-up, client-down, server-up or server-down.
         #[arg(value_name = "NAME")]
         name: String,
     },

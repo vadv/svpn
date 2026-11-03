@@ -186,11 +186,12 @@ configuration above.
 
 ## Client hooks
 
-In auto mode the embedded `scripts/client-route` from the current binary runs.
+In auto mode the embedded `scripts/client-up` and `scripts/client-down` from the current binary run.
 You can inspect the exact text before starting:
 
 ```bash
-svpn example client-route
+svpn example client-up
+svpn example client-down
 ```
 
 The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:

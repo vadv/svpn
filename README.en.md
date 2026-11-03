@@ -80,12 +80,13 @@ and verifies the installation. Debian 12 and Rocky 10 on x86_64 and aarch64
 are supported.
 
 Setup also leaves example `server-up` and `server-down` in
-`/usr/local/lib/svpn/`. In auto mode the embedded `scripts/client-route`,
-`scripts/server-up` and `scripts/server-down` from the current binary run
+`/usr/local/lib/svpn/`. In auto mode the embedded `scripts/client-up`,
+`scripts/client-down`, `scripts/server-up` and `scripts/server-down` from the current binary run
 instead. You can inspect their exact text before starting:
 
 ```bash
-svpn example client-route
+svpn example client-up
+svpn example client-down
 svpn example server-up
 svpn example server-down
 ```

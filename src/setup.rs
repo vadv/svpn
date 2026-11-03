@@ -25,7 +25,8 @@ pub fn down_or_default(command: Option<String>) -> String {
 /// Embedded hook example available for inspection before running SVPN.
 pub fn example(name: &str) -> Option<&'static str> {
     match name {
-        "client-route" => Some(crate::client_routing::SCRIPT),
+        "client-up" => Some(crate::client_routing::UP),
+        "client-down" => Some(crate::client_routing::DOWN),
         "server-up" => Some(SERVER_UP),
         "server-down" => Some(SERVER_DOWN),
         _ => None,

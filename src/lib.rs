@@ -223,7 +223,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Mode::Example { name } => {
             let Some(text) = setup::example(&name) else {
                 bail!(
-                    "unknown hook example {name}; expected client-route, server-up or server-down"
+                    "unknown hook example {name}; expected client-up, client-down, server-up or server-down"
                 );
             };
             print!("{text}");

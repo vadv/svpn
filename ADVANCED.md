@@ -185,11 +185,12 @@ Timeout — 10 секунд. Ошибка `up` не даёт поднять се
 
 ## Клиентские hooks
 
-В auto выполняется встроенный `scripts/client-route` из текущего бинарника.
+В auto выполняются встроенные `scripts/client-up` и `scripts/client-down` из текущего бинарника.
 Точный текст можно посмотреть до запуска:
 
 ```bash
-svpn example client-route
+svpn example client-up
+svpn example client-down
 ```
 
 Скрипт получает `SVPN_SERVER_ADDRS` и `SVPN_OS`, затем:
