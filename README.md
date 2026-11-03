@@ -15,8 +15,9 @@ flowchart TD
     local --> home["🌍 виден домашний IP"]
     brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(ASN — например Claude Code<br/>или Google) живёт на одном VPS"]
     asn --> mimic["🕵️ Мимикрия — авто<br/>под канал: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>или TCP 41020 (UDP закрыт)"]
-    mimic -->|"трафик Claude Code"| vps1["🖥️ VPS-1 · NL · вес 3<br/>decrypt → TUN → NAT"]
-    mimic -->|"трафик Google"| vps2["🖥️ VPS-2 · DE · вес 1<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 сетей<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик Google"| vps2["🖥️ VPS-2 · DE+EN · ≈1/4 сетей<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик в EN —<br/>только серверы с EN"| vps2
     vps1 --> net1["🌍 виден IP VPS-1"]
     vps2 --> net2["🌍 виден IP VPS-2"]
     vps1 -.->|"VPS-1 недоступен —<br/>сети переезжают"| vps2
@@ -38,6 +39,8 @@ flowchart TD
 `sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
 видел стабильный внешний IP. Трафик маскируется под обычные протоколы: клиент
 сам подбирает рабочий для канала, а при заблокированном UDP переходит на TCP.
+Страны на сервере (`countries`) сужают пул: трафик в такую страну идёт только
+через серверы, которые её обслуживают.
 
 ## Быстрый старт
 

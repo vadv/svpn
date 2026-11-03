@@ -95,9 +95,11 @@ weight = 1
 countries = ["NL", "DE"]
 ```
 
-`weight = 3` and `weight = 1` mean a rough 3:1 distribution. With `sticky-asn`
-addresses of one network keep their chosen exit while it is alive. Weights
-affect owner selection, not individual packets.
+`weight` is the share of destination networks a server owns: weights 3 and 1
+give a rough 3:1 distribution. An ASN always goes to one server as a whole,
+no matter how many addresses it contains. With `sticky-asn` addresses of one
+network keep their chosen exit while it is alive. Weights affect owner
+selection, not individual packets.
 
 ## How the path is selected
 

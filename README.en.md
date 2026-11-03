@@ -15,8 +15,9 @@ flowchart TD
     local --> home["🌍 home IP is visible"]
     brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (an ASN — Claude Code,<br/>Google…) lives on one VPS"]
     asn --> mimic["🕵️ Camouflage — auto<br/>per channel: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>or TCP 41020 if UDP blocked"]
-    mimic -->|"Claude Code traffic"| vps1["🖥️ VPS-1 · NL · weight 3<br/>decrypt → TUN → NAT"]
-    mimic -->|"Google traffic"| vps2["🖥️ VPS-2 · DE · weight 1<br/>decrypt → TUN → NAT"]
+    mimic -->|"Claude Code traffic"| vps1["🖥️ VPS-1 · NL · ≈3/4 of networks<br/>decrypt → TUN → NAT"]
+    mimic -->|"Google traffic"| vps2["🖥️ VPS-2 · DE+EN · ≈1/4 of networks<br/>decrypt → TUN → NAT"]
+    mimic -->|"EN traffic —<br/>only servers with EN"| vps2
     vps1 --> net1["🌍 VPS-1 IP is visible"]
     vps2 --> net2["🌍 VPS-2 IP is visible"]
     vps1 -.->|"if VPS-1 dies,<br/>networks move over"| vps2
@@ -38,7 +39,8 @@ Everything else is encrypted and sent to a VPS — the site sees the server IP.
 With several VPSs, `sticky-asn` pins every destination ASN to one server so a
 service sees a stable external IP. Tunnel traffic is disguised as ordinary
 protocols: the client probes them and keeps whichever works for the channel,
-falling back to TCP when UDP is blocked.
+falling back to TCP when UDP is blocked. Server `countries` narrow the pool:
+traffic to such a country leaves only through servers that serve it.
 
 ## Quick start
 
