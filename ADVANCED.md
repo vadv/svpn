@@ -31,67 +31,6 @@ udp-port-range = "60000-60009"
 up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
 down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
 
-# Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
-server-up = '''
-set -e
-if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != 1 ]; then
-    sysctl -qw net.ipv4.ip_forward=1
-fi
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-table=svpn_egress_$n
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-rm -f "$owner.rule" "$owner.route" "$owner.nat"
-default=$(ip -4 route show default)
-[ -n "$default" ] || {
-    echo "svpn: no IPv4 default route; leaving egress unchanged" >&2
-    exit 0
-}
-wan=$(printf '%s\n' "$default" | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(printf '%s\n' "$default" | awk 'NR==1{print $3}')
-if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
-    echo "svpn: policy priority $table_id is already in use" >&2
-    exit 1
-fi
-if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
-    echo "svpn: policy table $table_id is already in use" >&2
-    exit 1
-fi
-if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
-    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
-fi
-: > "$owner.rule"
-ip route replace default via "$gateway" dev "$wan" table "$table_id"
-: > "$owner.route"
-nft delete table inet "$table" 2>/dev/null || true
-nft -f - <<EOF
-add table inet $table
-add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
-add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
-EOF
-: > "$owner.nat"
-'''
-
-server-down = '''
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if [ -f "$owner.rule" ]; then
-    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.rule"
-fi
-if [ -f "$owner.route" ]; then
-    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.route"
-fi
-if [ -f "$owner.nat" ]; then
-    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
-    rm -f "$owner.nat"
-fi
-'''
-
 [[servers]]
 address = "nl.example.com"
 weight = 3
@@ -164,13 +103,19 @@ sudo systemctl restart svpn
 
 `server-up` и `server-down` выполняются на VPS, а также у `local-exit` на
 клиенте. Если поля не заданы, `serve` выполняет встроенные
-`scripts/server-up` и `scripts/server-down` текущего бинарника — не
-example-файлы.
+`scripts/server-up` и `scripts/server-down` текущего бинарника.
 
-`svpn setup` оставляет примеры этих скриптов в `/usr/local/lib/svpn/`. Они
-не запускаются по умолчанию: чтобы переопределить поведение, отредактируйте
-пример и укажите его путь в `server-up`/`server-down`. Можно также задать
-команду прямо строкой в TOML.
+Чтобы переопределить поведение, посмотрите пример, сохраните его,
+отредактируйте и укажите путь в `server-up`/`server-down`:
+
+```bash
+svpn example server-up > server-up
+svpn example server-down > server-down
+$EDITOR server-up
+scp server-up server-down root@vps:/usr/local/lib/svpn/
+```
+
+Можно также задать команду прямо строкой в TOML.
 
 Hooks получают переменные окружения:
 
@@ -281,7 +226,8 @@ journalctl -u svpn -f
 `svpn setup --config FILE` подготавливает каждый VPS из конфига: определяет
 окружение, ставит недостающие проверенные пакеты (`curl`, `tar`, `gzip`, `awk`,
 `ip`, `nft`, `sysctl`, CA-сертификаты), скачивает релиз SVPN с GitHub прямо на
-VPS и устанавливает `server-up`/`server-down`. Конфиг не изменяется.
+VPS и устанавливает бинарник. Конфиг не изменяется; hook-файлы setup не
+создаёт.
 
 Поддерживаемые окружения: Debian 12 и Rocky 10 (GNU libc) на x86_64 и aarch64 с
 аппаратным AES. Вход по SSH — `root` или обычный пользователь с безпарольным
@@ -290,10 +236,8 @@ musl команда не обслуживает.
 
 Повторные запуски и версии:
 
-- Перезаписываются только управляемые файлы: `/usr/local/bin/svpn`,
-  `/usr/local/lib/svpn/server-up`, `/usr/local/lib/svpn/server-down`.
-  Замена каждого файла атомарна, набор в целом — нет; отчёт честно показывает
-  `partial`.
+- Перезаписывается только управляемый файл `/usr/local/bin/svpn`.
+  Замена атомарна; отчёт честно показывает `partial` при частичной установке.
 - Предпочитается версия клиента. Если её релиз или архив под платформу
   недоступны, выбирается последний стабильный релиз с совместимыми
   control/hook метаданными, и причина сообщается. Ошибка контрольной суммы —
@@ -301,10 +245,9 @@ musl команда не обслуживает.
 - Выбранная более старая версия может заменить установленную новую — это
   сообщается явно полем `downgrade=`.
 
-После установки проверяются хеши, права и версия бинарника. Setup не запускает
+После установки проверяются хеш, права и версия бинарника. Setup не запускает
 SVPN и не выполняет хуки: команда не активирует маршруты, NAT, DNS и firewall,
-не создаёт сервисы и не трогает `local-exit`. Пути хуков должны уже быть в
-клиентском конфиге — setup их не добавляет.
+не создаёт сервисы и не трогает `local-exit`.
 
 Хосты обрабатываются по порядку конфига; сбой одного не останавливает
 остальные. Каждому хосту печатается строка

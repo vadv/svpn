@@ -75,10 +75,9 @@ sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /полны
 Команда скачает релиз SVPN прямо на VPS, установит бинарник и проверит
 установку. Поддерживаются Debian 12 и Rocky 10 на x86_64 и aarch64.
 
-Setup также оставляет примеры `server-up` и `server-down` в
-`/usr/local/lib/svpn/`. По умолчанию они не запускаются: в auto выполняются
-встроенные `scripts/client-up`, `scripts/client-down`, `scripts/server-up` и `scripts/server-down`
-из текущего бинарника. Точный текст этих скриптов можно посмотреть до запуска:
+В auto выполняются встроенные `scripts/client-up`, `scripts/client-down`,
+`scripts/server-up` и `scripts/server-down` из текущего бинарника. Точный
+текст этих скриптов можно посмотреть до запуска:
 
 ```bash
 svpn example client-up
@@ -87,8 +86,8 @@ svpn example server-up
 svpn example server-down
 ```
 
-Если нужно другое поведение, отредактируйте пример и укажите путь к нему в
-конфиге — см. [ADVANCED.md](ADVANCED.md).
+Если нужно другое поведение, сохраните вывод, отредактируйте файл и укажите
+путь к нему в конфиге — см. [ADVANCED.md](ADVANCED.md).
 
 ### 4. Запустите
 

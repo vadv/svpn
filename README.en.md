@@ -79,10 +79,9 @@ The command downloads the SVPN release on the VPS itself, installs the binary
 and verifies the installation. Debian 12 and Rocky 10 on x86_64 and aarch64
 are supported.
 
-Setup also leaves example `server-up` and `server-down` in
-`/usr/local/lib/svpn/`. In auto mode the embedded `scripts/client-up`,
-`scripts/client-down`, `scripts/server-up` and `scripts/server-down` from the current binary run
-instead. You can inspect their exact text before starting:
+In auto mode the embedded `scripts/client-up`, `scripts/client-down`,
+`scripts/server-up` and `scripts/server-down` from the current binary run.
+You can inspect their exact text before starting:
 
 ```bash
 svpn example client-up
@@ -91,8 +90,8 @@ svpn example server-up
 svpn example server-down
 ```
 
-To override, edit the example and point to it in the config — see
-[ADVANCED.en.md](ADVANCED.en.md).
+To override, save the output, edit the file and point to it in the config —
+see [ADVANCED.en.md](ADVANCED.en.md).
 
 ### 4. Start
 

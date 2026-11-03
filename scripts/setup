@@ -1,5 +1,5 @@
 #!/bin/sh
-# Provision the fixed SVPN server artifacts. Never starts SVPN or its hooks.
+# Provision the SVPN server binary. Never starts SVPN or installs hook examples.
 set -eu
 
 as_root() {
@@ -66,7 +66,7 @@ svpn_setup_preflight() {
             return 1
         }
     fi
-    for path in /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/svpn; do
+    for path in /usr/local /usr/local/bin; do
         [ ! -e "$path" ] || [ -d "$path" ] || {
             echo "svpn setup: managed parent must be a directory: $path" >&2
             return 1
@@ -76,7 +76,7 @@ svpn_setup_preflight() {
             return 1
         }
     done
-    for path in /usr/local/bin/svpn /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down; do
+    for path in /usr/local/bin/svpn; do
         [ ! -e "$path" ] || [ -f "$path" ] || {
             echo "svpn setup: managed destination must be a regular file: $path" >&2
             return 1
@@ -194,17 +194,11 @@ svpn_setup_release() {
         return 1
     }
     members=$(tar -tzf "$SVPN_STAGE/$SVPN_ASSET")
-    # Current releases ship the hook scripts; releases up to 0.9.6 did not.
-    # Both layouts are safe: setup always deploys the embedded hooks, never
-    # the archive copies.
-    legacy_members='svpn
+    expected_members='svpn
 build-info.json
 LICENSE
 THIRD-PARTY-NOTICES'
-    expected_members="$legacy_members
-scripts/server-up
-scripts/server-down"
-    [ "$members" = "$expected_members" ] || [ "$members" = "$legacy_members" ] || {
+    [ "$members" = "$expected_members" ] || {
         echo "svpn setup: unexpected release archive members" >&2
         return 1
     }
@@ -248,58 +242,16 @@ svpn_setup_downgrade() {
     printf 'SVPN_SETUP_DOWNGRADE=%s->%s\n' "$installed" "$SVPN_CLIENT_VERSION"
 }
 
-svpn_setup_payload() {
-    umask 077
-    SVPN_STAGE=$(mktemp -d /tmp/svpn-setup.XXXXXX)
-    trap 'rm -rf "$SVPN_STAGE"; as_root rm -f /usr/local/bin/.svpn.setup.$$ /usr/local/lib/svpn/.server-up.setup.$$ /usr/local/lib/svpn/.server-down.setup.$$' EXIT
-    # An abrupt disconnect (SIGHUP) must not skip the staged-file cleanup.
-    trap 'exit 129' HUP INT
-    trap 'exit 143' TERM
-    for hook in server-up server-down; do
-        read -r name expected bytes
-        [ "$name" = "$hook" ] || {
-            echo "svpn setup: invalid embedded payload" >&2
-            return 1
-        }
-        case "$bytes" in
-            ''|*[!0-9]*) return 1 ;;
-        esac
-        [ "$bytes" -le 65536 ] || {
-            echo "svpn setup: embedded hook exceeds 64 KiB" >&2
-            return 1
-        }
-        dd bs=1 count="$bytes" of="$SVPN_STAGE/$hook" 2>/dev/null
-        [ "$(wc -c < "$SVPN_STAGE/$hook")" -eq "$bytes" ] || {
-            echo "svpn setup: truncated embedded hook" >&2
-            return 1
-        }
-        actual=$(sha256sum "$SVPN_STAGE/$hook" | awk '{print $1}')
-        [ "$actual" = "$expected" ] || {
-            echo "svpn setup: embedded hook checksum mismatch" >&2
-            return 1
-        }
-        /bin/sh -n "$SVPN_STAGE/$hook"
-    done
-}
-
 svpn_setup_verify() {
-    # Contract: verify installed hashes, modes and the binary version.
-    for pair in \
-        "/usr/local/bin/svpn $SVPN_STAGE/extract/svpn" \
-        "/usr/local/lib/svpn/server-up $SVPN_STAGE/server-up" \
-        "/usr/local/lib/svpn/server-down $SVPN_STAGE/server-down"
-    do
-        # shellcheck disable=SC2086
-        set -- $pair
-        [ "$(stat -c %a "$1")" = 755 ] || {
-            echo "svpn setup: installed mode is not 755: $1" >&2
-            return 1
-        }
-        [ "$(sha256sum "$1" | awk '{print $1}')" = "$(sha256sum "$2" | awk '{print $1}')" ] || {
-            echo "svpn setup: installed file differs from the staged one: $1" >&2
-            return 1
-        }
-    done
+    [ "$(stat -c %a /usr/local/bin/svpn)" = 755 ] || {
+        echo "svpn setup: installed mode is not 755: /usr/local/bin/svpn" >&2
+        return 1
+    }
+    [ "$(sha256sum /usr/local/bin/svpn | awk '{print $1}')" = \
+      "$(sha256sum "$SVPN_STAGE/extract/svpn" | awk '{print $1}')" ] || {
+        echo "svpn setup: installed binary differs from the staged one" >&2
+        return 1
+    }
     version=$(/usr/local/bin/svpn --version | awk '{print $NF}')
     [ "$version" = "$SVPN_CLIENT_VERSION" ] || {
         echo "svpn setup: installed version is $version, expected $SVPN_CLIENT_VERSION" >&2
@@ -310,27 +262,18 @@ svpn_setup_verify() {
 
 svpn_setup_install() {
     svpn_setup_preflight
-    # Read the framed hooks before any package tooling can touch stdin.
-    svpn_setup_payload
+    umask 077
+    SVPN_STAGE=$(mktemp -d /tmp/svpn-setup.XXXXXX)
+    trap 'rm -rf "$SVPN_STAGE"; as_root rm -f /usr/local/bin/.svpn.setup.$$' EXIT
+    # An abrupt disconnect (SIGHUP) must not skip the staged-file cleanup.
+    trap 'exit 129' HUP INT
+    trap 'exit 143' TERM
     svpn_setup_packages
     svpn_setup_release
     svpn_setup_downgrade
-    # Existing directories keep their mode; new ones are created 755.
-    for path in /usr/local/bin /usr/local/lib/svpn; do
-        [ -d "$path" ] || as_root install -d -m 755 "$path"
-    done
-    up_tmp=/usr/local/lib/svpn/.server-up.setup.$$
-    down_tmp=/usr/local/lib/svpn/.server-down.setup.$$
+    [ -d /usr/local/bin ] || as_root install -d -m 755 /usr/local/bin
     bin_tmp=/usr/local/bin/.svpn.setup.$$
-    # Scripts first, binary last. Each rename is atomic; the set is not
-    # transactional: CHANGED is reported per file as soon as it is replaced.
-    as_root install -m 755 "$SVPN_STAGE/server-up" "$up_tmp"
-    as_root install -m 755 "$SVPN_STAGE/server-down" "$down_tmp"
     as_root install -m 755 "$SVPN_STAGE/extract/svpn" "$bin_tmp"
-    as_root mv -f "$up_tmp" /usr/local/lib/svpn/server-up
-    printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/lib/svpn/server-up
-    as_root mv -f "$down_tmp" /usr/local/lib/svpn/server-down
-    printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/lib/svpn/server-down
     as_root mv -f "$bin_tmp" /usr/local/bin/svpn
     printf 'SVPN_SETUP_CHANGED=%s\n' /usr/local/bin/svpn
     svpn_setup_verify

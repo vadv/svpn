@@ -259,14 +259,9 @@ fn advanced_multi_examples_parse_with_all_exit_features() {
             std::process::id()
         ));
         let example = &source[start..start + end];
-        assert!(example.contains("table_id=$((10000 + n))"));
-        assert!(!example.contains("ip route flush table"));
-        assert!(example.contains(
-            "ip rule del pref \"$table_id\" from \"$SVPN_PEER_ADDR\" table \"$table_id\""
-        ));
+        assert!(!example.contains("server-up = '''"));
+        assert!(!example.contains("server-down = '''"));
         assert!(example.contains("exit-state = \"/etc/svpn/exits.json\""));
-        assert!(example.contains("owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id"));
-        assert!(example.contains("if [ -f \"$owner.route\" ]; then"));
         std::fs::write(&path, example).unwrap();
         let args = load(&path, true).unwrap();
         assert_eq!(

@@ -1,12 +1,11 @@
-//! `svpn setup`: bounded SSH provisioning of the server binary and hooks.
-//! It never opens a TUN, starts a service, or executes the deployed hooks.
+//! `svpn setup`: bounded SSH provisioning of the server binary.
+//! It never opens a TUN, starts a service, or installs hook examples.
 
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use sha2::{Digest, Sha256};
 
-use crate::{config, shell_quote, ssh};
+use crate::{config, ssh};
 
 pub const SETUP_SCRIPT: &str = include_str!("../scripts/setup");
 pub const SERVER_UP: &str = include_str!("../scripts/server-up");
@@ -37,7 +36,6 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_PREFLIGHT_OUTPUT: usize = 64 * 1024;
 const MAX_INSTALL_OUTPUT: usize = 256 * 1024;
-const MAX_INSTALL_INPUT: usize = 256 * 1024;
 
 /// Verified result of one host.
 struct HostSuccess {
@@ -193,7 +191,7 @@ async fn run_connected(
     let install = ssh::exec(
         handle,
         "exec /bin/sh -eu -s",
-        &installer_input(env!("CARGO_PKG_VERSION")).map_err(HostReport::Failed)?,
+        &installer_input(env!("CARGO_PKG_VERSION")),
         MAX_INSTALL_OUTPUT,
         INSTALL_TIMEOUT,
     )
@@ -287,40 +285,9 @@ pub fn preflight_input() -> Vec<u8> {
     input
 }
 
-pub fn installer_input(version: &str) -> Result<Vec<u8>> {
-    let up_hash = hex(&Sha256::digest(SERVER_UP.as_bytes()));
-    let down_hash = hex(&Sha256::digest(SERVER_DOWN.as_bytes()));
-    let mut input = format!("SVPN_CLIENT_VERSION={}\n", shell_quote(version)).into_bytes();
+fn installer_input(version: &str) -> Vec<u8> {
+    let mut input = format!("SVPN_CLIENT_VERSION='{version}'\n").into_bytes();
     input.extend_from_slice(SETUP_SCRIPT.as_bytes());
-    input.extend_from_slice(b"\nsvpn_setup_install <<'SVPN_SETUP_PAYLOAD'\n");
-    input.extend_from_slice(format!("server-up {up_hash} {}\n", SERVER_UP.len()).as_bytes());
-    input.extend_from_slice(SERVER_UP.as_bytes());
-    input.extend_from_slice(format!("server-down {down_hash} {}\n", SERVER_DOWN.len()).as_bytes());
-    input.extend_from_slice(SERVER_DOWN.as_bytes());
-    input.extend_from_slice(b"SVPN_SETUP_PAYLOAD\n");
-    ensure!(
-        input.len() <= MAX_INSTALL_INPUT,
-        "installer input exceeds {MAX_INSTALL_INPUT} bytes"
-    );
-    ensure!(
-        framing_safe(SERVER_UP) && framing_safe(SERVER_DOWN),
-        "embedded payload contains its framing delimiter"
-    );
-    Ok(input)
-}
-
-/// A hook line equal to the heredoc delimiter would terminate the payload
-/// early, so it must not appear anywhere in an embedded script.
-pub fn framing_safe(script: &str) -> bool {
-    !script.lines().any(|line| line == "SVPN_SETUP_PAYLOAD")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+    input.extend_from_slice(b"\nsvpn_setup_install\n");
+    input
 }

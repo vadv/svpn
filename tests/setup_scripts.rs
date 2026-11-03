@@ -13,14 +13,6 @@ const SCRIPTS: [(&str, &str); 3] = [
     ("server-down", SERVER_DOWN),
 ];
 
-// ── embedded scripts ──
-
-#[test]
-fn server_hooks_match_docs() {
-    assert_eq!(SERVER_UP, script_with_shebang("server-up"));
-    assert_eq!(SERVER_DOWN, script_with_shebang("server-down"));
-}
-
 #[test]
 fn shell_scripts_parse() {
     for (name, script) in SCRIPTS {
@@ -44,19 +36,4 @@ fn shell_scripts_parse() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-}
-
-// ── helpers ──
-
-fn script_with_shebang(name: &str) -> String {
-    // The canonical hook sources are published in the advanced guide.
-    let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ADVANCED.md")).unwrap();
-    let start = format!("{name} = '''\n");
-    let body = readme
-        .split_once(&start)
-        .and_then(|(_, tail)| tail.split_once("\n'''"))
-        .map(|(body, _)| body)
-        .unwrap();
-    format!("#!/bin/sh\n{body}\n")
 }

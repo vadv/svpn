@@ -1,7 +1,6 @@
 """Provision a fresh Debian SSH host without starting SVPN or changing its network."""
 
 import base64
-import hashlib
 import pathlib
 import subprocess
 import tempfile
@@ -57,8 +56,6 @@ def build_asset(path, version, platform="linux-x86_64-gnu", meta=True, extra=(),
         add_file(tar, "build-info.json", json.dumps(info, indent=2).encode())
         add_file(tar, "LICENSE", b"MIT")
         add_file(tar, "THIRD-PARTY-NOTICES", b"none")
-        add_file(tar, "scripts/server-up", b"#!/bin/sh\\n")
-        add_file(tar, "scripts/server-down", b"#!/bin/sh\\n")
         for name in extra:
             add_file(tar, name, b"x")
 
@@ -219,10 +216,7 @@ def fake_scenarios(config):
     result = fake_setup(config, "good", version)
     remote("rm -f /usr/local/bin/stat")
     assert "status=partial" in result.stdout, result.stdout
-    assert (
-        "changed=/usr/local/lib/svpn/server-up,/usr/local/lib/svpn/server-down,"
-        "/usr/local/bin/svpn" in result.stdout
-    ), result.stdout
+    assert "changed=/usr/local/bin/svpn" in result.stdout, result.stdout
     result = fake_setup(config, "good", version)
     assert "status=success" in result.stdout, result.stdout
     print("PASS setup fake: interrupted verification reports partial and a re-run recovers")
@@ -239,6 +233,7 @@ def case_real_runs(ctx):
         admin_after = remote("sha256sum /etc/svpn/admin.conf; stat -c %a /etc/svpn/admin.conf").stdout
         assert admin_after == ctx.admin_before
         assert remote("test ! -e /tmp/svpn-setup-hook-ran").returncode == 0
+        assert remote("test ! -e /usr/local/lib/svpn").returncode == 0
         assert remote("! pgrep -f '^svpn serve'").returncode == 0
         assert (
             remote("test ! -e /etc/systemd/system/svpn.service && test ! -e /etc/init.d/svpn").returncode == 0
@@ -293,13 +288,7 @@ CASES = (
 
 def main():
     assert remote("test ! -e /usr/local/bin/svpn").returncode == 0
-    remote(
-        "mkdir -p /etc/svpn /usr/local/lib/svpn; "
-        "printf 'keep\\n' >/etc/svpn/admin.conf; chmod 640 /etc/svpn/admin.conf; "
-        "printf '#!/bin/sh\\ntouch /tmp/svpn-setup-hook-ran\\n' >/usr/local/lib/svpn/server-up; "
-        "cp /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down; "
-        "chmod 755 /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down"
-    )
+    remote("mkdir -p /etc/svpn; printf 'keep\\n' >/etc/svpn/admin.conf; chmod 640 /etc/svpn/admin.conf")
     before = snapshot()
     admin_before = remote("sha256sum /etc/svpn/admin.conf; stat -c %a /etc/svpn/admin.conf").stdout
     with tempfile.TemporaryDirectory(prefix="svpn-setup-e2e-") as directory:
@@ -307,8 +296,6 @@ def main():
         config.write_text(
             f'server = "{SERVER}"\nssh-user = "root"\nssh-identity = "/keys/client"\n'
             'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-            'server-up = "/usr/local/lib/svpn/server-up"\n'
-            'server-down = "/usr/local/lib/svpn/server-down"\n'
         )
         ctx = SimpleNamespace(
             config=str(config),
@@ -321,20 +308,10 @@ def main():
 
     local_version = command(["svpn", "--version"]).stdout.split()[-1]
     assert remote("svpn --version").stdout.split()[-1] == local_version
-    modes = remote(
-        "stat -c %a /usr/local/bin/svpn /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down"
-    ).stdout
-    assert modes.split() == ["755", "755", "755"]
-    hashes = remote(
-        "sha256sum /usr/local/bin/svpn /usr/local/lib/svpn/server-up /usr/local/lib/svpn/server-down"
-    ).stdout
-    assert len(hashes.splitlines()) == 3
-    installed_hooks = hashes.split()[0::2]
-    embedded_hooks = [
-        hashlib.sha256(pathlib.Path(f"/scripts/{name}").read_bytes()).hexdigest()
-        for name in ("server-up", "server-down")
-    ]
-    assert installed_hooks[1:] == embedded_hooks, (installed_hooks, embedded_hooks)
+    modes = remote("stat -c %a /usr/local/bin/svpn").stdout
+    assert modes.split() == ["755"]
+    hashes = remote("sha256sum /usr/local/bin/svpn").stdout
+    assert len(hashes.splitlines()) == 1
     print("PASS setup artifacts:", hashes.replace("\n", "; "))
     print("SETUP COMPOSE TESTS PASSED", flush=True)
 
