@@ -16,7 +16,7 @@ const SCRIPTS: [(&str, &str); 3] = [
 // ── embedded scripts ──
 
 #[test]
-fn server_hooks_match_quickstart() {
+fn server_hooks_match_docs() {
     assert_eq!(SERVER_UP, script_with_shebang("server-up"));
     assert_eq!(SERVER_DOWN, script_with_shebang("server-down"));
 }
@@ -49,8 +49,9 @@ fn shell_scripts_parse() {
 // ── helpers ──
 
 fn script_with_shebang(name: &str) -> String {
+    // The canonical hook sources are published in the advanced guide.
     let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ADVANCED.md")).unwrap();
     let start = format!("{name} = '''\n");
     let body = readme
         .split_once(&start)

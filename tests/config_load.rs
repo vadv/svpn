@@ -244,10 +244,10 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
 }
 
 #[test]
-fn readme_multi_examples_parse_with_all_exit_features() {
+fn advanced_multi_examples_parse_with_all_exit_features() {
     for (index, source) in [
-        include_str!("../README.md"),
-        include_str!("../README.en.md"),
+        include_str!("../ADVANCED.md"),
+        include_str!("../ADVANCED.en.md"),
     ]
     .into_iter()
     .enumerate()
