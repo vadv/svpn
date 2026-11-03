@@ -194,7 +194,7 @@ def local_exit_full_tunnel_guard():
 
 
 def local_exit_cleanup_requires_ownership():
-    source = pathlib.Path("README.md").read_text()
+    source = pathlib.Path("ADVANCED.md").read_text()
     script = re.search(r"server-down = '''\n(.*?)\n'''", source, re.S).group(1)
     with tempfile.TemporaryDirectory(prefix="svpn-cleanup-test-") as directory:
         root = pathlib.Path(directory)
