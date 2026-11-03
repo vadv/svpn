@@ -32,6 +32,9 @@ impl Fixture {
              if [ \"$1 $2 $3 $4\" = '-4 route show default' ]; then\n\
              [ \"${NO_DEFAULT:-0}\" = 1 ] || echo 'default via 192.0.2.1 dev eth0'\n\
              fi\n\
+             if [ \"$1 $2 $3\" = '-4 route get' ]; then\n\
+             [ \"${NO_SERVER_ROUTE:-0}\" = 1 ] || printf '%s via 192.0.2.1 dev eth0 src 10.0.0.2\\n' \"$4\"\n\
+             fi\n\
              if [ \"${FAIL_SPLIT:-0}\" = 1 ] && [ \"$3\" = '0.0.0.0/1' ]; then exit 1; fi\n",
         );
         write_exec(
@@ -40,12 +43,26 @@ impl Fixture {
              if [ \"$1 $2 $3\" = '-n get default' ]; then\n\
              printf '   route to: default\\n       gateway: 192.0.2.1\\n     interface: en0\\n'\n\
              fi\n\
+             if [ \"$1 $2\" = '-n get' ] && [ \"$3\" != default ]; then\n\
+             [ \"${NO_SERVER_ROUTE:-0}\" = 1 ] || printf '   route to: %s\\n       gateway: 192.0.2.1\\n     interface: en0\\n' \"$3\"\n\
+             fi\n\
              if [ \"${FAIL_SPLIT:-0}\" = 1 ] && [ \"$4\" = '0.0.0.0/1' ]; then exit 1; fi\n",
         );
         Self { root, bin, log }
     }
 
     fn run(&self, event: &str, os: &str, no_default: bool, fail_split: bool) -> Output {
+        self.run_with_no_server_route(event, os, no_default, fail_split, false)
+    }
+
+    fn run_with_no_server_route(
+        &self,
+        event: &str,
+        os: &str,
+        no_default: bool,
+        fail_split: bool,
+        no_server_route: bool,
+    ) -> Output {
         Command::new("/bin/sh")
             .arg(script())
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
@@ -53,6 +70,7 @@ impl Fixture {
             .env("CALL_LOG", &self.log)
             .env("NO_DEFAULT", if no_default { "1" } else { "0" })
             .env("FAIL_SPLIT", if fail_split { "1" } else { "0" })
+            .env("NO_SERVER_ROUTE", if no_server_route { "1" } else { "0" })
             .env("SVPN_ROUTE_STATE_DIR", self.root.join("state"))
             .env("SVPN_SESSION_ID", "4242")
             .env("SVPN_EVENT", event)
@@ -132,16 +150,30 @@ fn repeated_up_reclaims_previous_owner_first() {
 }
 
 #[test]
-fn missing_default_fails_before_any_route_change() {
+fn missing_default_route_does_not_block_auto_routing() {
     let fixture = Fixture::new();
     let output = fixture.run("up", "Linux", true, false);
+    assert!(output.status.success(), "{output:?}");
+    let log = fixture.log();
+    assert!(log.contains("route get 198.51.100.10"), "{log}");
+    assert!(log.contains("route replace 198.51.100.10/32"), "{log}");
+    assert!(log.contains("route replace 0.0.0.0/1"), "{log}");
+    assert!(fixture.run("down", "Linux", false, false).status.success());
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn missing_server_route_fails_before_split_default() {
+    let fixture = Fixture::new();
+    let output = fixture.run_with_no_server_route("up", "Linux", false, false, true);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no IPv4 default route"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cannot determine the route to 198.51.100.10"),
         "{output:?}"
     );
     assert!(
-        !fixture.log().contains("route replace"),
+        !fixture.log().contains("route replace 0.0.0.0/1"),
         "{}",
         fixture.log()
     );
