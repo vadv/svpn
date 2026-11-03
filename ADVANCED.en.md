@@ -113,6 +113,8 @@ To override, inspect the example, save it, edit it and point to it with
 svpn example server-up > server-up
 svpn example server-down > server-down
 $EDITOR server-up
+chmod 755 server-up server-down
+ssh root@vps 'mkdir -p /usr/local/lib/svpn'
 scp server-up server-down root@vps:/usr/local/lib/svpn/
 ```
 
@@ -127,8 +129,8 @@ Hooks receive these environment variables:
 - `SVPN_SESSION_ID` — the process PID.
 
 The timeout is 10 seconds. A failing `up` prevents the session from starting;
-a failing `down` is only logged. Example scripts are shown in the
-configuration above.
+a failing `down` is only logged. Use `svpn example server-up|server-down`
+to inspect the default scripts.
 
 ## Client hooks
 
@@ -140,6 +142,13 @@ svpn example client-up
 svpn example client-down
 ```
 
+For a manual override, save the output and make the file executable:
+
+```bash
+svpn example client-up > client-up
+chmod +x client-up
+```
+
 The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
 
 1. adds a `/32` host route to every VPS through the original path;
@@ -149,15 +158,6 @@ The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
 With `up-command`/`up-script`, that script does not run: your variant runs.
 `up-command` executes as `/bin/sh -c <string>`, while `up-script` directly
 executes the file.
-TUN it adds a `/32` host route to every VPS through the original gateway and
-split-default routes `0.0.0.0/1` and `128.0.0.0/1` through the TUN. All IPv4
-then goes through the tunnel while the VPS remains directly reachable. This
-works on Linux, OpenWrt and macOS.
-
-On shutdown only this session's routes are removed. Ownership is kept in
-`/var/run/svpn`; a failure or interruption triggers rollback, and the next
-start cleans the previous state first. Foreign default routes and unrelated
-admin routes are never overwritten.
 
 The fields below are manual overrides. Setting `up-command` or `up-script`
 disables the automatic up; the same applies to `down-command`/`down-script`.

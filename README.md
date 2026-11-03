@@ -54,8 +54,7 @@ sudo install -m 755 svpn /usr/local/bin/svpn
 svpn --version
 ```
 
-Для aarch64 возьмите архив `linux-aarch64-gnu`. В архиве, кроме бинарника, лежат
-`scripts/server-up` и `scripts/server-down` — hooks для сервера.
+Для aarch64 возьмите архив `linux-aarch64-gnu`.
 
 ### 2. Проверьте SSH до VPS
 

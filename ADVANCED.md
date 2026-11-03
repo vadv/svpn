@@ -112,6 +112,8 @@ sudo systemctl restart svpn
 svpn example server-up > server-up
 svpn example server-down > server-down
 $EDITOR server-up
+chmod 755 server-up server-down
+ssh root@vps 'mkdir -p /usr/local/lib/svpn'
 scp server-up server-down root@vps:/usr/local/lib/svpn/
 ```
 
@@ -138,6 +140,13 @@ svpn example client-up
 svpn example client-down
 ```
 
+Для ручного override сохраните вывод и сделайте файл исполняемым:
+
+```bash
+svpn example client-up > client-up
+chmod +x client-up
+```
+
 Скрипт получает `SVPN_SERVER_ADDRS` и `SVPN_OS`, затем:
 
 1. для каждого VPS добавляет `/32` host route через исходный путь;
@@ -147,14 +156,6 @@ svpn example client-down
 При `up-command`/`up-script` этот скрипт не запускается: выполняется ваш
 вариант. `up-command` запускается как `/bin/sh -c <строка>`, а `up-script` —
 как прямой запуск исполняемого файла.
-он добавляет host route `/32` до каждого VPS через исходный gateway и
-split-default `0.0.0.0/1` и `128.0.0.0/1` через TUN. Так весь IPv4 идёт в
-туннель, а прямой путь до VPS сохраняется. Работает на Linux, OpenWrt и macOS.
-
-При остановке удаляются только маршруты этой сессии. Владение хранится в
-`/var/run/svpn`; при ошибке или прерывании выполняется rollback, а при новом
-запуске прежнее состояние сначала очищается. Чужой default route и чужие
-маршруты не перезаписываются.
 
 Поля ниже — ручной override. Если задан `up-command` или `up-script`,
 автоматический up не выполняется; то же для `down-command`/`down-script`.

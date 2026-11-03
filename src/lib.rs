@@ -473,24 +473,24 @@ pub(crate) async fn open_link(
         matches!(bootstrap(&mut control).await?, Message::TunReady),
         "server TUN not ready"
     );
-    if params.server_up.is_some() || params.server_down.is_some() {
-        control
-            .send(Message::ServerHooks {
-                up: params.server_up.clone(),
-                down: params.server_down.clone(),
-            })
-            .await?;
-        let Message::HookResult { ok, stdout, stderr } = bootstrap(&mut control).await? else {
-            bail!("expected hook_result");
-        };
-        if !stdout.is_empty() {
-            crate::info!("server hook stdout: {stdout}");
-        }
-        if !stderr.is_empty() {
-            crate::info!("server hook stderr: {stderr}");
-        }
-        ensure!(ok, "server up hook failed");
+    // Always send the effective hooks: older servers only run explicit hooks,
+    // while new servers also default to the embedded hook text when absent.
+    control
+        .send(Message::ServerHooks {
+            up: Some(setup::up_or_default(params.server_up.clone())),
+            down: Some(setup::down_or_default(params.server_down.clone())),
+        })
+        .await?;
+    let Message::HookResult { ok, stdout, stderr } = bootstrap(&mut control).await? else {
+        bail!("expected hook_result");
+    };
+    if !stdout.is_empty() {
+        crate::info!("server hook stdout: {stdout}");
     }
+    if !stderr.is_empty() {
+        crate::info!("server hook stderr: {stderr}");
+    }
+    ensure!(ok, "server up hook failed");
     // Ready to exchange transport probes, not to route user IP packets yet.
     control.send(Message::TunReady).await?;
     let auto_mode = plan.strategies.is_empty();

@@ -296,6 +296,8 @@ def main():
         config.write_text(
             f'server = "{SERVER}"\nssh-user = "root"\nssh-identity = "/keys/client"\n'
             'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
+            'server-up = "touch /tmp/svpn-setup-hook-ran"\n'
+            'server-down = "touch /tmp/svpn-setup-hook-ran"\n'
         )
         ctx = SimpleNamespace(
             config=str(config),

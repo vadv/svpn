@@ -19,6 +19,8 @@ services:
     sysctls:
       net.ipv4.ip_forward: 1
     devices: [/dev/net/tun:/dev/net/tun]
+    environment:
+      SVPN_TEST_DEFAULT_GW: 172.30.77.1
     volumes:
       - keys:/keys:ro
     networks:
@@ -45,6 +47,8 @@ services:
     sysctls:
       net.ipv4.ip_forward: 1
     devices: [/dev/net/tun:/dev/net/tun]
+    environment:
+      SVPN_TEST_DEFAULT_GW: 172.30.77.1
     volumes:
       - keys:/keys:ro
     networks:

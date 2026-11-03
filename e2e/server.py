@@ -29,6 +29,10 @@ class TCPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+gateway = os.environ.get("SVPN_TEST_DEFAULT_GW")
+if gateway:
+    subprocess.run(["ip", "route", "replace", "default", "via", gateway], check=False)
+
 for service in (TCPServer(("0.0.0.0", 9000), TCP), socketserver.ThreadingUDPServer(("0.0.0.0", 9000), UDP)):
     threading.Thread(target=service.serve_forever, daemon=True).start()
 

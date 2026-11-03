@@ -10,8 +10,8 @@ owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
 rm -f "$owner.rule" "$owner.route" "$owner.nat"
 default=$(ip -4 route show default)
 [ -n "$default" ] || {
-    echo "svpn: no IPv4 default route; leaving egress unchanged" >&2
-    exit 0
+    echo "svpn: no IPv4 default route" >&2
+    exit 1
 }
 wan=$(printf '%s\n' "$default" | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 gateway=$(printf '%s\n' "$default" | awk 'NR==1{print $3}')
