@@ -10,13 +10,13 @@ systemd-сервис или отдельный конфиг.
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
-    tun --> brain("🧠 Выбор пути<br/>country · ASN<br/>local-exit")
+    tun --> brain("🧠 Выбор пути<br/>по адресу назначения")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 виден домашний IP"]
-    brain -->|"остальной мир"| geo["🗺️ Гео: страна назначения<br/>оставляет только серверы<br/>с ней в countries"]
-    geo -->|"US → только VPS-2"| asn["🎯 sticky-ASN: сеть назначения<br/>(Claude Code, Google…)<br/>закреплена за одним VPS"]
-    asn -->|"Claude Code"| vps1["🖥️ VPS-1 · NL, DE<br/>≈3/4 сетей<br/>🕵️ свой mimic: ssh · quic · UDP"]
-    asn -->|"Google"| vps2["🖥️ VPS-2 · DE, US<br/>≈1/4 сетей<br/>🕵️ свой mimic: mosh · obfs · TCP"]
+    brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(Claude Code, Google…)<br/>закреплена за одним VPS"]
+    asn --> mimic["🕵️ Маскировка: клиент сам<br/>подбирает, под что притвориться<br/>UDP, при блокировке — TCP"]
+    mimic -->|"Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 сетей<br/>🕵️ выглядит как ssh-трафик"]
+    mimic -->|"Google"| vps2["🖥️ VPS-2 · DE · ≈1/4 сетей<br/>🕵️ выглядит как mosh-трафик"]
     vps1 --> net1["🌍 виден IP VPS-1"]
     vps2 --> net2["🌍 виден IP VPS-2"]
     vps1 -.->|"VPS-1 недоступен —<br/>сети переезжают"| vps2
@@ -27,8 +27,8 @@ flowchart TD
     classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
     class brain brain
     class local local
-    class geo,asn asn
-    class vps1,vps2 vpn
+    class asn asn
+    class mimic,vps1,vps2 vpn
     class home,net1,net2 edge
 ```
 
@@ -36,10 +36,8 @@ flowchart TD
 идут через локальный выход — сайт видит ваш домашний IP. Остальные адреса
 шифруются и уходят на VPS — сайт видит IP сервера. В режиме нескольких VPS
 `sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
-видел стабильный внешний IP. Страна назначения сужает пул серверов через
-`countries`, а трафик маскируется под обычные протоколы: у каждого VPS свой
-набор масок в `mimic`, клиент подбирает рабочий для канала и переходит на TCP,
-если UDP заблокирован.
+видел стабильный внешний IP. Трафик маскируется: клиент сам подбирает, под что
+притвориться на канале, и переходит на TCP, если UDP заблокирован.
 
 ## Быстрый старт
 

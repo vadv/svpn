@@ -10,13 +10,13 @@ separate configuration on the VPS.
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
-    tun --> brain("🧠 Path selection<br/>country · ASN<br/>local-exit")
+    tun --> brain("🧠 Path selection<br/>by destination address")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 home IP is visible"]
-    brain -->|"rest of the world"| geo["🗺️ Geo: destination country<br/>keeps only servers that<br/>list it in countries"]
-    geo -->|"US → only VPS-2"| asn["🎯 sticky-ASN: each destination<br/>network (Claude Code, Google…)<br/>is pinned to one VPS"]
-    asn -->|"Claude Code"| vps1["🖥️ VPS-1 · NL, DE<br/>≈3/4 of networks<br/>🕵️ own mimic: ssh · quic · UDP"]
-    asn -->|"Google"| vps2["🖥️ VPS-2 · DE, US<br/>≈1/4 of networks<br/>🕵️ own mimic: mosh · obfs · TCP"]
+    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (Claude Code, Google…)<br/>is pinned to one VPS"]
+    asn --> mimic["🕵️ Camouflage: the client<br/>picks what to look like<br/>UDP, TCP when UDP blocked"]
+    mimic -->|"Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 of networks<br/>🕵️ looks like ssh traffic"]
+    mimic -->|"Google"| vps2["🖥️ VPS-2 · DE · ≈1/4 of networks<br/>🕵️ looks like mosh traffic"]
     vps1 --> net1["🌍 VPS-1 IP is visible"]
     vps2 --> net2["🌍 VPS-2 IP is visible"]
     vps1 -.->|"if VPS-1 dies,<br/>networks move over"| vps2
@@ -27,8 +27,8 @@ flowchart TD
     classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
     class brain brain
     class local local
-    class geo,asn asn
-    class vps1,vps2 vpn
+    class asn asn
+    class mimic,vps1,vps2 vpn
     class home,net1,net2 edge
 ```
 
@@ -36,10 +36,9 @@ The client picks the path before encryption. Addresses in `local-exits` (for
 example RU and BY) leave through the local exit — the site sees your home IP.
 Everything else is encrypted and sent to a VPS — the site sees the server IP.
 With several VPSs, `sticky-asn` pins every destination ASN to one server so a
-service sees a stable external IP. The destination country narrows the server
-pool through `countries`, and tunnel traffic is disguised as ordinary
-protocols: each VPS has its own `mimic` set, the client keeps whichever works
-for the channel and falls back to TCP when UDP is blocked.
+service sees a stable external IP. Tunnel traffic is disguised: the client
+itself picks what to look like on the channel and switches to TCP when UDP is
+blocked.
 
 ## Quick start
 
