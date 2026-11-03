@@ -43,7 +43,6 @@ fn shell_scripts_parse() {
 
 #[test]
 fn server_up_fails_without_a_default_route() {
-    use std::os::unix::fs::PermissionsExt;
     let root = temporary_dir();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
