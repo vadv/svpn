@@ -13,10 +13,10 @@ flowchart TD
     tun --> brain("🧠 Выбор пути<br/>country · ASN<br/>local-exit")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 виден домашний IP"]
-    brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(ASN — например Netflix<br/>или Google) живёт на одном VPS"]
+    brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(ASN — например Claude Code<br/>или Google) живёт на одном VPS"]
     asn --> mimic["🕵️ Мимикрия — авто<br/>под канал: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>или TCP 41020 (UDP закрыт)"]
-    mimic -->|"трафик сети Netflix"| vps1["🖥️ VPS-1 · NL · вес 3<br/>decrypt → TUN → NAT"]
-    mimic -->|"трафик сети Google"| vps2["🖥️ VPS-2 · DE · вес 1<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик Claude Code"| vps1["🖥️ VPS-1 · NL · вес 3<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик Google"| vps2["🖥️ VPS-2 · DE · вес 1<br/>decrypt → TUN → NAT"]
     vps1 --> net1["🌍 виден IP VPS-1"]
     vps2 --> net2["🌍 виден IP VPS-2"]
     vps1 -.->|"VPS-1 недоступен —<br/>сети переезжают"| vps2

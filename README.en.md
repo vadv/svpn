@@ -13,9 +13,9 @@ flowchart TD
     tun --> brain("🧠 Path selection<br/>country · ASN<br/>local-exit")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 home IP is visible"]
-    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (an ASN — Netflix,<br/>Google…) lives on one VPS"]
+    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (an ASN — Claude Code,<br/>Google…) lives on one VPS"]
     asn --> mimic["🕵️ Camouflage — auto<br/>per channel: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>or TCP 41020 if UDP blocked"]
-    mimic -->|"Netflix traffic"| vps1["🖥️ VPS-1 · NL · weight 3<br/>decrypt → TUN → NAT"]
+    mimic -->|"Claude Code traffic"| vps1["🖥️ VPS-1 · NL · weight 3<br/>decrypt → TUN → NAT"]
     mimic -->|"Google traffic"| vps2["🖥️ VPS-2 · DE · weight 1<br/>decrypt → TUN → NAT"]
     vps1 --> net1["🌍 VPS-1 IP is visible"]
     vps2 --> net2["🌍 VPS-2 IP is visible"]
