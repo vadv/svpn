@@ -201,6 +201,9 @@ By default SVPN uses SSH camouflage and UDP. If UDP is blocked, set
 `mimic = ["ssh"]` and `tcp-port = 41020`. The UDP port range is set with
 `udp-port-range = "60000-60009"`.
 
+`mimic` and `tcp-port` can be set per server inside `[[servers]]`: different
+VPSs may use different camouflage sets.
+
 ## Autostart
 
 ```bash
