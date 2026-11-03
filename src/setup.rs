@@ -1,7 +1,7 @@
 //! `svpn setup`: bounded SSH provisioning of the server binary and hooks.
 //! It never opens a TUN, starts a service, or executes the deployed hooks.
 
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,16 @@ use crate::{config, shell_quote, ssh};
 pub const SETUP_SCRIPT: &str = include_str!("../scripts/setup");
 pub const SERVER_UP: &str = include_str!("../scripts/server-up");
 pub const SERVER_DOWN: &str = include_str!("../scripts/server-down");
+
+/// Effective server up hook: an explicit command wins, otherwise the embedded example.
+pub fn up_or_default(command: Option<String>) -> String {
+    command.unwrap_or_else(|| SERVER_UP.to_owned())
+}
+
+/// Effective server down hook: an explicit command wins, otherwise the embedded example.
+pub fn down_or_default(command: Option<String>) -> String {
+    command.unwrap_or_else(|| SERVER_DOWN.to_owned())
+}
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -41,14 +51,18 @@ enum HostReport {
 }
 
 /// Provision every configured VPS sequentially, continuing after ordinary host failures.
-pub async fn run(path: &Path) -> Result<()> {
-    let args = match config::load(path, true) {
-        Ok(args) => args,
-        Err(multi_error) => config::load(path, false).map_err(|single_error| {
-            anyhow!(
-                "config is neither valid multi nor single mode:\nmulti: {multi_error:#}\nsingle: {single_error:#}"
-            )
-        })?,
+pub async fn run(cli_args: crate::cli::ClientArgs) -> Result<()> {
+    let path = cli_args.config.clone();
+    let args = match path {
+        Some(path) => match config::load(&path, true) {
+            Ok(args) => args,
+            Err(multi_error) => config::load(&path, false).map_err(|single_error| {
+                anyhow!(
+                    "config is neither valid multi nor single mode:\nmulti: {multi_error:#}\nsingle: {single_error:#}"
+                )
+            })?,
+        },
+        None => cli_args,
     };
     // Resolve and validate the complete target list before opening the first SSH connection.
     let servers = crate::server_spec::resolve_servers(&args.server, &args.globals)?;

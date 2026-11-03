@@ -23,7 +23,7 @@ ssh-identity = "/полный/путь/к/ключу"
 ssh-port = 22
 ssh-remote-bin = "/usr/local/bin/svpn"
 mimic = ["ssh"]
-tcp-port = 41020
+tcp-port = 41020  # фиксированный TCP-fallback; обязателен при mimic = ["ssh"] без UDP
 udp-port-range = "60000-60009"
 
 # Защита адресов VPS при перехвате default route. Для этих адресов не должно
@@ -34,14 +34,21 @@ down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/3
 # Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
 server-up = '''
 set -e
-sysctl -qw net.ipv4.ip_forward=1
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != 1 ]; then
+    sysctl -qw net.ipv4.ip_forward=1
+fi
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
 table=svpn_egress_$n
 owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
 rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+default=$(ip -4 route show default)
+[ -n "$default" ] || {
+    echo "svpn: no IPv4 default route; leaving egress unchanged" >&2
+    exit 0
+}
+wan=$(printf '%s\n' "$default" | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(printf '%s\n' "$default" | awk 'NR==1{print $3}')
 if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
     echo "svpn: policy priority $table_id is already in use" >&2
     exit 1
@@ -64,6 +71,7 @@ add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
 EOF
 : > "$owner.nat"
 '''
+
 server-down = '''
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
@@ -155,9 +163,13 @@ sudo systemctl restart svpn
 ## Server hooks
 
 `server-up` и `server-down` выполняются на VPS, а также у `local-exit` на
-клиенте. Готовые скрипты лежат в релизном архиве и устанавливаются командой
-`svpn setup` в `/usr/local/lib/svpn/`. Для ручной установки возьмите их из
-архива.
+клиенте. Если поля не заданы, `serve` выполняет встроенные hooks текущей
+версии бинарника.
+
+`svpn setup` оставляет примеры этих скриптов в `/usr/local/lib/svpn/`. Они
+не запускаются по умолчанию: чтобы переопределить поведение, отредактируйте
+пример и укажите его путь в `server-up`/`server-down`. Можно также задать
+команду прямо строкой в TOML.
 
 Hooks получают переменные окружения:
 
@@ -172,7 +184,9 @@ Timeout — 10 секунд. Ошибка `up` не даёт поднять се
 
 ## Клиентские hooks
 
-Если ручной hook не задан, SVPN настраивает маршруты сам. После создания TUN
+Если ручной hook не задан, выполняется встроенный `client-route` текущей
+версии бинарника; example-файлы по умолчанию не запускаются. SVPN настраивает
+маршруты сам. После создания TUN
 он добавляет host route `/32` до каждого VPS через исходный gateway и
 split-default `0.0.0.0/1` и `128.0.0.0/1` через TUN. Так весь IPv4 идёт в
 туннель, а прямой путь до VPS сохраняется. Работает на Linux, OpenWrt и macOS.
@@ -211,11 +225,14 @@ known-hosts файле. Для строгой проверки получите 
 ## Транспорт
 
 По умолчанию используется SSH camouflage и UDP. Если UDP заблокирован, задайте
-`mimic = ["ssh"]` и `tcp-port = 41020`. Диапазон UDP-портов задаётся строкой
+`mimic = ["ssh"]`. Диапазон UDP-портов задаётся строкой
 `udp-port-range = "60000-60009"`.
 
-`mimic` и `tcp-port` можно задать отдельно для каждого сервера внутри
-`[[servers]]`: разные VPS могут работать с разными масками.
+`tcp-port` — фиксированный порт TCP-fallback. В auto он необязателен и по
+умолчанию эфемерный, поэтому базовая настройка не требуется. Но при
+`mimic = ["ssh"]` без UDP-стратегий он обязателен: TCP-only серверу нужен
+известный порт. `mimic` и `tcp-port` можно задать отдельно для каждого сервера
+внутри `[[servers]]`: разные VPS могут работать с разными масками.
 
 ## Автозапуск
 

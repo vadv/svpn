@@ -69,49 +69,30 @@ ssh -i /full/path/to/key root@203.0.113.10
 If the key is passphrase-protected, load it into `ssh-agent` first. Instead of
 root you can use a regular user with passwordless `sudo -n`.
 
-### 3. Create the config
+### 3. Prepare the VPS
 
 ```bash
-sudo install -d -m 700 /etc/svpn
-sudoedit /etc/svpn/vpn.toml
-```
-
-```toml
-# Your VPS address and SSH key.
-server = "203.0.113.10"
-ssh-user = "root"
-ssh-identity = "/full/path/to/key"
-tcp-port = 41020   # TCP fallback when UDP is blocked
-
-# Hooks on the VPS: installed by svpn setup. They configure NAT and egress.
-server-up = "/usr/local/lib/svpn/server-up"
-server-down = "/usr/local/lib/svpn/server-down"
-```
-
-Replace the VPS address and the key path. SVPN configures the client routes
-automatically: all IPv4 goes into the tunnel while the VPS stays reachable
-directly. Automatic routes are removed on shutdown. Custom routing is covered
-in [ADVANCED.en.md](ADVANCED.en.md).
-
-### 4. Prepare the VPS
-
-```bash
-sudo svpn setup --config /etc/svpn/vpn.toml
+sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /full/path/to/key
 ```
 
 The command downloads the SVPN release on the VPS itself, installs the binary
-and hooks and verifies the installation. It never modifies the config. Debian
-12 and Rocky 10 on x86_64 and aarch64 are supported.
+and verifies the installation. Debian 12 and Rocky 10 on x86_64 and aarch64
+are supported.
 
-### 5. Start
+Setup also leaves example `server-up` and `server-down` in
+`/usr/local/lib/svpn/`. They do not run by default: `serve` uses the hooks
+embedded in the current build. To override, edit the example and point to it
+in the config — see [ADVANCED.en.md](ADVANCED.en.md).
+
+### 4. Start
 
 ```bash
-sudo -E svpn --config /etc/svpn/vpn.toml
+sudo -E svpn --server 203.0.113.10 --ssh-user root --ssh-identity /full/path/to/key
 ```
 
 Stop with `Ctrl-C`. For systemd autostart see [ADVANCED.en.md](ADVANCED.en.md).
 
-### 6. Verify
+### 5. Verify
 
 ```bash
 curl -4 https://ifconfig.me   # should print your VPS IP
@@ -119,6 +100,27 @@ ping -c1 1.1.1.1
 ```
 
 If `ifconfig.me` shows the VPS IP, traffic goes through the tunnel.
+
+## Country and ASN databases — only for local-exit and sticky-asn
+
+You do not need databases for a plain VPN. To send RU/BY destinations directly
+or pin the exit by ASN, download them on the client:
+
+```bash
+sudo install -d -m 700 /etc/svpn
+YEAR_MONTH=$(date +%Y-%m)
+
+curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
+gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+
+curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
+gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
+sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
+```
+
+Country DB answers “which country is this address”, ASN DB answers “which
+network is it”. Enabling these modes and the multi-server TOML is covered in
+ADVANCED.
 
 ## Next steps
 

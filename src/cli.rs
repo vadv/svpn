@@ -71,9 +71,8 @@ pub enum Mode {
     Client(ClientArgs),
     /// Install the server binary and embedded hooks on configured GNU Linux VPSs.
     Setup {
-        /// Existing single-server or multi-server client TOML; it is never modified.
-        #[arg(long, value_name = "FILE")]
-        config: PathBuf,
+        #[command(flatten)]
+        client: ClientArgs,
     },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
@@ -198,6 +197,15 @@ impl Cli {
                 mode
             }
             None => Mode::Client(raw.client),
+        };
+        let mode = match mode {
+            Mode::Setup { client } if client.config.is_some() == !client.server.is_empty() => {
+                return Err(clap::Error::raw(
+                    ErrorKind::ArgumentConflict,
+                    "setup requires exactly one of --config or --server",
+                ));
+            }
+            mode => mode,
         };
         let mode = match mode {
             Mode::Client(mut client) => {

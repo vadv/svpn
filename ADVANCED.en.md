@@ -23,7 +23,7 @@ ssh-identity = "/full/path/to/key"
 ssh-port = 22
 ssh-remote-bin = "/usr/local/bin/svpn"
 mimic = ["ssh"]
-tcp-port = 41020
+tcp-port = 41020  # fixed TCP-fallback port; required with mimic = ["ssh"] and no UDP
 udp-port-range = "60000-60009"
 
 # Protect the VPS addresses when the default route is replaced. This assumes
@@ -34,14 +34,21 @@ down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/3
 # These server hooks run on each VPS and at the local-exit on the client.
 server-up = '''
 set -e
-sysctl -qw net.ipv4.ip_forward=1
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != 1 ]; then
+    sysctl -qw net.ipv4.ip_forward=1
+fi
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
 table=svpn_egress_$n
 owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
 rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+default=$(ip -4 route show default)
+[ -n "$default" ] || {
+    echo "svpn: no IPv4 default route; leaving egress unchanged" >&2
+    exit 0
+}
+wan=$(printf '%s\n' "$default" | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(printf '%s\n' "$default" | awk 'NR==1{print $3}')
 if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
     echo "svpn: policy priority $table_id is already in use" >&2
     exit 1
@@ -64,6 +71,7 @@ add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
 EOF
 : > "$owner.nat"
 '''
+
 server-down = '''
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
@@ -156,9 +164,12 @@ a new database, validates it and keeps the previous one as `asn.csv.prev`.
 ## Server hooks
 
 `server-up` and `server-down` run on the VPS and at `local-exit` on the
-client. The ready-made scripts are shipped in the release archive and are
-installed by `svpn setup` into `/usr/local/lib/svpn/`. For a manual install
-take them from the archive.
+client. When these fields are absent, `serve` runs the hooks embedded in the
+current binary.
+
+`svpn setup` leaves example scripts in `/usr/local/lib/svpn/`. They do not
+run by default: to override, edit the example and point to it with
+`server-up`/`server-down`. A command can also be written directly in TOML.
 
 Hooks receive these environment variables:
 
@@ -174,7 +185,9 @@ configuration above.
 
 ## Client hooks
 
-When no manual hook is set, SVPN configures routes itself. After creating the
+When no manual hook is set, the embedded `client-route` of the current binary
+runs; example files do not run by default. SVPN configures routes itself.
+After creating the
 TUN it adds a `/32` host route to every VPS through the original gateway and
 split-default routes `0.0.0.0/1` and `128.0.0.0/1` through the TUN. All IPv4
 then goes through the tunnel while the VPS remains directly reachable. This
@@ -214,11 +227,14 @@ needed.
 ## Transport
 
 By default SVPN uses SSH camouflage and UDP. If UDP is blocked, set
-`mimic = ["ssh"]` and `tcp-port = 41020`. The UDP port range is set with
+`mimic = ["ssh"]`. The UDP port range is set with
 `udp-port-range = "60000-60009"`.
 
-`mimic` and `tcp-port` can be set per server inside `[[servers]]`: different
-VPSs may use different camouflage sets.
+`tcp-port` is a fixed TCP-fallback port. In auto mode it is optional and
+ephemeral by default, so no setting is required. With `mimic = ["ssh"]` and no
+UDP strategies it is required: a TCP-only server needs a known port. `mimic`
+and `tcp-port` can be set per server inside `[[servers]]`: different VPSs may
+use different camouflage sets.
 
 ## Autostart
 

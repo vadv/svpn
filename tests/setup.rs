@@ -4,10 +4,34 @@ use sha2::{Digest, Sha256};
 use svpn::{Cli, Mode, setup};
 
 #[test]
-fn setup_requires_its_own_config_argument() {
+fn setup_requires_exactly_one_of_config_or_server() {
     let cli = Cli::try_parse_from(["svpn", "setup", "--config", "client.toml"]).unwrap();
     assert!(matches!(cli.command, Mode::Setup { .. }));
+    let cli = Cli::try_parse_from(["svpn", "setup", "--server", "203.0.113.10"]).unwrap();
+    let Mode::Setup { client } = cli.command else {
+        unreachable!()
+    };
+    assert_eq!(client.server.len(), 1);
     assert!(Cli::try_parse_from(["svpn", "setup"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "svpn",
+            "setup",
+            "--config",
+            "client.toml",
+            "--server",
+            "203.0.113.10"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn absent_server_hooks_use_embedded_defaults_and_custom_commands_override() {
+    assert_eq!(setup::up_or_default(None), setup::SERVER_UP);
+    assert_eq!(setup::down_or_default(None), setup::SERVER_DOWN);
+    assert_eq!(setup::up_or_default(Some("true".into())), "true");
+    assert_eq!(setup::down_or_default(Some("true".into())), "true");
 }
 
 #[test]

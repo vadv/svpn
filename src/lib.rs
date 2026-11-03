@@ -216,7 +216,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Mode::Setup { config } => setup::run(&config).await,
+        Mode::Setup { client } => setup::run(client).await,
         Mode::Serve {
             tun_name,
             log_level: _,
@@ -729,52 +729,53 @@ pub(crate) async fn serve_tail(
                     peer: client_ip,
                     server_addrs: None,
                 };
-                if let Some(up) = up {
-                    let hook = hooks::Hook::Command(up);
-                    let (ok, stdout, stderr) =
-                        match hooks::run_with_capture(&hook, "up", &context).await {
-                            Ok((stdout, stderr)) => (true, stdout, stderr),
-                            Err(error) => {
-                                let message = format!("{error:#}");
-                                crate::error!("hook: up failed — {message}");
-                                (false, String::new(), message)
-                            }
-                        };
-                    control
-                        .send(Message::HookResult { ok, stdout, stderr })
-                        .await?;
-                    ensure!(ok, "server up hook failed");
-                } else {
-                    control
-                        .send(Message::HookResult {
-                            ok: true,
-                            stdout: String::new(),
-                            stderr: String::new(),
-                        })
-                        .await?;
-                }
+                let up = setup::up_or_default(up);
+                let hook = hooks::Hook::Command(up);
+                let (ok, stdout, stderr) =
+                    match hooks::run_with_capture(&hook, "up", &context).await {
+                        Ok((stdout, stderr)) => (true, stdout, stderr),
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            crate::error!("hook: up failed — {message}");
+                            (false, String::new(), message)
+                        }
+                    };
+                control
+                    .send(Message::HookResult { ok, stdout, stderr })
+                    .await?;
+                ensure!(ok, "server up hook failed");
                 ensure!(
                     matches!(bootstrap(&mut control).await?, Message::TunReady),
                     "client TUN not ready"
                 );
             }
-            Message::TunReady => {}
+            Message::TunReady => {
+                // No explicit server hooks: run the embedded up example for this build.
+                let context = hooks::TunContext {
+                    name: tun_name.clone(),
+                    local: server_ip,
+                    peer: client_ip,
+                    server_addrs: None,
+                };
+                let hook = hooks::Hook::Command(setup::up_or_default(None));
+                hooks::run_with_capture(&hook, "up", &context)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("default server up hook failed: {error:#}"))?;
+            }
             _ => bail!("expected server_hooks or tun_ready"),
         }
         session::run(control, tun, None, client_ip, mtu, config).await
     }
     .await;
-    if let Some(down) = server_down {
-        let context = hooks::TunContext {
-            name: tun_name,
-            local: server_ip,
-            peer: client_ip,
-            server_addrs: None,
-        };
-        let hook = hooks::Hook::Command(down);
-        if let Err(error) = hooks::run_with_capture(&hook, "down", &context).await {
-            crate::error!("hook: down failed — {error:#}");
-        }
+    let context = hooks::TunContext {
+        name: tun_name,
+        local: server_ip,
+        peer: client_ip,
+        server_addrs: None,
+    };
+    let hook = hooks::Hook::Command(setup::down_or_default(server_down));
+    if let Err(error) = hooks::run_with_capture(&hook, "down", &context).await {
+        crate::error!("hook: down failed — {error:#}");
     }
     result
 }
