@@ -164,8 +164,9 @@ a new database, validates it and keeps the previous one as `asn.csv.prev`.
 ## Server hooks
 
 `server-up` and `server-down` run on the VPS and at `local-exit` on the
-client. When these fields are absent, `serve` runs the hooks embedded in the
-current binary.
+client. When these fields are absent, `serve` runs the embedded
+`scripts/server-up` and `scripts/server-down` from the current binary — not
+the example files.
 
 `svpn setup` leaves example scripts in `/usr/local/lib/svpn/`. They do not
 run by default: to override, edit the example and point to it with
@@ -185,9 +186,17 @@ configuration above.
 
 ## Client hooks
 
-When no manual hook is set, the embedded `client-route` of the current binary
-runs; example files do not run by default. SVPN configures routes itself.
-After creating the
+When no manual hook is set, the **embedded `scripts/client-route` from the
+current binary** runs (not an example file). On the client it receives
+`SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
+
+1. adds a `/32` host route to every VPS through the original path;
+2. adds `0.0.0.0/1` and `128.0.0.0/1` through the TUN;
+3. removes only this session's routes on shutdown.
+
+With `up-command`/`up-script`, that script does not run: your variant runs.
+`up-command` executes as `/bin/sh -c <string>`, while `up-script` directly
+executes the file.
 TUN it adds a `/32` host route to every VPS through the original gateway and
 split-default routes `0.0.0.0/1` and `128.0.0.0/1` through the TUN. All IPv4
 then goes through the tunnel while the VPS remains directly reachable. This

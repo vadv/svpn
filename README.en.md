@@ -80,9 +80,10 @@ and verifies the installation. Debian 12 and Rocky 10 on x86_64 and aarch64
 are supported.
 
 Setup also leaves example `server-up` and `server-down` in
-`/usr/local/lib/svpn/`. They do not run by default: `serve` uses the hooks
-embedded in the current build. To override, edit the example and point to it
-in the config — see [ADVANCED.en.md](ADVANCED.en.md).
+`/usr/local/lib/svpn/`. In auto mode the embedded `scripts/client-route`,
+`scripts/server-up` and `scripts/server-down` from the current binary run
+instead. To override, edit the example and point to it in the config — see
+[ADVANCED.en.md](ADVANCED.en.md).
 
 ### 4. Start
 

@@ -76,9 +76,10 @@ sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /полны
 установку. Поддерживаются Debian 12 и Rocky 10 на x86_64 и aarch64.
 
 Setup также оставляет примеры `server-up` и `server-down` в
-`/usr/local/lib/svpn/`. По умолчанию они не запускаются: `serve` использует
-встроенные hooks текущей версии. Если нужно другое поведение, отредактируйте
-пример и укажите путь к нему в конфиге — см. [ADVANCED.md](ADVANCED.md).
+`/usr/local/lib/svpn/`. По умолчанию они не запускаются: в auto выполняются
+встроенные `scripts/client-route`, `scripts/server-up` и `scripts/server-down`
+из текущего бинарника. Если нужно другое поведение, отредактируйте пример и
+укажите путь к нему в конфиге — см. [ADVANCED.md](ADVANCED.md).
 
 ### 4. Запустите
 
