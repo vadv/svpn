@@ -186,9 +186,14 @@ configuration above.
 
 ## Client hooks
 
-When no manual hook is set, the **embedded `scripts/client-route` from the
-current binary** runs (not an example file). On the client it receives
-`SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
+In auto mode the embedded `scripts/client-route` from the current binary runs.
+You can inspect the exact text before starting:
+
+```bash
+svpn example client-route
+```
+
+The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
 
 1. adds a `/32` host route to every VPS through the original path;
 2. adds `0.0.0.0/1` and `128.0.0.0/1` through the TUN;

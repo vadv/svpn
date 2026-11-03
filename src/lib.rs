@@ -84,7 +84,7 @@ pub fn main_entry() -> ExitCode {
         Mode::Client(args) => args.globals.log_level,
         Mode::Perf { globals, .. } => globals.log_level,
         Mode::Serve { log_level, .. } => *log_level,
-        Mode::Setup { .. } => logging::Level::Info,
+        Mode::Setup { .. } | Mode::Example { .. } => logging::Level::Info,
     };
     if logging::init(level).is_err() {
         return ExitCode::FAILURE;
@@ -104,7 +104,10 @@ pub fn main_entry() -> ExitCode {
     let result = runtime.block_on(async {
         // The client owns an asynchronous cleanup path; do not drop it on a signal.
         // Setup prints its own per-host report when interrupted.
-        if matches!(&cli.command, Mode::Client(_) | Mode::Setup { .. }) {
+        if matches!(
+            &cli.command,
+            Mode::Client(_) | Mode::Setup { .. } | Mode::Example { .. }
+        ) {
             return run(cli).await;
         }
         let mut terminate =
@@ -217,6 +220,15 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Mode::Setup { client } => setup::run(client).await,
+        Mode::Example { name } => {
+            let Some(text) = setup::example(&name) else {
+                bail!(
+                    "unknown hook example {name}; expected client-route, server-up or server-down"
+                );
+            };
+            print!("{text}");
+            Ok(())
+        }
         Mode::Serve {
             tun_name,
             log_level: _,

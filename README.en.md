@@ -82,7 +82,15 @@ are supported.
 Setup also leaves example `server-up` and `server-down` in
 `/usr/local/lib/svpn/`. In auto mode the embedded `scripts/client-route`,
 `scripts/server-up` and `scripts/server-down` from the current binary run
-instead. To override, edit the example and point to it in the config — see
+instead. You can inspect their exact text before starting:
+
+```bash
+svpn example client-route
+svpn example server-up
+svpn example server-down
+```
+
+To override, edit the example and point to it in the config — see
 [ADVANCED.en.md](ADVANCED.en.md).
 
 ### 4. Start

@@ -22,6 +22,16 @@ pub fn down_or_default(command: Option<String>) -> String {
     command.unwrap_or_else(|| SERVER_DOWN.to_owned())
 }
 
+/// Embedded hook example available for inspection before running SVPN.
+pub fn example(name: &str) -> Option<&'static str> {
+    match name {
+        "client-route" => Some(crate::client_routing::SCRIPT),
+        "server-up" => Some(SERVER_UP),
+        "server-down" => Some(SERVER_DOWN),
+        _ => None,
+    }
+}
+
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_PREFLIGHT_OUTPUT: usize = 64 * 1024;

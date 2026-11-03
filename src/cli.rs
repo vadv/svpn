@@ -74,6 +74,12 @@ pub enum Mode {
         #[command(flatten)]
         client: ClientArgs,
     },
+    /// Print an embedded hook example to stdout.
+    Example {
+        /// Hook example name: client-route, server-up or server-down.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
         /// Exactly one server, using the client syntax but without weight.
