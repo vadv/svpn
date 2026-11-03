@@ -23,6 +23,7 @@ fn context() -> TunContext {
         name: "utun$(false); literal".into(),
         local: Ipv4Addr::new(10, 77, 0, 2),
         peer: Ipv4Addr::new(10, 77, 0, 1),
+        server_addrs: None,
     }
 }
 
@@ -203,6 +204,8 @@ async fn failed_up_runs_compensation_once_with_same_context() {
 #[tokio::test]
 async fn failed_down_is_not_retried_and_never_runs_before_tun() {
     let mut hooks = Args {
+        // Keep this test about the failing down hook, not the automatic up route.
+        up_command: Some("true".into()),
         down_command: Some("exit 7".into()),
         ..Args::default()
     }
@@ -212,6 +215,7 @@ async fn failed_down_is_not_retried_and_never_runs_before_tun() {
     hooks
         .start(context().name, context().local, context().peer)
         .unwrap();
+    hooks.wait_up().await.unwrap();
     assert!(!hooks.starting());
     assert!(hooks.finish().await.is_err());
     hooks.finish().await.unwrap();

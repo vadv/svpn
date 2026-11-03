@@ -1,0 +1,136 @@
+#!/bin/sh
+# Automatic client full-tunnel routing. Called only when no manual hook is set.
+set -eu
+# Hooks may run with a deliberately empty PATH; use the trusted system tools.
+PATH=${SVPN_ROUTE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+umask 077
+
+state_dir=${SVPN_ROUTE_STATE_DIR:-/var/run/svpn}
+state="$state_dir/full-tunnel-$SVPN_SESSION_ID"
+
+state_field() {
+    sed -n "s/^$1 //p" "$state"
+}
+
+linux_route_to() {
+    server=$1
+    route=$(ip -4 route get "$server")
+    [ -n "$route" ] || {
+        echo "svpn: cannot determine the route to $server" >&2
+        return 1
+    }
+    route_wan=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    route_gw=$(printf '%s\n' "$route" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+    [ -n "$route_wan" ] || {
+        echo "svpn: cannot determine the interface to $server" >&2
+        return 1
+    }
+    if [ -n "$route_gw" ]; then
+        ip route replace "$server/32" via "$route_gw" dev "$route_wan"
+    else
+        ip route replace "$server/32" dev "$route_wan"
+    fi
+}
+
+linux_up() {
+    for server in ${SVPN_SERVER_ADDRS:-}; do
+        linux_route_to "$server"
+    done
+    ip route replace 0.0.0.0/1 dev "$SVPN_TUN_NAME"
+    ip route replace 128.0.0.0/1 dev "$SVPN_TUN_NAME"
+}
+
+linux_down() {
+    down_tun=$1
+    down_servers=$2
+    for server in $down_servers; do
+        ip route del "$server/32" 2>/dev/null || true
+    done
+    ip route del 0.0.0.0/1 dev "$down_tun" 2>/dev/null || true
+    ip route del 128.0.0.0/1 dev "$down_tun" 2>/dev/null || true
+}
+
+macos_route_to() {
+    server=$1
+    route=$(route -n get "$server")
+    route_gw=$(printf '%s\n' "$route" | awk '$1=="gateway:" {print $2; exit}')
+    route_wan=$(printf '%s\n' "$route" | awk '$1=="interface:" {print $2; exit}')
+    [ -n "$route_wan" ] || {
+        echo "svpn: cannot determine the interface to $server" >&2
+        return 1
+    }
+    if [ -n "$route_gw" ]; then
+        route -n add -inet -host "$server" "$route_gw"
+    else
+        route -n add -inet -host "$server" -interface "$route_wan"
+    fi
+}
+
+macos_up() {
+    for server in ${SVPN_SERVER_ADDRS:-}; do
+        macos_route_to "$server"
+    done
+    route -n add -inet 0.0.0.0/1 -interface "$SVPN_TUN_NAME"
+    route -n add -inet 128.0.0.0/1 -interface "$SVPN_TUN_NAME"
+}
+
+macos_down() {
+    down_tun=$1
+    down_servers=$2
+    for server in $down_servers; do
+        route -n delete -inet -host "$server" 2>/dev/null || true
+    done
+    route -n delete -inet 0.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
+    route -n delete -inet 128.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
+}
+
+route_down() {
+    [ -f "$state" ] || return 0
+    down_os=$(state_field os)
+    down_tun=$(state_field tun)
+    down_servers=$(state_field servers)
+    case "$down_os" in
+        linux) linux_down "$down_tun" "$down_servers" ;;
+        macos) macos_down "$down_tun" "$down_servers" ;;
+        *)
+            echo "svpn: unsupported OS for route cleanup: $down_os" >&2
+            return 1
+            ;;
+    esac
+    rm -f "$state"
+}
+
+route_up() {
+    # Reclaim only the previous session's routes before adding ours.
+    route_down
+    os=${SVPN_OS:-}
+    case "$os" in
+        linux|macos) ;;
+        *)
+            echo "svpn: automatic client routing supports only Linux and macOS, got $os" >&2
+            return 1
+            ;;
+    esac
+    mkdir -p "$state_dir"
+    state_tmp="$state.$$"
+    printf 'os %s\ntun %s\nservers %s\n' "$os" "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" >"$state_tmp"
+    mv -f "$state_tmp" "$state"
+    # Any failure or interruption rolls back only this session's routes.
+    trap 'route_down' EXIT
+    trap 'exit 1' HUP INT TERM
+    case "$os" in
+        linux) linux_up ;;
+        macos) macos_up ;;
+    esac
+    trap - EXIT HUP INT TERM
+}
+
+case "${SVPN_EVENT:-}" in
+    up) route_up ;;
+    down) route_down ;;
+    *)
+        echo "svpn: unexpected SVPN_EVENT: ${SVPN_EVENT:-}" >&2
+        exit 1
+        ;;
+esac

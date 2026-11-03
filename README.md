@@ -83,14 +83,12 @@ tcp-port = 41020   # TCP-fallback, если UDP заблокирован
 # Хуки на VPS: их установит svpn setup. Настраивают NAT и выход в Интернет.
 server-up = "/usr/local/lib/svpn/server-up"
 server-down = "/usr/local/lib/svpn/server-down"
-
-# Маршруты на клиенте: весь IPv4 идёт в туннель, дорога до VPS — напрямую.
-up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gw=$(ip -4 route show default | awk 'NR==1{print $3}'); ip route replace 203.0.113.10/32 via \"$gw\" dev \"$wan\"; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
-down-command = "ip route del 203.0.113.10/32 2>/dev/null || true; ip route del 0.0.0.0/1 2>/dev/null || true; ip route del 128.0.0.0/1 2>/dev/null || true"
 ```
 
-Замените адрес VPS и путь к ключу. Тот же адрес уже стоит в `up-command` и
-`down-command` — если меняете его, поменяйте и там.
+Замените адрес VPS и путь к ключу. Маршруты на клиенте SVPN настраивает сам:
+весь IPv4 идёт в туннель, а прямой путь до VPS сохраняется. При остановке
+автоматические маршруты удаляются. Собственная маршрутизация описана в
+[ADVANCED.md](ADVANCED.md).
 
 ### 4. Подготовьте VPS
 
