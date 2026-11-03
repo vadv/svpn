@@ -23,10 +23,6 @@ impl Fixture {
         fs::create_dir(&bin).unwrap();
         let log = root.join("calls.log");
         write_exec(
-            &bin.join("uname"),
-            "#!/bin/sh\nprintf '%s\\n' \"$FAKE_OS\"\n",
-        );
-        write_exec(
             &bin.join("ip"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n\
              if [ \"$1 $2 $3 $4\" = '-4 route show default' ]; then\n\
@@ -65,8 +61,11 @@ impl Fixture {
     ) -> Output {
         Command::new("/bin/sh")
             .arg(script())
-            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
-            .env("FAKE_OS", os)
+            .env(
+                "SVPN_ROUTE_PATH",
+                format!("{}:/usr/bin:/bin", self.bin.display()),
+            )
+            .env("SVPN_OS", os)
             .env("CALL_LOG", &self.log)
             .env("NO_DEFAULT", if no_default { "1" } else { "0" })
             .env("FAIL_SPLIT", if fail_split { "1" } else { "0" })
@@ -107,7 +106,7 @@ fn script_parses_as_posix_shell() {
 #[test]
 fn linux_up_down_installs_and_removes_only_owned_routes() {
     let fixture = Fixture::new();
-    let output = fixture.run("up", "Linux", false, false);
+    let output = fixture.run("up", "linux", false, false);
     assert!(output.status.success(), "{output:?}");
     let log = fixture.log();
     for expected in [
@@ -121,7 +120,7 @@ fn linux_up_down_installs_and_removes_only_owned_routes() {
     assert!(fixture.state_exists());
 
     fixture.clear_log();
-    let output = fixture.run("down", "Linux", false, false);
+    let output = fixture.run("down", "linux", false, false);
     assert!(output.status.success(), "{output:?}");
     let log = fixture.log();
     for expected in [
@@ -139,33 +138,33 @@ fn linux_up_down_installs_and_removes_only_owned_routes() {
 #[test]
 fn repeated_up_reclaims_previous_owner_first() {
     let fixture = Fixture::new();
-    assert!(fixture.run("up", "Linux", false, false).status.success());
+    assert!(fixture.run("up", "linux", false, false).status.success());
     fixture.clear_log();
-    assert!(fixture.run("up", "Linux", false, false).status.success());
+    assert!(fixture.run("up", "linux", false, false).status.success());
     let log = fixture.log();
     let first_change = log.lines().find(|line| !line.is_empty()).unwrap();
     assert_eq!(first_change, "route del 198.51.100.10/32", "{log}");
-    assert!(fixture.run("down", "Linux", false, false).status.success());
+    assert!(fixture.run("down", "linux", false, false).status.success());
     fs::remove_dir_all(fixture.root).unwrap();
 }
 
 #[test]
 fn missing_default_route_does_not_block_auto_routing() {
     let fixture = Fixture::new();
-    let output = fixture.run("up", "Linux", true, false);
+    let output = fixture.run("up", "linux", true, false);
     assert!(output.status.success(), "{output:?}");
     let log = fixture.log();
     assert!(log.contains("route get 198.51.100.10"), "{log}");
     assert!(log.contains("route replace 198.51.100.10/32"), "{log}");
     assert!(log.contains("route replace 0.0.0.0/1"), "{log}");
-    assert!(fixture.run("down", "Linux", false, false).status.success());
+    assert!(fixture.run("down", "linux", false, false).status.success());
     fs::remove_dir_all(fixture.root).unwrap();
 }
 
 #[test]
 fn missing_server_route_fails_before_split_default() {
     let fixture = Fixture::new();
-    let output = fixture.run_with_no_server_route("up", "Linux", false, false, true);
+    let output = fixture.run_with_no_server_route("up", "linux", false, false, true);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -184,7 +183,7 @@ fn missing_server_route_fails_before_split_default() {
 #[test]
 fn failed_split_route_rolls_back_host_routes() {
     let fixture = Fixture::new();
-    let output = fixture.run("up", "Linux", false, true);
+    let output = fixture.run("up", "linux", false, true);
     assert!(!output.status.success());
     let log = fixture.log();
     assert!(log.contains("route replace 198.51.100.10/32"), "{log}");
@@ -197,7 +196,7 @@ fn failed_split_route_rolls_back_host_routes() {
 #[test]
 fn down_without_owned_state_is_a_noop() {
     let fixture = Fixture::new();
-    let output = fixture.run("down", "Linux", false, false);
+    let output = fixture.run("down", "linux", false, false);
     assert!(output.status.success(), "{output:?}");
     assert!(fixture.log().is_empty(), "{}", fixture.log());
     fs::remove_dir_all(fixture.root).unwrap();
@@ -206,7 +205,7 @@ fn down_without_owned_state_is_a_noop() {
 #[test]
 fn macos_up_down_uses_route_commands() {
     let fixture = Fixture::new();
-    let output = fixture.run("up", "Darwin", false, false);
+    let output = fixture.run("up", "macos", false, false);
     assert!(output.status.success(), "{output:?}");
     let log = fixture.log();
     for expected in [
@@ -218,7 +217,7 @@ fn macos_up_down_uses_route_commands() {
         assert!(log.contains(expected), "missing {expected} in {log}");
     }
     fixture.clear_log();
-    let output = fixture.run("down", "Darwin", false, false);
+    let output = fixture.run("down", "macos", false, false);
     assert!(output.status.success(), "{output:?}");
     let log = fixture.log();
     assert!(log.contains("delete -inet -host 198.51.100.10"), "{log}");

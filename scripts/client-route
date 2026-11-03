@@ -1,6 +1,9 @@
 #!/bin/sh
 # Automatic client full-tunnel routing. Called only when no manual hook is set.
 set -eu
+# Hooks may run with a deliberately empty PATH; use the trusted system tools.
+PATH=${SVPN_ROUTE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
 umask 077
 
 state_dir=${SVPN_ROUTE_STATE_DIR:-/var/run/svpn}
@@ -88,8 +91,8 @@ route_down() {
     down_tun=$(state_field tun)
     down_servers=$(state_field servers)
     case "$down_os" in
-        Linux) linux_down "$down_tun" "$down_servers" ;;
-        Darwin) macos_down "$down_tun" "$down_servers" ;;
+        linux) linux_down "$down_tun" "$down_servers" ;;
+        macos) macos_down "$down_tun" "$down_servers" ;;
         *)
             echo "svpn: unsupported OS for route cleanup: $down_os" >&2
             return 1
@@ -101,9 +104,9 @@ route_down() {
 route_up() {
     # Reclaim only the previous session's routes before adding ours.
     route_down
-    os=$(uname -s)
+    os=${SVPN_OS:-}
     case "$os" in
-        Linux|Darwin) ;;
+        linux|macos) ;;
         *)
             echo "svpn: automatic client routing supports only Linux and macOS, got $os" >&2
             return 1
@@ -117,8 +120,8 @@ route_up() {
     trap 'route_down' EXIT
     trap 'exit 1' HUP INT TERM
     case "$os" in
-        Linux) linux_up ;;
-        Darwin) macos_up ;;
+        linux) linux_up ;;
+        macos) macos_up ;;
     esac
     trap - EXIT HUP INT TERM
 }

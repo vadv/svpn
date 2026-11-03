@@ -186,6 +186,7 @@ impl Running {
             .env("SVPN_SESSION_ID", std::process::id().to_string());
         if let Some(addrs) = &context.server_addrs {
             command.env("SVPN_SERVER_ADDRS", addrs);
+            command.env("SVPN_OS", std::env::consts::OS);
         }
         command.stdin(Stdio::null()).kill_on_drop(true);
         Ok(command)
