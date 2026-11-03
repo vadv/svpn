@@ -174,6 +174,22 @@ configuration above.
 
 ## Client hooks
 
+When no manual hook is set, SVPN configures routes itself. After creating the
+TUN it adds a `/32` host route to every VPS through the original gateway and
+split-default routes `0.0.0.0/1` and `128.0.0.0/1` through the TUN. All IPv4
+then goes through the tunnel while the VPS remains directly reachable. This
+works on Linux, OpenWrt and macOS.
+
+On shutdown only this session's routes are removed. Ownership is kept in
+`/var/run/svpn`; a failure or interruption triggers rollback, and the next
+start cleans the previous state first. Foreign default routes and unrelated
+admin routes are never overwritten.
+
+The fields below are manual overrides. Setting `up-command` or `up-script`
+disables the automatic up; the same applies to `down-command`/`down-script`.
+Directions are independent: you can keep automatic up and provide a custom
+down.
+
 Client-side commands are configured with:
 
 - `up-command` and `down-command` — a string for `/bin/sh -c`;

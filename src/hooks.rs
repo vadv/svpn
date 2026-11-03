@@ -55,12 +55,14 @@ pub struct TunContext {
     pub name: String,
     pub local: Ipv4Addr,
     pub peer: Ipv4Addr,
+    pub server_addrs: Option<String>,
 }
 
 #[derive(Default)]
 pub struct Hooks {
     up: Option<Hook>,
     down: Option<Hook>,
+    server_addrs: Option<String>,
     pub context: Option<TunContext>,
     pub running: Option<Running>,
 }
@@ -78,6 +80,7 @@ impl Args {
         Ok(Hooks {
             up: resolve(self.up_script, self.up_command)?,
             down: resolve(self.down_script, self.down_command)?,
+            server_addrs: None,
             context: None,
             running: None,
         })
@@ -85,13 +88,36 @@ impl Args {
 }
 
 impl Hooks {
+    pub fn needs_auto_up(&self) -> bool {
+        self.up.is_none()
+    }
+
+    pub fn needs_auto_down(&self) -> bool {
+        self.down.is_none()
+    }
+
+    pub fn set_server_addrs(&mut self, addrs: String) {
+        self.server_addrs = Some(addrs);
+    }
+
     pub fn start(&mut self, name: String, local: Ipv4Addr, peer: Ipv4Addr) -> Result<()> {
         ensure!(self.context.is_none(), "TUN hooks already started");
-        self.context = Some(TunContext { name, local, peer });
-        if let Some(up) = &self.up {
-            let context = self.context.as_ref().context("missing TUN hook context")?;
-            self.running = Some(Running::spawn(up, "up", context)?);
-        }
+        self.context = Some(TunContext {
+            name,
+            local,
+            peer,
+            server_addrs: self.server_addrs.clone(),
+        });
+        let auto_up;
+        let up = match &self.up {
+            Some(hook) => hook,
+            None => {
+                auto_up = Hook::Command(crate::client_routing::SCRIPT.to_owned());
+                &auto_up
+            }
+        };
+        let context = self.context.as_ref().context("missing TUN hook context")?;
+        self.running = Some(Running::spawn(up, "up", context)?);
         Ok(())
     }
 
@@ -126,9 +152,15 @@ impl Hooks {
     pub async fn finish(&mut self) -> Result<()> {
         self.cancel_up().await?;
         // Taking the context makes repeated cleanup a no-op, including failed down.
-        if let Some(context) = self.context.take()
-            && let Some(down) = &self.down
-        {
+        if let Some(context) = self.context.take() {
+            let auto_down;
+            let down = match &self.down {
+                Some(hook) => hook,
+                None => {
+                    auto_down = Hook::Command(crate::client_routing::SCRIPT.to_owned());
+                    &auto_down
+                }
+            };
             Running::spawn(down, "down", &context)?.wait().await?;
         }
         Ok(())
@@ -151,9 +183,11 @@ impl Running {
             .env("SVPN_TUN_NAME", &context.name)
             .env("SVPN_TUN_ADDR", context.local.to_string())
             .env("SVPN_PEER_ADDR", context.peer.to_string())
-            .env("SVPN_SESSION_ID", std::process::id().to_string())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+            .env("SVPN_SESSION_ID", std::process::id().to_string());
+        if let Some(addrs) = &context.server_addrs {
+            command.env("SVPN_SERVER_ADDRS", addrs);
+        }
+        command.stdin(Stdio::null()).kill_on_drop(true);
         Ok(command)
     }
 

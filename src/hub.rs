@@ -1077,6 +1077,9 @@ pub async fn run(
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
+    if hooks.needs_auto_up() || hooks.needs_auto_down() {
+        hooks.set_server_addrs(crate::client_routing::server_addrs(&servers).await?);
+    }
     let pool = Pool::new(servers.iter().map(|s| s.weight));
     // Stable node identity is host:port (spec): a port change is a new node.
     let nodes: Vec<(String, u32)> = servers

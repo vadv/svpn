@@ -86,14 +86,12 @@ tcp-port = 41020   # TCP fallback when UDP is blocked
 # Hooks on the VPS: installed by svpn setup. They configure NAT and egress.
 server-up = "/usr/local/lib/svpn/server-up"
 server-down = "/usr/local/lib/svpn/server-down"
-
-# Client routes: all IPv4 goes into the tunnel, the VPS stays reachable directly.
-up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gw=$(ip -4 route show default | awk 'NR==1{print $3}'); ip route replace 203.0.113.10/32 via \"$gw\" dev \"$wan\"; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
-down-command = "ip route del 203.0.113.10/32 2>/dev/null || true; ip route del 0.0.0.0/1 2>/dev/null || true; ip route del 128.0.0.0/1 2>/dev/null || true"
 ```
 
-Replace the VPS address and the key path. The same address appears in
-`up-command` and `down-command` — change it there too.
+Replace the VPS address and the key path. SVPN configures the client routes
+automatically: all IPv4 goes into the tunnel while the VPS stays reachable
+directly. Automatic routes are removed on shutdown. Custom routing is covered
+in [ADVANCED.en.md](ADVANCED.en.md).
 
 ### 4. Prepare the VPS
 

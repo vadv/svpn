@@ -13,6 +13,7 @@ const _: () = {
 pub mod addrpool;
 pub mod channel;
 pub mod cli;
+pub mod client_routing;
 mod cmdline;
 pub mod config;
 pub mod control;
@@ -726,6 +727,7 @@ pub(crate) async fn serve_tail(
                     name: tun_name.clone(),
                     local: server_ip,
                     peer: client_ip,
+                    server_addrs: None,
                 };
                 if let Some(up) = up {
                     let hook = hooks::Hook::Command(up);
@@ -767,6 +769,7 @@ pub(crate) async fn serve_tail(
             name: tun_name,
             local: server_ip,
             peer: client_ip,
+            server_addrs: None,
         };
         let hook = hooks::Hook::Command(down);
         if let Err(error) = hooks::run_with_capture(&hook, "down", &context).await {
