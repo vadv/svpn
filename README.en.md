@@ -12,11 +12,14 @@ flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
     tun --> brain("🧠 Path selection<br/>country · ASN<br/>local-exit")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
-    brain -->|"NL / DE / others"| asn["🎯 sticky-ASN<br/>ASN → one VPS"]
-    asn --> enc["🔒 Encryption<br/>UDP 60000–60009<br/>or TCP 41020"]
-    enc --> vps["🖥️ VPS A or B<br/>decrypt → TUN<br/>masquerade"]
-    local --> home["🌍 Internet<br/>home IP is visible"]
-    vps --> via["🌍 Internet<br/>VPS IP is visible"]
+    local --> home["🌍 home IP is visible"]
+    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (an ASN — Netflix,<br/>Google…) lives on one VPS"]
+    asn --> mimic["🕵️ Camouflage — auto<br/>per channel: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>or TCP 41020 if UDP blocked"]
+    mimic -->|"Netflix traffic"| vps1["🖥️ VPS-1 · NL · weight 3<br/>decrypt → TUN → NAT"]
+    mimic -->|"Google traffic"| vps2["🖥️ VPS-2 · DE · weight 1<br/>decrypt → TUN → NAT"]
+    vps1 --> net1["🌍 VPS-1 IP is visible"]
+    vps2 --> net2["🌍 VPS-2 IP is visible"]
+    vps1 -.->|"if VPS-1 dies,<br/>networks move over"| vps2
     classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
     classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
@@ -25,15 +28,17 @@ flowchart TD
     class brain brain
     class local local
     class asn asn
-    class enc,vps vpn
-    class home,via edge
+    class mimic,vps1,vps2 vpn
+    class home,net1,net2 edge
 ```
 
 The client picks the path before encryption. Addresses in `local-exits` (for
 example RU and BY) leave through the local exit — the site sees your home IP.
 Everything else is encrypted and sent to a VPS — the site sees the server IP.
 With several VPSs, `sticky-asn` pins every destination ASN to one server so a
-service sees a stable external IP.
+service sees a stable external IP. Tunnel traffic is disguised as ordinary
+protocols: the client probes them and keeps whichever works for the channel,
+falling back to TCP when UDP is blocked.
 
 ## Quick start
 

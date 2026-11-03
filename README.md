@@ -12,11 +12,14 @@ flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
     tun --> brain("🧠 Выбор пути<br/>country · ASN<br/>local-exit")
     brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
-    brain -->|"NL / DE / остальные"| asn["🎯 sticky-ASN<br/>ASN → один VPS"]
-    asn --> enc["🔒 Шифрование<br/>UDP 60000–60009<br/>или TCP 41020"]
-    enc --> vps["🖥️ VPS A или B<br/>decrypt → TUN<br/>masquerade"]
-    local --> home["🌍 Интернет<br/>виден домашний IP"]
-    vps --> via["🌍 Интернет<br/>виден IP VPS"]
+    local --> home["🌍 виден домашний IP"]
+    brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(ASN — например Netflix<br/>или Google) живёт на одном VPS"]
+    asn --> mimic["🕵️ Мимикрия — авто<br/>под канал: ssh · mosh · quic<br/>webrtc · obfs<br/>UDP 60000–60009<br/>или TCP 41020 (UDP закрыт)"]
+    mimic -->|"трафик сети Netflix"| vps1["🖥️ VPS-1 · NL · вес 3<br/>decrypt → TUN → NAT"]
+    mimic -->|"трафик сети Google"| vps2["🖥️ VPS-2 · DE · вес 1<br/>decrypt → TUN → NAT"]
+    vps1 --> net1["🌍 виден IP VPS-1"]
+    vps2 --> net2["🌍 виден IP VPS-2"]
+    vps1 -.->|"VPS-1 недоступен —<br/>сети переезжают"| vps2
     classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
     classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
@@ -25,15 +28,16 @@ flowchart TD
     class brain brain
     class local local
     class asn asn
-    class enc,vps vpn
-    class home,via edge
+    class mimic,vps1,vps2 vpn
+    class home,net1,net2 edge
 ```
 
 Клиент выбирает путь до шифрования. Адреса из `local-exits` (например, RU и BY)
 идут через локальный выход — сайт видит ваш домашний IP. Остальные адреса
 шифруются и уходят на VPS — сайт видит IP сервера. В режиме нескольких VPS
 `sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
-видел стабильный внешний IP.
+видел стабильный внешний IP. Трафик маскируется под обычные протоколы: клиент
+сам подбирает рабочий для канала, а при заблокированном UDP переходит на TCP.
 
 ## Быстрый старт
 
