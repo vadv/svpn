@@ -10,34 +10,37 @@ systemd-сервис или отдельный конфиг.
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
-    tun --> brain("🧠 Выбор пути<br/>по адресу назначения")
-    brain -->|"RU"| local["🏠 Local exit<br/>NAT → WAN"]
-    local --> home["🌍 виден домашний IP"]
-    brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(Claude Code, Google…)<br/>закреплена за одним VPS"]
-    asn --> mimic["🕵️ Маскировка: клиент сам<br/>подбирает, под что притвориться<br/>UDP, при блокировке — TCP"]
-    mimic -->|"Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 сетей<br/>🕵️ выглядит как ssh-трафик"]
-    mimic -->|"Google"| vps2["🖥️ VPS-2 · DE · ≈1/4 сетей<br/>🕵️ выглядит как mosh-трафик"]
+    tun --> rules("📋 Sticky-правила —<br/>порядок как в конфиге,<br/>первое совпадение побеждает")
+    rules -->|"имя из правила<br/>claude.ai"| vps1["🖥️ VPS-1 · NL<br/>🎯 закреплён правилом<br/>🕵️ выглядит как ssh"]
+    rules -->|"страна из правила<br/>RU"| local2["🏠 via = local<br/>мимо VPN"]
+    local2 --> home["🌍 виден домашний IP"]
+    rules -->|"всё остальное"| fb["🎲 fallback_sticky:<br/>balance или sticky-asn —<br/>сети по весам VPS"]
+    fb -->|"≈3/4 сетей"| vps1
+    fb -->|"≈1/4 сетей"| vps2["🖥️ VPS-2 · DE<br/>🕵️ выглядит как mosh"]
     vps1 --> net1["🌍 виден IP VPS-1"]
     vps2 --> net2["🌍 виден IP VPS-2"]
-    vps1 -.->|"VPS-1 недоступен —<br/>сети переезжают"| vps2
-    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    vps1 -.->|"VPS-1 недоступен —<br/>его группы едут на VPS-2,<br/>обратно не возвращаются"| vps2
+    classDef rules fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
-    classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef fb fill:#fff8e1,stroke:#f9a825,color:#5d4037
     classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
     classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
-    class brain brain
-    class local local
-    class asn asn
-    class mimic,vps1,vps2 vpn
-    class home,net1,net2 edge
+    class rules rules
+    class local2,home local
+    class fb fb
+    class vps1,vps2 vpn
+    class net1,net2 edge
 ```
 
-Клиент выбирает путь до шифрования. Адреса из sticky-блока с `via = local`
-идут через локальный выход — сайт видит ваш домашний IP. Остальные адреса
-шифруются и уходят на VPS — сайт видит IP сервера. В режиме нескольких VPS
-`sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
-видел стабильный внешний IP. Трафик маскируется: клиент сам подбирает, под что
-притвориться на канале, и переходит на TCP, если UDP заблокирован.
+Клиент выбирает путь до шифрования. Правила `sticky` в конфиге проверяются
+по порядку: первое совпавшее решает, куда идёт адрес. `via = ["nl"]` —
+закреплено за одним VPS (отказ VPS переносит его группы на следующий из
+списка, возврат владельца ничего не возвращает обратно); `via = local` —
+мимо VPN, сайт видит ваш домашний IP. Ничего не совпало — работает
+`fallback_sticky`: `balance` раскидывает потоки по весам, `sticky-asn`
+закрепляет каждую сеть (ASN) за одним VPS, чтобы сервис видел стабильный
+внешний IP. Трафик маскируется: клиент сам подбирает, под что притвориться
+на канале, и переходит на TCP, если UDP заблокирован.
 
 ## Быстрый старт
 

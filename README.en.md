@@ -10,33 +10,37 @@ separate configuration on the VPS.
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
-    tun --> brain("🧠 Path selection<br/>by destination address")
-    brain -->|"RU"| local["🏠 Local exit<br/>NAT → WAN"]
-    local --> home["🌍 home IP is visible"]
-    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (Claude Code, Google…)<br/>is pinned to one VPS"]
-    asn --> mimic["🕵️ Camouflage: the client<br/>picks what to look like<br/>UDP, TCP when UDP blocked"]
-    mimic -->|"Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 of networks<br/>🕵️ looks like ssh traffic"]
-    mimic -->|"Google"| vps2["🖥️ VPS-2 · DE · ≈1/4 of networks<br/>🕵️ looks like mosh traffic"]
+    tun --> rules("📋 Sticky rules —<br/>ordered as written,<br/>first match wins")
+    rules -->|"a name from a rule<br/>claude.ai"| vps1["🖥️ VPS-1 · NL<br/>🎯 pinned by the rule<br/>🕵️ looks like ssh"]
+    rules -->|"a country from a rule<br/>RU"| local2["🏠 via = local<br/>outside the VPN"]
+    local2 --> home["🌍 home IP is visible"]
+    rules -->|"everything else"| fb["🎲 fallback_sticky:<br/>balance or sticky-asn —<br/>networks by VPS weights"]
+    fb -->|"≈3/4 of networks"| vps1
+    fb -->|"≈1/4 of networks"| vps2["🖥️ VPS-2 · DE<br/>🕵️ looks like mosh"]
     vps1 --> net1["🌍 VPS-1 IP is visible"]
     vps2 --> net2["🌍 VPS-2 IP is visible"]
-    vps1 -.->|"if VPS-1 dies,<br/>networks move over"| vps2
-    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    vps1 -.->|"if VPS-1 dies, its groups<br/>move to VPS-2 and stay<br/>when it comes back"| vps2
+    classDef rules fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
-    classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef fb fill:#fff8e1,stroke:#f9a825,color:#5d4037
     classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
     classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
-    class brain brain
-    class local local
-    class asn asn
-    class mimic,vps1,vps2 vpn
-    class home,net1,net2 edge
+    class rules rules
+    class local2,home local
+    class fb fb
+    class vps1,vps2 vpn
+    class net1,net2 edge
 ```
 
-The client picks the path before encryption. Addresses in a sticky block with `via = local` leave through the local exit — the site sees your home IP.
-Everything else is encrypted and sent to a VPS — the site sees the server IP.
-With several VPSs, `sticky-asn` pins every destination ASN to one server so a
-service sees a stable external IP. Tunnel traffic is disguised: the client
-itself picks what to look like on the channel and switches to TCP when UDP is
+The client picks the path before encryption. The `sticky` rules in the config
+are checked in order: the first match decides where the address goes.
+`via = ["nl"]` pins it to one VPS (when that VPS dies its groups move to the
+next one in the list and stay there when it returns); `via = local` sends it
+outside the VPN — the site sees your home IP. When nothing matches,
+`fallback_sticky` takes over: `balance` spreads flows by weights, and
+`sticky-asn` pins every destination network (ASN) to one VPS so a service
+sees a stable external IP. Tunnel traffic is disguised: the client itself
+picks what to look like on the channel and switches to TCP when UDP is
 blocked.
 
 ## Quick start
