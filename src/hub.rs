@@ -98,39 +98,16 @@ pub struct LocalExitState {
     pub ready: bool,
 }
 
-/// A destination country with assigned servers.
-/// Country constrains candidates; ASN supplies affinity within them.
-struct CountryRoute {
-    /// Packed ISO code — the rendezvous key payload.
-    packed: u32,
-    /// Links configured for the country, in configuration order.
-    candidates: Vec<usize>,
-    /// Destination ASN when the ASN database covers it.
-    asn: Option<u32>,
-}
-
-impl CountryRoute {
-    /// Use a scoped `CC:ASN` persistence key when ASN data is available.
-    fn exit_key(&self) -> crate::exit_state::ExitKey {
-        let code = crate::geo::unpack_country(self.packed);
-        match self.asn {
-            Some(asn) => crate::exit_state::ExitKey::ScopedAsn(code, asn),
-            None => crate::exit_state::ExitKey::Country(code),
-        }
-    }
-}
-
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
     /// Sticky exit: ASN grouping under exit-policy sticky-asn;
     /// None = weighted balance.
     pub geo: Option<crate::geo::Geo>,
-    /// Sticky exit: country table for the destination Country constraint;
-    /// None = no country routing.
+    /// Country table for countries selectors; None — no country data.
     pub country: Option<crate::geo::Geo>,
-    /// Packed countries whose destinations use local-exit.
-    pub local_exits: Vec<u32>,
+    /// Explicit sticky blocks, in config order (first match wins).
+    pub stickies: Vec<crate::sticky::RuntimeSticky>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -214,12 +191,12 @@ impl Hub {
         }
     }
 
-    /// A database match in local-exits uses the local path; misses use VPN.
+    /// Matched by a sticky block with `via = local`; misses use VPN.
     fn is_local_exit(&self, destination: Ipv4Addr) -> bool {
-        self.country
-            .as_ref()
-            .and_then(|geo| geo.lookup(destination))
-            .is_some_and(|country| self.local_exits.contains(&country))
+        self.stickies.iter().any(|block| {
+            matches!(block.block.via, crate::sticky::Via::Local)
+                && block.matches(destination, self.country.as_ref(), self.geo.as_ref())
+        })
     }
 
     /// Local-exit traffic never falls back to the VPN; other traffic picks a
@@ -459,7 +436,11 @@ impl Hub {
                 self.sticky.asn_miss
             ));
         }
-        if !self.local_exits.is_empty() {
+        if self
+            .stickies
+            .iter()
+            .any(|s| matches!(s.block.via, crate::sticky::Via::Local))
+        {
             report.push_str(&format!(
                 "\nlocal-exit: opened {} / failed {} / closed {}",
                 self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
@@ -628,14 +609,6 @@ impl Hub {
         if let Some(state) = &mut self.exit_state {
             state.flush_due(StdInstant::now());
         }
-        // Country constrains candidates before ASN affinity, even in balance mode.
-        if let Some(route) = self.country_route(key.destination) {
-            let group = match route.asn {
-                Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
-                None => crate::geo::country_key(route.packed),
-            };
-            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key(), true);
-        }
         let Some(geo) = &self.geo else {
             return self.pool.pick();
         };
@@ -648,30 +621,6 @@ impl Hub {
         };
         let group = crate::geo::asn_key(asn);
         self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
-    }
-
-    /// Return assigned destination countries as a candidate constraint.
-    /// Unknown or unassigned countries leave normal selection unchanged.
-    fn country_route(&self, destination: Ipv4Addr) -> Option<CountryRoute> {
-        let packed = self.country.as_ref()?.lookup(destination)?;
-        let code = crate::geo::unpack_country(packed);
-        let candidates: Vec<usize> = self
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, link)| link.params.countries.contains(&code))
-            .map(|(link, _)| link)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        Some(CountryRoute {
-            packed,
-            candidates,
-            // The ASN affinity applies only under exit-policy sticky-asn:
-            // without the ASN database the group is the country itself.
-            asn: self.geo.as_ref().and_then(|geo| geo.lookup(destination)),
-        })
     }
 
     /// Select a sticky owner without snap-back.
@@ -744,7 +693,11 @@ impl Hub {
         primary_tun: &str,
         params: &LinkParams,
     ) -> Result<()> {
-        if self.local_exits.is_empty() || self.local.is_some() {
+        let wants_local = self
+            .stickies
+            .iter()
+            .any(|s| matches!(s.block.via, crate::sticky::Via::Local));
+        if !wants_local || self.local.is_some() {
             return Ok(());
         }
         let epoch = Epoch {
@@ -1023,42 +976,24 @@ impl Hub {
     }
 }
 
-/// Geo-driven exit inputs of one client run (spec §2-4): the ASN affinity
-/// table, the country constraint table and the one shared owner state.
+/// Geo-driven exit inputs of one client run: the ASN affinity table, the
+/// country table, the explicit sticky blocks and the shared owner state.
 #[derive(Default)]
 pub struct GeoExits {
     /// ASN database; None — sticky-asn degraded to weighted balance.
     pub geo: Option<crate::geo::Geo>,
-    /// Country database; None — no country routing.
+    /// Country database; None — no country data.
     pub country: Option<crate::geo::Geo>,
-    /// Packed countries whose destinations use local-exit.
-    pub local_exits: Vec<u32>,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
 
 /// Map a persisted typed owner key to its numeric rendezvous group.
-/// Restore only while the owner remains a candidate for its country.
 #[doc(hidden)]
-pub fn restored_group(
-    servers: &[LinkParams],
-    key: crate::exit_state::ExitKey,
-    link: usize,
-) -> Option<u64> {
-    let candidate = |code: &str| {
-        servers
-            .get(link)
-            .is_some_and(|params| params.countries.iter().any(|c| c == code))
-    };
+pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
     match key {
         crate::exit_state::ExitKey::Asn(asn) => Some(crate::geo::asn_key(asn)),
-        crate::exit_state::ExitKey::Country(code) if candidate(&code) => {
-            Some(crate::geo::country_key(crate::geo::pack_country(&code)?))
-        }
-        crate::exit_state::ExitKey::ScopedAsn(code, asn) if candidate(&code) => Some(
-            crate::geo::scoped_asn_key(crate::geo::pack_country(&code)?, asn),
-        ),
-        _ => None,
+        crate::exit_state::ExitKey::Sticky(canonical) => Some(crate::sticky::group_key(&canonical)),
     }
 }
 
@@ -1069,14 +1004,18 @@ pub async fn run(
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
     exits: GeoExits,
+    sticky_blocks: Vec<crate::sticky::StickyBlock>,
 ) -> Result<()> {
     let GeoExits {
         geo,
         country,
-        local_exits,
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
+    let stickies: Vec<crate::sticky::RuntimeSticky> = sticky_blocks
+        .into_iter()
+        .map(crate::sticky::RuntimeSticky::new)
+        .collect();
     if hooks.needs_auto_up() || hooks.needs_auto_down() {
         hooks.set_server_addrs(crate::client_routing::server_addrs(&servers).await?);
     }
@@ -1094,9 +1033,7 @@ pub async fn run(
             state
                 .owner_indices(&ids)
                 .into_iter()
-                .filter_map(|(key, link)| {
-                    restored_group(&servers, key, link).map(|group| (group, link))
-                })
+                .filter_map(|(key, link)| restored_group(key).map(|group| (group, link)))
                 .collect()
         }
         None => std::collections::HashMap::new(),
@@ -1107,7 +1044,7 @@ pub async fn run(
     let mut hub = Hub {
         geo,
         country,
-        local_exits,
+        stickies,
         local: None,
         local_task: None,
         local_cleanup: None,

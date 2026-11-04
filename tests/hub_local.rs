@@ -20,9 +20,9 @@ const BY_DEST: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 35);
 
 fn params() -> LinkParams {
     LinkParams {
+        label: String::new(),
         server: "server".to_owned(),
         weight: 1,
-        countries: Vec::new(),
         identity: None,
         user: None,
         ssh_port: 22,
@@ -74,10 +74,14 @@ fn local_hub() -> Hub {
                 svpn::geo::pack_country("BY").unwrap(),
             ),
         ])),
-        local_exits: vec![
-            svpn::geo::pack_country("RU").unwrap(),
-            svpn::geo::pack_country("BY").unwrap(),
-        ],
+        stickies: vec![svpn::sticky::RuntimeSticky::new(
+            svpn::sticky::StickyBlock {
+                label: "local".to_owned(),
+                selector: svpn::sticky::Selector::Countries(vec!["RU".to_owned(), "BY".to_owned()]),
+                via: svpn::sticky::Via::Local,
+                every: std::time::Duration::from_secs(300),
+            },
+        )],
         local: None,
         local_task: None,
         local_cleanup: None,
@@ -124,7 +128,7 @@ async fn every_local_exit_country_uses_local_path() {
 #[tokio::test]
 async fn shutdown_without_local_exit_does_not_start_one() {
     let mut hub = local_hub();
-    hub.local_exits.clear();
+    hub.stickies.clear();
     assert!(hub.local.is_none());
     assert!(hub.local_cleanup.is_none());
     hub.shutdown_local().await.unwrap();

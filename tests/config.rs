@@ -1,4 +1,4 @@
-//! Config text: parsing, defaults, inheritance, and rejection of invalid fields.
+//! Config text: parsing, defaults, inheritance, sticky blocks, rejections.
 
 use std::path::Path;
 
@@ -6,9 +6,12 @@ use svpn::MimicArg;
 use svpn::cli::{Cli, Mode};
 use svpn::config::parse;
 use svpn::server_spec::resolve_servers;
+use svpn::sticky::{Selector, Via};
 
-const SINGLE: &str = "server = 'vpn.example'\npeer-tun-name = 'svpn0'\n";
-const MULTI: &str = "peer-tun-name = 'svpn0'\n[[servers]]\naddress = 'vpn.example'\n";
+const SINGLE: &str =
+    "server \"main\" {\n  address = \"vpn.example\"\n}\ntunnel {\n  peer_name = \"svpn0\"\n}\n";
+const MULTI: &str =
+    "tunnel {\n  peer_name = \"svpn0\"\n}\nserver \"a\" {\n  address = \"vpn.example\"\n}\n";
 
 // ── defaults and inheritance ──
 
@@ -28,25 +31,29 @@ fn typed_modes_defaults_and_inheritance() {
         Mode::Client(args) => args,
         _ => unreachable!(),
     };
-    assert_eq!(
-        format!(
-            "{:?}",
-            resolve_servers(&file.server, &file.globals).unwrap()
-        ),
-        format!("{:?}", resolve_servers(&cli.server, &cli.globals).unwrap())
-    );
+    let strip = |args: &svpn::cli::ClientArgs| {
+        resolve_servers(&args.server, &args.globals)
+            .unwrap()
+            .into_iter()
+            .map(|mut p| {
+                p.label.clear();
+                format!("{p:?}")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strip(&file), strip(&cli));
     assert_eq!(file.stats_interval, 30);
     let disabled = parse(
-        &format!("{SINGLE}stats-interval = 0\n"),
+        &format!("{SINGLE}transport {{\n  stats = \"0s\"\n}}\n"),
         Path::new("/config"),
         false,
     )
     .unwrap();
     assert_eq!(disabled.stats_interval, 0);
     let file = parse(
-        "peer-tun-name = ''\nssh-port = 2222\nmimic = ['mosh']\n\
-         [[servers]]\naddress = 'VPN.example'\nweight = 2\n\
-         [[servers]]\naddress = '203.0.113.2'\nssh-port = 2200\nmimic = []\n",
+        "tunnel {\n  peer_name = \"\"\n}\nssh {\n  port = 2222\n}\ntransport {\n  mimic = [\"mosh\"]\n}\n\
+         server \"a\" {\n  address = \"VPN.example\"\n  weight = 2\n}\n\
+         server \"b\" {\n  address = \"203.0.113.2\"\n  ssh_port = 2200\n  mimic = []\n}\n",
         Path::new("/config"),
         true,
     )
@@ -68,9 +75,9 @@ fn typed_modes_defaults_and_inheritance() {
 #[test]
 fn paths_are_relative_to_file_but_remote_paths_and_commands_are_literal() {
     let args = parse(
-        "server = 'vpn.example'\npeer-tun-name = 'svpn0'\n\
-         ssh-identity = 'keys/client key'\nssh-remote-bin = '~/bin/$SVPN'\n\
-         up-script = 'scripts/up script'\ndown-command = 'echo $HOME; ./down'\n",
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+         ssh {\n  identity = \"keys/client key\"\n  remote_bin = \"~/bin/$SVPN\"\n}\n\
+         hooks {\n  up_script = \"scripts/up script\"\n  down_command = \"echo $HOME; ./down\"\n}\n",
         Path::new("/configs"),
         false,
     )
@@ -86,9 +93,9 @@ fn paths_are_relative_to_file_but_remote_paths_and_commands_are_literal() {
     );
     assert_eq!(args.hooks.down_command.unwrap(), "echo $HOME; ./down");
     let args = parse(
-        "ssh-identity = 'global key'\npeer-tun-name = 'svpn0'\n\
-         [[servers]]\naddress = 'a.example'\nssh-identity = '/absolute/key'\n\
-         [[servers]]\naddress = 'b.example'\nssh-identity = '~/relative/key'\n",
+        "ssh {\n  identity = \"global key\"\n}\n\
+         server \"a\" {\n  address = \"a.example\"\n  ssh_identity = \"/absolute/key\"\n}\n\
+         server \"b\" {\n  address = \"b.example\"\n  ssh_identity = \"~/relative/key\"\n}\n",
         Path::new("/configs"),
         true,
     )
@@ -107,9 +114,8 @@ fn paths_are_relative_to_file_but_remote_paths_and_commands_are_literal() {
 #[test]
 fn numeric_boundaries_and_cli_relative_identity_are_preserved() {
     let args = parse(
-        "peer-tun-name = ''\nssh-port = 65535\ntcp-port = 0\n\
-         mtu = 1400\nudp-port-range = '1-65535'\n[[servers]]\n\
-         address = 'a.example'\nweight = 4294967295\n",
+        "ssh {\n  port = 65535\n}\ntransport {\n  tcp_port = 0\n  mtu = 1400\n  udp_ports = \"1-65535\"\n}\n\
+         server \"a\" {\n  address = \"a.example\"\n  weight = 4294967295\n}\n",
         Path::new("."),
         true,
     )
@@ -143,65 +149,56 @@ fn numeric_boundaries_and_cli_relative_identity_are_preserved() {
 fn rejects_unknown_wrong_typed_and_conflicting_fields() {
     for text in [
         "",
-        "server = 'a:22'",
-        "server = 'a,mimic=mosh'",
-        "server = ['a']",
-        "server = '::1'",
-        "server = 'a'\nservers = []",
-        "server = 'a'\nweight = 1",
-        "server = 'a'\nconfig = 'other'",
-        "server = 'a'\nssh = {}",
-        "server = 'a'\nprofile = 'work'",
-        "server = 'a'\nserver = 'b'",
-        "server = 'a'\nmode = 'single'",
+        "server \"a\" {\n  address = \"a:22\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n  extra = 1\n}\n",
+        "server \"a\" {\n  address = \"::1\"\n}\n",
+        "server \"UPPER\" {\n  address = \"a\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n}\nserver \"a\" {\n  address = \"b\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n}\nunknown {\n}\n",
+        "server \"a\" {\n  address = \"a\"\n}\nssh {\n  port = 22\n}\nssh {\n  port = 23\n}\n",
+        "mystery = 1\nserver \"a\" {\n  address = \"a\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n}\nserver \"b\" {\n  address = \"b\"\n}\n",
     ] {
         assert!(parse(text, Path::new("."), false).is_err(), "{text}");
     }
     for field in [
-        "mtu = '1280'",
-        "mtu = -1",
-        "mtu = 1401",
-        "mtu = 1.5",
-        "ssh-port = 0",
-        "ssh-port = 65536",
-        "ssh-port = -1",
-        "tcp-port = 65536",
-        "stats-interval = -1",
-        "stats-interval = 4294967296",
-        "log-level = 'INFO'",
-        "mimic = 'mosh'",
-        "mimic = ['auto']",
-        "mimic = ['ssh', 'banner']",
-        "udp-port-range = '0-1'",
-        "udp-port-range = [1, 2]",
-        "udp-port-range = '2-1'",
-        "ssh-user = ''",
-        "ssh-identity = ''",
-        "ssh-remote-bin = ''",
-        "ssh-host-key = 'bad'",
-        "tun-addr = '::1'",
-        "tun-addr = '0.0.0.0'",
-        "up-script = ''",
-        "up-command = ' '",
-        "down-command = ''",
-        "up-script = 'up'\nup-command = 'true'",
-        "down-script = 'down'\ndown-command = 'true'",
+        "transport {\n  mtu = \"1280\"\n}\n",
+        "transport {\n  mtu = -1\n}\n",
+        "transport {\n  mtu = 1401\n}\n",
+        "transport {\n  mtu = 1.5\n}\n",
+        "ssh {\n  port = 0\n}\n",
+        "ssh {\n  port = 65536\n}\n",
+        "ssh {\n  port = -1\n}\n",
+        "transport {\n  tcp_port = 65536\n}\n",
+        "transport {\n  stats = \"-1s\"\n}\n",
+        "log_level = \"verbose\"\n",
+        "transport {\n  mimic = \"mosh\"\n}\n",
+        "transport {\n  mimic = [\"auto\"]\n}\n",
+        "transport {\n  mimic = [\"ssh\", \"banner\"]\n}\n",
+        "transport {\n  udp_ports = \"0-1\"\n}\n",
+        "transport {\n  udp_ports = \"2-1\"\n}\n",
+        "ssh {\n  user = \"\"\n}\n",
+        "ssh {\n  identity = \"\"\n}\n",
+        "ssh {\n  remote_bin = \"\"\n}\n",
+        "ssh {\n  host_key = \"bad\"\n}\n",
+        "tunnel {\n  addr = \"::1\"\n}\n",
+        "tunnel {\n  addr = \"0.0.0.0\"\n}\n",
+        "hooks {\n  up_script = \"\"\n}\n",
+        "hooks {\n  up_command = \" \"\n}\n",
+        "hooks {\n  down_command = \"\"\n}\n",
+        "hooks {\n  up_script = \"up\"\n  up_command = \"true\"\n}\n",
+        "hooks {\n  down_script = \"down\"\n  down_command = \"true\"\n}\n",
     ] {
-        let text = format!("{SINGLE}{field}\n");
+        let text = format!("{SINGLE}{field}");
         assert!(parse(&text, Path::new("."), false).is_err(), "{field}");
     }
     for text in [
-        "servers = []",
-        "server = 'a'",
-        "server = 'a'\n[[servers]]\naddress = 'a'",
-        "[[servers]]\naddress = 'a:22'",
-        "[[servers]]\nserver = 'a'",
-        "[[servers]]\naddress = 'a'\nweight = 0",
-        "[[servers]]\naddress = 'a'\nweight = 4294967296",
-        "[[servers]]\naddress = 'a'\nssh-user = ''",
-        "[[servers]]\naddress = 'a'\nup-command = 'true'",
-        "[[servers]]\naddress = 'a'\nstats-interval = 0",
-        "[[servers]]\naddress = 'a'\ntun-name = ''",
+        "server \"a\" {\n  address = \"a:22\"\n}\n",
+        "server \"a\" {\n  weight = 0\n}\n",
+        "server \"a\" {\n  weight = 4294967296\n}\n",
+        "server \"a\" {\n  address = \"a\"\n  ssh_user = \"\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n  up_command = \"true\"\n}\n",
+        "server \"a\" {\n  address = \"a\"\n  tunnel {\n  }\n}\n",
     ] {
         assert!(parse(text, Path::new("."), true).is_err(), "{text}");
     }
@@ -210,184 +207,210 @@ fn rejects_unknown_wrong_typed_and_conflicting_fields() {
 #[test]
 fn invalid_globals_cannot_be_hidden_by_valid_server_overrides() {
     for (global, local) in [
-        ("ssh-port = 0", "ssh-port = 22"),
-        ("ssh-identity = ''", "ssh-identity = '/key'"),
+        ("ssh {\n  port = 0\n}\n", "ssh_port = 22"),
+        ("ssh {\n  identity = \"\"\n}\n", "ssh_identity = \"/key\""),
         (
-            "ssh-host-key = 'bad'",
-            "ssh-host-key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'",
+            "ssh {\n  host_key = \"bad\"\n}\n",
+            "ssh_host_key = \"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
         ),
-        ("ssh-user = ''", "ssh-user = 'root'"),
-        ("ssh-remote-bin = ''", "ssh-remote-bin = '/svpn'"),
-        ("udp-port-range = '0-1'", "udp-port-range = '1-2'"),
-        ("peer-addr = '0.0.0.0'", "peer-addr = '10.77.0.1'"),
+        ("ssh {\n  user = \"\"\n}\n", "ssh_user = \"root\""),
+        (
+            "ssh {\n  remote_bin = \"\"\n}\n",
+            "ssh_remote_bin = \"/svpn\"",
+        ),
+        (
+            "transport {\n  udp_ports = \"0-1\"\n}\n",
+            "udp_port_range = \"1-2\"",
+        ),
+        (
+            "tunnel {\n  peer_addr = \"0.0.0.0\"\n}\n",
+            "peer_addr = \"10.77.0.1\"",
+        ),
     ] {
-        let text = format!("{global}\n{MULTI}{local}\n");
+        let text =
+            format!("{global}{MULTI}server \"b\" {{\n  address = \"b.example\"\n  {local}\n}}\n");
         assert!(parse(&text, Path::new("."), true).is_err(), "{global}");
     }
 }
 
 #[test]
 fn malformed_values_are_not_echoed_in_errors() {
-    for field in ["ssh-port", "log-level", "mimic"] {
-        let text = format!("{SINGLE}{field} = 'PRIVATE_MARKER_DO_NOT_LOG'");
+    for field in ["port", "mimic"] {
+        let text = format!("{SINGLE}ssh {{\n  {field} = \"PRIVATE_MARKER_DO_NOT_LOG\"\n}}\n");
         let error = parse(&text, Path::new("."), false)
             .err()
             .unwrap()
             .to_string();
         assert!(!error.contains("PRIVATE_MARKER"), "{error}");
-        assert!(error.contains("line 3") && error.contains(field), "{error}");
+        assert!(error.contains(field), "{error}");
     }
+    // Syntax errors carry a sanitized line/column.
+    let text = format!("{SINGLE}ssh {{\n  port = \n}}\n");
+    let error = parse(&text, Path::new("."), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("line 8"), "{error}");
+    assert!(error.contains("invalid config syntax"), "{error}");
 }
 
-// ── geo country config ──
+// ── sticky blocks ──
 
 #[test]
-fn countries_normalize_and_may_repeat_across_servers() {
+fn sticky_blocks_parse_with_all_selectors() {
     let args = parse(
-        "country-db = 'country.csv'
-peer-tun-name = 'svpn0'
-\
-         [[servers]]
-address = 'a.example'
-countries = ['de', 'AT']
-\
-         [[servers]]
-address = 'b.example'
-countries = ['DE']
-",
+        "fallback_sticky {\n  strategy = \"sticky-asn\"\n  state = \"exits.json\"\n}\n\
+         geo {\n  db = \"asn.csv\"\n}\ncountry {\n  db = \"country.csv\"\n}\n\
+         server \"nl1\" {\n  address = \"nl1.example\"\n  weight = 3\n}\n\
+         server \"de1\" {\n  address = \"de1.example\"\n}\n\
+         sticky \"claude\" {\n  names = [\"claude.ai\", \"anthropic.com\"]\n  via = [\"nl1\"]\n  every = \"5m\"\n}\n\
+         sticky \"eu\" {\n  countries = [\"NL\", \"DE\"]\n  via = [\"de1\", \"nl1\"]\n}\n\
+         sticky \"cf\" {\n  asn = [13335]\n  via = [\"de1\"]\n}\n\
+         sticky \"legacy\" {\n  ips = [\"1.2.3.4\", \"5.6.0.0/16\"]\n  via = [\"nl1\"]\n}\n\
+         sticky \"home\" {\n  names = [\"printer.lan\"]\n  via = local\n}\n\
+         sticky \"printer2\" {\n  names = [\"printer2.lan\"]\n  via = local\n}\n",
         Path::new("/configs"),
         true,
     )
     .unwrap();
-    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(args.exit_policy, svpn::cli::ExitPolicy::StickyAsn);
     assert_eq!(
-        params[0].countries,
-        ["DE", "AT"],
-        "codes normalize to uppercase"
+        args.exit_state,
+        Some(std::path::PathBuf::from("/configs/exits.json"))
     );
-    assert_eq!(
-        params[1].countries,
-        ["DE"],
-        "the same country may serve two servers"
-    );
+    assert_eq!(args.geo_db.as_deref(), Some(Path::new("/configs/asn.csv")));
     assert_eq!(
         args.country_db.as_deref(),
-        Some(Path::new("/configs/country.csv")),
-        "country-db is relative to the config file"
+        Some(Path::new("/configs/country.csv"))
     );
-}
-
-#[test]
-fn duplicate_countries_within_one_server_are_rejected() {
-    for countries in ["['DE', 'DE']", "['de', 'DE', 'at']"] {
-        let text = format!(
-            "country-db = 'c.csv'
-peer-tun-name = 'svpn0'
-[[servers]]
-address = 'a.example'
-countries = {countries}
-"
-        );
-        assert!(parse(&text, Path::new("."), true).is_err(), "{countries}");
-    }
-}
-
-#[test]
-fn local_exit_country_codes_are_validated() {
-    for field in [
-        "local-exits = ['R']",
-        "local-exits = ['RUS']",
-        "local-exits = ['R1']",
-        "local-exits = ['']",
-    ] {
-        let text = format!(
-            "{SINGLE}country-db = 'c.csv'
-{field}
-"
-        );
-        assert!(parse(&text, Path::new("."), false).is_err(), "{field}");
-    }
-    for countries in ["['DEU']", "['D1']", "['']", "['D']", "'DE'"] {
-        let text = format!(
-            "peer-tun-name = 'svpn0'
-[[servers]]
-address = 'a.example'
-countries = {countries}
-"
-        );
-        assert!(parse(&text, Path::new("."), true).is_err(), "{countries}");
-    }
-    let args = parse(
-        &format!(
-            "{SINGLE}country-db = 'c.csv'
-local-exits = ['ru', 'by']
-"
-        ),
-        Path::new("."),
-        false,
-    )
-    .unwrap();
+    let stickies = &args.stickies;
+    assert_eq!(stickies.len(), 6);
+    assert_eq!(stickies[0].label, "claude");
     assert_eq!(
-        args.local_exits,
-        Some(vec![String::from("RU"), String::from("BY")])
+        stickies[0].selector,
+        Selector::Names(vec!["claude.ai".into(), "anthropic.com".into()])
     );
+    assert_eq!(stickies[0].via, Via::Servers(vec!["nl1".into()]));
+    assert_eq!(stickies[0].every, std::time::Duration::from_secs(300));
+    assert_eq!(
+        stickies[1].selector,
+        Selector::Countries(vec!["NL".into(), "DE".into()])
+    );
+    assert_eq!(stickies[2].selector, Selector::Asn(vec![13335]));
+    assert_eq!(stickies[3].via, Via::Servers(vec!["nl1".into()]));
+    assert_eq!(stickies[4].via, Via::Local);
+    assert_eq!(
+        stickies[5].every,
+        std::time::Duration::from_secs(300),
+        "names default every"
+    );
+    // Config order is preserved: first match wins.
+    assert_eq!(stickies[0].canonical_key(), "name:anthropic.com,claude.ai");
+    assert_eq!(stickies[1].canonical_key(), "cc:DE,NL");
+    assert_eq!(stickies[2].canonical_key(), "asn:13335");
 }
 
 #[test]
-fn local_exits_or_countries_require_country_db() {
+fn sticky_blocks_reject_invalid_shapes() {
+    let base = "server \"nl1\" {\n  address = \"nl1.example\"\n}\n";
+    for sticky in [
+        // no selector
+        "sticky \"x\" {\n  via = [\"nl1\"]\n}\n",
+        // two selectors
+        "sticky \"x\" {\n  names = [\"a.example\"]\n  asn = [1]\n  via = [\"nl1\"]\n}\n",
+        // unknown via label
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"ghost\"]\n}\n",
+        // empty via list
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n  via = []\n}\n",
+        // via missing
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n}\n",
+        // every with a non-name selector
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n  every = \"5m\"\n}\n",
+        // every below the minimum
+        "sticky \"x\" {\n  names = [\"a.example\"]\n  via = [\"nl1\"]\n  every = \"1s\"\n}\n",
+        // duplicate canonical key
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n}\n\
+         sticky \"y\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n}\n",
+        // duplicate label
+        "sticky \"x\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n}\n\
+         sticky \"x\" {\n  ips = [\"5.6.7.8\"]\n  via = [\"nl1\"]\n}\n",
+        // host bits set
+        "sticky \"x\" {\n  ips = [\"5.6.7.8/16\"]\n  via = [\"nl1\"]\n}\n",
+        // uppercase name
+        "sticky \"x\" {\n  names = [\"Claude.ai\"]\n  via = [\"nl1\"]\n  every = \"5m\"\n}\n",
+        // bad country code
+        "sticky \"x\" {\n  countries = [\"ZZZ\"]\n  via = local\n}\n",
+        // asn out of range
+        "sticky \"x\" {\n  asn = [4294967296]\n  via = [\"nl1\"]\n}\n",
+        // block label problems
+        "sticky \"Bad Label\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n}\n",
+        "sticky \"way_too_long_label_1234567890_abcdef\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"nl1\"]\n}\n",
+    ] {
+        let text = format!("{base}{sticky}");
+        assert!(parse(&text, Path::new("."), true).is_err(), "{sticky}");
+    }
+    for name in [
+        "sticky \"x\" {\n  names = [\"\"]\n  via = local\n  every = \"5m\"\n}\n",
+        "sticky \"x\" {\n  names = [\"a..b\"]\n  via = local\n  every = \"5m\"\n}\n",
+    ] {
+        let text = format!("{base}{name}");
+        assert!(parse(&text, Path::new("."), true).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn sticky_selectors_require_their_databases() {
+    let servers = "server \"nl1\" {\n  address = \"nl1.example\"\n}\n";
+    // countries selector without country db
     assert!(
         parse(
-            &format!(
-                "{SINGLE}local-exits = ['RU']
-"
-            ),
+            &format!("{servers}sticky \"x\" {{\n  countries = [\"DE\"]\n  via = local\n}}\n"),
             Path::new("."),
-            false
+            true
         )
         .is_err()
     );
-    let text = "peer-tun-name = 'svpn0'
-[[servers]]
-address = 'a.example'
-countries = ['DE']
-";
-    assert!(parse(text, Path::new("."), true).is_err());
-    // country-db without either consumer parses fine; ignoring it with a
-    // warning is a runtime concern, not a parse error.
+    // asn selector without geo db
     assert!(
         parse(
-            &format!(
-                "{SINGLE}country-db = 'c.csv'
-"
-            ),
+            &format!("{servers}sticky \"x\" {{\n  asn = [13335]\n  via = [\"nl1\"]\n}}\n"),
             Path::new("."),
-            false
+            true
         )
-        .is_ok()
+        .is_err()
     );
-    // An empty countries list carries no constraint.
-    let text = "peer-tun-name = 'svpn0'
-[[servers]]
-address = 'a.example'
-countries = []
-";
-    assert!(parse(text, Path::new("."), true).is_ok());
+    // names + via local need no databases
+    assert!(parse(
+        &format!("{servers}sticky \"x\" {{\n  names = [\"printer.lan\"]\n  via = local\n  every = \"5m\"\n}}\n"),
+        Path::new("."),
+        true
+    )
+    .is_ok());
+    // sticky-asn strategy without geo db
+    assert!(
+        parse(
+            &format!("fallback_sticky {{\n  strategy = \"sticky-asn\"\n}}\n{servers}"),
+            Path::new("."),
+            true
+        )
+        .is_err()
+    );
 }
 
 // ── server hooks ──
 
 #[test]
 fn server_hooks_root_and_per_server_override() {
-    let text = "server = 'vpn.example'\npeer-tun-name = 'svpn0'\n\
-                server-up = 'echo root-up'\nserver-down = 'echo root-down'\n";
+    let text = "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+                hooks {\n  server_up = \"echo root-up\"\n  server_down = \"echo root-down\"\n}\n";
     let args = parse(text, Path::new("/config"), false).unwrap();
     let params = resolve_servers(&args.server, &args.globals).unwrap();
     assert_eq!(params[0].server_up.as_deref(), Some("echo root-up"));
     assert_eq!(params[0].server_down.as_deref(), Some("echo root-down"));
 
-    let text = "peer-tun-name = 'svpn0'\nserver-up = 'echo root-up'\n\
-                [[servers]]\naddress = 'a.example'\n\
-                [[servers]]\naddress = 'b.example'\nserver-up = 'echo b-up'\n";
+    let text = "hooks {\n  server_up = \"echo root-up\"\n}\n\
+                server \"a\" {\n  address = \"a.example\"\n}\n\
+                server \"b\" {\n  address = \"b.example\"\n  server_up = \"echo b-up\"\n}\n";
     let args = parse(text, Path::new("/config"), true).unwrap();
     let params = resolve_servers(&args.server, &args.globals).unwrap();
     assert_eq!(params[0].server_up.as_deref(), Some("echo root-up"));
@@ -397,8 +420,8 @@ fn server_hooks_root_and_per_server_override() {
 
 #[test]
 fn server_hooks_empty_rejected() {
-    for field in ["server-up", "server-down"] {
-        let text = format!("{SINGLE}{field} = ''\n");
+    for field in ["server_up", "server_down"] {
+        let text = format!("{SINGLE}hooks {{\n  {field} = \"\"\n}}\n");
         let error = parse(&text, Path::new("."), false)
             .err()
             .unwrap()
@@ -406,9 +429,8 @@ fn server_hooks_empty_rejected() {
         assert!(error.contains("must not be empty"), "{error}");
         assert!(error.contains(field), "{error}");
     }
-    for field in ["server-up", "server-down"] {
-        let text =
-            format!("peer-tun-name = 'ok'\n[[servers]]\naddress = 'a.example'\n{field} = '  '\n");
+    for field in ["server_up", "server_down"] {
+        let text = format!("server \"a\" {{\n  address = \"a.example\"\n  {field} = \"  \"\n}}\n");
         let error = parse(&text, Path::new("."), true).err().unwrap();
         let error = format!("{error:#}");
         assert!(error.contains("must not be empty"), "{error}");
@@ -417,7 +439,15 @@ fn server_hooks_empty_rejected() {
 }
 
 #[test]
-fn server_hooks_cli_parity() {
+fn server_hooks_heredoc_and_cli_parity() {
+    let text = "server \"main\" {\n  address = \"vpn.example\"\n  server_up = <<EOF\nsysctl -w net.ipv4.ip_forward=1\nEOF\n}\n";
+    let args = parse(text, Path::new("/config"), false).unwrap();
+    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(
+        params[0].server_up.as_deref(),
+        Some("sysctl -w net.ipv4.ip_forward=1")
+    );
+
     let cli = match Cli::try_parse_from([
         "svpn",
         "--server",
