@@ -1,4 +1,4 @@
-//! Automatic client-route script: command fixtures, rollback and owner cleanup.
+//! Automatic client-up/down scripts: command fixtures, rollback and owner cleanup.
 
 use std::{
     fs,
@@ -60,7 +60,7 @@ impl Fixture {
         no_server_route: bool,
     ) -> Output {
         Command::new("/bin/sh")
-            .arg(script())
+            .arg(script_for(event))
             .env(
                 "SVPN_ROUTE_PATH",
                 format!("{}:/usr/bin:/bin", self.bin.display()),
@@ -72,7 +72,6 @@ impl Fixture {
             .env("NO_SERVER_ROUTE", if no_server_route { "1" } else { "0" })
             .env("SVPN_ROUTE_STATE_DIR", self.root.join("state"))
             .env("SVPN_SESSION_ID", "4242")
-            .env("SVPN_EVENT", event)
             .env("SVPN_TUN_NAME", "svpn-test0")
             .env("SVPN_SERVER_ADDRS", SERVERS)
             .output()
@@ -93,14 +92,16 @@ impl Fixture {
 }
 
 #[test]
-fn script_parses_as_posix_shell() {
-    assert!(
-        Command::new("/bin/sh")
-            .args(["-n", script().to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success()
-    );
+fn scripts_parse_as_posix_shell() {
+    for event in ["up", "down"] {
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-n", script_for(event).to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 }
 
 #[test]
@@ -264,8 +265,13 @@ async fn server_addresses_are_resolved_and_joined_in_stable_order() {
     assert_eq!(addresses, "198.51.100.10 198.51.100.20");
 }
 
-fn script() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/client-route")
+fn script_for(event: &str) -> PathBuf {
+    let name = if event == "up" {
+        "client-up"
+    } else {
+        "client-down"
+    };
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("scripts/{name}"))
 }
 
 fn temporary_dir() -> PathBuf {

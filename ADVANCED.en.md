@@ -23,66 +23,13 @@ ssh-identity = "/full/path/to/key"
 ssh-port = 22
 ssh-remote-bin = "/usr/local/bin/svpn"
 mimic = ["ssh"]
-tcp-port = 41020
+tcp-port = 41020  # fixed TCP-fallback port; required with mimic = ["ssh"] and no UDP
 udp-port-range = "60000-60009"
 
 # Protect the VPS addresses when the default route is replaced. This assumes
 # no pre-existing host routes for these addresses.
 up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
 down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
-
-# These server hooks run on each VPS and at the local-exit on the client.
-server-up = '''
-set -e
-sysctl -qw net.ipv4.ip_forward=1
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-table=svpn_egress_$n
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
-    echo "svpn: policy priority $table_id is already in use" >&2
-    exit 1
-fi
-if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
-    echo "svpn: policy table $table_id is already in use" >&2
-    exit 1
-fi
-if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
-    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
-fi
-: > "$owner.rule"
-ip route replace default via "$gateway" dev "$wan" table "$table_id"
-: > "$owner.route"
-nft delete table inet "$table" 2>/dev/null || true
-nft -f - <<EOF
-add table inet $table
-add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
-add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
-EOF
-: > "$owner.nat"
-'''
-server-down = '''
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if [ -f "$owner.rule" ]; then
-    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.rule"
-fi
-if [ -f "$owner.route" ]; then
-    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.route"
-fi
-if [ -f "$owner.nat" ]; then
-    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
-    rm -f "$owner.nat"
-fi
-'''
 
 [[servers]]
 address = "nl.example.com"
@@ -156,9 +103,22 @@ a new database, validates it and keeps the previous one as `asn.csv.prev`.
 ## Server hooks
 
 `server-up` and `server-down` run on the VPS and at `local-exit` on the
-client. The ready-made scripts are shipped in the release archive and are
-installed by `svpn setup` into `/usr/local/lib/svpn/`. For a manual install
-take them from the archive.
+client. When these fields are absent, `serve` runs the embedded
+`scripts/server-up` and `scripts/server-down` from the current binary.
+
+To override, inspect the example, save it, edit it and point to it with
+`server-up`/`server-down`:
+
+```bash
+svpn example server-up > server-up
+svpn example server-down > server-down
+$EDITOR server-up
+chmod 755 server-up server-down
+ssh root@vps 'mkdir -p /usr/local/lib/svpn'
+scp server-up server-down root@vps:/usr/local/lib/svpn/
+```
+
+A command can also be written directly in TOML.
 
 Hooks receive these environment variables:
 
@@ -169,21 +129,35 @@ Hooks receive these environment variables:
 - `SVPN_SESSION_ID` — the process PID.
 
 The timeout is 10 seconds. A failing `up` prevents the session from starting;
-a failing `down` is only logged. Example scripts are shown in the
-configuration above.
+a failing `down` is only logged. Use `svpn example server-up|server-down`
+to inspect the default scripts.
 
 ## Client hooks
 
-When no manual hook is set, SVPN configures routes itself. After creating the
-TUN it adds a `/32` host route to every VPS through the original gateway and
-split-default routes `0.0.0.0/1` and `128.0.0.0/1` through the TUN. All IPv4
-then goes through the tunnel while the VPS remains directly reachable. This
-works on Linux, OpenWrt and macOS.
+In auto mode the embedded `scripts/client-up` and `scripts/client-down` from the current binary run.
+You can inspect the exact text before starting:
 
-On shutdown only this session's routes are removed. Ownership is kept in
-`/var/run/svpn`; a failure or interruption triggers rollback, and the next
-start cleans the previous state first. Foreign default routes and unrelated
-admin routes are never overwritten.
+```bash
+svpn example client-up
+svpn example client-down
+```
+
+For a manual override, save the output and make the file executable:
+
+```bash
+svpn example client-up > client-up
+chmod +x client-up
+```
+
+The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
+
+1. adds a `/32` host route to every VPS through the original path;
+2. adds `0.0.0.0/1` and `128.0.0.0/1` through the TUN;
+3. removes only this session's routes on shutdown.
+
+With `up-command`/`up-script`, that script does not run: your variant runs.
+`up-command` executes as `/bin/sh -c <string>`, while `up-script` directly
+executes the file.
 
 The fields below are manual overrides. Setting `up-command` or `up-script`
 disables the automatic up; the same applies to `down-command`/`down-script`.
@@ -214,11 +188,14 @@ needed.
 ## Transport
 
 By default SVPN uses SSH camouflage and UDP. If UDP is blocked, set
-`mimic = ["ssh"]` and `tcp-port = 41020`. The UDP port range is set with
+`mimic = ["ssh"]`. The UDP port range is set with
 `udp-port-range = "60000-60009"`.
 
-`mimic` and `tcp-port` can be set per server inside `[[servers]]`: different
-VPSs may use different camouflage sets.
+`tcp-port` is a fixed TCP-fallback port. In auto mode it is optional and
+ephemeral by default, so no setting is required. With `mimic = ["ssh"]` and no
+UDP strategies it is required: a TCP-only server needs a known port. `mimic`
+and `tcp-port` can be set per server inside `[[servers]]`: different VPSs may
+use different camouflage sets.
 
 ## Autostart
 
@@ -252,8 +229,8 @@ For a single server replace `multi` with the plain invocation:
 `svpn setup --config FILE` prepares every VPS from the configuration: it
 detects the environment, installs the missing approved packages (`curl`, `tar`,
 `gzip`, `awk`, `ip`, `nft`, `sysctl`, CA certificates), downloads the SVPN
-release from GitHub on the VPS itself and installs
-`server-up`/`server-down`. The configuration is never modified.
+release from GitHub on the VPS itself and installs the binary. The
+configuration is never modified and setup does not create hook files.
 
 Supported environments: Debian 12 and Rocky 10 (GNU libc) on x86_64 and
 aarch64 with hardware AES. SSH access as `root` or as a regular user with
@@ -262,10 +239,8 @@ OpenWrt, Alpine and musl are not covered.
 
 Repeat runs and versions:
 
-- Only the managed files are overwritten: `/usr/local/bin/svpn`,
-  `/usr/local/lib/svpn/server-up`, `/usr/local/lib/svpn/server-down`.
-  Each replacement is atomic; the set as a whole is not, and the report shows
-  `partial`.
+- Only the managed file `/usr/local/bin/svpn` is overwritten.
+  The replacement is atomic; the report shows `partial` for a partial install.
 - The client's exact version is preferred. If its release or platform archive
   is unavailable, the latest stable release with compatible control/hook
   metadata is selected and the reason is reported. A checksum failure is an
@@ -273,11 +248,9 @@ Repeat runs and versions:
 - A selected older version may replace a newer installation; setup reports
   this explicitly in a `downgrade=` field.
 
-After installation the hashes, modes and the binary version are verified.
+After installation the binary hash, mode and version are verified.
 Setup never starts SVPN and never executes the hooks: it activates no routes,
-NAT, DNS or firewall, creates no services and does not touch local-exit. The
-hook paths must already be present in the client configuration — setup does
-not add them.
+NAT, DNS or firewall, creates no services and does not touch local-exit.
 
 Hosts are processed in configuration order; one failing host does not stop the
 others. Every host prints a

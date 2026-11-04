@@ -6,8 +6,9 @@ use anyhow::Result;
 
 use crate::server_spec::{LinkParams, resolve_ipv4};
 
-/// Embedded automatic client routing, used only when a manual hook is absent.
-pub const SCRIPT: &str = include_str!("../scripts/client-route");
+/// Embedded automatic client routing, used only when manual hooks are absent.
+pub const UP: &str = include_str!("../scripts/client-up");
+pub const DOWN: &str = include_str!("../scripts/client-down");
 
 /// Resolve every configured VPS once, before the first full-tunnel route.
 pub async fn server_addrs(servers: &[LinkParams]) -> Result<String> {

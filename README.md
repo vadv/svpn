@@ -54,8 +54,7 @@ sudo install -m 755 svpn /usr/local/bin/svpn
 svpn --version
 ```
 
-Для aarch64 возьмите архив `linux-aarch64-gnu`. В архиве, кроме бинарника, лежат
-`scripts/server-up` и `scripts/server-down` — hooks для сервера.
+Для aarch64 возьмите архив `linux-aarch64-gnu`.
 
 ### 2. Проверьте SSH до VPS
 
@@ -66,49 +65,38 @@ ssh -i /полный/путь/к/ключу root@203.0.113.10
 Если ключ защищён passphrase, загрузите его в `ssh-agent` заранее. Вместо root
 можно использовать обычного пользователя с безпарольным `sudo -n`.
 
-### 3. Создайте конфиг
+### 3. Подготовьте VPS
 
 ```bash
-sudo install -d -m 700 /etc/svpn
-sudoedit /etc/svpn/vpn.toml
+sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /полный/путь/к/ключу
 ```
 
-```toml
-# Адрес вашего VPS и SSH-ключ.
-server = "203.0.113.10"
-ssh-user = "root"
-ssh-identity = "/полный/путь/к/ключу"
-tcp-port = 41020   # TCP-fallback, если UDP заблокирован
+Команда скачает релиз SVPN прямо на VPS, установит бинарник и проверит
+установку. Поддерживаются Debian 12 и Rocky 10 на x86_64 и aarch64.
 
-# Хуки на VPS: их установит svpn setup. Настраивают NAT и выход в Интернет.
-server-up = "/usr/local/lib/svpn/server-up"
-server-down = "/usr/local/lib/svpn/server-down"
-```
-
-Замените адрес VPS и путь к ключу. Маршруты на клиенте SVPN настраивает сам:
-весь IPv4 идёт в туннель, а прямой путь до VPS сохраняется. При остановке
-автоматические маршруты удаляются. Собственная маршрутизация описана в
-[ADVANCED.md](ADVANCED.md).
-
-### 4. Подготовьте VPS
+В auto выполняются встроенные `scripts/client-up`, `scripts/client-down`,
+`scripts/server-up` и `scripts/server-down` из текущего бинарника. Точный
+текст этих скриптов можно посмотреть до запуска:
 
 ```bash
-sudo svpn setup --config /etc/svpn/vpn.toml
+svpn example client-up
+svpn example client-down
+svpn example server-up
+svpn example server-down
 ```
 
-Команда скачает релиз SVPN прямо на VPS, установит бинарник и hooks и проверит
-установку. Конфиг она не меняет. Поддерживаются Debian 12 и Rocky 10 на x86_64
-и aarch64.
+Если нужно другое поведение, сохраните вывод, отредактируйте файл и укажите
+путь к нему в конфиге — см. [ADVANCED.md](ADVANCED.md).
 
-### 5. Запустите
+### 4. Запустите
 
 ```bash
-sudo -E svpn --config /etc/svpn/vpn.toml
+sudo -E svpn --server 203.0.113.10 --ssh-user root --ssh-identity /полный/путь/к/ключу
 ```
 
 Остановить — `Ctrl-C`. Для автозапуска через systemd см. [ADVANCED.md](ADVANCED.md).
 
-### 6. Проверьте
+### 5. Проверьте
 
 ```bash
 curl -4 https://ifconfig.me   # должен показать IP вашего VPS
@@ -116,6 +104,26 @@ ping -c1 1.1.1.1
 ```
 
 Если `ifconfig.me` показывает IP VPS, трафик идёт через туннель.
+
+## Базы Country и ASN — только для local-exit и sticky-asn
+
+Для обычного VPN базы не нужны. Если хотите отправлять RU/BY напрямую или
+закреплять выход по ASN, скачайте их на клиенте:
+
+```bash
+sudo install -d -m 700 /etc/svpn
+YEAR_MONTH=$(date +%Y-%m)
+
+curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
+gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+
+curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
+gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
+sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
+```
+
+Country DB отвечает на вопрос «какая страна у адреса», ASN DB — «какая сеть».
+Подключение этих режимов и TOML для нескольких серверов описаны в ADVANCED.
 
 ## Что дальше
 

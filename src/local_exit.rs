@@ -306,24 +306,22 @@ async fn client_handshake(
         matches!(crate::bootstrap(control).await?, Message::TunReady),
         "local server TUN not ready"
     );
-    if server_up.is_some() || server_down.is_some() {
-        control
-            .send(Message::ServerHooks {
-                up: server_up,
-                down: server_down,
-            })
-            .await?;
-        let Message::HookResult { ok, stdout, stderr } = crate::bootstrap(control).await? else {
-            bail!("expected hook_result");
-        };
-        if !stdout.is_empty() {
-            crate::info!("local hook stdout: {stdout}");
-        }
-        if !stderr.is_empty() {
-            crate::info!("local hook stderr: {stderr}");
-        }
-        ensure!(ok, "local server up hook failed");
+    control
+        .send(Message::ServerHooks {
+            up: Some(crate::setup::up_or_default(server_up)),
+            down: Some(crate::setup::down_or_default(server_down)),
+        })
+        .await?;
+    let Message::HookResult { ok, stdout, stderr } = crate::bootstrap(control).await? else {
+        bail!("expected hook_result");
+    };
+    if !stdout.is_empty() {
+        crate::info!("local hook stdout: {stdout}");
     }
+    if !stderr.is_empty() {
+        crate::info!("local hook stderr: {stderr}");
+    }
+    ensure!(ok, "local server up hook failed");
     control.send(Message::TunReady).await?;
     Ok(port)
 }

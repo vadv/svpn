@@ -201,7 +201,6 @@ def check_release(root):
         "empty-notices",
         "wrong-notices",
         "wrong-license",
-        "changed-hook",
         "changed-binary",
     ):
         with tarfile.open(archive, "w:gz") as tar:
@@ -211,8 +210,6 @@ def check_release(root):
                 content = original_content
                 if member.name == "svpn" and defect == "bad-mode":
                     member.mode = 0o4755
-                if member.name == "scripts/server-up" and defect == "changed-hook":
-                    content += b"changed"
                 if member.name == "svpn" and defect == "changed-binary":
                     content += b"changed"
                 if member.name == "LICENSE" and defect == "wrong-license":
@@ -286,16 +283,12 @@ def check():
                         "build-info.json",
                         "LICENSE",
                         "THIRD-PARTY-NOTICES",
-                        *package.HOOKS,
                     ]
                     assert tar.extractfile("LICENSE").read() == (package.ROOT / "LICENSE").read_bytes()
                     assert tar.extractfile("THIRD-PARTY-NOTICES").read() == notices.read_bytes()
-                    for hook in package.HOOKS:
-                        assert tar.extractfile(hook).read() == (package.ROOT / hook).read_bytes()
                     assert all(member.isfile() and member.uid == member.gid == 0 for member in tar)
                     assert tar.getmember("svpn").mode == 0o755, "do not retain setuid bits"
                     assert tar.getmember("build-info.json").mode == 0o644
-                    assert all(tar.getmember(hook).mode == 0o755 for hook in package.HOOKS)
                     assert all(member.mtime == 1600000000 for member in tar)
                     assert tar.extractfile("svpn").read() == payload
                     info = json.load(tar.extractfile("build-info.json"))

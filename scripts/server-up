@@ -1,13 +1,20 @@
 #!/bin/sh
 set -e
-sysctl -qw net.ipv4.ip_forward=1
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != 1 ]; then
+    sysctl -qw net.ipv4.ip_forward=1
+fi
 n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
 table_id=$((10000 + n))
 table=svpn_egress_$n
 owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
 rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
+default=$(ip -4 route show default)
+[ -n "$default" ] || {
+    echo "svpn: no IPv4 default route" >&2
+    exit 1
+}
+wan=$(printf '%s\n' "$default" | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+gateway=$(printf '%s\n' "$default" | awk 'NR==1{print $3}')
 if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
     echo "svpn: policy priority $table_id is already in use" >&2
     exit 1

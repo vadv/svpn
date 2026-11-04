@@ -23,66 +23,13 @@ ssh-identity = "/полный/путь/к/ключу"
 ssh-port = 22
 ssh-remote-bin = "/usr/local/bin/svpn"
 mimic = ["ssh"]
-tcp-port = 41020
+tcp-port = 41020  # фиксированный TCP-fallback; обязателен при mimic = ["ssh"] без UDP
 udp-port-range = "60000-60009"
 
 # Защита адресов VPS при перехвате default route. Для этих адресов не должно
 # быть заранее настроенных host routes.
 up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
 down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
-
-# Эти server hooks выполняются и на VPS, и у local-exit на клиенте.
-server-up = '''
-set -e
-sysctl -qw net.ipv4.ip_forward=1
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-table=svpn_egress_$n
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-rm -f "$owner.rule" "$owner.route" "$owner.nat"
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if ip -4 rule show pref "$table_id" | grep -v "from $SVPN_PEER_ADDR lookup $table_id" | grep -q .; then
-    echo "svpn: policy priority $table_id is already in use" >&2
-    exit 1
-fi
-if ip -4 route show table "$table_id" | grep -v "via $gateway dev $wan" | grep -q .; then
-    echo "svpn: policy table $table_id is already in use" >&2
-    exit 1
-fi
-if ! ip -4 rule show pref "$table_id" | grep -q "from $SVPN_PEER_ADDR lookup $table_id"; then
-    ip rule add pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id"
-fi
-: > "$owner.rule"
-ip route replace default via "$gateway" dev "$wan" table "$table_id"
-: > "$owner.route"
-nft delete table inet "$table" 2>/dev/null || true
-nft -f - <<EOF
-add table inet $table
-add chain inet $table postrouting { type nat hook postrouting priority srcnat; }
-add rule inet $table postrouting ip saddr $SVPN_PEER_ADDR masquerade
-EOF
-: > "$owner.nat"
-'''
-server-down = '''
-n=$(printf '%s\n' "$SVPN_PEER_ADDR" | cut -d. -f3)
-table_id=$((10000 + n))
-owner=/run/svpn-egress-$SVPN_SESSION_ID-$table_id
-wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-gateway=$(ip -4 route show default | awk 'NR==1{print $3}')
-if [ -f "$owner.rule" ]; then
-    ip rule del pref "$table_id" from "$SVPN_PEER_ADDR" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.rule"
-fi
-if [ -f "$owner.route" ]; then
-    ip route del default via "$gateway" dev "$wan" table "$table_id" 2>/dev/null || true
-    rm -f "$owner.route"
-fi
-if [ -f "$owner.nat" ]; then
-    nft delete table inet "svpn_egress_$n" 2>/dev/null || true
-    rm -f "$owner.nat"
-fi
-'''
 
 [[servers]]
 address = "nl.example.com"
@@ -155,9 +102,22 @@ sudo systemctl restart svpn
 ## Server hooks
 
 `server-up` и `server-down` выполняются на VPS, а также у `local-exit` на
-клиенте. Готовые скрипты лежат в релизном архиве и устанавливаются командой
-`svpn setup` в `/usr/local/lib/svpn/`. Для ручной установки возьмите их из
-архива.
+клиенте. Если поля не заданы, `serve` выполняет встроенные
+`scripts/server-up` и `scripts/server-down` текущего бинарника.
+
+Чтобы переопределить поведение, посмотрите пример, сохраните его,
+отредактируйте и укажите путь в `server-up`/`server-down`:
+
+```bash
+svpn example server-up > server-up
+svpn example server-down > server-down
+$EDITOR server-up
+chmod 755 server-up server-down
+ssh root@vps 'mkdir -p /usr/local/lib/svpn'
+scp server-up server-down root@vps:/usr/local/lib/svpn/
+```
+
+Можно также задать команду прямо строкой в TOML.
 
 Hooks получают переменные окружения:
 
@@ -172,15 +132,30 @@ Timeout — 10 секунд. Ошибка `up` не даёт поднять се
 
 ## Клиентские hooks
 
-Если ручной hook не задан, SVPN настраивает маршруты сам. После создания TUN
-он добавляет host route `/32` до каждого VPS через исходный gateway и
-split-default `0.0.0.0/1` и `128.0.0.0/1` через TUN. Так весь IPv4 идёт в
-туннель, а прямой путь до VPS сохраняется. Работает на Linux, OpenWrt и macOS.
+В auto выполняются встроенные `scripts/client-up` и `scripts/client-down` из текущего бинарника.
+Точный текст можно посмотреть до запуска:
 
-При остановке удаляются только маршруты этой сессии. Владение хранится в
-`/var/run/svpn`; при ошибке или прерывании выполняется rollback, а при новом
-запуске прежнее состояние сначала очищается. Чужой default route и чужие
-маршруты не перезаписываются.
+```bash
+svpn example client-up
+svpn example client-down
+```
+
+Для ручного override сохраните вывод и сделайте файл исполняемым:
+
+```bash
+svpn example client-up > client-up
+chmod +x client-up
+```
+
+Скрипт получает `SVPN_SERVER_ADDRS` и `SVPN_OS`, затем:
+
+1. для каждого VPS добавляет `/32` host route через исходный путь;
+2. добавляет `0.0.0.0/1` и `128.0.0.0/1` через TUN;
+3. при `down` удаляет только маршруты этой сессии.
+
+При `up-command`/`up-script` этот скрипт не запускается: выполняется ваш
+вариант. `up-command` запускается как `/bin/sh -c <строка>`, а `up-script` —
+как прямой запуск исполняемого файла.
 
 Поля ниже — ручной override. Если задан `up-command` или `up-script`,
 автоматический up не выполняется; то же для `down-command`/`down-script`.
@@ -211,11 +186,14 @@ known-hosts файле. Для строгой проверки получите 
 ## Транспорт
 
 По умолчанию используется SSH camouflage и UDP. Если UDP заблокирован, задайте
-`mimic = ["ssh"]` и `tcp-port = 41020`. Диапазон UDP-портов задаётся строкой
+`mimic = ["ssh"]`. Диапазон UDP-портов задаётся строкой
 `udp-port-range = "60000-60009"`.
 
-`mimic` и `tcp-port` можно задать отдельно для каждого сервера внутри
-`[[servers]]`: разные VPS могут работать с разными масками.
+`tcp-port` — фиксированный порт TCP-fallback. В auto он необязателен и по
+умолчанию эфемерный, поэтому базовая настройка не требуется. Но при
+`mimic = ["ssh"]` без UDP-стратегий он обязателен: TCP-only серверу нужен
+известный порт. `mimic` и `tcp-port` можно задать отдельно для каждого сервера
+внутри `[[servers]]`: разные VPS могут работать с разными масками.
 
 ## Автозапуск
 
@@ -249,7 +227,8 @@ journalctl -u svpn -f
 `svpn setup --config FILE` подготавливает каждый VPS из конфига: определяет
 окружение, ставит недостающие проверенные пакеты (`curl`, `tar`, `gzip`, `awk`,
 `ip`, `nft`, `sysctl`, CA-сертификаты), скачивает релиз SVPN с GitHub прямо на
-VPS и устанавливает `server-up`/`server-down`. Конфиг не изменяется.
+VPS и устанавливает бинарник. Конфиг не изменяется; hook-файлы setup не
+создаёт.
 
 Поддерживаемые окружения: Debian 12 и Rocky 10 (GNU libc) на x86_64 и aarch64 с
 аппаратным AES. Вход по SSH — `root` или обычный пользователь с безпарольным
@@ -258,10 +237,8 @@ musl команда не обслуживает.
 
 Повторные запуски и версии:
 
-- Перезаписываются только управляемые файлы: `/usr/local/bin/svpn`,
-  `/usr/local/lib/svpn/server-up`, `/usr/local/lib/svpn/server-down`.
-  Замена каждого файла атомарна, набор в целом — нет; отчёт честно показывает
-  `partial`.
+- Перезаписывается только управляемый файл `/usr/local/bin/svpn`.
+  Замена атомарна; отчёт честно показывает `partial` при частичной установке.
 - Предпочитается версия клиента. Если её релиз или архив под платформу
   недоступны, выбирается последний стабильный релиз с совместимыми
   control/hook метаданными, и причина сообщается. Ошибка контрольной суммы —
@@ -269,10 +246,9 @@ musl команда не обслуживает.
 - Выбранная более старая версия может заменить установленную новую — это
   сообщается явно полем `downgrade=`.
 
-После установки проверяются хеши, права и версия бинарника. Setup не запускает
+После установки проверяются хеш, права и версия бинарника. Setup не запускает
 SVPN и не выполняет хуки: команда не активирует маршруты, NAT, DNS и firewall,
-не создаёт сервисы и не трогает `local-exit`. Пути хуков должны уже быть в
-клиентском конфиге — setup их не добавляет.
+не создаёт сервисы и не трогает `local-exit`.
 
 Хосты обрабатываются по порядку конфига; сбой одного не останавливает
 остальные. Каждому хосту печатается строка

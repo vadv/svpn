@@ -1,5 +1,5 @@
 #!/bin/sh
-# Automatic client full-tunnel routing. Called only when no manual hook is set.
+# Automatic client full-tunnel route setup. Called only when no manual up hook is set.
 set -eu
 # Hooks may run with a deliberately empty PATH; use the trusted system tools.
 PATH=${SVPN_ROUTE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
@@ -33,15 +33,7 @@ linux_route_to() {
     fi
 }
 
-linux_up() {
-    for server in ${SVPN_SERVER_ADDRS:-}; do
-        linux_route_to "$server"
-    done
-    ip route replace 0.0.0.0/1 dev "$SVPN_TUN_NAME"
-    ip route replace 128.0.0.0/1 dev "$SVPN_TUN_NAME"
-}
-
-linux_down() {
+linux_cleanup() {
     down_tun=$1
     down_servers=$2
     for server in $down_servers; do
@@ -49,6 +41,14 @@ linux_down() {
     done
     ip route del 0.0.0.0/1 dev "$down_tun" 2>/dev/null || true
     ip route del 128.0.0.0/1 dev "$down_tun" 2>/dev/null || true
+}
+
+linux_up() {
+    for server in ${SVPN_SERVER_ADDRS:-}; do
+        linux_route_to "$server"
+    done
+    ip route replace 0.0.0.0/1 dev "$SVPN_TUN_NAME"
+    ip route replace 128.0.0.0/1 dev "$SVPN_TUN_NAME"
 }
 
 macos_route_to() {
@@ -67,15 +67,7 @@ macos_route_to() {
     fi
 }
 
-macos_up() {
-    for server in ${SVPN_SERVER_ADDRS:-}; do
-        macos_route_to "$server"
-    done
-    route -n add -inet 0.0.0.0/1 -interface "$SVPN_TUN_NAME"
-    route -n add -inet 128.0.0.0/1 -interface "$SVPN_TUN_NAME"
-}
-
-macos_down() {
+macos_cleanup() {
     down_tun=$1
     down_servers=$2
     for server in $down_servers; do
@@ -85,14 +77,22 @@ macos_down() {
     route -n delete -inet 128.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
 }
 
-route_down() {
+macos_up() {
+    for server in ${SVPN_SERVER_ADDRS:-}; do
+        macos_route_to "$server"
+    done
+    route -n add -inet 0.0.0.0/1 -interface "$SVPN_TUN_NAME"
+    route -n add -inet 128.0.0.0/1 -interface "$SVPN_TUN_NAME"
+}
+
+cleanup() {
     [ -f "$state" ] || return 0
     down_os=$(state_field os)
     down_tun=$(state_field tun)
     down_servers=$(state_field servers)
     case "$down_os" in
-        linux) linux_down "$down_tun" "$down_servers" ;;
-        macos) macos_down "$down_tun" "$down_servers" ;;
+        linux) linux_cleanup "$down_tun" "$down_servers" ;;
+        macos) macos_cleanup "$down_tun" "$down_servers" ;;
         *)
             echo "svpn: unsupported OS for route cleanup: $down_os" >&2
             return 1
@@ -101,36 +101,24 @@ route_down() {
     rm -f "$state"
 }
 
-route_up() {
-    # Reclaim only the previous session's routes before adding ours.
-    route_down
-    os=${SVPN_OS:-}
-    case "$os" in
-        linux|macos) ;;
-        *)
-            echo "svpn: automatic client routing supports only Linux and macOS, got $os" >&2
-            return 1
-            ;;
-    esac
-    mkdir -p "$state_dir"
-    state_tmp="$state.$$"
-    printf 'os %s\ntun %s\nservers %s\n' "$os" "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" >"$state_tmp"
-    mv -f "$state_tmp" "$state"
-    # Any failure or interruption rolls back only this session's routes.
-    trap 'route_down' EXIT
-    trap 'exit 1' HUP INT TERM
-    case "$os" in
-        linux) linux_up ;;
-        macos) macos_up ;;
-    esac
-    trap - EXIT HUP INT TERM
-}
-
-case "${SVPN_EVENT:-}" in
-    up) route_up ;;
-    down) route_down ;;
+cleanup
+os=${SVPN_OS:-}
+case "$os" in
+    linux|macos) ;;
     *)
-        echo "svpn: unexpected SVPN_EVENT: ${SVPN_EVENT:-}" >&2
+        echo "svpn: automatic client routing supports only Linux and macOS, got $os" >&2
         exit 1
         ;;
 esac
+mkdir -p "$state_dir"
+state_tmp="$state.$$"
+printf 'os %s\ntun %s\nservers %s\n' "$os" "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" >"$state_tmp"
+mv -f "$state_tmp" "$state"
+# Any failure or interruption rolls back only this session's routes.
+trap 'cleanup' EXIT
+trap 'exit 1' HUP INT TERM
+case "$os" in
+    linux) linux_up ;;
+    macos) macos_up ;;
+esac
+trap - EXIT HUP INT TERM

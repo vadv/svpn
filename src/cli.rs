@@ -69,11 +69,16 @@ pub enum Mode {
     /// Connect to one or more servers sharing a client TUN.
     #[command(name = "multi")]
     Client(ClientArgs),
-    /// Install the server binary and embedded hooks on configured GNU Linux VPSs.
+    /// Install the server binary on configured GNU Linux VPSs.
     Setup {
-        /// Existing single-server or multi-server client TOML; it is never modified.
-        #[arg(long, value_name = "FILE")]
-        config: PathBuf,
+        #[command(flatten)]
+        client: ClientArgs,
+    },
+    /// Print an embedded hook example to stdout.
+    Example {
+        /// Hook example name: client-up, client-down, server-up or server-down.
+        #[arg(value_name = "NAME")]
+        name: String,
     },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
@@ -198,6 +203,15 @@ impl Cli {
                 mode
             }
             None => Mode::Client(raw.client),
+        };
+        let mode = match mode {
+            Mode::Setup { client } if client.config.is_some() == !client.server.is_empty() => {
+                return Err(clap::Error::raw(
+                    ErrorKind::ArgumentConflict,
+                    "setup requires exactly one of --config or --server",
+                ));
+            }
+            mode => mode,
         };
         let mode = match mode {
             Mode::Client(mut client) => {
