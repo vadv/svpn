@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.0.0
+
+Setup and automatic routing release.
+
+- `svpn setup` provisions VPSs over SSH: environment preflight (Debian 12,
+  Rocky 10, GNU libc, hardware AES), installs the approved packages, downloads
+  the matching release on the VPS itself, installs the binary atomically and
+  verifies hash, mode and version. Works with `--server HOST` for a single
+  VPS or `--config FILE` for the whole pool; one host's failure does not stop
+  the others. Setup never starts SVPN, never executes hooks and never touches
+  the network.
+- Automatic client routing is embedded: without `up-command`/`up-script` the
+  client runs the built-in `client-up`/`client-down` — a per-server `/32` host
+  route through the original path plus a split default (`0.0.0.0/1`,
+  `128.0.0.0/1`) through the TUN, with rollback of only its own routes.
+  Works on Linux and macOS without a default-route requirement.
+- Automatic server hooks are embedded: without `server-up`/`server-down`
+  the server runs the built-in `scripts/server-up`/`server-down` —
+  forwarding, a dedicated policy table per session and nftables masquerade.
+  A missing IPv4 default route is a hard error. The client always sends the
+  effective hooks, so new clients keep old servers working.
+- `svpn example client-up|client-down|server-up|server-down` prints the
+  exact embedded hook text, so the effective scripts can be audited before
+  the first run and saved for customization. Manual overrides win over the
+  auto mode per direction.
+- Release archives are binary-only (svpn, build-info.json, LICENSE,
+  THIRD-PARTY-NOTICES); setup no longer installs example hook files.
+- README quick start covers a single VPS without TOML, a two-server
+  `multi` config, and moves every advanced topic to ADVANCED.md.
+
 ## v0.9.6
 
 Local-exit correctness and setup documentation release.

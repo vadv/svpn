@@ -11,7 +11,7 @@ systemd-сервис или отдельный конфиг.
 flowchart TD
     app["🖥️ Приложение"] --> tun["TUN клиента<br/>10.77.0.2"]
     tun --> brain("🧠 Выбор пути<br/>по адресу назначения")
-    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
+    brain -->|"RU"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 виден домашний IP"]
     brain -->|"остальной мир"| asn["🎯 sticky-ASN: сеть назначения<br/>(Claude Code, Google…)<br/>закреплена за одним VPS"]
     asn --> mimic["🕵️ Маскировка: клиент сам<br/>подбирает, под что притвориться<br/>UDP, при блокировке — TCP"]
@@ -32,7 +32,7 @@ flowchart TD
     class home,net1,net2 edge
 ```
 
-Клиент выбирает путь до шифрования. Адреса из `local-exits` (например, RU и BY)
+Клиент выбирает путь до шифрования. Адреса из `local-exits` (например, RU)
 идут через локальный выход — сайт видит ваш домашний IP. Остальные адреса
 шифруются и уходят на VPS — сайт видит IP сервера. В режиме нескольких VPS
 `sticky-asn` закрепляет каждый ASN назначения за одним сервером, чтобы сервис
@@ -47,7 +47,7 @@ flowchart TD
 ### 1. Установите SVPN на клиент
 
 ```bash
-VERSION=0.9.6
+VERSION=1.0.0
 curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 sudo install -m 755 svpn /usr/local/bin/svpn
@@ -105,9 +105,33 @@ ping -c1 1.1.1.1
 
 Если `ifconfig.me` показывает IP VPS, трафик идёт через туннель.
 
+### Несколько VPS — не сложнее одного
+
+Одна строчка `[[servers]]` на каждый сервер, общие SSH-настройки сверху:
+
+```toml
+# vpn.toml
+ssh-user = "root"
+ssh-identity = "/полный/путь/к/ключу"
+
+[[servers]]
+address = "203.0.113.10"
+
+[[servers]]
+address = "198.51.100.20"
+```
+
+```bash
+sudo svpn setup --config vpn.toml      # подготовить оба VPS
+sudo -E svpn multi --config vpn.toml   # запустить
+```
+
+Трафик распределяется между серверами по весам (по умолчанию поровну). Один VPS
+недоступен — сети переезжают на оставшиеся, при восстановлении возвращаются.
+
 ## Базы Country и ASN — только для local-exit и sticky-asn
 
-Для обычного VPN базы не нужны. Если хотите отправлять RU/BY напрямую или
+Для обычного VPN базы не нужны. Если хотите отправлять RU напрямую или
 закреплять выход по ASN, скачайте их на клиенте:
 
 ```bash
@@ -123,14 +147,14 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
 Country DB отвечает на вопрос «какая страна у адреса», ASN DB — «какая сеть».
-Подключение этих режимов и TOML для нескольких серверов описаны в ADVANCED.
+Подключение этих режимов описано в ADVANCED.
 
 ## Что дальше
 
-Всё, что сложнее одного сервера, описано в [ADVANCED.md](ADVANCED.md):
+Всё, что сложнее пары серверов из quick start, описано в [ADVANCED.md](ADVANCED.md):
 
-- несколько VPS и распределение по весам;
-- выбор по странам и `local-exit` для RU/BY;
+- веса серверов и закрепление сетей по ASN (`sticky-asn`);
+- выбор по странам и `local-exit` для RU;
 - `sticky-asn` — стабильный внешний IP на ASN;
 - базы Country и ASN, их обновление;
 - hooks и переменные окружения;

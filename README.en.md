@@ -11,7 +11,7 @@ separate configuration on the VPS.
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
     tun --> brain("🧠 Path selection<br/>by destination address")
-    brain -->|"RU / BY"| local["🏠 Local exit<br/>NAT → WAN"]
+    brain -->|"RU"| local["🏠 Local exit<br/>NAT → WAN"]
     local --> home["🌍 home IP is visible"]
     brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (Claude Code, Google…)<br/>is pinned to one VPS"]
     asn --> mimic["🕵️ Camouflage: the client<br/>picks what to look like<br/>UDP, TCP when UDP blocked"]
@@ -33,7 +33,7 @@ flowchart TD
 ```
 
 The client picks the path before encryption. Addresses in `local-exits` (for
-example RU and BY) leave through the local exit — the site sees your home IP.
+example RU) leave through the local exit — the site sees your home IP.
 Everything else is encrypted and sent to a VPS — the site sees the server IP.
 With several VPSs, `sticky-asn` pins every destination ASN to one server so a
 service sees a stable external IP. Tunnel traffic is disguised: the client
@@ -49,7 +49,7 @@ You need a Linux client and one Linux VPS with root SSH. The client needs TUN,
 ### 1. Install SVPN on the client
 
 ```bash
-VERSION=0.9.6
+VERSION=1.0.0
 curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 sudo install -m 755 svpn /usr/local/bin/svpn
@@ -108,9 +108,33 @@ ping -c1 1.1.1.1
 
 If `ifconfig.me` shows the VPS IP, traffic goes through the tunnel.
 
+### Several VPSs — no harder than one
+
+One `[[servers]]` line per server, shared SSH settings on top:
+
+```toml
+# vpn.toml
+ssh-user = "root"
+ssh-identity = "/full/path/to/key"
+
+[[servers]]
+address = "203.0.113.10"
+
+[[servers]]
+address = "198.51.100.20"
+```
+
+```bash
+sudo svpn setup --config vpn.toml      # provision both VPSs
+sudo -E svpn multi --config vpn.toml   # run
+```
+
+Traffic is distributed between the servers by weight (equal by default). When a
+VPS goes down its networks move to the remaining ones and return once it is back.
+
 ## Country and ASN databases — only for local-exit and sticky-asn
 
-You do not need databases for a plain VPN. To send RU/BY destinations directly
+You do not need databases for a plain VPN. To send RU destinations directly
 or pin the exit by ASN, download them on the client:
 
 ```bash
@@ -126,15 +150,15 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
 Country DB answers “which country is this address”, ASN DB answers “which
-network is it”. Enabling these modes and the multi-server TOML is covered in
-ADVANCED.
+network is it”. Enabling these modes is covered in ADVANCED.
 
 ## Next steps
 
-Everything beyond a single server is covered in [ADVANCED.en.md](ADVANCED.en.md):
+Everything beyond the quick-start pair of servers is covered in
+[ADVANCED.en.md](ADVANCED.en.md):
 
-- several VPSs and weight-based distribution;
-- country-based selection and `local-exit` for RU/BY;
+- server weights and per-ASN exit pinning (`sticky-asn`);
+- country-based selection and `local-exit` for RU;
 - `sticky-asn` — a stable external IP per ASN;
 - Country and ASN databases and their updates;
 - hooks and environment variables;
