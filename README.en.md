@@ -32,8 +32,7 @@ flowchart TD
     class home,net1,net2 edge
 ```
 
-The client picks the path before encryption. Addresses in `local-exits` (for
-example RU) leave through the local exit — the site sees your home IP.
+The client picks the path before encryption. Addresses in a sticky block with `via = local` leave through the local exit — the site sees your home IP.
 Everything else is encrypted and sent to a VPS — the site sees the server IP.
 With several VPSs, `sticky-asn` pins every destination ASN to one server so a
 service sees a stable external IP. Tunnel traffic is disguised: the client
@@ -110,32 +109,36 @@ If `ifconfig.me` shows the VPS IP, traffic goes through the tunnel.
 
 ### Several VPSs — no harder than one
 
-One `[[servers]]` line per server, shared SSH settings on top:
+One `server` block per server, shared SSH settings on top. The config is HCL:
 
-```toml
-# vpn.toml
-ssh-user = "root"
-ssh-identity = "/full/path/to/key"
+```hcl
+# vpn.hcl
+ssh {
+  user     = "root"
+  identity = "/full/path/to/key"
+}
 
-[[servers]]
-address = "203.0.113.10"
+server "nl" {
+  address = "203.0.113.10"
+}
 
-[[servers]]
-address = "198.51.100.20"
+server "de" {
+  address = "198.51.100.20"
+}
 ```
 
 ```bash
-sudo svpn setup --config vpn.toml      # provision both VPSs
-sudo -E svpn multi --config vpn.toml   # run
+sudo svpn setup --config vpn.hcl      # provision both VPSs
+sudo -E svpn multi --config vpn.hcl   # run
 ```
 
 Traffic is distributed between the servers by weight (equal by default). When a
 VPS goes down its networks move to the remaining ones and return once it is back.
 
-## Country and ASN databases — only for local-exit and sticky-asn
+## Country and ASN databases — only for sticky modes
 
-You do not need databases for a plain VPN. To send RU destinations directly
-or pin the exit by ASN, download them on the client:
+You do not need databases for a plain VPN. To pin exits by country or ASN
+(sticky blocks in ADVANCED), download them on the client:
 
 ```bash
 sudo install -d -m 700 /etc/svpn
@@ -157,9 +160,9 @@ network is it”. Enabling these modes is covered in ADVANCED.
 Everything beyond the quick-start pair of servers is covered in
 [ADVANCED.en.md](ADVANCED.en.md):
 
-- server weights and per-ASN exit pinning (`sticky-asn`);
-- country-based selection and `local-exit` for RU;
-- `sticky-asn` — a stable external IP per ASN;
+- `sticky` blocks: pinning exits by DNS names, IPs, ASNs and countries;
+- `via = local` — sending selected addresses outside the VPN;
+- `fallback_sticky` — how the pool serves the remaining traffic;
 - Country and ASN databases and their updates;
 - hooks and environment variables;
 - transport: mimic, TCP fallback, UDP port range;
