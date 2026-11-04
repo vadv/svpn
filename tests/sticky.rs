@@ -46,9 +46,25 @@ fn durations_accept_seconds_minutes_hours() {
     assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
     assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
     assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
-    for text in ["", "5", "m", "1d", "-5s", "1.5h"] {
+    for text in [
+        "",
+        "5",
+        "m",
+        "1d",
+        "-5s",
+        "1.5h",
+        "é",
+        "5é",
+        "18446744073709551616s",
+        "18446744073709551615h",
+    ] {
         assert!(parse_duration(text).is_err(), "{text}");
     }
+    // Just below the overflow boundary still parses.
+    assert_eq!(
+        parse_duration("5124095h").unwrap(),
+        Duration::from_secs(5124095 * 3600)
+    );
 }
 
 // ── names ──

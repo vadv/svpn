@@ -311,6 +311,45 @@ fn sticky_blocks_parse_with_all_selectors() {
 }
 
 #[test]
+fn extra_block_labels_are_rejected() {
+    let text = "server \"a\" \"b\" {\n  address = \"a.example\"\n}\n";
+    assert!(parse(text, Path::new("."), false).is_err());
+    let text = "server \"a\" {\n  address = \"a.example\"\n}\nsticky \"x\" \"y\" {\n  ips = [\"1.2.3.4\"]\n  via = [\"a\"]\n}\n";
+    assert!(parse(text, Path::new("."), true).is_err());
+}
+
+#[test]
+fn escaped_template_markers_are_literal_values() {
+    let text = concat!(
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n",
+        "hooks {\n  up_command = <<EOF\n",
+        "echo literal $${HOME} and %%{var} here\n",
+        "EOF\n}\n",
+    );
+    let args = parse(text, Path::new("."), false).unwrap();
+    let command = args.hooks.up_command.unwrap();
+    // HCL strips the escape: the hook sees one $ and one %.
+    assert!(command.contains("${HOME}"), "{command}");
+    assert!(command.contains("%{var}"), "{command}");
+}
+
+#[test]
+fn sticky_errors_do_not_echo_values_in_the_chain() {
+    let text = concat!(
+        "server \"a\" {\n  address = \"a.example\"\n}\n",
+        "sticky \"x\" {\n  ips = [\"PRIVATE.MARKER/16\"]\n  via = [\"a\"]\n}\n",
+    );
+    let error = format!("{:#}", parse(text, Path::new("."), true).err().unwrap());
+    assert!(!error.contains("PRIVATE.MARKER"), "{error}");
+    let text = concat!(
+        "server \"a\" {\n  address = \"a.example\"\n}\n",
+        "sticky \"x\" {\n  ips = [\"9.9.9.9\"]\n  via = [\"a\"]\n  every = \"PRIVATE\"\n}\n",
+    );
+    let error = format!("{:#}", parse(text, Path::new("."), true).err().unwrap());
+    assert!(!error.contains("PRIVATE"), "{error}");
+}
+
+#[test]
 fn sticky_blocks_reject_invalid_shapes() {
     let base = "server \"nl1\" {\n  address = \"nl1.example\"\n}\n";
     for sticky in [

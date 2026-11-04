@@ -5,9 +5,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use svpn::geo::{
-    Geo, asn_key, country_key, ip_key, pack_country, rendezvous, scoped_asn_key, unpack_country,
-};
+use svpn::geo::{Geo, asn_key, ip_key, pack_country, rendezvous};
 
 struct Csv(PathBuf);
 
@@ -218,28 +216,6 @@ fn country_errors_never_include_row_contents() {
     assert!(message.contains("rows 1 and 100001"), "{message}");
     assert!(!message.contains("10.0.0.64"), "{message}");
     assert!(!message.contains("10.0.0.128"), "{message}");
-}
-
-#[test]
-fn country_codes_pack_roundtrip_and_key_domains_stay_disjoint() {
-    assert_eq!(pack_country("us"), Some(0x5553));
-    assert_eq!(pack_country("US"), Some(0x5553));
-    for bad in ["", "U", "USA", "U5", "US "] {
-        assert_eq!(pack_country(bad), None, "{bad:?}");
-    }
-    assert_eq!(unpack_country(0x5553), "US");
-    assert_eq!(unpack_country(0x5255), "RU");
-    // ASN keys live in [0, 2^32), bare IPs above them, then country and
-    // scoped-ASN keys — no rendezvous collisions across group kinds.
-    assert!(asn_key(u32::MAX) < ip_key(Ipv4Addr::new(0, 0, 0, 0)));
-    assert!(ip_key(Ipv4Addr::new(255, 255, 255, 255)) < country_key(0));
-    assert!(country_key(0xFFFF) < scoped_asn_key(0, 0));
-    assert_ne!(asn_key(0x5553), country_key(0x5553));
-    assert_ne!(
-        scoped_asn_key(pack_country("CH").unwrap(), 64500),
-        scoped_asn_key(pack_country("CL").unwrap(), 64500),
-        "country bits must not be overwritten by the scoped domain tag"
-    );
 }
 
 // ── lookup ──

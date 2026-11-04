@@ -178,12 +178,6 @@ impl ServerSpec {
         Ok(())
     }
 
-    pub(crate) fn relative_identity(&mut self, base: &std::path::Path) {
-        if let Some(path) = &mut self.identity {
-            *path = base.join(&*path);
-        }
-    }
-
     pub fn resolve(&self, globals: &Globals) -> Result<LinkParams> {
         let (tun_addr, peer_addr, addr_auto) =
             match (globals.tun_addr, self.peer_addr.or(globals.peer_addr)) {

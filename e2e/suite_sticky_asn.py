@@ -451,7 +451,7 @@ def test_country_asn_scope():
     print("PASS country+ASN: shared-country owner and constrained failover stay stable")
 
 
-def test_local_exits_and_vpn():
+def test_local_egress_and_vpn():
     fresh_state()
     # The internal Compose network has no default route; use its physical uplink.
     command(["ip", "route", "replace", "default", "dev", "eth0"])
@@ -511,5 +511,5 @@ TESTS = [
     ("test_failover_move", test_failover_move),
     ("test_restart_restore", test_restart_restore),
     ("test_country_asn_scope", test_country_asn_scope),
-    ("test_local_exits_and_vpn", test_local_exits_and_vpn),
+    ("test_local_egress_and_vpn", test_local_egress_and_vpn),
 ]

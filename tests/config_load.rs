@@ -53,6 +53,39 @@ fn bounded_regular_utf8_file_and_config_positions() {
 }
 
 #[test]
+fn relative_paths_join_the_config_directory_exactly_once() {
+    use std::fs;
+    let base = std::env::temp_dir().join(format!("svpn config once {}", std::process::id()));
+    let nested = base.join("configs");
+    fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("config.hcl");
+    std::fs::write(
+        &path,
+        concat!(
+            "ssh {\n  identity = \"key.pem\"\n}\n",
+            "hooks {\n  up_script = \"up.sh\"\n}\n",
+            "server \"main\" {\n  address = \"vpn.example\"\n  ssh_identity = \"server.pem\"\n}\n",
+        ),
+    )
+    .unwrap();
+    let args = load(&path, false).unwrap();
+    assert_eq!(
+        args.globals.ssh_identity.as_deref(),
+        Some(nested.join("key.pem").as_path())
+    );
+    assert_eq!(
+        args.hooks.up_script.as_deref(),
+        Some(nested.join("up.sh").as_path())
+    );
+    let params = resolve_servers(&args.server, &args.globals).unwrap();
+    assert_eq!(
+        params[0].identity.as_deref(),
+        Some(nested.join("server.pem").as_path())
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn symlink_uses_its_directory_for_global_record_and_hook_paths() {
     use std::{fs, os::unix::fs::symlink};
     let base = std::env::temp_dir().join(format!("svpn config symlink {}", std::process::id()));

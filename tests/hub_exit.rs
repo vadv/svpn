@@ -93,6 +93,7 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
                 assigned: Arc::default(),
             })
             .collect(),
+        policy: svpn::cli::ExitPolicy::StickyAsn,
         pool,
         geo,
         country,
@@ -472,6 +473,22 @@ fn uncovered_ip_is_stateless() {
         first
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn balance_mode_ignores_the_geo_table() {
+    // geo may be loaded for an asn selector while the fallback stays balance.
+    let mut hub = selector_hub(&[1, 1], true, Some(asn_table()), None);
+    hub.policy = svpn::cli::ExitPolicy::Balance;
+    let mut seen = std::collections::HashSet::new();
+    for port in 1000..1020u16 {
+        seen.insert(pick_link(&mut hub, flow(Ipv4Addr::new(1, 0, 0, 5), port)).link);
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "balance spreads per flow despite the geo table"
+    );
 }
 
 #[test]

@@ -47,6 +47,7 @@ fn params() -> LinkParams {
 fn local_hub() -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
+        policy: svpn::cli::ExitPolicy::Balance,
         links: vec![Link {
             params: params(),
             outgoing: None,

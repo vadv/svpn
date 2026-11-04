@@ -158,17 +158,20 @@ impl ExitState {
         Ok(())
     }
 
-    /// Restore link indices per typed key. Stored keys that do not parse and
-    /// nodes that left the configuration are skipped.
+    /// Restore link indices per typed key. Each map accepts only its own key
+    /// shape: a numeric entry in the sticky map (or a canonical selector in
+    /// the asn map) is corrupt and skipped, not silently re-typed.
     pub fn owner_indices(&self, ids: &[String]) -> HashMap<ExitKey, usize> {
-        self.asn
-            .iter()
-            .chain(self.sticky.iter())
-            .filter_map(|(stored, node)| {
-                let key = ExitKey::parse(stored)?;
-                ids.iter().position(|id| id == node).map(|link| (key, link))
-            })
-            .collect()
+        let link_of = |node: &str| ids.iter().position(|id| id == node);
+        let asn = self.asn.iter().filter_map(|(stored, node)| {
+            let key = ExitKey::Asn(stored.parse::<u32>().ok()?);
+            link_of(node).map(|link| (key, link))
+        });
+        let sticky = self.sticky.iter().filter_map(|(stored, node)| {
+            let key = ExitKey::parse(stored).filter(|key| matches!(key, ExitKey::Sticky(_)))?;
+            link_of(node).map(|link| (key, link))
+        });
+        asn.chain(sticky).collect()
     }
 }
 

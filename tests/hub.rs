@@ -47,6 +47,7 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
 fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
+        policy: svpn::cli::ExitPolicy::Balance,
         links: servers
             .into_iter()
             .enumerate()

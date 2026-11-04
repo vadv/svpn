@@ -52,6 +52,18 @@ pub fn load(path: &Path, multi: bool) -> Result<ClientArgs> {
         crate::server_spec::resolve_servers(&args.server, &args.globals)?;
         Ok(args)
     })
+    .map(|mut args| {
+        // Sticky owners persist even without any database: default the state
+        // file next to the config itself.
+        if args.exit_state.is_none()
+            && !args.stickies.is_empty()
+            && args.geo_db.is_none()
+            && args.country_db.is_none()
+        {
+            args.exit_state = Some(path.with_extension("state.json"));
+        }
+        args
+    })
     .with_context(|| path.display().to_string())
 }
 
@@ -59,7 +71,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
     let body = hcl::parse(text).map_err(sanitize_parse_error)?;
     let mut top = Top::split(&body)?;
 
-    let mut globals = Globals {
+    let globals = Globals {
         ssh_identity: top.take_path("ssh", "identity", base)?,
         ssh_user: top.take_string("ssh", "user")?,
         ssh_port: top.take_port("ssh", "port")?.unwrap_or(22),
@@ -108,11 +120,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
             .validate_fields()
             .with_context(|| format!("server {label}"))?;
         server.label = label;
-        server.relative_identity(base);
         server_specs.push(server);
-    }
-    if let Some(path) = &mut globals.ssh_identity {
-        *path = base.join(&*path);
     }
 
     let mut hooks = hooks::Args {
@@ -134,7 +142,6 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
                 !path.as_os_str().is_empty(),
                 "{name}-script must not be empty"
             );
-            *path = base.join(&*path);
         }
         if let Some(command) = command {
             ensure!(
@@ -183,6 +190,15 @@ fn sanitize_parse_error(error: hcl::Error) -> anyhow::Error {
     }
 }
 
+/// True when the text contains a live `${`/`%{` sequence. The escaped forms
+/// `$${` and `%%{` are literals, not interpolation.
+fn has_interpolation(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.windows(2).enumerate().any(|(index, pair)| {
+        (pair == b"${" || pair == b"%{") && index > 0 && bytes[index - 1] != bytes[index]
+    })
+}
+
 /// Reject expressions we do not evaluate (variables, traversals, function
 /// calls, operators, interpolation): the config is data, not a program.
 fn literal(expr: &hcl::Expression) -> Result<hcl::Value> {
@@ -198,7 +214,7 @@ fn literal(expr: &hcl::Expression) -> Result<hcl::Value> {
         Expression::TemplateExpr(template) => {
             let text = template.to_string();
             ensure!(
-                !text.contains("${") && !text.contains("%{"),
+                !has_interpolation(&text),
                 "template expressions are not allowed"
             );
             // A heredoc's final newline is file formatting, not value.
@@ -520,6 +536,10 @@ impl<'a> Top<'a> {
         let mut labels = HashSet::new();
         let blocks = std::mem::take(&mut self.split.blocks);
         for block in blocks.iter().filter(|b| b.identifier() == "server") {
+            ensure!(
+                block.labels().len() == 1,
+                "server: exactly one block label is required"
+            );
             let label = block
                 .labels()
                 .first()
@@ -563,6 +583,10 @@ impl<'a> Top<'a> {
         let mut out = Vec::new();
         let blocks = std::mem::take(&mut self.split.blocks);
         for block in blocks.iter().filter(|b| b.identifier() == "sticky") {
+            ensure!(
+                block.labels().len() == 1,
+                "sticky: exactly one block label is required"
+            );
             let label = block
                 .labels()
                 .first()

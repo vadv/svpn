@@ -154,12 +154,12 @@ fn retain_nodes_drops_departed_in_both_maps() {
 // ── restore ──
 
 #[test]
-fn owner_indices_are_typed_and_skip_foreign_entries() {
+fn owner_indices_are_typed_per_map_and_skip_foreign_entries() {
     let path = state_path("indices");
     std::fs::write(
         &path,
-        r#"{"version":1,"sticky":{"cc:RU":"node-a","??":"node-a","stuck":"node-b"},
-            "asn":{"64512":"node-a","junk":"node-a"}}"#,
+        r#"{"version":1,"sticky":{"cc:RU":"node-a","64512":"node-b","name:x":"node-b"},
+            "asn":{"64512":"node-a","cc:DE":"node-b","junk":"node-a"}}"#,
     )
     .unwrap();
     let state = ExitState::load(Some(path.clone()));
@@ -170,9 +170,13 @@ fn owner_indices_are_typed_and_skip_foreign_entries() {
         indices.remove(&ExitKey::Sticky("cc:RU".to_string())),
         Some(0)
     );
+    assert_eq!(
+        indices.remove(&ExitKey::Sticky("name:x".to_string())),
+        Some(1)
+    );
     assert!(
         indices.is_empty(),
-        "unparseable stored keys are not restored"
+        "cross-map keys are corrupt, never re-typed"
     );
     let _ = std::fs::remove_file(path);
 }

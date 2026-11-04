@@ -58,8 +58,6 @@ pub struct StickyStats {
     pub lookup_hit: u64,
     pub lookup_miss: u64,
     pub failover_moves: u64,
-    pub country_hit: u64,
-    pub country_miss: u64,
     pub asn_hit: u64,
     pub asn_miss: u64,
     /// Explicit sticky blocks: matches, resolver outcomes.
@@ -71,17 +69,13 @@ pub struct StickyStats {
 }
 
 impl StickyStats {
-    fn lookup(&mut self, country: bool, hit: bool) {
+    fn lookup(&mut self, hit: bool) {
         if hit {
             self.lookup_hit += 1;
+            self.asn_hit += 1;
         } else {
             self.lookup_miss += 1;
-        }
-        match (country, hit) {
-            (true, true) => self.country_hit += 1,
-            (true, false) => self.country_miss += 1,
-            (false, true) => self.asn_hit += 1,
-            (false, false) => self.asn_miss += 1,
+            self.asn_miss += 1;
         }
     }
 }
@@ -133,6 +127,8 @@ pub struct Hub {
     pub local_cleanup: Option<LocalServer>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
+    /// Fallback strategy for traffic matched by no sticky block.
+    pub policy: crate::cli::ExitPolicy,
     /// Sticky owners: group key → link index. An alive owner keeps its group
     /// (no snap-back); reassigned only when the owner cannot serve new flows.
     pub exit_owners: std::collections::HashMap<u64, usize>,
@@ -234,6 +230,10 @@ impl Hub {
         client_ip: Ipv4Addr,
     ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
+        // Retry throttled persistence on every new flow, whatever routes it.
+        if let Some(state) = &mut self.exit_state {
+            state.flush_due(StdInstant::now());
+        }
         let epoch = match self.route(key.destination) {
             Route::Local => return self.open_local(parsed, bytes),
             Route::Sticky(index) => self.pick_sticky(index),
@@ -265,7 +265,6 @@ impl Hub {
             group,
             Some(&links),
             crate::exit_state::ExitKey::Sticky(canonical),
-            false,
         )
     }
 
@@ -468,17 +467,10 @@ impl Hub {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
         }
-        if self.geo.is_some() || self.country.is_some() {
+        if self.geo.is_some() {
             report.push_str(&format!(
                 "\nsticky: lookup hit {} / miss {} | failover moves {}",
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
-            ));
-            report.push_str(&format!(
-                "\ncountry: lookup hit {} / miss {} | asn: lookup hit {} / miss {}",
-                self.sticky.country_hit,
-                self.sticky.country_miss,
-                self.sticky.asn_hit,
-                self.sticky.asn_miss
             ));
         }
         if self
@@ -660,22 +652,21 @@ impl Hub {
     }
 
     pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
-        // Retry throttled persistence even when no failover follows.
-        if let Some(state) = &mut self.exit_state {
-            state.flush_due(StdInstant::now());
+        if self.policy != crate::cli::ExitPolicy::StickyAsn {
+            return self.pool.pick();
         }
         let Some(geo) = &self.geo else {
             return self.pool.pick();
         };
         let Some(asn) = geo.lookup(key.destination) else {
             // Uncovered /32 uses stateless rendezvous without persisted ownership.
-            self.sticky.lookup(false, false);
+            self.sticky.lookup(false);
             return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
                 .into_iter()
                 .find_map(|link| self.pool.ready_epoch(link));
         };
         let group = crate::geo::asn_key(asn);
-        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
+        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn))
     }
 
     /// Select a sticky owner without snap-back.
@@ -686,18 +677,17 @@ impl Hub {
         group: u64,
         candidates: Option<&[usize]>,
         key: crate::exit_state::ExitKey,
-        country: bool,
     ) -> Option<Epoch> {
         let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
-        if let Some(&owner) = self.exit_owners.get(&group) {
+        if let Some(&owner) = self.exit_owners.get(&group).filter(|&&owner| serves(owner)) {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
-                self.sticky.lookup(country, true);
+                self.sticky.lookup(true);
                 return Some(epoch);
             }
             // Checking owner keeps its group: serve new flows from a reserve
             // without migrating (spec: no migration on Checking).
             if self.pool.link_checking(owner) {
-                self.sticky.lookup(country, true);
+                self.sticky.lookup(true);
                 return crate::geo::rendezvous(group, &self.nodes)
                     .into_iter()
                     .filter(|&link| link != owner && serves(link))
@@ -713,7 +703,7 @@ impl Hub {
                 return None;
             }
         }
-        self.sticky.lookup(country, false);
+        self.sticky.lookup(false);
         let previous = self.exit_owners.get(&group).copied();
         let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
             .into_iter()
@@ -1058,13 +1048,16 @@ impl Hub {
 }
 
 /// Geo-driven exit inputs of one client run: the ASN affinity table, the
-/// country table, the explicit sticky blocks and the shared owner state.
+/// country table, the fallback strategy, the explicit sticky blocks and the
+/// shared owner state.
 #[derive(Default)]
 pub struct GeoExits {
     /// ASN database; None — sticky-asn degraded to weighted balance.
     pub geo: Option<crate::geo::Geo>,
     /// Country database; None — no country data.
     pub country: Option<crate::geo::Geo>,
+    /// Fallback strategy for traffic matched by no sticky block.
+    pub policy: crate::cli::ExitPolicy,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
@@ -1109,46 +1102,45 @@ fn spawn_sticky_resolver(
             (0..named.len()).map(|_| Default::default()).collect();
         let mut next: Vec<tokio::time::Instant> =
             named.iter().map(|_| tokio::time::Instant::now()).collect();
+        // One blocking lookup per slot at a time: a stuck getaddrinfo (glibc
+        // bounds its own retries) delays its block instead of piling up
+        // blocking threads on every tick.
+        let mut in_flight: Vec<Option<tokio::task::JoinHandle<Option<Vec<Ipv4Addr>>>>> =
+            (0..named.len()).map(|_| None).collect();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => return,
                 () = tokio::time::sleep_until(next.iter().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))) => {
                     let now = tokio::time::Instant::now();
-                    for (slot, (index, names, every)) in named.iter().enumerate() {
+                    for slot in 0..named.len() {
                         if next[slot] > now {
                             continue;
                         }
-                        next[slot] = now + *every;
-                        let mut ips = Vec::new();
-                        let mut ok = true;
-                        for name in names {
-                            match resolve_name(name).await {
-                                Some(found) => ips.extend(found),
-                                None => {
-                                    ok = false;
-                                    break;
+                        if let Some(handle) = &mut in_flight[slot] {
+                            if !handle.is_finished() {
+                                next[slot] = now + Duration::from_secs(1);
+                                continue;
+                            }
+                            let outcome = handle.await.unwrap_or(None);
+                            in_flight[slot] = None;
+                            deliver(&tx, &mut caches[slot], named[slot].0, outcome).await;
+                            next[slot] = now + named[slot].2;
+                            continue;
+                        }
+                        let names = named[slot].1.clone();
+                        in_flight[slot] = Some(tokio::task::spawn_blocking(move || {
+                            let mut ips = Vec::new();
+                            for name in &names {
+                                match resolve_blocking(name) {
+                                    Some(found) => ips.extend(found),
+                                    None => return None,
                                 }
                             }
-                        }
-                        let (set, purged) = if ok {
-                            ips.sort_unstable();
-                            ips.dedup();
-                            caches[slot].refresh(&ips)
-                        } else {
-                            (Default::default(), 0)
-                        };
-                        if tx
-                            .send(crate::sticky::Update {
-                                index: *index,
-                                ips: set,
-                                purged,
-                                ok,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return; // hub is gone
-                        }
+                            Some(ips)
+                        }));
+                        // Re-check the join soon: the first refresh must land
+                        // right after startup, not one `every` later.
+                        next[slot] = now + Duration::from_millis(100);
                     }
                 }
             }
@@ -1157,35 +1149,53 @@ fn spawn_sticky_resolver(
     (Some(rx), Some(task))
 }
 
-/// One name → sorted unique IPv4 addresses via the system resolver, off the
-/// async runtime. An empty answer is `Some(vec![])`: the refresh still counts
-/// (that is how disappeared IPs purge). None only on timeout/hard failure,
-/// where the previous cache is kept.
-async fn resolve_name(name: &str) -> Option<Vec<Ipv4Addr>> {
-    let name = name.to_string();
-    let lookup = tokio::time::timeout(
-        crate::sticky::RESOLVE_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            (name.as_str(), 0)
-                .to_socket_addrs()
-                .map(|addrs| {
-                    addrs
-                        .map(|addr| addr.ip())
-                        .filter_map(|ip| match ip {
-                            std::net::IpAddr::V4(ip) => Some(ip),
-                            std::net::IpAddr::V6(_) => None,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        }),
-    )
-    .await;
-    match lookup {
-        Ok(Ok(ips)) => Some(ips),
-        _ => None,
-    }
+/// Fold one finished lookup into the cache and send the update upstream.
+async fn deliver(
+    tx: &mpsc::Sender<crate::sticky::Update>,
+    cache: &mut crate::sticky::ResolveCache,
+    index: usize,
+    outcome: Option<Vec<Ipv4Addr>>,
+) {
+    let (ips, ok) = match outcome {
+        Some(mut ips) => {
+            ips.sort_unstable();
+            ips.dedup();
+            (ips, true)
+        }
+        None => (Vec::new(), false),
+    };
+    let (set, purged) = if ok {
+        cache.refresh(&ips)
+    } else {
+        (Default::default(), 0)
+    };
+    let _ = tx
+        .send(crate::sticky::Update {
+            index,
+            ips: set,
+            purged,
+            ok,
+        })
+        .await; // a closed channel ends the task via the next send error path
+}
+
+/// One name → unique IPv4 addresses via the system resolver, on a blocking
+/// thread. An empty answer is `Some(vec![])`: the refresh still counts (that
+/// is how disappeared IPs purge). None on error keeps the previous cache.
+fn resolve_blocking(name: &str) -> Option<Vec<Ipv4Addr>> {
+    use std::net::ToSocketAddrs;
+    // Only a real answer counts as a refresh: a resolver error keeps the
+    // previous set instead of purging it (glibc reports NODATA and NXDOMAIN
+    // alike as errors, so absence ages out only via a successful empty set).
+    (name, 0).to_socket_addrs().ok().map(|addrs| {
+        addrs
+            .map(|addr| addr.ip())
+            .filter_map(|ip| match ip {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 impl Drop for Hub {
@@ -1208,6 +1218,7 @@ pub async fn run(
     let GeoExits {
         geo,
         country,
+        policy: exits_policy,
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
@@ -1262,6 +1273,7 @@ pub async fn run(
     let mut hub = Hub {
         geo,
         country,
+        policy: exits_policy,
         stickies,
         sticky_via,
         sticky_updates,

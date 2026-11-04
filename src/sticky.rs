@@ -9,9 +9,6 @@ use std::{
 
 use anyhow::{Result, bail, ensure};
 
-/// Hard cap on one name lookup; a stuck resolver must not stall the loop.
-pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Default re-resolve interval for name selectors.
 pub const DEFAULT_EVERY: Duration = Duration::from_secs(300);
 /// Lower bound keeps a misconfigured file from turning into a resolve storm.
@@ -28,16 +25,16 @@ impl IpNet {
     pub fn parse(text: &str) -> Result<Self> {
         let (addr, prefix) = match text.split_once('/') {
             Some((addr, prefix)) => {
-                let prefix: u8 = prefix.parse().map_err(|_| bad_net(text))?;
+                let prefix: u8 = prefix.parse().map_err(|_| bad_net())?;
                 (addr, Some(prefix))
             }
             None => (text, None),
         };
-        let addr: Ipv4Addr = addr.parse().map_err(|_| bad_net(text))?;
+        let addr: Ipv4Addr = addr.parse().map_err(|_| bad_net())?;
         let prefix = prefix.unwrap_or(32);
-        ensure!(prefix <= 32, "{text}: prefix length exceeds 32");
+        ensure!(prefix <= 32, "prefix length exceeds 32");
         let host = u32::from(addr) & !mask(prefix);
-        ensure!(host == 0, "{text}: host bits must be zero");
+        ensure!(host == 0, "host bits must be zero");
         Ok(IpNet { addr, prefix })
     }
 
@@ -62,8 +59,8 @@ fn mask(prefix: u8) -> u32 {
     }
 }
 
-fn bad_net(text: &str) -> anyhow::Error {
-    anyhow::anyhow!("{text}: invalid IPv4 address or network")
+fn bad_net() -> anyhow::Error {
+    anyhow::anyhow!("invalid IPv4 address or network")
 }
 
 /// Group membership selector; exactly one per sticky block.
@@ -192,18 +189,25 @@ pub fn group_key(canonical: &str) -> u64 {
 }
 
 /// Duration `N(s|m|h)`; the single duration syntax for the whole config.
+/// Untrusted input never panics: non-UTF-8-safe slicing is avoided and the
+/// product is checked.
 pub fn parse_duration(text: &str) -> Result<Duration> {
-    let (num, unit) = text.split_at(text.len().saturating_sub(1));
-    let scale = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        _ => bail!("{text}: invalid duration, expected Ns/Nm/Nh"),
+    let (digits, scale) = if let Some(digits) = text.strip_suffix('s') {
+        (digits, 1u64)
+    } else if let Some(digits) = text.strip_suffix('m') {
+        (digits, 60)
+    } else if let Some(digits) = text.strip_suffix('h') {
+        (digits, 3600)
+    } else {
+        bail!("invalid duration, expected Ns/Nm/Nh")
     };
-    let secs: u64 = num
+    let secs: u64 = digits
         .parse()
-        .map_err(|_| anyhow::anyhow!("{text}: invalid duration"))?;
-    Ok(Duration::from_secs(secs * scale))
+        .map_err(|_| anyhow::anyhow!("invalid duration"))?;
+    let total = secs
+        .checked_mul(scale)
+        .ok_or_else(|| anyhow::anyhow!("duration exceeds the supported range"))?;
+    Ok(Duration::from_secs(total))
 }
 
 /// Validate a DNS name: ASCII lowercase host, ≤253 chars, 1..=8 per block.
@@ -215,16 +219,13 @@ pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         name.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
-        "{name}: DNS names must be lowercase ASCII letters, digits, '-' or '.'"
+        "DNS names must be lowercase ASCII letters, digits, '-' or '.'"
     );
     for label in name.split('.') {
-        ensure!(
-            !label.is_empty() && label.len() <= 63,
-            "{name}: invalid DNS label"
-        );
+        ensure!(!label.is_empty() && label.len() <= 63, "invalid DNS label");
         ensure!(
             !label.starts_with('-') && !label.ends_with('-'),
-            "{name}: DNS labels must not start or end with '-'"
+            "DNS labels must not start or end with '-'"
         );
     }
     Ok(())

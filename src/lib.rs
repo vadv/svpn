@@ -137,11 +137,13 @@ pub fn main_entry() -> ExitCode {
 fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
     // Keep runtime validation aligned with CLI parsing.
     args.validate_geo()?;
-    let asn_needed = args.exit_policy == cli::ExitPolicy::StickyAsn
-        || args
-            .stickies
-            .iter()
-            .any(|s| matches!(s.selector, sticky::Selector::Asn(_)));
+    // An explicit asn selector must match by database contents: a broken
+    // database fails startup instead of silently bypassing the rule.
+    let asn_selectors = args
+        .stickies
+        .iter()
+        .any(|s| matches!(s.selector, sticky::Selector::Asn(_)));
+    let asn_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || asn_selectors;
     let asn = match (&args.geo_db, asn_needed) {
         (_, false) => {
             if args.geo_db.is_some() {
@@ -158,13 +160,16 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 );
                 Some(geo)
             }
-            // Graceful degradation: a missing/broken ASN database must not
-            // stop the VPN. The country database below is strict — a wrong
-            // country table misroutes flows instead of losing affinity.
-            Err(error) => {
+            // Graceful degradation only for the automatic fallback: a broken
+            // database degrades sticky-asn to balance. An explicit asn
+            // selector keeps its promise or the run does not start; the
+            // country database below is strict for the same reason — a wrong
+            // table misroutes flows instead of losing affinity.
+            Err(error) if !asn_selectors => {
                 crate::error!("{error:#} — falling back to balance");
                 None
             }
+            Err(error) => return Err(error),
         },
         (None, true) => unreachable!("validate_geo requires geo db"),
     };
@@ -209,6 +214,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
     Ok(hub::GeoExits {
         geo: asn,
         country,
+        policy: args.exit_policy,
         exit_state,
     })
 }

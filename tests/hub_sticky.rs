@@ -109,6 +109,7 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
                 assigned: Arc::default(),
             })
             .collect(),
+        policy: svpn::cli::ExitPolicy::Balance,
         pool,
         geo: None,
         country: None,
@@ -297,6 +298,22 @@ fn names_selector_uses_the_resolved_set() {
 }
 
 #[test]
+fn restored_owner_removed_from_via_relinquishes_the_group() {
+    // The persisted owner is restored, then the config drops it from via.
+    let mut hub = sticky_hub(vec![block(
+        "cf",
+        Selector::Ips(vec![svpn::sticky::IpNet::parse("1.2.3.4").unwrap()]),
+        Via::Servers(vec!["s0".into(), "s1".into()]),
+    )]);
+    let dest = Ipv4Addr::new(1, 2, 3, 4);
+    let owner = dispatch_link(&mut hub, dest, 1000).unwrap().unwrap();
+    // Simulate a restored owner that no longer serves the changed via list.
+    hub.sticky_via = vec![svpn::sticky::ResolvedVia::Links(vec![1 - owner])];
+    let after = dispatch_link(&mut hub, dest, 1001).unwrap().unwrap();
+    assert_ne!(after, owner, "a removed owner cannot keep the group");
+}
+
+#[test]
 fn sticky_failover_persists_under_the_canonical_key() {
     let dir = std::env::temp_dir().join(format!("svpn-sticky-state-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -330,22 +347,4 @@ fn sticky_failover_persists_under_the_canonical_key() {
         "the failover deviation persists under the canonical key"
     );
     let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn debug_probe() {
-    let mut hub = sticky_hub(vec![block(
-        "cf",
-        Selector::Ips(vec![svpn::sticky::IpNet::parse("1.2.3.4").unwrap()]),
-        Via::Servers(vec!["s0".into(), "s1".into()]),
-    )]);
-    eprintln!("ready_epoch0 = {:?}", hub.pool.ready_epoch(0));
-    eprintln!("links0 epoch = {:?}", hub.links[0].epoch);
-    eprintln!("outgoing is some = {}", hub.links[0].outgoing.is_some());
-    let bytes = packet_to(Ipv4Addr::new(1, 2, 3, 4), 1000);
-    let parsed = svpn::packet::parse(&bytes, true).unwrap();
-    eprintln!("can_open = {} flow = {:?}", parsed.can_open, parsed.flow);
-    hub.dispatch(&bytes, CLIENT).unwrap();
-    eprintln!("by_key len = {}", hub.routes.by_key.len());
-    eprintln!("block_hit = {}", hub.sticky.block_hit);
 }
