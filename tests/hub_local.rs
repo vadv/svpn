@@ -74,6 +74,9 @@ fn local_hub() -> Hub {
                 svpn::geo::pack_country("BY").unwrap(),
             ),
         ])),
+        sticky_via: vec![svpn::sticky::ResolvedVia::Local],
+        sticky_updates: None,
+        sticky_task: None,
         stickies: vec![svpn::sticky::RuntimeSticky::new(
             svpn::sticky::StickyBlock {
                 label: "local".to_owned(),

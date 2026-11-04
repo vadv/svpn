@@ -122,3 +122,38 @@ fn group_keys_are_stable_and_disjoint() {
     );
     assert_ne!(group_key("asn:13335"), group_key("cc:DE,NL"));
 }
+
+// ── resolve cache (two-miss purge) ──
+
+#[test]
+fn resolve_cache_purges_after_two_misses() {
+    let mut cache = svpn::sticky::ResolveCache::default();
+    let a = Ipv4Addr::new(1, 1, 1, 1);
+    let b = Ipv4Addr::new(2, 2, 2, 2);
+    let (set, purged) = cache.refresh(&[a, b]);
+    assert_eq!(set.len(), 2);
+    assert_eq!(purged, 0);
+
+    // One miss: the disappeared IP survives.
+    let (set, purged) = cache.refresh(&[b]);
+    assert!(set.contains(&a), "a single miss keeps the IP pinned");
+    assert_eq!(purged, 0);
+
+    // Two misses: it leaves the set.
+    let (set, purged) = cache.refresh(&[b]);
+    assert!(!set.contains(&a), "a second miss purges the IP");
+    assert_eq!(purged, 1);
+    assert_eq!(set.len(), 1);
+
+    // A returning IP re-enters and survives again.
+    let (set, _) = cache.refresh(&[a, b]);
+    assert_eq!(set.len(), 2);
+}
+
+#[test]
+fn resolve_cache_dedups_and_keeps_order_irrelevant() {
+    let mut cache = svpn::sticky::ResolveCache::default();
+    let ip = Ipv4Addr::new(9, 9, 9, 9);
+    let (set, _) = cache.refresh(&[ip, ip]);
+    assert_eq!(set.len(), 1);
+}

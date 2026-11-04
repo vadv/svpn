@@ -62,6 +62,12 @@ pub struct StickyStats {
     pub country_miss: u64,
     pub asn_hit: u64,
     pub asn_miss: u64,
+    /// Explicit sticky blocks: matches, resolver outcomes.
+    pub block_hit: u64,
+    pub resolve_ok: u64,
+    pub resolve_fail: u64,
+    pub resolved_ips: u64,
+    pub purged_ips: u64,
 }
 
 impl StickyStats {
@@ -98,6 +104,13 @@ pub struct LocalExitState {
     pub ready: bool,
 }
 
+/// First-match decision for one destination.
+enum Route {
+    Local,
+    Sticky(usize),
+    Auto,
+}
+
 pub struct Hub {
     pub links: Vec<Link>,
     pub pool: Pool,
@@ -108,6 +121,12 @@ pub struct Hub {
     pub country: Option<crate::geo::Geo>,
     /// Explicit sticky blocks, in config order (first match wins).
     pub stickies: Vec<crate::sticky::RuntimeSticky>,
+    /// `via` resolved to link indices at startup.
+    pub sticky_via: Vec<crate::sticky::ResolvedVia>,
+    /// Resolver deliveries; None when no name selectors exist.
+    pub sticky_updates: Option<mpsc::Receiver<crate::sticky::Update>>,
+    /// Episodic name resolver; aborted when the hub goes away.
+    pub sticky_task: Option<tokio::task::JoinHandle<()>>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -191,16 +210,23 @@ impl Hub {
         }
     }
 
-    /// Matched by a sticky block with `via = local`; misses use VPN.
-    fn is_local_exit(&self, destination: Ipv4Addr) -> bool {
-        self.stickies.iter().any(|block| {
-            matches!(block.block.via, crate::sticky::Via::Local)
-                && block.matches(destination, self.country.as_ref(), self.geo.as_ref())
-        })
+    /// Where one destination goes: the first matching sticky block decides;
+    /// a miss falls back to the automatic strategy.
+    fn route(&mut self, destination: Ipv4Addr) -> Route {
+        for (index, block) in self.stickies.iter().enumerate() {
+            if block.matches(destination, self.country.as_ref(), self.geo.as_ref()) {
+                self.sticky.block_hit += 1;
+                return match &self.sticky_via[index] {
+                    crate::sticky::ResolvedVia::Local => Route::Local,
+                    crate::sticky::ResolvedVia::Links(_) => Route::Sticky(index),
+                };
+            }
+        }
+        Route::Auto
     }
 
-    /// Local-exit traffic never falls back to the VPN; other traffic picks a
-    /// remote owner.
+    /// Sticky-block traffic never falls back; other traffic picks a remote
+    /// owner through the automatic strategy.
     fn open_flow(
         &mut self,
         parsed: &packet::Packet,
@@ -208,10 +234,12 @@ impl Hub {
         client_ip: Ipv4Addr,
     ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
-        if self.is_local_exit(key.destination) {
-            return self.open_local(parsed, bytes);
-        }
-        let Some(epoch) = self.pick(&key) else {
+        let epoch = match self.route(key.destination) {
+            Route::Local => return self.open_local(parsed, bytes),
+            Route::Sticky(index) => self.pick_sticky(index),
+            Route::Auto => self.pick(&key),
+        };
+        let Some(epoch) = epoch else {
             return Ok(None);
         };
         let link = &self.links[epoch.link];
@@ -222,6 +250,23 @@ impl Hub {
         self.routes
             .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?;
         Ok(None)
+    }
+
+    /// Owner of one sticky group: rendezvous inside `via`, no snap-back,
+    /// failover persisted under the canonical selector key.
+    fn pick_sticky(&mut self, index: usize) -> Option<Epoch> {
+        let canonical = self.stickies[index].block.canonical_key();
+        let group = crate::sticky::group_key(&canonical);
+        let links: Vec<usize> = match &self.sticky_via[index] {
+            crate::sticky::ResolvedVia::Links(links) => links.clone(),
+            crate::sticky::ResolvedVia::Local => unreachable!("route() separated local blocks"),
+        };
+        self.sticky_epoch(
+            group,
+            Some(&links),
+            crate::exit_state::ExitKey::Sticky(canonical),
+            false,
+        )
     }
 
     fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
@@ -444,6 +489,16 @@ impl Hub {
             report.push_str(&format!(
                 "\nlocal-exit: opened {} / failed {} / closed {}",
                 self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
+            ));
+        }
+        if !self.stickies.is_empty() {
+            report.push_str(&format!(
+                "\nsticky: blocks matched {} | resolve ok {} / fail {} | ips {} (purged {})",
+                self.sticky.block_hit,
+                self.sticky.resolve_ok,
+                self.sticky.resolve_fail,
+                self.sticky.resolved_ips,
+                self.sticky.purged_ips
             ));
         }
         for line in per_link {
@@ -686,6 +741,21 @@ impl Hub {
         Some(epoch)
     }
 
+    /// Fold one resolver delivery into the block cache and the counters.
+    fn apply_sticky_update(&mut self, update: crate::sticky::Update) {
+        if update.ok {
+            self.sticky.resolve_ok += 1;
+            self.sticky.resolved_ips = update.ips.len() as u64;
+            self.sticky.purged_ips += update.purged as u64;
+            if let Some(block) = self.stickies.get_mut(update.index) {
+                block.resolved = update.ips;
+            }
+        } else {
+            self.sticky.resolve_fail += 1;
+            crate::warn!("sticky: name resolution failed — keeping the previous IP set");
+        }
+    }
+
     async fn start_local(
         &mut self,
         client: Ipv4Addr,
@@ -806,6 +876,17 @@ impl Hub {
                 event = self.incoming.recv() => {
                     let (epoch, event) = event.context("server event channel stopped")?;
                     self.handle_event(epoch, event, tun, &params, &mut started, hooks).await?;
+                }
+                update = async {
+                    match &mut self.sticky_updates {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.sticky_updates.is_some() => {
+                    match update {
+                        Some(update) => self.apply_sticky_update(update),
+                        None => self.sticky_updates = None,
+                    }
                 }
                 event = async {
                     match &mut self.local {
@@ -997,6 +1078,122 @@ pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
     }
 }
 
+/// Start the episodic name resolver when any sticky block selects by name.
+/// The task resolves every due block in order (first resolve immediately),
+/// purges IPs missing from two refreshes, and stops on shutdown or when the
+/// hub drops the receiving end.
+fn spawn_sticky_resolver(
+    stickies: &[crate::sticky::RuntimeSticky],
+    shutdown: &mut watch::Receiver<bool>,
+) -> (
+    Option<mpsc::Receiver<crate::sticky::Update>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let named: Vec<(usize, Vec<String>, Duration)> = stickies
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match &block.block.selector {
+            crate::sticky::Selector::Names(names) => {
+                Some((index, names.clone(), block.block.every))
+            }
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return (None, None);
+    }
+    let (tx, rx) = mpsc::channel(16);
+    let mut shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let mut caches: Vec<crate::sticky::ResolveCache> =
+            (0..named.len()).map(|_| Default::default()).collect();
+        let mut next: Vec<tokio::time::Instant> =
+            named.iter().map(|_| tokio::time::Instant::now()).collect();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                () = tokio::time::sleep_until(next.iter().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))) => {
+                    let now = tokio::time::Instant::now();
+                    for (slot, (index, names, every)) in named.iter().enumerate() {
+                        if next[slot] > now {
+                            continue;
+                        }
+                        next[slot] = now + *every;
+                        let mut ips = Vec::new();
+                        let mut ok = true;
+                        for name in names {
+                            match resolve_name(name).await {
+                                Some(found) => ips.extend(found),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let (set, purged) = if ok {
+                            ips.sort_unstable();
+                            ips.dedup();
+                            caches[slot].refresh(&ips)
+                        } else {
+                            (Default::default(), 0)
+                        };
+                        if tx
+                            .send(crate::sticky::Update {
+                                index: *index,
+                                ips: set,
+                                purged,
+                                ok,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return; // hub is gone
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (Some(rx), Some(task))
+}
+
+/// One name → sorted unique IPv4 addresses via the system resolver,
+/// off the async runtime; None on timeout or failure (old cache is kept).
+async fn resolve_name(name: &str) -> Option<Vec<Ipv4Addr>> {
+    let name = name.to_string();
+    let lookup = tokio::time::timeout(
+        crate::sticky::RESOLVE_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            (name.as_str(), 0)
+                .to_socket_addrs()
+                .map(|addrs| {
+                    addrs
+                        .map(|addr| addr.ip())
+                        .filter_map(|ip| match ip {
+                            std::net::IpAddr::V4(ip) => Some(ip),
+                            std::net::IpAddr::V6(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(ips)) if !ips.is_empty() => Some(ips),
+        _ => None,
+    }
+}
+
+impl Drop for Hub {
+    fn drop(&mut self) {
+        if let Some(task) = &self.sticky_task {
+            task.abort();
+        }
+    }
+}
+
 pub async fn run(
     servers: Vec<LinkParams>,
     started: Option<oneshot::Sender<()>>,
@@ -1015,6 +1212,24 @@ pub async fn run(
     let stickies: Vec<crate::sticky::RuntimeSticky> = sticky_blocks
         .into_iter()
         .map(crate::sticky::RuntimeSticky::new)
+        .collect();
+    let label_index: std::collections::HashMap<String, usize> = servers
+        .iter()
+        .enumerate()
+        .filter(|(_, params)| !params.label.is_empty())
+        .map(|(index, params)| (params.label.clone(), index))
+        .collect();
+    let sticky_via: Vec<crate::sticky::ResolvedVia> = stickies
+        .iter()
+        .map(|block| match &block.block.via {
+            crate::sticky::Via::Local => crate::sticky::ResolvedVia::Local,
+            crate::sticky::Via::Servers(labels) => crate::sticky::ResolvedVia::Links(
+                labels
+                    .iter()
+                    .map(|label| label_index[label])
+                    .collect::<Vec<usize>>(),
+            ),
+        })
         .collect();
     if hooks.needs_auto_up() || hooks.needs_auto_down() {
         hooks.set_server_addrs(crate::client_routing::server_addrs(&servers).await?);
@@ -1041,10 +1256,14 @@ pub async fn run(
     // Startup grace covers exactly the restored owners: two connect budgets.
     let grace_until = (!exit_owners.is_empty()).then(|| StdInstant::now() + STARTUP_GRACE);
     let (events, incoming) = mpsc::channel(QUEUE);
+    let (sticky_updates, sticky_task) = spawn_sticky_resolver(&stickies, &mut shutdown);
     let mut hub = Hub {
         geo,
         country,
         stickies,
+        sticky_via,
+        sticky_updates,
+        sticky_task,
         local: None,
         local_task: None,
         local_cleanup: None,

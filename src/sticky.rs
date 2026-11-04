@@ -1,8 +1,16 @@
 //! Explicit sticky routing: ordered first-match groups (names/countries/ips/asn).
 
-use std::{collections::HashSet, fmt, net::Ipv4Addr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    net::Ipv4Addr,
+    time::Duration,
+};
 
 use anyhow::{Result, bail, ensure};
+
+/// Hard cap on one name lookup; a stuck resolver must not stall the loop.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default re-resolve interval for name selectors.
 pub const DEFAULT_EVERY: Duration = Duration::from_secs(300);
@@ -71,6 +79,13 @@ pub enum Selector {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Via {
     Servers(Vec<String>),
+    Local,
+}
+
+/// `via` resolved against the configured pool: labels → link indices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedVia {
+    Links(Vec<usize>),
     Local,
 }
 
@@ -218,5 +233,38 @@ pub fn validate_name(name: &str) -> Result<()> {
 impl fmt::Display for IpNet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.canon())
+    }
+}
+
+/// Resolver → hub delivery: one refresh of one name block.
+pub struct Update {
+    pub index: usize,
+    /// Surviving set after this refresh; empty on a failed lookup.
+    pub ips: HashSet<Ipv4Addr>,
+    pub purged: usize,
+    pub ok: bool,
+}
+
+/// Two-miss purge cache for one name block: an IP not seen in the last two
+/// refreshes leaves the pinned set (it may have been re-leased to a CDN).
+#[derive(Default)]
+pub struct ResolveCache {
+    seq: u64,
+    seen: HashMap<Ipv4Addr, u64>,
+}
+
+impl ResolveCache {
+    /// Record one refresh; returns the surviving set and the purge count.
+    pub fn refresh(&mut self, ips: &[Ipv4Addr]) -> (HashSet<Ipv4Addr>, usize) {
+        self.seq += 1;
+        for ip in ips {
+            self.seen.insert(*ip, self.seq);
+        }
+        let before = self.seen.len();
+        self.seen.retain(|_, seen| self.seq - *seen < 2);
+        (
+            self.seen.keys().copied().collect(),
+            before - self.seen.len(),
+        )
     }
 }
