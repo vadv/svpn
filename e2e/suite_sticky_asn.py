@@ -124,43 +124,52 @@ def enable_target_masquerade(host=SERVER):
     )
 
 
-def country_args(local_exit=False):
+CONFIG = pathlib.Path("/tmp/e2e-country.hcl")
+
+
+def country_args(local_exit=False, shared=False, slow_down=False):
+    """Country routing as explicit sticky blocks: RU/DE pins and the
+    RU+BY local egress replace the removed countries/local-exits flags."""
     write_geo()
     write_country()
-    args = [
-        "svpn",
-        "multi",
-        "--server",
-        f"{SERVER},user=root,identity=/keys/client,countries=RU",
-        "--server",
-        f"{SERVER2},user=root,identity=/keys/client,countries=DE",
-        "--peer-tun-name",
-        "svpn0",
-        "--tun-name",
-        "svpn0",
-        "--exit-policy",
-        "sticky-asn",
-        "--geo-db",
-        str(CSV),
-        "--country-db",
-        str(COUNTRY_CSV),
-        "--exit-state",
-        str(STATE),
-        "--stats-interval",
-        "1",
-    ]
+    via_ru = '["s1", "s2"]' if shared else '["s1"]'
+    hooks = ""
     if local_exit:
-        args += [
-            "--local-exits",
-            "RU,BY",
-            "--server-up",
-            LOCAL_EGRESS_UP
+        down = "sleep 3\n" + LOCAL_EGRESS_DOWN if slow_down else LOCAL_EGRESS_DOWN
+        hooks = (
+            "hooks {\n"
+            "  server_up = <<EOF\n"
+            + LOCAL_EGRESS_UP.lstrip("\n")
             + '\nip route replace 172.31.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n'
-            + '\nip route replace 172.32.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n',
-            "--server-down",
-            LOCAL_EGRESS_DOWN,
-        ]
-    return args
+            + '\nip route replace 172.32.77.0/24 via 172.30.77.2 dev eth0 table "$table"\n'
+            + "EOF\n"
+            + "  server_down = <<EOF\n"
+            + down.lstrip("\n")
+            + "EOF\n}\n"
+        )
+    CONFIG.write_text(
+        'ssh {\n  user = "root"\n  identity = "/keys/client"\n}\n'
+        'log_level = "debug"\n'
+        'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+        'transport {\n  stats = "1s"\n}\n'
+        + f'fallback_sticky {{\n  strategy = "sticky-asn"\n  state = "{STATE}"\n}}\n'
+        + f'geo {{\n  db = "{CSV}"\n}}\n'
+        + f'country {{\n  db = "{COUNTRY_CSV}"\n}}\n'
+        + hooks
+        + f'server "s1" {{\n  address = "{SERVER}"\n}}\n'
+        + f'server "s2" {{\n  address = "{SERVER2}"\n}}\n'
+        + (
+            (f'sticky "ru" {{\n  countries = ["RU"]\n  via = {via_ru}\n}}\n' if not local_exit else "")
+            + ('sticky "de" {\n  countries = ["DE"]\n  via = ["s2"]\n}\n' if not local_exit else "")
+            + (
+                'sticky "ru-by" {\n  countries = ["RU", "BY"]\n  via = local\n}\n'
+                'sticky "de" {\n  countries = ["DE"]\n  via = ["s2"]\n}\n'
+                if local_exit
+                else ""
+            )
+        )
+    )
+    return ["svpn", "multi", "--config", str(CONFIG)]
 
 
 def sticky_args():
@@ -262,7 +271,7 @@ def test_balance_diff():
         path,
     ):
         until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
-        assert "geo-db set without exit-policy sticky-asn — ignoring" in path.read_text()
+        assert "geo db set without sticky-asn or asn selectors — ignoring" in path.read_text()
         assert "sticky: lookup" not in path.read_text(), "balance must not group destinations"
         baseline = opened(path)
         for index in range(12):
@@ -328,7 +337,7 @@ def test_restart_restore():
     cleanup_verified(process, server_hosts=HOSTS)
     persisted = json.loads(STATE.read_text())
     # Persisted identity is host:port (spec); the default ssh port is 22.
-    assert persisted == {"version": 2, "country": {}, "asn": {str(asn): f"{spare}:22"}}, persisted
+    assert persisted == {"version": 1, "asn": {str(asn): f"{spare}:22"}, "sticky": {}}, persisted
     with session("sticky-restart-2", args=sticky_args(), server_hosts=HOSTS, ready_timeout=20) as (
         process,
         path,
@@ -393,12 +402,7 @@ def udp_echo(peer, payload=b"direct-udp"):
 
 
 def shared_country_args():
-    return [
-        f"{value.split(',', 1)[0]},user=root,identity=/keys/client,countries=RU"
-        if value.startswith((f"{SERVER},", f"{SERVER2},"))
-        else value
-        for value in country_args()
-    ]
+    return country_args(shared=True)
 
 
 def test_country_asn_scope():
@@ -487,9 +491,7 @@ def test_local_exits_and_vpn():
         ping_local(TARGET)
     cleanup_verified(process, server_hosts=HOSTS)
 
-    restart_args = list(args)
-    down = restart_args.index("--server-down")
-    restart_args[down + 1] = "sleep 3\n" + restart_args[down + 1]
+    restart_args = country_args(local_exit=True, slow_down=True)
     with session("local-restart", args=restart_args, server_hosts=HOSTS, ready_timeout=20) as (process, path):
         until(lambda: "local-exit: ready" in path.read_text(), seconds=15)
         until(lambda: local_opened(path) is not None, seconds=10)

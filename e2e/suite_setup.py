@@ -261,12 +261,12 @@ def case_multi_isolation(ctx):
     if getattr(ctx, "real_skipped", False):
         print("SKIP setup multi: real install unavailable in the bootstrap window")
         return
-    multi = pathlib.Path(ctx.directory) / "multi.toml"
+    multi = pathlib.Path(ctx.directory) / "multi.hcl"
     multi.write_text(
-        'ssh-user = "root"\nssh-identity = "/keys/client"\n'
-        'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-        '[[servers]]\naddress = "172.30.88.250"\n'
-        f'[[servers]]\naddress = "{SERVER}"\n'
+        'ssh {\n  user = "root"\n  identity = "/keys/client"\n}\n'
+        'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+        'server "unreachable" {\n  address = "172.30.88.250"\n}\n'
+        f'server "main" {{\n  address = "{SERVER}"\n}}\n'
     )
     result = command(["svpn", "setup", "--config", str(multi)], check=False, timeout=360)
     assert result.returncode != 0, result.stdout
@@ -314,12 +314,15 @@ def main():
     before = snapshot()
     admin_before = remote("sha256sum /etc/svpn/admin.conf; stat -c %a /etc/svpn/admin.conf").stdout
     with tempfile.TemporaryDirectory(prefix="svpn-setup-e2e-") as directory:
-        config = pathlib.Path(directory) / "client.toml"
+        config = pathlib.Path(directory) / "client.hcl"
         config.write_text(
-            f'server = "{SERVER}"\nssh-user = "root"\nssh-identity = "/keys/client"\n'
-            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-            'server-up = "touch /tmp/svpn-setup-hook-ran"\n'
-            'server-down = "touch /tmp/svpn-setup-hook-ran"\n'
+            'ssh {\n  user = "root"\n  identity = "/keys/client"\n}\n'
+            'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+            'server "main" {\n'
+            f'  address = "{SERVER}"\n'
+            '  server_up = "touch /tmp/svpn-setup-hook-ran"\n'
+            '  server_down = "touch /tmp/svpn-setup-hook-ran"\n'
+            "}\n"
         )
         ctx = SimpleNamespace(
             config=str(config),

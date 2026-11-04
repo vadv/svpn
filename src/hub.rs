@@ -1157,8 +1157,10 @@ fn spawn_sticky_resolver(
     (Some(rx), Some(task))
 }
 
-/// One name → sorted unique IPv4 addresses via the system resolver,
-/// off the async runtime; None on timeout or failure (old cache is kept).
+/// One name → sorted unique IPv4 addresses via the system resolver, off the
+/// async runtime. An empty answer is `Some(vec![])`: the refresh still counts
+/// (that is how disappeared IPs purge). None only on timeout/hard failure,
+/// where the previous cache is kept.
 async fn resolve_name(name: &str) -> Option<Vec<Ipv4Addr>> {
     let name = name.to_string();
     let lookup = tokio::time::timeout(
@@ -1181,7 +1183,7 @@ async fn resolve_name(name: &str) -> Option<Vec<Ipv4Addr>> {
     )
     .await;
     match lookup {
-        Ok(Ok(ips)) if !ips.is_empty() => Some(ips),
+        Ok(Ok(ips)) => Some(ips),
         _ => None,
     }
 }

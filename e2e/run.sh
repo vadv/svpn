@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 usage() {
-    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|setup|udp|tcp-auto|reselect|recovery|sticky-asn]"
+    echo "Usage: $0 [--matrix] [all|bootstrap|lifecycle-pool|setup|udp|tcp-auto|reselect|recovery|sticky-asn|sticky]"
     echo "Matrix groups: all, udp, tcp-auto. Run groups sequentially on a local Docker host."
 }
 matrix=0
@@ -17,14 +17,14 @@ export SVPN_TEST_GROUP=${1-all}
 case "$SVPN_TEST_GROUP" in
     -h|--help) usage; exit 0 ;;
     all|udp|tcp-auto) ;;
-    bootstrap|lifecycle-pool|setup|reselect|recovery|sticky-asn)
+    bootstrap|lifecycle-pool|setup|reselect|recovery|sticky-asn|sticky)
         if (( matrix )); then usage >&2; exit 2; fi ;;
     *) usage >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 compose_file=$PWD/compose.yaml
 compose_project=svpn-test
-startup=(server server2 target target_by)
+startup=(server server2 target target_by dns)
 if [[ $SVPN_TEST_GROUP == setup ]]; then
     compose_file=$PWD/e2e/compose.setup.yaml
     compose_project=svpn-setup-test
