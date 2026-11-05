@@ -3,6 +3,10 @@ name: CI
 on:
   pull_request:
   push:
+    branches:
+      - master
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -25,6 +29,7 @@ defaults:
 
 jobs:
   fmt:
+    if: github.ref_type != 'tag'
     name: Rust formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -38,6 +43,7 @@ jobs:
         run: cargo "+$RUST_TOOLCHAIN" fmt --all -- --check
 
   clippy:
+    if: github.ref_type != 'tag'
     name: Rust Clippy (ubuntu-24.04)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -49,10 +55,14 @@ jobs:
         run: cc --version
       - name: Install Clippy
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ matrix.rust || env.RUST_TOOLCHAIN || 'stable' }}-${{ runner.os }}-${{ runner.arch }}"
       - name: Check all Rust targets
         run: cargo "+$RUST_TOOLCHAIN" clippy --locked --workspace --all-targets -- -D warnings
 
   lint-python:
+    if: github.ref_type != 'tag'
     name: Python lint and formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -66,6 +76,7 @@ jobs:
         run: pipx run ruff==0.14.3 format --check
 
   native:
+    if: github.ref_type != 'tag'
     name: Native tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -84,6 +95,9 @@ jobs:
         run: cc --version
       - name: Install Rust
         run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ matrix.rust || env.RUST_TOOLCHAIN || 'stable' }}-${{ runner.os }}-${{ runner.arch }}"
       - name: Test Rust without TUN privileges
         run: cargo "+$RUST_VERSION" test --locked --workspace --all-targets
       - name: Test harness cleanup and log retention without Docker
@@ -94,6 +108,7 @@ jobs:
           python3 e2e/test_package.py
 
   network:
+    if: github.ref_type != 'tag'
     name: Network ${{ matrix.suite }} / ${{ matrix.group }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -219,6 +234,9 @@ jobs:
         run: test "$(uname -m)" = arm64
       - name: Install Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ matrix.rust || env.RUST_TOOLCHAIN || 'stable' }}-${{ runner.os }}-${{ runner.arch }}"
       - name: Lint darwin branches
         run: cargo "+$RUST_TOOLCHAIN" clippy --locked --workspace --all-targets -- -D warnings
       - name: Build and smoke-test native binary
