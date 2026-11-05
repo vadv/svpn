@@ -108,11 +108,11 @@ jobs:
           - suite: integration
             group: udp
           - suite: integration
-            group: sticky
-          - suite: integration
-            group: jobs-asn
+            group: sticky-asn
           - suite: integration
             group: sticky
+          - suite: integration
+            group: jobs
           - suite: integration
             group: tcp-auto
           - suite: matrix
