@@ -21,8 +21,11 @@ svpn_setup_preflight() {
     }
     # shellcheck disable=SC1091
     . /etc/os-release
-    case "$ID:$VERSION_ID" in
-        debian:12|debian:12.*|rocky:10|rocky:10.*) ;;
+    # Families, not pinned releases: apt on Debian/Ubuntu, dnf on
+    # Rocky/CentOS Stream; the arch/loader/AES checks below are the real gate.
+    case "$ID" in
+        debian|ubuntu) SVPN_SETUP_FAMILY=debian ;;
+        rocky|centos) SVPN_SETUP_FAMILY=rocky ;;
         *)
             echo "svpn setup: unsupported OS: $PRETTY_NAME" >&2
             return 1
@@ -93,7 +96,7 @@ svpn_setup_packages() {
     packages=
     for tool in curl tar gzip sha256sum awk grep ip nft sysctl; do
         if ! command -v "$tool" >/dev/null 2>&1; then
-            case "$ID:$tool" in
+        case "$SVPN_SETUP_FAMILY:$tool" in
                 debian:curl) packages="$packages curl" ;;
                 debian:tar) packages="$packages tar" ;;
                 debian:gzip) packages="$packages gzip" ;;
@@ -115,12 +118,12 @@ svpn_setup_packages() {
             esac
         fi
     done
-    case "$ID" in
+    case "$SVPN_SETUP_FAMILY" in
         debian) [ -r /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-certificates" ;;
         rocky) [ -r /etc/pki/tls/certs/ca-bundle.crt ] || packages="$packages ca-certificates" ;;
     esac
     if [ -n "$packages" ]; then
-        case "$ID" in
+        case "$SVPN_SETUP_FAMILY" in
             debian)
                 export DEBIAN_FRONTEND=noninteractive
                 as_root apt-get update

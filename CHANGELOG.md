@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.1
+
+- setup: preflight и установка пакетов принимают семейства дистрибутивов —
+  Debian/Ubuntu (apt) и Rocky/CentOS Stream (dnf) — вместо пинов
+  `debian:12`/`rocky:10`. Реальный фильтр совместимости — проверки
+  arch/loader/glibc/AES в preflight.
+
 ## v1.0.0
 
 Background jobs (EPIC-022).
@@ -38,8 +45,9 @@ Background jobs (EPIC-022).
 
 ## v1.0.0 (continued): setup and automatic routing.
 
-- `svpn setup` provisions VPSs over SSH: environment preflight (Debian 12,
-  Rocky 10, GNU libc, hardware AES), installs the approved packages, downloads
+- `svpn setup` provisions VPSs over SSH: environment preflight (Debian 12 /
+  Rocky 10 at release time, GNU libc, hardware AES), installs the approved
+  packages, downloads
   the matching release on the VPS itself, installs the binary atomically and
   verifies hash, mode and version. Works with `--server HOST` for a single
   VPS or `--config FILE` for the whole pool; one host's failure does not stop
