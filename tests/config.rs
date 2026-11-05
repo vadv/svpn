@@ -445,6 +445,7 @@ fn job_blocks_parse_with_defaults() {
             "server \"main\" {\n  address = \"a.example\"\n}\n",
             "job \"geo-update\" {\n",
             "  every = \"24h\"\n",
+            "  skip_if = \"[ -f \\\"$SVPN_GEO_DB\\\" ]\"\n",
             "  run = <<EOF\n",
             "curl -fL \"https://example/dbip-$(date +%Y-%m).csv.gz\"\n",
             "EOF\n",
@@ -477,8 +478,10 @@ fn job_blocks_parse_with_defaults() {
         jobs[0].reload,
         [svpn::job::Reload::Geo, svpn::job::Reload::Country]
     );
+    assert_eq!(jobs[0].skip_if.as_deref(), Some("[ -f \"$SVPN_GEO_DB\" ]"));
     assert_eq!(jobs[1].timeout, std::time::Duration::from_secs(30));
     assert!(jobs[1].reload.is_empty());
+    assert_eq!(jobs[1].skip_if, None, "skip_if is optional");
 }
 
 #[test]
@@ -497,6 +500,8 @@ fn job_blocks_reject_invalid_shapes() {
         // reload vocabulary and duplicates
         "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n  reload = [\"dns\"]\n}\n",
         "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n  reload = [\"geo\", \"geo\"]\n}\n",
+        // skip_if present but blank
+        "job \"x\" {\n  every = \"5m\"\n  skip_if = \" \"\n  run = \"true\"\n}\n",
         // labels: duplicate, invalid charset, extra
         "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n}\njob \"x\" {\n  every = \"5m\"\n  run = \"true\"\n}\n",
         "job \"Bad Label\" {\n  every = \"5m\"\n  run = \"true\"\n}\n",
