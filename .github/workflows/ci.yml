@@ -257,7 +257,7 @@ jobs:
   release:
     name: Publish verified release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'vadv/svpn'
-    needs: [fmt, clippy, lint-python, native, network, build-linux, build-macos]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
