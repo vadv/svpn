@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.0
 
 Background jobs (EPIC-022).
 
@@ -22,9 +22,7 @@ Background jobs (EPIC-022).
 - `scripts/update-asn-db.sh` is superseded by the job templates and
   removed.
 
-## v1.0.0
-
-HCL configuration and explicit sticky routing.
+## v1.0.0 (continued): HCL configuration and explicit sticky routing.
 
 - The configuration file is HCL now; TOML is not supported. Subsystem blocks
   (`ssh`, `transport`, `tunnel`, `geo`, `country`, `hooks`, `fallback_sticky`),
@@ -38,9 +36,7 @@ HCL configuration and explicit sticky routing.
 - Removed: `local-exits` and per-server `countries` (replaced by sticky
   blocks), the `--local-exits` CLI flag, legacy exit-state migrations.
 
-## v1.0.0
-
-Setup and automatic routing release.
+## v1.0.0 (continued): setup and automatic routing.
 
 - `svpn setup` provisions VPSs over SSH: environment preflight (Debian 12,
   Rocky 10, GNU libc, hardware AES), installs the approved packages, downloads
