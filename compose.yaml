@@ -83,6 +83,16 @@ services:
       test:
         ipv4_address: 172.30.77.7
 
+  files:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /e2e/fileserver.py]
+    volumes:
+      - jobfiles:/files
+    networks:
+      test:
+        ipv4_address: 172.30.77.8
+
   client:
     image: svpn-test:local
     init: true
@@ -97,6 +107,7 @@ services:
     volumes:
       - keys:/keys:ro
       - dnsconf:/dns
+      - jobfiles:/files
       - ${SVPN_TEST_ARTIFACTS:-./e2e/.work/artifacts/manual}/sessions:/testlogs
     networks:
       test:
@@ -120,6 +131,7 @@ services:
 volumes:
   keys:
   dnsconf:
+  jobfiles:
 
 networks:
   test:

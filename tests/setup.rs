@@ -82,3 +82,32 @@ fn downgrade_marker_parses_only_version_pairs() {
         None
     );
 }
+
+#[test]
+fn example_prints_job_templates() {
+    for (name, label, table) in [
+        ("job-geo-update", "geo-update", "geo"),
+        ("job-country-update", "country-update", "country"),
+    ] {
+        let text = svpn::setup::example(name).unwrap();
+        assert!(text.contains(&format!("job \"{label}\"")), "{name}");
+        assert!(text.contains(&format!("reload  = [\"{table}\"]")), "{name}");
+        // The template must survive our own config sanitizer: no live ${ or %{
+        // sequences inside the heredocs.
+        assert!(!text.contains("${") && !text.contains("%{"), "{name}");
+        // And it must actually parse as a config fragment with a server.
+        let dir = std::env::temp_dir().join(format!("svpn-example-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vpn.hcl");
+        std::fs::write(
+            &path,
+            format!("{text}\nserver \"s1\" {{\n  address = \"a.example\"\n}}\n"),
+        )
+        .unwrap();
+        let parsed = svpn::config::load(&path, true).unwrap();
+        assert_eq!(parsed.jobs.len(), 1, "{name}");
+        assert_eq!(parsed.jobs[0].label, label, "{name}");
+        assert!(parsed.jobs[0].run_if.is_some(), "{name}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

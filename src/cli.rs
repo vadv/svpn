@@ -45,6 +45,9 @@ pub struct ClientArgs {
     /// Explicit sticky groups (config-file only).
     #[arg(skip)]
     pub stickies: Vec<crate::sticky::StickyBlock>,
+    /// Scheduled background jobs (config-file only).
+    #[arg(skip)]
+    pub jobs: Vec<crate::job::JobSpec>,
     #[command(flatten)]
     pub hooks: hooks::Args,
     #[command(flatten)]
@@ -76,9 +79,15 @@ pub enum Mode {
     },
     /// Print an embedded hook example to stdout.
     Example {
-        /// Hook example name: client-up, client-down, server-up or server-down.
+        /// Example name: client-up, client-down, server-up, server-down,
+        /// job-geo-update or job-country-update.
         #[arg(value_name = "NAME")]
         name: String,
+    },
+    /// Scheduled background jobs from the config (systemd-style).
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
@@ -129,6 +138,25 @@ pub enum Mode {
         /// TCP fallback port; 0 — ephemeral.
         #[arg(long)]
         tcp_port: Option<u16>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum JobCommand {
+    /// Run one job now, in the foreground; the exit code is the job's.
+    Run {
+        /// Job label from the config.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Config file with the job definition.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+    /// List the jobs declared in the config.
+    List {
+        /// Config file with the job definitions.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
     },
 }
 

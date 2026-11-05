@@ -112,6 +112,8 @@ jobs:
           - suite: integration
             group: sticky
           - suite: integration
+            group: jobs
+          - suite: integration
             group: tcp-auto
           - suite: matrix
             group: udp

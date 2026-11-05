@@ -184,7 +184,8 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
 Country DB answers “which country is this address”, ASN DB answers “which
-network is it”. Enabling these modes is covered in ADVANCED.
+network is it”. Enabling these modes and the automatic updates
+(`svpn example job-geo-update`) are covered in ADVANCED.
 
 ## Next steps
 
@@ -194,7 +195,7 @@ Everything beyond the quick-start pair of servers is covered in
 - `sticky` blocks: pinning exits by DNS names, IPs, ASNs and countries;
 - `via = local` — sending selected addresses outside the VPN;
 - `fallback_sticky` — how the pool serves the remaining traffic;
-- Country and ASN databases and their updates;
+- Country and ASN databases and their background auto-update (`job` blocks);
 - hooks and environment variables;
 - transport: mimic, TCP fallback, UDP port range;
 - systemd and readiness checks;

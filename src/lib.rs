@@ -24,6 +24,7 @@ pub mod framing;
 pub mod geo;
 pub mod hooks;
 pub mod hub;
+pub mod job;
 pub mod limits;
 pub mod link_io;
 pub mod local_exit;
@@ -73,6 +74,63 @@ pub use mimic::{MimicArg, MimicPlan, plan_mimic};
 pub use tun::{if_index_of, is_busy_tun, validate_tun_name};
 
 /// Binary entry point: parses CLI, sets up logging and the runtime.
+/// `svpn job run|list`: the manual, scheduler-free path over the same
+/// config. `run` is fully transparent — inherited stdio, the exit code is
+/// the job's own (124 when the timeout kills it).
+fn job_command(command: crate::cli::JobCommand) -> Result<()> {
+    let (name, config, list) = match command {
+        crate::cli::JobCommand::Run { name, config } => (name, config, false),
+        crate::cli::JobCommand::List { config } => (String::new(), config, true),
+    };
+    let args = crate::config::load(&config, true)?;
+    let context = hub::JobContext::from_args(&args);
+    if list {
+        for job in &args.jobs {
+            let reload = if job.reload.is_empty() {
+                "-".to_owned()
+            } else {
+                job.reload
+                    .iter()
+                    .map(|r| match r {
+                        crate::job::Reload::Geo => "geo",
+                        crate::job::Reload::Country => "country",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            println!(
+                "{:<16} every={:<6} timeout={:<6} reload={:<14} run_if={}",
+                job.label,
+                format!("{}s", job.every.as_secs()),
+                format!("{}s", job.timeout.as_secs()),
+                reload,
+                job.run_if.is_some()
+            );
+        }
+        return Ok(());
+    }
+    let spec = args
+        .jobs
+        .iter()
+        .find(|job| job.label == name)
+        .with_context(|| format!("unknown job {name}"))?
+        .clone();
+    let mut env = context.env();
+    for (key, value) in &mut env {
+        if key == "SVPN_JOB" {
+            value.push_str(&spec.label);
+        }
+    }
+    let code = crate::job::run_foreground(&spec, &env);
+    if code != 0 {
+        // Propagate the job's code verbatim through the process exit;
+        // flush the log thread first — process::exit skips destructors.
+        logging::finish();
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 pub fn main_entry() -> ExitCode {
     // A panicking thread must kill the process: a silently dead thread once
     // shipped a broken webrtc warmup to the field (0.5.2). Print, then abort.
@@ -85,7 +143,7 @@ pub fn main_entry() -> ExitCode {
         Mode::Client(args) => args.globals.log_level,
         Mode::Perf { globals, .. } => globals.log_level,
         Mode::Serve { log_level, .. } => *log_level,
-        Mode::Setup { .. } | Mode::Example { .. } => logging::Level::Info,
+        Mode::Setup { .. } | Mode::Example { .. } | Mode::Job { .. } => logging::Level::Info,
     };
     if logging::init(level).is_err() {
         return ExitCode::FAILURE;
@@ -107,7 +165,7 @@ pub fn main_entry() -> ExitCode {
         // Setup prints its own per-host report when interrupted.
         if matches!(
             &cli.command,
-            Mode::Client(_) | Mode::Setup { .. } | Mode::Example { .. }
+            Mode::Client(_) | Mode::Setup { .. } | Mode::Example { .. } | Mode::Job { .. }
         ) {
             return run(cli).await;
         }
@@ -143,6 +201,24 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         .stickies
         .iter()
         .any(|s| matches!(s.selector, sticky::Selector::Asn(_)));
+    let provider_of = |table: GeoTable| {
+        args.jobs
+            .iter()
+            .find(|job| {
+                job.reload.iter().any(|r| {
+                    matches!(
+                        (r, table),
+                        (crate::job::Reload::Geo, GeoTable::Geo)
+                            | (crate::job::Reload::Country, GeoTable::Country)
+                    )
+                })
+            })
+            .map(|job| job.label.clone())
+    };
+    let geo_provider = provider_of(GeoTable::Geo);
+    let country_provider = provider_of(GeoTable::Country);
+    let mut geo_pending = None;
+    let mut country_pending = None;
     let asn_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || asn_selectors;
     let asn = match (&args.geo_db, asn_needed) {
         (_, false) => {
@@ -160,11 +236,18 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 );
                 Some(geo)
             }
-            // Graceful degradation only for the automatic fallback: a broken
-            // database degrades sticky-asn to balance. An explicit asn
-            // selector keeps its promise or the run does not start; the
-            // country database below is strict for the same reason — a wrong
-            // table misroutes flows instead of losing affinity.
+            // A missing file with a provider job is a degraded start, not an
+            // error: the job fetches the table and reload activates it live.
+            // Other errors keep the old contract: graceful for the automatic
+            // fallback, strict for explicit asn selectors.
+            Err(error) if error.chain().any(is_not_found) && geo_provider.is_some() => {
+                crate::error!(
+                    "vpn: degraded start — geo database missing, job {label} fetching it",
+                    label = geo_provider.clone().unwrap_or_default()
+                );
+                geo_pending = geo_provider;
+                None
+            }
             Err(error) if !asn_selectors => {
                 crate::error!("{error:#} — falling back to balance");
                 None
@@ -178,15 +261,25 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         .iter()
         .any(|s| matches!(s.selector, sticky::Selector::Countries(_)));
     let country = match (&args.country_db, country_needed) {
-        (Some(path), true) => {
-            let country = geo::Geo::load_country(path)?;
-            crate::info!(
-                "country database {}: {} IPv4 ranges",
-                path.display(),
-                country.rows()
-            );
-            Some(country)
-        }
+        (Some(path), true) => match geo::Geo::load_country(path) {
+            Ok(country) => {
+                crate::info!(
+                    "country database {}: {} IPv4 ranges",
+                    path.display(),
+                    country.rows()
+                );
+                Some(country)
+            }
+            Err(error) if error.chain().any(is_not_found) && country_provider.is_some() => {
+                crate::error!(
+                    "vpn: degraded start — country database missing, job {label} fetching it",
+                    label = country_provider.clone().unwrap_or_default()
+                );
+                country_pending = country_provider;
+                None
+            }
+            Err(error) => return Err(error),
+        },
         (Some(_), false) => {
             crate::warn!("country db set without countries selectors — ignoring");
             None
@@ -216,16 +309,19 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         country,
         policy: args.exit_policy,
         exit_state,
+        geo_pending,
+        country_pending,
     })
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Mode::Setup { client } => setup::run(client).await,
+        Mode::Job { command } => job_command(command),
         Mode::Example { name } => {
             let Some(text) = setup::example(&name) else {
                 bail!(
-                    "unknown hook example {name}; expected client-up, client-down, server-up or server-down"
+                    "unknown example {name}; expected client-up, client-down, server-up, server-down, job-geo-update or job-country-update"
                 );
             };
             print!("{text}");
@@ -262,6 +358,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Mode::Client(args) => {
             let exits = load_geo(&args)?;
+            let jobs = hub::JobContext::from_args(&args);
             let hooks = args.hooks.resolve()?;
             let servers = resolve_servers(&args.server, &args.globals)?;
             let mut interrupt =
@@ -278,7 +375,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 hooks,
                 shutdown,
                 exits,
-                args.stickies.clone(),
+                hub::Extras {
+                    sticky_blocks: args.stickies.clone(),
+                    jobs,
+                },
             );
             tokio::pin!(client);
             tokio::select! {
@@ -330,7 +430,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default(), Vec::new()) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default(), hub::Extras::default()) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),
@@ -884,4 +984,18 @@ pub fn validate_addresses(local: Ipv4Addr, peer: Ipv4Addr, mtu: u16) -> Result<(
         "MTU must be between 576 and 1400"
     );
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum GeoTable {
+    Geo,
+    Country,
+}
+
+/// True when the error root is a missing file (ENOENT), the degraded-start
+/// signal for provider jobs.
+fn is_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }

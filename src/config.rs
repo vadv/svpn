@@ -19,7 +19,9 @@ use clap::ValueEnum;
 use crate::{
     MimicArg,
     cli::ClientArgs,
-    hooks, logging,
+    hooks,
+    job::JobSpec,
+    logging,
     server_spec::{Globals, ServerSpec, parse_country_code},
     sticky::{IpNet, Selector, StickyBlock, Via, parse_duration, validate_name},
 };
@@ -53,6 +55,9 @@ pub fn load(path: &Path, multi: bool) -> Result<ClientArgs> {
         Ok(args)
     })
     .map(|mut args| {
+        // Keep the supplied path: the job env contract and the state default
+        // below both derive from it (parse rebuilds ClientArgs with None).
+        args.config = Some(path.to_path_buf());
         // Sticky owners persist even without any database: default the state
         // file next to the config itself.
         if args.exit_state.is_none()
@@ -153,6 +158,8 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
 
     let stickies = top.stickies()?;
     StickyBlock::validate_all(&stickies, &server_label_refs)?;
+    let jobs = top.jobs()?;
+    crate::job::JobSpec::validate_all(&jobs)?;
 
     let args = ClientArgs {
         config: None,
@@ -168,6 +175,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         country_db: top.take_path("country", "db", base)?,
         exit_state: top.take_path("fallback_sticky", "state", base)?,
         stickies,
+        jobs,
         hooks,
         globals,
     };
@@ -422,7 +430,7 @@ impl<'a> Top<'a> {
             let block = split.blocks[index];
             index += 1;
             let name = block.identifier();
-            if matches!(name, "server" | "sticky") {
+            if matches!(name, "server" | "sticky" | "job") {
                 continue;
             }
             ensure!(
@@ -450,7 +458,7 @@ impl<'a> Top<'a> {
         }
         split
             .blocks
-            .retain(|b| matches!(b.identifier(), "server" | "sticky"));
+            .retain(|b| matches!(b.identifier(), "server" | "sticky" | "job"));
         // Top-level attributes other than log_level are unknown; keep them
         // in a dedicated split so `take_level` can find log_level.
         let mut log_level_attrs = Split {
@@ -574,6 +582,70 @@ impl<'a> Top<'a> {
                 .or(take_port_range(&mut split, "udp_ports")?);
             split.finish()?;
             out.push((label, spec));
+        }
+        self.split.blocks = blocks;
+        Ok(out)
+    }
+
+    fn jobs(&mut self) -> Result<Vec<crate::job::JobSpec>> {
+        let mut out = Vec::new();
+        let blocks = std::mem::take(&mut self.split.blocks);
+        for block in blocks.iter().filter(|b| b.identifier() == "job") {
+            ensure!(
+                block.labels().len() == 1,
+                "job: exactly one block label is required"
+            );
+            let label = block
+                .labels()
+                .first()
+                .map(|l| l.as_str().to_owned())
+                .filter(|l| valid_label(l))
+                .context("job: block label must match [a-z0-9_-]{1,32}")?;
+            let ctx = format!("job {label}");
+            let mut split = Split::of(&block.body, &ctx)?;
+            let every = split
+                .take_duration_secs("every")?
+                .with_context(|| format!("{ctx}: every is required"))?;
+            ensure!(
+                every >= crate::job::MIN_EVERY,
+                "{ctx}: every must be at least {}s",
+                crate::job::MIN_EVERY.as_secs()
+            );
+            let timeout = split
+                .take_duration_secs("timeout")?
+                .unwrap_or(crate::job::DEFAULT_TIMEOUT);
+            ensure!(
+                !timeout.is_zero() && timeout <= crate::job::MAX_TIMEOUT,
+                "{ctx}: timeout must be 1s..=24h"
+            );
+            let run_if = split.take_string("run_if")?;
+            if let Some(check) = &run_if {
+                ensure!(!check.trim().is_empty(), "{ctx}: run_if must not be empty");
+            }
+            let run = split
+                .take_string("run")?
+                .with_context(|| format!("{ctx}: run is required"))?;
+            ensure!(!run.trim().is_empty(), "{ctx}: run must not be empty");
+            let mut reload = Vec::new();
+            for item in take_string_list(&mut split, "reload")?.unwrap_or_default() {
+                reload.push(
+                    crate::job::Reload::parse(&item)
+                        .with_context(|| format!("{ctx}: attribute reload"))?,
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for reload in &reload {
+                ensure!(seen.insert(*reload), "{ctx}: duplicate reload entry");
+            }
+            split.finish()?;
+            out.push(JobSpec {
+                label,
+                every,
+                timeout,
+                run_if,
+                run,
+                reload,
+            });
         }
         self.split.blocks = blocks;
         Ok(out)
