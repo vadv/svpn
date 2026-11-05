@@ -19,6 +19,7 @@ import suite_pool
 import suite_recovery
 import suite_reselect
 import suite_setup
+import suite_sticky
 import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
@@ -51,7 +52,11 @@ test_recovery_without_alternative_closes_within_budget
 """.split()
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
-test_country_asn_scope test_local_exits_and_vpn
+test_country_asn_scope test_local_egress_and_vpn
+""".split()
+STICKY_DNS_BASELINE = """
+test_name_pin test_first_match_over_later_blocks test_failover_without_snapback
+test_ip_change_purges_stale_pins test_restart_restores_pinned_owner
 """.split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
@@ -87,11 +92,12 @@ def integration_groups():
         "reselect": suite_reselect,
         "recovery": suite_recovery,
         "sticky-asn": suite_sticky_asn,
+        "sticky": suite_sticky,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE + STICKY_BASELINE
+    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE + STICKY_BASELINE + STICKY_DNS_BASELINE
     assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
     assert len(tests) == len(set(tests)) == len(by_fn), "a test is assigned twice or dropped"
@@ -111,6 +117,7 @@ def integration_groups():
         "reselect": 4,
         "recovery": 3,
         "sticky-asn": 6,
+        "sticky": 5,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -129,6 +136,33 @@ def integration_groups():
                 integration.main()
             assert called == expected, (group, args)
     print(f"PASS integration: {len(tests)} cases assigned once, CLI/env selection and original order")
+
+
+def dnsserver_wire_selftest():
+    """Pin the DNS wire format the sticky rig depends on."""
+    import struct
+
+    import dnsserver
+
+    def query(qname, qtype):
+        encoded = b"".join(bytes([len(part)]) + part.encode() for part in qname.split(".")) + b"\0"
+        return struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0) + encoded + struct.pack("!HH", qtype, 1)
+
+    answer = dnsserver.answer(0x4242, "pin.example", "1.2.3.4")
+    # 12 header + 17 question + 2 pointer + 2+2+4+2 rdlength + 4 rdata
+    assert len(answer) == 45, len(answer)
+    rdlength = struct.unpack_from("!H", answer, len(answer) - 6)[0]
+    assert rdlength == 4 and answer[-4:] == bytes([1, 2, 3, 4])
+
+    nodata = dnsserver.nodata(0x4242, "pin.example", 28)
+    echoed_qtype = struct.unpack_from("!H", nodata, len(nodata) - 4)[0]
+    assert echoed_qtype == 28, "NODATA must echo the AAAA qtype"
+
+    ident, qname, qtype = dnsserver.question(query("pin.example", 1))
+    assert (ident, qname, qtype) == (0x4242, "pin.example", 1)
+    assert dnsserver.question(b"\x00" * 8) is None, "truncated questions are rejected"
+    assert dnsserver.question(query("pin.example", 1)[:14]) is None
+    print("PASS dnsserver wire: A rdlength, NODATA qtype echo, question parsing")
 
 
 # The setup suite runs on its own compose rig, outside the integration registry.
@@ -341,6 +375,7 @@ def shell_groups():
 
 if __name__ == "__main__":
     integration_groups()
+    dnsserver_wire_selftest()
     setup_suite_groups()
     matrix_groups()
     matrix_diagnostics()

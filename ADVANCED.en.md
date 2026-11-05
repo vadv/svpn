@@ -1,76 +1,113 @@
 # SVPN: advanced configuration
 
 The basic single-server setup is described in [README.en.md](README.en.md).
-This file covers several VPSs, `local-exit`, `sticky-asn`, GeoIP databases,
-hooks, transport, systemd and `svpn setup` details.
+This file covers several VPSs, the sticky policy, GeoIP databases, hooks,
+transport, systemd and `svpn setup` details. The configuration file is HCL.
 
-## Several VPSs and local-exit
+## Several VPSs and sticky
 
-A complete example: two VPSs, country-based selection, `local-exit` for RU and
-BY, `sticky-asn` and weight-based distribution. Replace `nl.example.com` and
-`de.example.com` with the servers' IPv4 addresses in the `servers` blocks
-**and in the hooks**, and replace the key path.
+A complete example: two VPSs, `sticky` blocks by names, countries and ASN,
+a local egress for RU/BY and weight-based distribution. Replace the server
+addresses and the key path.
 
-```toml
-exit-policy = "sticky-asn"
-country-db = "/etc/svpn/country.csv"
-geo-db = "/etc/svpn/asn.csv"
-exit-state = "/etc/svpn/exits.json"
-local-exits = ["RU", "BY"]
+```hcl
+# vpn.hcl
+ssh {
+  user       = "root"
+  identity   = "/full/path/to/key"
+  port       = 22
+  remote_bin = "/usr/local/bin/svpn"
+}
 
-ssh-user = "root"
-ssh-identity = "/full/path/to/key"
-ssh-port = 22
-ssh-remote-bin = "/usr/local/bin/svpn"
-mimic = ["ssh"]
-tcp-port = 41020  # fixed TCP-fallback port; required with mimic = ["ssh"] and no UDP
-udp-port-range = "60000-60009"
+transport {
+  mimic      = ["ssh"]
+  tcp_port   = 41020  # fixed TCP fallback; required with mimic = ["ssh"] and no UDP
+  udp_ports  = "60000-60009"
+}
 
-# Protect the VPS addresses when the default route is replaced. This assumes
-# no pre-existing host routes for these addresses.
-up-command = "wan=$(ip -4 route show default | awk 'NR==1{print $5}'); gateway=$(ip -4 route show default | awk 'NR==1{print $3}'); for ip in nl.example.com de.example.com; do ip route replace \"$ip/32\" via \"$gateway\" dev \"$wan\"; done; ip route replace 0.0.0.0/1 dev \"$SVPN_TUN_NAME\"; ip route replace 128.0.0.0/1 dev \"$SVPN_TUN_NAME\""
-down-command = "for ip in nl.example.com de.example.com; do ip route del \"$ip/32\" 2>/dev/null || true; done"
+geo {
+  db = "/etc/svpn/asn.csv"         # for asn selectors and strategy = "sticky-asn"
+}
 
-[[servers]]
-address = "nl.example.com"
-weight = 3
-countries = ["NL", "DE"]
+country {
+  db = "/etc/svpn/country.csv"     # for countries selectors
+}
 
-[[servers]]
-address = "de.example.com"
-weight = 1
-countries = ["NL", "DE"]
+fallback_sticky {
+  strategy = "sticky-asn"          # how the pool serves traffic outside sticky blocks
+  state    = "/etc/svpn/exits.json"
+}
+
+server "nl" {
+  address = "203.0.113.10"
+  weight  = 3
+}
+
+server "de" {
+  address = "198.51.100.20"
+  weight  = 1
+}
+
+# Block order = priority: first match wins.
+sticky "claude" {
+  names = ["claude.ai", "anthropic.com"]
+  via   = ["nl"]                   # one element = a hard pin
+  every = "5m"                     # name re-resolve (min 5s, default 300s)
+}
+
+sticky "eu" {
+  countries = ["NL", "DE"]
+  via       = ["de", "nl"]         # rendezvous: stable + failover
+}
+
+sticky "home" {
+  countries = ["RU", "BY"]
+  via       = local                # local egress, outside the VPN
+}
 ```
-
-`weight` is the share of destination networks a server owns: weights 3 and 1
-give a rough 3:1 distribution. An ASN always goes to one server as a whole,
-no matter how many addresses it contains. With `sticky-asn` addresses of one
-network keep their chosen exit while it is alive. Weights affect owner
-selection, not individual packets.
 
 ## How the path is selected
 
-| Destination | Path |
+Routing is exactly two mechanisms:
+
+1. **sticky blocks** — ordered first-match: the destination address is checked
+   against the blocks top to bottom; the first match wins. On a match:
+   - `via = ["…"]` — the whole group is pinned to one server from the list
+     (rendezvous by weights; a server failure moves the group to the next one,
+     and recovery does not move it back — no snap-back);
+   - `via = local` — packets leave through the local SVPN server and the
+     physical uplink (the site sees your home IP). No databases are needed
+     when the selector is `names` or `ips`.
+2. **fallback_sticky** — traffic matched by no block: `balance` (weighted per
+   flow) or `sticky-asn` (ASN groups with a stable owner; requires `geo.db`).
+
+| Destination from the example | Path |
 |---|---|
-| `RU` or `BY` | `local-exit` through the local SVPN server and physical egress |
-| `NL` or `DE` | Only servers listing that country in `countries` |
-| Any other country or an address outside Country DB | Both example servers, using ASN affinity and weights |
+| IPs that claude.ai / anthropic.com resolve to | Always via `nl` |
+| NL and DE addresses | One owner from `de`+`nl`, failover between them |
+| RU and BY addresses | Local egress, outside the VPN |
+| Everything else | `sticky-asn`: an ASN group → one owner from the whole pool |
 
-One country can have several servers. `countries` restricts selection for that
-country but does not remove the server from the general pool for other
-countries. A server without `countries` also participates in ordinary
-selection.
+`weight` is the share of groups a server owns: weights 3 and 1 give a rough
+3:1 distribution. Weights affect owner selection, not individual packets.
 
-`local-exit` is not a TCP proxy. SVPN forwards IPv4 packets through its local
-server. It needs `server-up` and `server-down`. Return routes are managed by
-SVPN automatically. The hook sends packets sourced from `SVPN_PEER_ADDR`
-through the physical uplink instead of back into the primary TUN.
+### Selectors and the resolver
 
-The example `server-up` enables IPv4 forwarding and uses policy table
-`10000+n`. It rejects foreign rules and tables. It does not restore the
-previous forwarding value on shutdown. It assumes no pre-existing host routes
-to `nl.example.com` or `de.example.com`. If you already have such routes, save
-them and add restoration to your own `down-command`.
+- Exactly one selector per block: `names`, `countries`, `ips` or `asn` — all
+  lists; the group is the union of the elements.
+- `names`: SVPN itself resolves the names with the system resolver
+  episodically — the first resolve happens at startup, then every `every`.
+  Until the first resolve the addresses follow the fallback. An IP missing
+  from two consecutive resolves leaves the group (protection against CDN
+  re-leasing). A resolve error keeps the previous IP set.
+- `ips`: exact addresses and CIDRs; CIDR host bits must be zero.
+- `countries` requires `country.db`; `asn` and `strategy = "sticky-asn"`
+  require `geo.db`.
+- The same selector in two blocks is an error: the second would be dead
+  config.
+
+Owners of sticky groups and ASN groups persist in one `state` file and
+survive restarts: a restart during an outage does not snap groups back.
 
 ## Country and ASN databases
 
@@ -89,8 +126,9 @@ gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
 sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
-Country Lite determines the destination country. ASN Lite is needed for
-`sticky-asn`. SVPN loads the CSV files at startup and does not re-read them
+Country Lite determines the destination country (needed by `countries`
+selectors); ASN Lite determines the network (needed by `asn` selectors and
+`sticky-asn`). SVPN loads the CSV files at startup and does not re-read them
 live. Update the files and restart the service:
 
 ```bash
@@ -102,23 +140,34 @@ a new database, validates it and keeps the previous one as `asn.csv.prev`.
 
 ## Server hooks
 
-`server-up` and `server-down` run on the VPS and at `local-exit` on the
+`server_up` and `server_down` run on the VPSs and at the local egress on the
 client. When these fields are absent, `serve` runs the embedded
 `scripts/server-up` and `scripts/server-down` from the current binary.
 
-To override, inspect the example, save it, edit it and point to it with
-`server-up`/`server-down`:
+Global defaults live in the `hooks` block; per-server overrides live inside
+the server block (heredocs keep multiline commands readable):
+
+```hcl
+hooks {
+  server_up = <<EOF
+sysctl -w net.ipv4.ip_forward=1
+EOF
+}
+
+server "de" {
+  address    = "198.51.100.20"
+  server_up = "echo custom variant for this server only"
+}
+```
+
+To customize the embedded script, inspect it, save it, edit it and point the
+config at it:
 
 ```bash
 svpn example server-up > server-up
 svpn example server-down > server-down
-$EDITOR server-up
-chmod 755 server-up server-down
-ssh root@vps 'mkdir -p /usr/local/lib/svpn'
-scp server-up server-down root@vps:/usr/local/lib/svpn/
+$EDITOR server-up server-down
 ```
-
-A command can also be written directly in TOML.
 
 Hooks receive these environment variables:
 
@@ -129,24 +178,16 @@ Hooks receive these environment variables:
 - `SVPN_SESSION_ID` — the process PID.
 
 The timeout is 10 seconds. A failing `up` prevents the session from starting;
-a failing `down` is only logged. Use `svpn example server-up|server-down`
-to inspect the default scripts.
+a failing `down` is only logged.
 
 ## Client hooks
 
-In auto mode the embedded `scripts/client-up` and `scripts/client-down` from the current binary run.
-You can inspect the exact text before starting:
+In auto mode the embedded `scripts/client-up` and `scripts/client-down` from
+the current binary run. The exact text can be inspected before starting:
 
 ```bash
 svpn example client-up
 svpn example client-down
-```
-
-For a manual override, save the output and make the file executable:
-
-```bash
-svpn example client-up > client-up
-chmod +x client-up
 ```
 
 The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
@@ -155,47 +196,36 @@ The script receives `SVPN_SERVER_ADDRS` and `SVPN_OS`, then:
 2. adds `0.0.0.0/1` and `128.0.0.0/1` through the TUN;
 3. removes only this session's routes on shutdown.
 
-With `up-command`/`up-script`, that script does not run: your variant runs.
-`up-command` executes as `/bin/sh -c <string>`, while `up-script` directly
-executes the file.
-
-The fields below are manual overrides. Setting `up-command` or `up-script`
-disables the automatic up; the same applies to `down-command`/`down-script`.
-Directions are independent: you can keep automatic up and provide a custom
-down.
-
-Client-side commands are configured with:
-
-- `up-command` and `down-command` — a string for `/bin/sh -c`;
-- `up-script` and `down-script` — a path to an executable file.
-
-Only one variant per direction may be set. Commands receive the same variables
-as server hooks and share the same 10-second timeout. The example in the quick
-start sends all IPv4 into the tunnel and keeps a direct route to the VPS. With
-several servers add a route for each of them.
+Manual overrides live in the `hooks` block: `up_command`/`down_command` (a
+string for `/bin/sh -c`) or `up_script`/`down_script` (a path to an executable
+file). Directions are independent: you can keep the automatic up and provide a
+custom down. An explicit command disables the embedded script only for its
+own direction. Commands receive the same variables as server hooks and share
+the same 10-second timeout.
 
 ## SSH checks and host keys
 
 The client needs a private key, and its public part must be authorized on the
-VPS. Use an absolute key path. If the key is passphrase-protected, load it into
-`ssh-agent` first.
+VPS. Use an absolute key path (relative paths in the config are resolved
+against the config file's directory). If the key is passphrase-protected,
+load it into `ssh-agent` first.
 
-Without `ssh-host-key` SVPN uses TOFU and stores the fingerprint in its
+Without `host_key` SVPN uses TOFU and stores the fingerprint in its
 known-hosts file. For strict checking obtain the fingerprint from the provider
-and add `ssh-host-key = "SHA256:..."` to each server. An empty value is not
+and add `host_key = "SHA256:..."` to the server block. An empty value is not
 needed.
 
 ## Transport
 
 By default SVPN uses SSH camouflage and UDP. If UDP is blocked, set
-`mimic = ["ssh"]`. The UDP port range is set with
-`udp-port-range = "60000-60009"`.
+`mimic = ["ssh"]` in the `transport` block. The UDP port range is the string
+`udp_ports = "60000-60009"`.
 
-`tcp-port` is a fixed TCP-fallback port. In auto mode it is optional and
-ephemeral by default, so no setting is required. With `mimic = ["ssh"]` and no
-UDP strategies it is required: a TCP-only server needs a known port. `mimic`
-and `tcp-port` can be set per server inside `[[servers]]`: different VPSs may
-use different camouflage sets.
+`tcp_port` is a fixed TCP-fallback port. In auto mode it is optional and
+ephemeral by default, so no setting is required. With `mimic = ["ssh"]` and
+no UDP strategies it is required: a TCP-only server needs a known port.
+`mimic` and `tcp_port` can be set per server inside its block: different VPSs
+may use different camouflage sets.
 
 ## Autostart
 
@@ -208,7 +238,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/svpn multi --config /etc/svpn/vpn.toml
+ExecStart=/usr/local/bin/svpn multi --config /etc/svpn/vpn.hcl
 Restart=on-failure
 RestartSec=2
 
@@ -222,15 +252,15 @@ journalctl -u svpn -f
 ```
 
 For a single server replace `multi` with the plain invocation:
-`ExecStart=/usr/local/bin/svpn --config /etc/svpn/vpn.toml`.
+`ExecStart=/usr/local/bin/svpn --config /etc/svpn/vpn.hcl`.
 
 ## `svpn setup` details
 
 `svpn setup --config FILE` prepares every VPS from the configuration: it
-detects the environment, installs the missing approved packages (`curl`, `tar`,
-`gzip`, `awk`, `ip`, `nft`, `sysctl`, CA certificates), downloads the SVPN
-release from GitHub on the VPS itself and installs the binary. The
-configuration is never modified and setup does not create hook files.
+detects the environment, installs the missing approved packages (`curl`,
+`tar`, `gzip`, `awk`, `ip`, `nft`, `sysctl`, CA certificates), downloads the
+SVPN release from GitHub on the VPS itself and installs the binary. The
+configuration is never modified; setup creates no hook files.
 
 Supported environments: Debian 12 and Rocky 10 (GNU libc) on x86_64 and
 aarch64 with hardware AES. SSH access as `root` or as a regular user with
@@ -239,8 +269,8 @@ OpenWrt, Alpine and musl are not covered.
 
 Repeat runs and versions:
 
-- Only the managed file `/usr/local/bin/svpn` is overwritten.
-  The replacement is atomic; the report shows `partial` for a partial install.
+- Only the managed file `/usr/local/bin/svpn` is overwritten. The replacement
+  is atomic; the report shows `partial` for a partial install.
 - The client's exact version is preferred. If its release or platform archive
   is unavailable, the latest stable release with compatible control/hook
   metadata is selected and the reason is reported. A checksum failure is an
@@ -248,12 +278,12 @@ Repeat runs and versions:
 - A selected older version may replace a newer installation; setup reports
   this explicitly in a `downgrade=` field.
 
-After installation the binary hash, mode and version are verified.
-Setup never starts SVPN and never executes the hooks: it activates no routes,
-NAT, DNS or firewall, creates no services and does not touch local-exit.
+After installation the binary hash, mode and version are verified. Setup
+never starts SVPN and never executes the hooks: it activates no routes, NAT,
+DNS or firewall, creates no services and does not touch the local egress.
 
-Hosts are processed in configuration order; one failing host does not stop the
-others. Every host prints a
+Hosts are processed in configuration order; one failing host does not stop
+the others. Every host prints a
 `SETUP host=… status=success|failed|partial|unknown|not-attempted` line with
 the selected version, a `downgrade=` field and the `changed=` list. The
 aggregate exit code is nonzero after any failure. Interruption (Ctrl+C,
@@ -264,45 +294,64 @@ ones `not-attempted`.
 
 In the foreground watch for the `serving` and `local-exit: ready` lines. With
 systemd use `journalctl -u svpn -f`. Repeated runs of identical configurations
-take address pairs from the `10.77.0.0/16` pool. On a conflict inspect the used
-addresses with `ip addr`.
+take address pairs from the `10.77.0.0/16` pool. On a conflict inspect the
+used addresses with `ip addr`.
 
-`exit-state` stores the selected ASN owners. By default it is a path next to
-`geo-db` with a `.state.json` suffix. State survives restarts. No snap-back is
-performed.
+`fallback_sticky.state` stores the owners of ASN groups and sticky groups.
+By default it is a path beside the geo database with a `.state.json` suffix.
+State survives restarts. No snap-back is performed.
 
 ## Using only part of the features
 
-Sticky ASN without `local-exit`:
+Only sticky by names, no databases:
 
-```toml
-exit-policy = "sticky-asn"
-geo-db = "/etc/svpn/asn.csv"
+```hcl
+server "nl" { address = "203.0.113.10" }
+
+sticky "claude" {
+  names = ["claude.ai"]
+  via   = ["nl"]
+  every = "5m"
+}
 ```
 
-Country selection without `local-exit`:
+Only ASN groups (automatic sticky for everything):
 
-```toml
-country-db = "/etc/svpn/country.csv"
+```hcl
+geo { db = "/etc/svpn/asn.csv" }
 
-[[servers]]
-address = "nl.example.com"
-countries = ["NL"]
+fallback_sticky {
+  strategy = "sticky-asn"
+}
 
-[[servers]]
-address = "de.example.com"
-countries = ["DE"]
+server "nl" { address = "203.0.113.10" }
+server "de" { address = "198.51.100.20" }
 ```
 
-`local-exits` and `countries` require `country-db`. `sticky-asn` requires
-`multi` and `geo-db`. Do not add fields your scenario does not need.
+Only a local egress by names:
+
+```hcl
+server "nl" { address = "203.0.113.10" }
+
+sticky "home" {
+  names = ["printer.lan", "nas.home"]
+  via   = local
+  every = "5m"
+}
+```
+
+`countries` selectors need `country.db`; `asn` selectors and
+`strategy = "sticky-asn"` need `geo.db`. Do not add blocks your scenario does
+not need.
 
 ## Limits
 
 - Only IPv4 is tunnelled. IPv6 is not protected by this configuration.
-- DNS is not changed automatically. Choose DNS separately.
-- Country and ASN databases do not classify domains. The decision is made by
-  destination IP after name resolution.
+- DNS is not intercepted or spoofed: SVPN resolves only the names from its
+  sticky blocks; the system resolver stays yours.
+- A name behind a large CDN resolves into thousands of addresses shared with
+  other services: the sticky group pins them too, until the records wash out.
+  Use `ips` for precise cases.
 - The complete Linux example uses TUN, root, `iproute2` and `nftables`.
 - Client hooks do not run after `SIGKILL`. The kernel closes TUN and sockets.
   The next start must restore its routes and rules. Do not use hooks for

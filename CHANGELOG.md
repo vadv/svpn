@@ -2,6 +2,22 @@
 
 ## v1.0.0
 
+HCL configuration and explicit sticky routing.
+
+- The configuration file is HCL now; TOML is not supported. Subsystem blocks
+  (`ssh`, `transport`, `tunnel`, `geo`, `country`, `hooks`, `fallback_sticky`),
+  labeled `server` blocks (one block = single mode, several = pool) and
+  heredocs for multiline hooks.
+- Explicit sticky blocks: ordered first-match groups by DNS names, IPs/CIDRs,
+  ASN or countries; `via` is a server list (rendezvous owner, failover without
+  snap-back) or `local` (egress outside the VPN). Name selectors re-resolve
+  episodically (`every`, default 300s) through the system resolver; IPs
+  missing from two refreshes are purged. Owners persist in the exit state.
+- Removed: `local-exits` and per-server `countries` (replaced by sticky
+  blocks), the `--local-exits` CLI flag, legacy exit-state migrations.
+
+## v1.0.0
+
 Setup and automatic routing release.
 
 - `svpn setup` provisions VPSs over SSH: environment preflight (Debian 12,

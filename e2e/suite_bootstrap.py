@@ -1,4 +1,4 @@
-"""Bootstrap group: CLI/TOML parity, credentials, TUN naming, log levels, stats and readiness."""
+"""Bootstrap group: CLI/HCL parity, credentials, TUN naming, log levels, stats and readiness."""
 
 import json
 import os
@@ -32,7 +32,7 @@ def traffic(index):
     tcp_echo(index)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(5)
-        payload = b"TOML UDP test"
+        payload = b"HCL UDP test"
         sock.sendto(payload, (PEER, 9000))
         received, address = sock.recvfrom(2048)
         assert received == payload and address == (PEER, 9000)
@@ -54,15 +54,18 @@ def test_configuration():
                 + "\n"
             )
             script.chmod(0o700)
+        # One open transport block: each fixture appends its own stats line.
         common = (
-            'ssh-user = "root"\nssh-identity = "identity"\n'
-            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-            'log-level = "debug"\nmimic = ["mosh"]\n'
+            'ssh {\n  user = "root"\n  identity = "identity"\n}\n'
+            'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+            'log_level = "debug"\ntransport {\n  mimic = ["mosh"]\n'
         )
-        single = base / "single.toml"
+        single = base / "single.hcl"
         single.write_text(
-            common + f'server = "{SERVER}"\nstats-interval = 0\n'
-            'up-script = "up hook"\ndown-script = "down hook"\n'
+            common
+            + '  stats = "0s"\n}\n'
+            + f'server "main" {{\n  address = "{SERVER}"\n}}\n'
+            + 'hooks {\n  up_script = "up hook"\n  down_script = "down hook"\n}\n'
         )
         with session("config-single", args=["svpn", "--config", str(single)]) as (process, log):
             traffic(0)
@@ -71,23 +74,30 @@ def test_configuration():
             assert "stats: last " not in log.read_text(), log.read_text()
         cleanup_verified(process)
         assert events.read_text() == "up svpn0\ndown svpn0\n"
-        print("PASS TOML single: relative identity/scripts, hooks, data, stats off, cleanup")
+        print("PASS HCL single: relative identity/scripts, hooks, data, stats off, cleanup")
 
         events.unlink()
-        multi = base / "multi.toml"
-        hooks = "".join(
-            event
-            + "-command = "
-            + json.dumps("printf '" + event + ' %s\\n\' "$SVPN_TUN_NAME" >> ' + shlex.quote(str(events)))
-            + "\n"
+        multi = base / "multi.hcl"
+        commands = "".join(
+            "  "
+            + event.replace("-", "_")
+            + '_command = "'
+            + "printf '"
+            + event
+            + " %s\\n' $SVPN_TUN_NAME >> "
+            + shlex.quote(str(events))
+            + '"\n'
             for event in ("up", "down")
         )
         multi.write_text(
-            common + hooks + "stats-interval = 1\n"
-            f'[[servers]]\naddress = "{SERVER}"\nweight = 2\n'
-            'udp-port-range = "61000-61009"\n'
-            f'[[servers]]\naddress = "{SERVER2}"\n'
-            'ssh-identity = "identity"\nudp-port-range = "62000-62009"\n'
+            common
+            + '  stats = "1s"\n}\n'
+            + "hooks {\n"
+            + commands
+            + "}\n"
+            + f'server "a" {{\n  address = "{SERVER}"\n  weight = 2\n  udp_port_range = "61000-61009"\n}}\n'
+            + 'server "b" {\n  address = "'
+            + f'{SERVER2}"\n  ssh_identity = "identity"\n  udp_port_range = "62000-62009"\n}}\n'
         )
         # Both config positions use the same grammar. This run covers prefix placement.
         with session(
@@ -104,26 +114,32 @@ def test_configuration():
             assert events.read_text() == "up svpn0\n"
         cleanup_verified(process, server_hosts=[SERVER, SERVER2])
         assert events.read_text() == "up svpn0\ndown svpn0\n"
-        print("PASS TOML multi: inherited/per-server identity, command hooks once, stats, cleanup")
+        print("PASS HCL multi: inherited/per-server identity, command hooks once, stats, cleanup")
 
-        one = base / "one.toml"
-        one.write_text(common + f'stats-interval = 1\n[[servers]]\naddress = "{SERVER}"\n')
+        one = base / "one.hcl"
+        one.write_text(common + '  stats = "1s"\n}\n' + f'server "a" {{\n  address = "{SERVER}"\n}}\n')
         with session("config-multi-one", args=["svpn", "multi", "--config", str(one)]) as (process, log):
             traffic(2)
             until(lambda: "stats: last " in log.read_text())
         cleanup_verified(process)
-        print("PASS TOML multi: one server accepted without special setup")
+        print("PASS HCL multi: one server accepted without special setup")
 
-        bad = base / "bad.toml"
+        bad = base / "bad.hcl"
         cases = [
-            ([], common + f'server = "{SERVER}"\nunknown = true\n'),
-            ([], common + f'server = "{SERVER}"\nweight = 1\n'),
-            ([], common + f'server = "{SERVER}"\nup-script = ""\n'),
-            ([], common + f'server = "{SERVER}"\nup-script = "up hook"\nup-command = "true"\n'),
+            ([], common + f'server "main" {{\n  address = "{SERVER}"\n}}\nmystery = true\n'),
+            ([], common + f'server "main" {{\n  address = "{SERVER}"\n  weight = 1\n}}\n'),
+            ([], common + f'server "main" {{\n  address = "{SERVER}"\n}}\nhooks {{\n  up_script = ""\n}}\n'),
+            (
+                [],
+                common
+                + f'server "main" {{\n  address = "{SERVER}"\n}}\n'
+                + 'hooks {\n  up_script = "up hook"\n  up_command = "true"\n}\n',
+            ),
             (
                 ["multi"],
-                common + f'[[servers]]\naddress = "{SERVER}"\n'
-                f'[[servers]]\naddress = "{SERVER2}"\npeer-tun-name = "bad/name"\n',
+                common
+                + f'server "a" {{\n  address = "{SERVER}"\n}}\n'
+                + f'server "b" {{\n  address = "{SERVER2}"\n  peer_tun_name = "bad/name"\n}}\n',
             ),
         ]
         for mode, content in cases:
@@ -148,11 +164,11 @@ def test_configuration():
             marker = base / "unexpected hook"
             bad.write_text(
                 common
-                + "up-command = "
+                + "hooks {\n  up_command = "
                 + json.dumps("touch " + shlex.quote(str(marker)))
-                + '\n[[servers]]\naddress = "127.0.0.1"\n'
-                + f"ssh-port = {listener.getsockname()[1]}\n"
-                + f'[[servers]]\naddress = "{SERVER2}"\npeer-tun-name = "bad/name"\n'
+                + '\n}\nserver "a" {\n  address = "127.0.0.1"\n'
+                + f"  ssh_port = {listener.getsockname()[1]}\n}}\n"
+                + f'server "b" {{\n  address = "{SERVER2}"\n  peer_tun_name = "bad/name"\n}}\n'
             )
             result = command(["svpn", "multi", "--config", str(bad)], check=False, timeout=3)
             assert result.returncode == 2, result.stdout
@@ -169,7 +185,7 @@ def test_configuration():
         )
         assert result.returncode == 2 and "Permission denied" in result.stdout, result.stdout
         print(
-            "PASS TOML rejects mixed sources, invalid fields/hooks, unreadable file "
+            "PASS HCL rejects mixed sources, invalid fields/hooks, unreadable file "
             "and removed client command before TUN"
         )
 
@@ -182,14 +198,14 @@ def test_server_hooks():
         down_marker = "/tmp/svpn-server-down"
         for marker in (up_marker, down_marker):
             command(ssh_to(SERVER) + [f"rm -f {shlex.quote(marker)}"])
-        config = base / "config.toml"
+        config = base / "config.hcl"
         config.write_text(
-            'ssh-user = "root"\nssh-identity = "identity"\n'
-            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-            'log-level = "debug"\nmimic = ["mosh"]\n'
-            f'server = "{SERVER}"\nstats-interval = 0\n'
-            f'server-up = "touch {up_marker} && echo up-done"\n'
-            f'server-down = "touch {down_marker} && echo down-done"\n'
+            'ssh {\n  user = "root"\n  identity = "identity"\n}\n'
+            'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+            'log_level = "debug"\ntransport {\n  mimic = ["mosh"]\n  stats = "0s"\n}\n'
+            + f'server "main" {{\n  address = "{SERVER}"\n'
+            + f'  server_up = "touch {up_marker} && echo up-done"\n'
+            + f'  server_down = "touch {down_marker} && echo down-done"\n}}\n'
         )
         with session("server-hooks", args=["svpn", "--config", str(config)]) as (process, log):
             until(lambda: "vpn: started" in log.read_text(), seconds=10)
@@ -199,11 +215,10 @@ def test_server_hooks():
         print("PASS server hooks: up/down executed on server")
 
         config.write_text(
-            'ssh-user = "root"\nssh-identity = "identity"\n'
-            'peer-tun-name = "svpn0"\ntun-name = "svpn0"\n'
-            'log-level = "debug"\nmimic = ["mosh"]\n'
-            f'server = "{SERVER}"\nstats-interval = 0\n'
-            'server-up = "exit 1"\n'
+            'ssh {\n  user = "root"\n  identity = "identity"\n}\n'
+            'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
+            'log_level = "debug"\ntransport {\n  mimic = ["mosh"]\n  stats = "0s"\n}\n'
+            + f'server "main" {{\n  address = "{SERVER}"\n  server_up = "exit 1"\n}}\n'
         )
         result = command(["svpn", "--config", str(config)], check=False, timeout=10)
         assert result.returncode != 0

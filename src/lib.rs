@@ -45,6 +45,7 @@ pub mod session;
 pub mod setup;
 pub mod ssh;
 pub mod stats;
+pub mod sticky;
 pub mod tcp;
 mod tun;
 pub mod udp;
@@ -136,16 +137,21 @@ pub fn main_entry() -> ExitCode {
 fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
     // Keep runtime validation aligned with CLI parsing.
     args.validate_geo()?;
-    let asn = match (args.exit_policy, &args.geo_db) {
-        (cli::ExitPolicy::Balance, None) => None,
-        (cli::ExitPolicy::Balance, Some(_)) => {
-            crate::warn!("geo-db set without exit-policy sticky-asn — ignoring");
+    // An explicit asn selector must match by database contents: a broken
+    // database fails startup instead of silently bypassing the rule.
+    let asn_selectors = args
+        .stickies
+        .iter()
+        .any(|s| matches!(s.selector, sticky::Selector::Asn(_)));
+    let asn_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || asn_selectors;
+    let asn = match (&args.geo_db, asn_needed) {
+        (_, false) => {
+            if args.geo_db.is_some() {
+                crate::warn!("geo db set without sticky-asn or asn selectors — ignoring");
+            }
             None
         }
-        (cli::ExitPolicy::StickyAsn, None) => {
-            anyhow::bail!("exit-policy sticky-asn requires geo-db")
-        }
-        (cli::ExitPolicy::StickyAsn, Some(path)) => match geo::Geo::load(path) {
+        (Some(path), true) => match geo::Geo::load(path) {
             Ok(geo) => {
                 crate::info!(
                     "geo database {}: {} IPv4 ranges",
@@ -154,21 +160,24 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 );
                 Some(geo)
             }
-            // Graceful degradation: a missing/broken ASN database must not
-            // stop the VPN. The country database below is strict — a wrong
-            // country table misroutes flows instead of losing affinity.
-            Err(error) => {
+            // Graceful degradation only for the automatic fallback: a broken
+            // database degrades sticky-asn to balance. An explicit asn
+            // selector keeps its promise or the run does not start; the
+            // country database below is strict for the same reason — a wrong
+            // table misroutes flows instead of losing affinity.
+            Err(error) if !asn_selectors => {
                 crate::error!("{error:#} — falling back to balance");
                 None
             }
+            Err(error) => return Err(error),
         },
+        (None, true) => unreachable!("validate_geo requires geo db"),
     };
-    let country_routing = args.server.iter().any(|spec| !spec.countries().is_empty());
-    let local_exits = args
-        .local_exits
-        .as_ref()
-        .is_some_and(|codes| !codes.is_empty());
-    let country = match (&args.country_db, country_routing || local_exits) {
+    let country_needed = args
+        .stickies
+        .iter()
+        .any(|s| matches!(s.selector, sticky::Selector::Countries(_)));
+    let country = match (&args.country_db, country_needed) {
         (Some(path), true) => {
             let country = geo::Geo::load_country(path)?;
             crate::info!(
@@ -179,11 +188,14 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
             Some(country)
         }
         (Some(_), false) => {
-            crate::warn!("country-db set without local-exits or server countries — ignoring");
+            crate::warn!("country db set without countries selectors — ignoring");
             None
         }
-        (None, _) => None,
+        (None, false) => None,
+        (None, true) => unreachable!("validate_geo requires country db"),
     };
+    // Owners persist while sticky-asn or any explicit sticky group exists.
+    let owners_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || !args.stickies.is_empty();
     // Prefer the explicit state path, then a file beside either database.
     let state_path = args
         .exit_state
@@ -198,22 +210,12 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 .as_ref()
                 .map(|path| path.with_extension("state.json"))
         });
-    let state = (asn.is_some() || country_routing).then(|| exit_state::ExitState::load(state_path));
-    let local_exits = args
-        .local_exits
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|code| {
-            geo::pack_country(code)
-                .ok_or_else(|| anyhow::anyhow!("invalid local-exit country {code}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let exit_state = owners_needed.then(|| exit_state::ExitState::load(state_path));
     Ok(hub::GeoExits {
         geo: asn,
         country,
-        local_exits,
-        exit_state: state,
+        policy: args.exit_policy,
+        exit_state,
     })
 }
 
@@ -269,7 +271,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("install SIGTERM handler")?;
             let (stop, shutdown) = tokio::sync::watch::channel(false);
-            let client = hub::run(servers, None, args.stats_interval, hooks, shutdown, exits);
+            let client = hub::run(
+                servers,
+                None,
+                args.stats_interval,
+                hooks,
+                shutdown,
+                exits,
+                args.stickies.clone(),
+            );
             tokio::pin!(client);
             tokio::select! {
                 result = &mut client => result,
@@ -320,7 +330,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default()) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default(), Vec::new()) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),

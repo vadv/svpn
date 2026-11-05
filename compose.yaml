@@ -73,6 +73,16 @@ services:
       zby:
         ipv4_address: 172.32.77.5
 
+  dns:
+    image: svpn-test:local
+    init: true
+    command: [python3, -u, /e2e/dnsserver.py]
+    volumes:
+      - dnsconf:/dns
+    networks:
+      test:
+        ipv4_address: 172.30.77.7
+
   client:
     image: svpn-test:local
     init: true
@@ -86,6 +96,7 @@ services:
       SVPN_TEST_GROUP: ${SVPN_TEST_GROUP:-all}
     volumes:
       - keys:/keys:ro
+      - dnsconf:/dns
       - ${SVPN_TEST_ARTIFACTS:-./e2e/.work/artifacts/manual}/sessions:/testlogs
     networks:
       test:
@@ -93,6 +104,8 @@ services:
     depends_on:
       server:
         condition: service_healthy
+      dns:
+        condition: service_started
 
   target:
     image: svpn-test:local
@@ -106,6 +119,7 @@ services:
 
 volumes:
   keys:
+  dnsconf:
 
 networks:
   test:

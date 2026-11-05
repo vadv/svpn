@@ -72,44 +72,32 @@ pub struct Globals {
     pub server_down: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[derive(Clone, Debug, Default)]
 pub struct ServerSpec {
-    #[serde(rename = "address", deserialize_with = "deserialize_host")]
-    server: String,
-    ssh_port: Option<u16>,
-    weight: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_countries")]
-    countries: Vec<String>,
-    #[serde(rename = "ssh-user")]
-    user: Option<String>,
-    #[serde(rename = "ssh-identity")]
-    identity: Option<PathBuf>,
-    #[serde(
-        default,
-        rename = "ssh-host-key",
-        deserialize_with = "crate::config::pin"
-    )]
-    host_key: Option<Fingerprint>,
-    mimic: Option<Vec<MimicArg>>,
-    #[serde(rename = "ssh-remote-bin")]
-    remote_bin: Option<String>,
-    peer_tun_name: Option<String>,
-    peer_addr: Option<Ipv4Addr>,
-    #[serde(default, deserialize_with = "crate::config::port_range")]
-    udp_port_range: Option<(u16, u16)>,
-    tcp_port: Option<u16>,
-    server_up: Option<String>,
-    server_down: Option<String>,
+    /// Config-block label; empty for CLI-constructed specs.
+    pub label: String,
+    pub server: String,
+    pub ssh_port: Option<u16>,
+    pub weight: Option<u32>,
+    pub user: Option<String>,
+    pub identity: Option<PathBuf>,
+    pub host_key: Option<Fingerprint>,
+    pub mimic: Option<Vec<MimicArg>>,
+    pub remote_bin: Option<String>,
+    pub peer_tun_name: Option<String>,
+    pub peer_addr: Option<Ipv4Addr>,
+    pub udp_port_range: Option<(u16, u16)>,
+    pub tcp_port: Option<u16>,
+    pub server_up: Option<String>,
+    pub server_down: Option<String>,
 }
 
 /// Owned configuration retained across future supervisor retries.
 #[derive(Clone, Debug)]
 pub struct LinkParams {
+    pub label: String,
     pub server: String,
     pub weight: u32,
-    /// Country constraint of this exit; empty — none (spec: manual only).
-    pub countries: Vec<String>,
     pub identity: Option<PathBuf>,
     pub user: Option<String>,
     pub ssh_port: u16,
@@ -133,47 +121,35 @@ pub struct LinkParams {
 }
 
 impl ServerSpec {
-    pub(crate) fn from_host(host: &str) -> Result<Self> {
-        Ok(Self {
-            server: normalize_host(host)?,
-            ..Self::default()
-        })
-    }
-
-    /// Normalized two-letter ISO codes; empty — no country constraint.
-    pub fn countries(&self) -> &[String] {
-        &self.countries
-    }
-
     pub(crate) fn without_weight(&self, mode: &str) -> Result<()> {
         ensure!(self.weight.is_none(), "weight is not supported by {mode}");
         Ok(())
     }
 
     pub(crate) fn validate_fields(&self) -> Result<()> {
-        ensure!(self.ssh_port != Some(0), "ssh-port must be in 1..=65535");
+        ensure!(self.ssh_port != Some(0), "ssh_port must be in 1..=65535");
         ensure!(self.weight != Some(0), "weight must be nonzero");
         ensure!(
             self.user.as_ref().is_none_or(|v| !v.is_empty()),
-            "ssh-user must not be empty"
+            "ssh_user must not be empty"
         );
         ensure!(
             self.remote_bin.as_ref().is_none_or(|v| !v.is_empty()),
-            "ssh-remote-bin must not be empty"
+            "ssh_remote_bin must not be empty"
         );
         ensure!(
             self.identity
                 .as_ref()
                 .is_none_or(|v| !v.as_os_str().is_empty()),
-            "ssh-identity must not be empty"
+            "ssh_identity must not be empty"
         );
         ensure!(
             self.peer_addr.is_none_or(packet::unicast),
-            "peer-addr must be unicast IPv4"
+            "peer_addr must be unicast IPv4"
         );
         ensure!(
             self.server_up.as_ref().is_none_or(|v| !v.trim().is_empty()),
-            "server-up must not be empty"
+            "server_up must not be empty"
         );
         ensure!(
             self.server_up
@@ -186,7 +162,7 @@ impl ServerSpec {
             self.server_down
                 .as_ref()
                 .is_none_or(|v| !v.trim().is_empty()),
-            "server-down must not be empty"
+            "server_down must not be empty"
         );
         ensure!(
             self.server_down
@@ -196,21 +172,10 @@ impl ServerSpec {
             crate::config::MAX_SERVER_HOOK
         );
         if let Some(name) = self.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
-            validate_tun_name(name).context("peer-tun-name")?;
+            validate_tun_name(name).context("peer_tun_name")?;
         }
-        let mut seen = HashSet::new();
-        ensure!(
-            self.countries.iter().all(|code| seen.insert(code)),
-            "duplicate country code in countries"
-        );
         validate_mimic_fields(self.mimic.as_deref().unwrap_or_default())?;
         Ok(())
-    }
-
-    pub(crate) fn relative_identity(&mut self, base: &std::path::Path) {
-        if let Some(path) = &mut self.identity {
-            *path = base.join(&*path);
-        }
     }
 
     pub fn resolve(&self, globals: &Globals) -> Result<LinkParams> {
@@ -222,12 +187,12 @@ impl ServerSpec {
                     true,
                 ),
                 (Some(tun), Some(peer)) => (tun, peer, false),
-                _ => bail!("set both tun-addr and peer-addr, or neither for automatic assignment"),
+                _ => bail!("set both tun_addr and peer_addr, or neither for automatic assignment"),
             };
         let params = LinkParams {
+            label: self.label.clone(),
             server: self.server.clone(),
             weight: self.weight.unwrap_or(1),
-            countries: self.countries.clone(),
             identity: self
                 .identity
                 .as_ref()
@@ -319,10 +284,10 @@ impl FromStr for ServerSpec {
                 .transpose()?;
             ensure!(ssh_port != Some(0), "SSH port must be 1..=65535");
             let mut spec = Self {
+                label: String::new(),
                 server,
                 ssh_port,
                 weight: None,
-                countries: Vec::new(),
                 user: None,
                 identity: None,
                 host_key: None,
@@ -362,12 +327,6 @@ impl FromStr for ServerSpec {
                                 .collect::<Result<_>>()?,
                         );
                     }
-                    "countries" => {
-                        spec.countries = value
-                            .split('+')
-                            .map(|code| parse_country_code(code).map_err(anyhow::Error::msg))
-                            .collect::<Result<_>>()?;
-                    }
                     "remote-bin" => spec.remote_bin = Some(value.into()),
                     "peer-tun" => spec.peer_tun_name = Some(value.into()),
                     "peer-addr" => {
@@ -392,20 +351,20 @@ impl FromStr for ServerSpec {
 
 impl Globals {
     pub(crate) fn validate_fields(&self) -> Result<()> {
-        ensure!(self.ssh_port != 0, "ssh-port must be in 1..=65535");
+        ensure!(self.ssh_port != 0, "ssh_port must be in 1..=65535");
         ensure!(
             self.ssh_user.as_ref().is_none_or(|v| !v.is_empty()),
-            "ssh-user must not be empty"
+            "ssh_user must not be empty"
         );
         ensure!(
             !self.ssh_remote_bin.is_empty(),
-            "ssh-remote-bin must not be empty"
+            "ssh_remote_bin must not be empty"
         );
         ensure!(
             self.ssh_identity
                 .as_ref()
                 .is_none_or(|v| !v.as_os_str().is_empty()),
-            "ssh-identity must not be empty"
+            "ssh_identity must not be empty"
         );
         if let Some(pin) = &self.ssh_host_key {
             parse_host_key(pin)?;
@@ -423,14 +382,14 @@ impl Globals {
             "UDP ports require 1<=MIN<=MAX"
         );
         if let Some(name) = self.peer_tun_name.as_deref().filter(|v| !v.is_empty()) {
-            validate_tun_name(name).context("peer-tun-name")?;
+            validate_tun_name(name).context("peer_tun_name")?;
         }
         if let Some(name) = self.tun_name.as_deref().filter(|v| !v.is_empty()) {
-            validate_local_tun_name(name, cfg!(target_os = "macos")).context("tun-name")?;
+            validate_local_tun_name(name, cfg!(target_os = "macos")).context("tun_name")?;
         }
         ensure!(
             self.server_up.as_ref().is_none_or(|v| !v.trim().is_empty()),
-            "server-up must not be empty"
+            "server_up must not be empty"
         );
         ensure!(
             self.server_up
@@ -443,7 +402,7 @@ impl Globals {
             self.server_down
                 .as_ref()
                 .is_none_or(|v| !v.trim().is_empty()),
-            "server-down must not be empty"
+            "server_down must not be empty"
         );
         ensure!(
             self.server_down
@@ -545,7 +504,7 @@ fn server_ipv4(ip: Ipv4Addr) -> bool {
     packet::unicast(ip) && ip.octets()[0] != 0 && ip.octets()[0] < 240
 }
 
-fn normalize_host(host: &str) -> Result<String> {
+pub(crate) fn normalize_host(host: &str) -> Result<String> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         ensure!(server_ipv4(ip), "host must be a unicast IPv4 address");
         return Ok(ip.to_string());
@@ -588,20 +547,6 @@ pub(crate) fn parse_country_code(value: &str) -> Result<String, String> {
         }
         _ => Err("country code must be two ASCII letters, e.g. RU".into()),
     }
-}
-
-fn deserialize_countries<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error> {
-    <Vec<String> as serde::Deserialize>::deserialize(deserializer)?
-        .into_iter()
-        .map(|code| parse_country_code(&code).map_err(serde::de::Error::custom))
-        .collect()
-}
-
-fn deserialize_host<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let host = <String as serde::Deserialize>::deserialize(deserializer)?;
-    normalize_host(&host).map_err(serde::de::Error::custom)
 }
 
 fn validate_mimic_fields(mimic: &[MimicArg]) -> Result<()> {

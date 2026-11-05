@@ -1,6 +1,7 @@
 //! Persistent failover owners for sticky routing.
 //! Writes are atomic; corrupt or foreign-version state loads empty.
-//! Version 2 separates country, global ASN and country-scoped ASN keys.
+//! Version 1: automatic ASN groups and explicit sticky groups; no legacy
+//! migrations (EPIC-021 dropped pre-HCL state formats with the users).
 
 use std::{
     collections::HashMap,
@@ -12,18 +13,16 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 1;
 const FLUSH_EVERY: Duration = Duration::from_secs(5);
 
-/// Typed persistent exit key: one sticky assignment per domain.
+/// Typed persistent owner key: one sticky assignment per domain.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ExitKey {
-    /// Global ASN.
+    /// Automatic sticky-asn group.
     Asn(u32),
-    /// Country-scoped ASN (`CC:ASN`).
-    ScopedAsn(String, u32),
-    /// Country (`CC`).
-    Country(String),
+    /// Explicit sticky group (canonical `kind:members` selector key).
+    Sticky(String),
 }
 
 impl ExitKey {
@@ -31,25 +30,20 @@ impl ExitKey {
     fn key(&self) -> String {
         match self {
             ExitKey::Asn(asn) => asn.to_string(),
-            ExitKey::ScopedAsn(country, asn) => format!("{country}:{asn}"),
-            ExitKey::Country(country) => country.clone(),
+            ExitKey::Sticky(canonical) => canonical.clone(),
         }
     }
 
     /// Parse a stored map key; `None` marks a foreign or corrupt entry.
     fn parse(stored: &str) -> Option<Self> {
-        if let Some((country, asn)) = stored.split_once(':') {
-            return Some(ExitKey::ScopedAsn(country.to_string(), asn.parse().ok()?));
+        if stored.starts_with("name:")
+            || stored.starts_with("cc:")
+            || stored.starts_with("ip:")
+            || stored.starts_with("asn:")
+        {
+            return Some(ExitKey::Sticky(stored.to_string()));
         }
-        if let Ok(asn) = stored.parse() {
-            return Some(ExitKey::Asn(asn));
-        }
-        match stored.as_bytes() {
-            [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
-                Some(ExitKey::Country(stored.to_ascii_uppercase()))
-            }
-            _ => None,
-        }
+        stored.parse::<u32>().ok().map(ExitKey::Asn)
     }
 }
 
@@ -57,22 +51,13 @@ impl ExitKey {
 #[serde(deny_unknown_fields)]
 struct File {
     version: u32,
-    country: HashMap<String, String>,
     asn: HashMap<String, String>,
-}
-
-/// A version 1 document carries one `owners` map of numeric group keys.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Legacy {
-    version: u32,
-    #[serde(default)]
-    owners: HashMap<String, String>,
+    sticky: HashMap<String, String>,
 }
 
 pub struct ExitState {
-    country: HashMap<String, String>,
     asn: HashMap<String, String>,
+    sticky: HashMap<String, String>,
     path: Option<PathBuf>,
     dirty: bool,
     last_flush: Instant,
@@ -81,14 +66,14 @@ pub struct ExitState {
 impl ExitState {
     /// Missing, unreadable, corrupt or foreign-version state starts empty.
     pub fn load(path: Option<PathBuf>) -> Self {
-        let (country, asn) = path
+        let (asn, sticky) = path
             .as_deref()
             .and_then(|path| fs::read_to_string(path).ok())
             .and_then(|text| parse(&text))
             .unwrap_or_default();
         Self {
-            country,
             asn,
+            sticky,
             path,
             dirty: false,
             last_flush: Instant::now(),
@@ -103,8 +88,8 @@ impl ExitState {
     pub fn assign(&mut self, key: ExitKey, node: &str) {
         let stored = key.key();
         let map = match &key {
-            ExitKey::Country(_) => &mut self.country,
-            _ => &mut self.asn,
+            ExitKey::Asn(_) => &mut self.asn,
+            ExitKey::Sticky(_) => &mut self.sticky,
         };
         if map.get(&stored).is_none_or(|current| current != node) {
             map.insert(stored, node.to_string());
@@ -114,10 +99,10 @@ impl ExitState {
 
     /// Drop entries pinned to nodes that left the configuration.
     pub fn retain_nodes(&mut self, ids: &[String]) {
-        let before = self.country.len() + self.asn.len();
-        self.country.retain(|_, node| ids.contains(node));
+        let before = self.asn.len() + self.sticky.len();
         self.asn.retain(|_, node| ids.contains(node));
-        self.dirty |= self.country.len() + self.asn.len() != before;
+        self.sticky.retain(|_, node| ids.contains(node));
+        self.dirty |= self.asn.len() + self.sticky.len() != before;
     }
 
     pub fn flush_due(&mut self, now: Instant) {
@@ -142,8 +127,8 @@ impl ExitState {
 
     fn map(&self, key: &ExitKey) -> &HashMap<String, String> {
         match key {
-            ExitKey::Country(_) => &self.country,
-            _ => &self.asn,
+            ExitKey::Asn(_) => &self.asn,
+            ExitKey::Sticky(_) => &self.sticky,
         }
     }
 
@@ -153,8 +138,8 @@ impl ExitState {
         };
         let file = File {
             version: VERSION,
-            country: self.country.clone(),
             asn: self.asn.clone(),
+            sticky: self.sticky.clone(),
         };
         let bytes = serde_json::to_vec(&file).context("serialize exit state")?;
         let tmp = path.with_extension("json.tmp");
@@ -173,43 +158,25 @@ impl ExitState {
         Ok(())
     }
 
-    /// Restore link indices per typed key. The originating map is part of
-    /// the type: a numeric Country entry or an alphabetic ASN entry is
-    /// corrupt, not a key in the other domain. Stored keys that do not
-    /// parse and nodes that left the configuration are skipped.
+    /// Restore link indices per typed key. Each map accepts only its own key
+    /// shape: a numeric entry in the sticky map (or a canonical selector in
+    /// the asn map) is corrupt and skipped, not silently re-typed.
     pub fn owner_indices(&self, ids: &[String]) -> HashMap<ExitKey, usize> {
-        let country = self.country.iter().filter_map(|(stored, node)| {
-            let key = ExitKey::parse(stored)?;
-            if !matches!(key, ExitKey::Country(_)) {
-                return None;
-            }
-            ids.iter().position(|id| id == node).map(|link| (key, link))
-        });
+        let link_of = |node: &str| ids.iter().position(|id| id == node);
         let asn = self.asn.iter().filter_map(|(stored, node)| {
-            let key = ExitKey::parse(stored)?;
-            if matches!(key, ExitKey::Country(_)) {
-                return None;
-            }
-            ids.iter().position(|id| id == node).map(|link| (key, link))
+            let key = ExitKey::Asn(stored.parse::<u32>().ok()?);
+            link_of(node).map(|link| (key, link))
         });
-        country.chain(asn).collect()
+        let sticky = self.sticky.iter().filter_map(|(stored, node)| {
+            let key = ExitKey::parse(stored).filter(|key| matches!(key, ExitKey::Sticky(_)))?;
+            link_of(node).map(|link| (key, link))
+        });
+        asn.chain(sticky).collect()
     }
 }
 
-/// Both maps of a document, or `None` when it is corrupt or foreign.
-/// A v1 `owners` map migrates into the global ASN domain only: its keys
-/// were numeric group ids, and a v1 file has no country owners.
+/// Both maps of a document, or `None` when it is corrupt or foreign version.
 fn parse(text: &str) -> Option<(HashMap<String, String>, HashMap<String, String>)> {
-    if let Ok(file) = serde_json::from_str::<File>(text) {
-        return (file.version == VERSION).then_some((file.country, file.asn));
-    }
-    let legacy = serde_json::from_str::<Legacy>(text).ok()?;
-    (legacy.version == 1).then(|| {
-        let asn = legacy
-            .owners
-            .into_iter()
-            .filter(|(group, _)| group.parse::<u64>().is_ok())
-            .collect();
-        (HashMap::new(), asn)
-    })
+    let file = serde_json::from_str::<File>(text).ok()?;
+    (file.version == VERSION).then_some((file.asn, file.sticky))
 }

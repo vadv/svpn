@@ -36,7 +36,7 @@ tests/run.sh --matrix all    # All eight matrix rows; separate from integration
 
 | Integration group | Checks |
 | --- | --- |
-| `bootstrap` | CLI/TOML, SSH identity/trust, TUN names, logging/stats, addresses, readiness |
+| `bootstrap` | CLI/HCL, SSH identity/trust, TUN names, logging/stats, addresses, readiness |
 | `lifecycle-pool` | Hooks, hostname resolution, pool recovery, SSH/heartbeat loss, cleanup, Checking |
 | `udp` | Packet transfer, MTU, resource limits, forwarding/NAT, UDP ports, perf command |
 | `tcp-auto` | RST delivery, idle teardown, TCP framing/ports, fallback and exhausted candidates |

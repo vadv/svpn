@@ -1,5 +1,5 @@
-//! Exit state: typed country/ASN owners persist across restarts, corruption
-//! degrades to empty.
+//! Exit state: typed ASN/sticky owners persist across restarts, corruption
+//! degrades to empty. Format v1 (EPIC-021); no legacy migrations.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,8 +20,8 @@ fn roundtrip_survives_reload_per_domain() {
     let path = state_path("roundtrip");
     let mut state = ExitState::load(Some(path.clone()));
     state.assign(ExitKey::Asn(64512), "node-a");
-    state.assign(ExitKey::ScopedAsn("RU".into(), 64500), "node-b");
-    state.assign(ExitKey::Country("RU".into()), "node-b");
+    state.assign(ExitKey::Sticky("cc:RU".into()), "node-b");
+    state.assign(ExitKey::Sticky("name:claude.ai".into()), "node-b");
     state.flush();
 
     let reloaded = ExitState::load(Some(path.clone()));
@@ -31,22 +31,22 @@ fn roundtrip_survives_reload_per_domain() {
     );
     assert_eq!(
         reloaded
-            .owner(&ExitKey::ScopedAsn("RU".into(), 64500))
+            .owner(&ExitKey::Sticky("cc:RU".into()))
             .map(String::as_str),
         Some("node-b")
     );
     assert_eq!(
         reloaded
-            .owner(&ExitKey::Country("RU".into()))
+            .owner(&ExitKey::Sticky("name:claude.ai".into()))
             .map(String::as_str),
         Some("node-b")
     );
     // The maps are independent: one domain never answers another's query.
-    assert_eq!(reloaded.owner(&ExitKey::Country("DE".into())), None);
+    assert_eq!(reloaded.owner(&ExitKey::Sticky("cc:DE".into())), None);
     assert_eq!(
         reloaded.owner(&ExitKey::Asn(64500)),
         None,
-        "scoped and global ASN are distinct keys"
+        "explicit and automatic ASN keys are distinct"
     );
     let _ = std::fs::remove_file(path);
 }
@@ -56,17 +56,14 @@ fn written_document_keeps_both_maps_with_typed_string_keys() {
     let path = state_path("format");
     let mut state = ExitState::load(Some(path.clone()));
     state.assign(ExitKey::Asn(64512), "node-a");
-    state.assign(ExitKey::ScopedAsn("RU".into(), 64500), "node-b");
-    state.assign(ExitKey::Country("RU".into()), "node-c");
+    state.assign(ExitKey::Sticky("cc:RU".into()), "node-b");
     state.flush();
     let document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(document["version"], 2);
-    assert_eq!(document["country"]["RU"], "node-c");
+    assert_eq!(document["version"], 1);
     assert_eq!(document["asn"]["64512"], "node-a");
-    assert_eq!(document["asn"]["RU:64500"], "node-b");
-    assert_eq!(document["country"].as_object().unwrap().len(), 1);
-    assert_eq!(document["asn"].as_object().unwrap().len(), 2);
+    assert_eq!(document["sticky"]["cc:RU"], "node-b");
+    assert_eq!(document["sticky"].as_object().unwrap().len(), 1);
     let _ = std::fs::remove_file(path);
 }
 
@@ -74,41 +71,7 @@ fn written_document_keeps_both_maps_with_typed_string_keys() {
 fn missing_file_starts_empty() {
     let state = ExitState::load(Some(state_path("missing")));
     assert_eq!(state.owner(&ExitKey::Asn(42)), None);
-    assert_eq!(state.owner(&ExitKey::Country("RU".into())), None);
-}
-
-// ── v1 migration ──
-
-#[test]
-fn v1_owners_migrate_into_global_asn_only() {
-    let path = state_path("v1");
-    std::fs::write(
-        &path,
-        r#"{"version":1,"owners":{"64512":"node-a","junk":"node-b"}}"#,
-    )
-    .unwrap();
-    let mut state = ExitState::load(Some(path.clone()));
-    assert_eq!(
-        state.owner(&ExitKey::Asn(64512)).map(String::as_str),
-        Some("node-a")
-    );
-    assert_eq!(
-        state.owner(&ExitKey::Country("RU".into())),
-        None,
-        "a v1 file has no country owners"
-    );
-    // Non-numeric v1 group keys cannot be global ASN keys and are dropped.
-    assert_eq!(state.owner(&ExitKey::Asn(0)), None);
-
-    // The migration persists once the state is written again, as v2.
-    state.assign(ExitKey::Country("DE".into()), "node-c");
-    state.flush();
-    let document: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(document["version"], 2);
-    assert_eq!(document["asn"].as_object().unwrap().len(), 1);
-    assert_eq!(document["country"]["DE"], "node-c");
-    let _ = std::fs::remove_file(path);
+    assert_eq!(state.owner(&ExitKey::Sticky("cc:RU".into())), None);
 }
 
 // ── degradation, never an error ──
@@ -117,16 +80,20 @@ fn v1_owners_migrate_into_global_asn_only() {
 fn foreign_and_corrupt_documents_start_empty() {
     for text in [
         "not json at all",
-        r#"{"version":3,"country":{},"asn":{}}"#,
-        r#"{"version":2,"country":{"RU":"node-a"}}"#,
-        r#"{"version":1,"country":{},"asn":{}}"#,
-        r#"{"version":2,"country":{"RU":"node-a"},"asn":{},"extra":1}"#,
+        r#"{"version":2,"country":{},"asn":{}}"#,
+        r#"{"version":1,"asn":{},"sticky":{}}"#,
+        r#"{"version":1,"asn":{},"sticky":{},"extra":1}"#,
+        r#"{"version":1,"sticky":{"cc:RU":"node-a"}}"#,
     ] {
         let path = state_path("foreign");
         std::fs::write(&path, text).unwrap();
         let state = ExitState::load(Some(path.clone()));
         assert_eq!(state.owner(&ExitKey::Asn(1)), None, "{text}");
-        assert_eq!(state.owner(&ExitKey::Country("RU".into())), None, "{text}");
+        assert_eq!(
+            state.owner(&ExitKey::Sticky("cc:RU".into())),
+            None,
+            "{text}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -170,10 +137,9 @@ fn retain_nodes_drops_departed_in_both_maps() {
     let path = state_path("retain");
     let mut state = ExitState::load(Some(path.clone()));
     state.assign(ExitKey::Asn(42), "node-a");
-    state.assign(ExitKey::ScopedAsn("DE".into(), 64500), "node-a");
-    state.assign(ExitKey::Country("RU".into()), "node-b");
+    state.assign(ExitKey::Sticky("cc:RU".into()), "node-b");
     state.retain_nodes(&["node-a".to_string()]);
-    assert_eq!(state.owner(&ExitKey::Country("RU".into())), None);
+    assert_eq!(state.owner(&ExitKey::Sticky("cc:RU".into())), None);
     state.flush();
 
     let reloaded = ExitState::load(Some(path.clone()));
@@ -181,25 +147,19 @@ fn retain_nodes_drops_departed_in_both_maps() {
         reloaded.owner(&ExitKey::Asn(42)).map(String::as_str),
         Some("node-a")
     );
-    assert_eq!(
-        reloaded
-            .owner(&ExitKey::ScopedAsn("DE".into(), 64500))
-            .map(String::as_str),
-        Some("node-a")
-    );
-    assert_eq!(reloaded.owner(&ExitKey::Country("RU".into())), None);
+    assert_eq!(reloaded.owner(&ExitKey::Sticky("cc:RU".into())), None);
     let _ = std::fs::remove_file(path);
 }
 
 // ── restore ──
 
 #[test]
-fn owner_indices_are_typed_and_skip_foreign_entries() {
+fn owner_indices_are_typed_per_map_and_skip_foreign_entries() {
     let path = state_path("indices");
     std::fs::write(
         &path,
-        r#"{"version":2,"country":{"RU":"node-a","??":"node-a","64512":"node-b"},
-            "asn":{"64512":"node-a","RU:64500":"node-b","DE":"node-a","junk":"node-a"}}"#,
+        r#"{"version":1,"sticky":{"cc:RU":"node-a","64512":"node-b","name:x":"node-b"},
+            "asn":{"64512":"node-a","cc:DE":"node-b","junk":"node-a"}}"#,
     )
     .unwrap();
     let state = ExitState::load(Some(path.clone()));
@@ -207,13 +167,16 @@ fn owner_indices_are_typed_and_skip_foreign_entries() {
     let mut indices = state.owner_indices(&ids);
     assert_eq!(indices.remove(&ExitKey::Asn(64512)), Some(0));
     assert_eq!(
-        indices.remove(&ExitKey::ScopedAsn("RU".to_string(), 64500)),
+        indices.remove(&ExitKey::Sticky("cc:RU".to_string())),
+        Some(0)
+    );
+    assert_eq!(
+        indices.remove(&ExitKey::Sticky("name:x".to_string())),
         Some(1)
     );
-    assert_eq!(indices.remove(&ExitKey::Country("RU".to_string())), Some(0));
     assert!(
         indices.is_empty(),
-        "unparseable stored keys are not restored"
+        "cross-map keys are corrupt, never re-typed"
     );
     let _ = std::fs::remove_file(path);
 }

@@ -4,7 +4,7 @@ use svpn::{Cli, Mode, setup};
 
 #[test]
 fn setup_requires_exactly_one_of_config_or_server() {
-    let cli = Cli::try_parse_from(["svpn", "setup", "--config", "client.toml"]).unwrap();
+    let cli = Cli::try_parse_from(["svpn", "setup", "--config", "client.hcl"]).unwrap();
     assert!(matches!(cli.command, Mode::Setup { .. }));
     let cli = Cli::try_parse_from(["svpn", "setup", "--server", "203.0.113.10"]).unwrap();
     let Mode::Setup { client } = cli.command else {
@@ -17,7 +17,7 @@ fn setup_requires_exactly_one_of_config_or_server() {
             "svpn",
             "setup",
             "--config",
-            "client.toml",
+            "client.hcl",
             "--server",
             "203.0.113.10"
         ])

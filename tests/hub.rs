@@ -20,9 +20,9 @@ use tokio::time::Instant;
 
 fn link_params(server: Ipv4Addr) -> LinkParams {
     LinkParams {
+        label: String::new(),
         server: server.to_string(),
         weight: 1,
-        countries: Vec::new(),
         identity: None,
         user: None,
         ssh_port: 22,
@@ -47,6 +47,7 @@ fn link_params(server: Ipv4Addr) -> LinkParams {
 fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
+        policy: svpn::cli::ExitPolicy::Balance,
         links: servers
             .into_iter()
             .enumerate()
@@ -67,7 +68,10 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         pool: Pool::new([1, 1]),
         geo: None,
         country: None,
-        local_exits: Vec::new(),
+        stickies: Vec::new(),
+        sticky_via: Vec::new(),
+        sticky_updates: None,
+        sticky_task: None,
         local: None,
         local_task: None,
         local_cleanup: None,
@@ -398,7 +402,8 @@ async fn parallel_bootstrap_failures_exit_without_creating_a_tun() {
                 0,
                 Hooks::default(),
                 shutdown,
-                GeoExits::default()
+                GeoExits::default(),
+                Vec::new()
             ),
             peer
         );

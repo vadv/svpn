@@ -10,34 +10,37 @@ separate configuration on the VPS.
 %%{init: {"flowchart": {"wrappingWidth": 280}}}%%
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
-    tun --> brain("🧠 Path selection<br/>by destination address")
-    brain -->|"RU"| local["🏠 Local exit<br/>NAT → WAN"]
-    local --> home["🌍 home IP is visible"]
-    brain -->|"rest of the world"| asn["🎯 sticky-ASN: each destination<br/>network (Claude Code, Google…)<br/>is pinned to one VPS"]
-    asn --> mimic["🕵️ Camouflage: the client<br/>picks what to look like<br/>UDP, TCP when UDP blocked"]
-    mimic -->|"Claude Code"| vps1["🖥️ VPS-1 · NL · ≈3/4 of networks<br/>🕵️ looks like ssh traffic"]
-    mimic -->|"Google"| vps2["🖥️ VPS-2 · DE · ≈1/4 of networks<br/>🕵️ looks like mosh traffic"]
+    tun --> rules("📋 Sticky rules —<br/>ordered as written,<br/>first match wins")
+    rules -->|"a name from a rule<br/>claude.ai"| vps1["🖥️ VPS-1 · NL<br/>🎯 pinned by the rule<br/>🕵️ looks like ssh"]
+    rules -->|"a country from a rule<br/>RU"| local2["🏠 via = local<br/>outside the VPN"]
+    local2 --> home["🌍 home IP is visible"]
+    rules -->|"everything else"| fb["🎲 fallback_sticky:<br/>balance or sticky-asn —<br/>networks by VPS weights"]
+    fb -->|"≈3/4 of networks"| vps1
+    fb -->|"≈1/4 of networks"| vps2["🖥️ VPS-2 · DE<br/>🕵️ looks like mosh"]
     vps1 --> net1["🌍 VPS-1 IP is visible"]
     vps2 --> net2["🌍 VPS-2 IP is visible"]
-    vps1 -.->|"if VPS-1 dies,<br/>networks move over"| vps2
-    classDef brain fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
+    vps1 -.->|"if VPS-1 dies, its groups<br/>move to VPS-2 and stay<br/>when it comes back"| vps2
+    classDef rules fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px,color:#4a148c
     classDef local fill:#e8f5e9,stroke:#43a047,color:#1b5e20
-    classDef asn fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef fb fill:#fff8e1,stroke:#f9a825,color:#5d4037
     classDef vpn fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
     classDef edge fill:#eceff1,stroke:#546e7a,color:#263238
-    class brain brain
-    class local local
-    class asn asn
-    class mimic,vps1,vps2 vpn
-    class home,net1,net2 edge
+    class rules rules
+    class local2,home local
+    class fb fb
+    class vps1,vps2 vpn
+    class net1,net2 edge
 ```
 
-The client picks the path before encryption. Addresses in `local-exits` (for
-example RU) leave through the local exit — the site sees your home IP.
-Everything else is encrypted and sent to a VPS — the site sees the server IP.
-With several VPSs, `sticky-asn` pins every destination ASN to one server so a
-service sees a stable external IP. Tunnel traffic is disguised: the client
-itself picks what to look like on the channel and switches to TCP when UDP is
+The client picks the path before encryption. The `sticky` rules in the config
+are checked in order: the first match decides where the address goes.
+`via = ["nl"]` pins it to one VPS (when that VPS dies its groups move to the
+next one in the list and stay there when it returns); `via = local` sends it
+outside the VPN — the site sees your home IP. When nothing matches,
+`fallback_sticky` takes over: `balance` spreads flows by weights, and
+`sticky-asn` pins every destination network (ASN) to one VPS so a service
+sees a stable external IP. Tunnel traffic is disguised: the client itself
+picks what to look like on the channel and switches to TCP when UDP is
 blocked.
 
 ## Quick start
@@ -110,32 +113,36 @@ If `ifconfig.me` shows the VPS IP, traffic goes through the tunnel.
 
 ### Several VPSs — no harder than one
 
-One `[[servers]]` line per server, shared SSH settings on top:
+One `server` block per server, shared SSH settings on top. The config is HCL:
 
-```toml
-# vpn.toml
-ssh-user = "root"
-ssh-identity = "/full/path/to/key"
+```hcl
+# vpn.hcl
+ssh {
+  user     = "root"
+  identity = "/full/path/to/key"
+}
 
-[[servers]]
-address = "203.0.113.10"
+server "nl" {
+  address = "203.0.113.10"
+}
 
-[[servers]]
-address = "198.51.100.20"
+server "de" {
+  address = "198.51.100.20"
+}
 ```
 
 ```bash
-sudo svpn setup --config vpn.toml      # provision both VPSs
-sudo -E svpn multi --config vpn.toml   # run
+sudo svpn setup --config vpn.hcl      # provision both VPSs
+sudo -E svpn multi --config vpn.hcl   # run
 ```
 
 Traffic is distributed between the servers by weight (equal by default). When a
 VPS goes down its networks move to the remaining ones and return once it is back.
 
-## Country and ASN databases — only for local-exit and sticky-asn
+## Country and ASN databases — only for sticky modes
 
-You do not need databases for a plain VPN. To send RU destinations directly
-or pin the exit by ASN, download them on the client:
+You do not need databases for a plain VPN. To pin exits by country or ASN
+(sticky blocks in ADVANCED), download them on the client:
 
 ```bash
 sudo install -d -m 700 /etc/svpn
@@ -157,9 +164,9 @@ network is it”. Enabling these modes is covered in ADVANCED.
 Everything beyond the quick-start pair of servers is covered in
 [ADVANCED.en.md](ADVANCED.en.md):
 
-- server weights and per-ASN exit pinning (`sticky-asn`);
-- country-based selection and `local-exit` for RU;
-- `sticky-asn` — a stable external IP per ASN;
+- `sticky` blocks: pinning exits by DNS names, IPs, ASNs and countries;
+- `via = local` — sending selected addresses outside the VPN;
+- `fallback_sticky` — how the pool serves the remaining traffic;
 - Country and ASN databases and their updates;
 - hooks and environment variables;
 - transport: mimic, TCP fallback, UDP port range;

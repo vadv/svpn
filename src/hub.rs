@@ -58,24 +58,24 @@ pub struct StickyStats {
     pub lookup_hit: u64,
     pub lookup_miss: u64,
     pub failover_moves: u64,
-    pub country_hit: u64,
-    pub country_miss: u64,
     pub asn_hit: u64,
     pub asn_miss: u64,
+    /// Explicit sticky blocks: matches, resolver outcomes.
+    pub block_hit: u64,
+    pub resolve_ok: u64,
+    pub resolve_fail: u64,
+    pub resolved_ips: u64,
+    pub purged_ips: u64,
 }
 
 impl StickyStats {
-    fn lookup(&mut self, country: bool, hit: bool) {
+    fn lookup(&mut self, hit: bool) {
         if hit {
             self.lookup_hit += 1;
+            self.asn_hit += 1;
         } else {
             self.lookup_miss += 1;
-        }
-        match (country, hit) {
-            (true, true) => self.country_hit += 1,
-            (true, false) => self.country_miss += 1,
-            (false, true) => self.asn_hit += 1,
-            (false, false) => self.asn_miss += 1,
+            self.asn_miss += 1;
         }
     }
 }
@@ -98,26 +98,11 @@ pub struct LocalExitState {
     pub ready: bool,
 }
 
-/// A destination country with assigned servers.
-/// Country constrains candidates; ASN supplies affinity within them.
-struct CountryRoute {
-    /// Packed ISO code — the rendezvous key payload.
-    packed: u32,
-    /// Links configured for the country, in configuration order.
-    candidates: Vec<usize>,
-    /// Destination ASN when the ASN database covers it.
-    asn: Option<u32>,
-}
-
-impl CountryRoute {
-    /// Use a scoped `CC:ASN` persistence key when ASN data is available.
-    fn exit_key(&self) -> crate::exit_state::ExitKey {
-        let code = crate::geo::unpack_country(self.packed);
-        match self.asn {
-            Some(asn) => crate::exit_state::ExitKey::ScopedAsn(code, asn),
-            None => crate::exit_state::ExitKey::Country(code),
-        }
-    }
+/// First-match decision for one destination.
+enum Route {
+    Local,
+    Sticky(usize),
+    Auto,
 }
 
 pub struct Hub {
@@ -126,17 +111,24 @@ pub struct Hub {
     /// Sticky exit: ASN grouping under exit-policy sticky-asn;
     /// None = weighted balance.
     pub geo: Option<crate::geo::Geo>,
-    /// Sticky exit: country table for the destination Country constraint;
-    /// None = no country routing.
+    /// Country table for countries selectors; None — no country data.
     pub country: Option<crate::geo::Geo>,
-    /// Packed countries whose destinations use local-exit.
-    pub local_exits: Vec<u32>,
+    /// Explicit sticky blocks, in config order (first match wins).
+    pub stickies: Vec<crate::sticky::RuntimeSticky>,
+    /// `via` resolved to link indices at startup.
+    pub sticky_via: Vec<crate::sticky::ResolvedVia>,
+    /// Resolver deliveries; None when no name selectors exist.
+    pub sticky_updates: Option<mpsc::Receiver<crate::sticky::Update>>,
+    /// Episodic name resolver; aborted when the hub goes away.
+    pub sticky_task: Option<tokio::task::JoinHandle<()>>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
     pub local_cleanup: Option<LocalServer>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
+    /// Fallback strategy for traffic matched by no sticky block.
+    pub policy: crate::cli::ExitPolicy,
     /// Sticky owners: group key → link index. An alive owner keeps its group
     /// (no snap-back); reassigned only when the owner cannot serve new flows.
     pub exit_owners: std::collections::HashMap<u64, usize>,
@@ -214,16 +206,23 @@ impl Hub {
         }
     }
 
-    /// A database match in local-exits uses the local path; misses use VPN.
-    fn is_local_exit(&self, destination: Ipv4Addr) -> bool {
-        self.country
-            .as_ref()
-            .and_then(|geo| geo.lookup(destination))
-            .is_some_and(|country| self.local_exits.contains(&country))
+    /// Where one destination goes: the first matching sticky block decides;
+    /// a miss falls back to the automatic strategy.
+    fn route(&mut self, destination: Ipv4Addr) -> Route {
+        for (index, block) in self.stickies.iter().enumerate() {
+            if block.matches(destination, self.country.as_ref(), self.geo.as_ref()) {
+                self.sticky.block_hit += 1;
+                return match &self.sticky_via[index] {
+                    crate::sticky::ResolvedVia::Local => Route::Local,
+                    crate::sticky::ResolvedVia::Links(_) => Route::Sticky(index),
+                };
+            }
+        }
+        Route::Auto
     }
 
-    /// Local-exit traffic never falls back to the VPN; other traffic picks a
-    /// remote owner.
+    /// Sticky-block traffic never falls back; other traffic picks a remote
+    /// owner through the automatic strategy.
     fn open_flow(
         &mut self,
         parsed: &packet::Packet,
@@ -231,10 +230,16 @@ impl Hub {
         client_ip: Ipv4Addr,
     ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
-        if self.is_local_exit(key.destination) {
-            return self.open_local(parsed, bytes);
+        // Retry throttled persistence on every new flow, whatever routes it.
+        if let Some(state) = &mut self.exit_state {
+            state.flush_due(StdInstant::now());
         }
-        let Some(epoch) = self.pick(&key) else {
+        let epoch = match self.route(key.destination) {
+            Route::Local => return self.open_local(parsed, bytes),
+            Route::Sticky(index) => self.pick_sticky(index),
+            Route::Auto => self.pick(&key),
+        };
+        let Some(epoch) = epoch else {
             return Ok(None);
         };
         let link = &self.links[epoch.link];
@@ -245,6 +250,22 @@ impl Hub {
         self.routes
             .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?;
         Ok(None)
+    }
+
+    /// Owner of one sticky group: rendezvous inside `via`, no snap-back,
+    /// failover persisted under the canonical selector key.
+    fn pick_sticky(&mut self, index: usize) -> Option<Epoch> {
+        let canonical = self.stickies[index].block.canonical_key();
+        let group = crate::sticky::group_key(&canonical);
+        let links: Vec<usize> = match &self.sticky_via[index] {
+            crate::sticky::ResolvedVia::Links(links) => links.clone(),
+            crate::sticky::ResolvedVia::Local => unreachable!("route() separated local blocks"),
+        };
+        self.sticky_epoch(
+            group,
+            Some(&links),
+            crate::exit_state::ExitKey::Sticky(canonical),
+        )
     }
 
     fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
@@ -446,23 +467,30 @@ impl Hub {
             report.push('\n');
             report.push_str(&stats::format("all servers", &delta, &total, elapsed));
         }
-        if self.geo.is_some() || self.country.is_some() {
+        if self.geo.is_some() {
             report.push_str(&format!(
                 "\nsticky: lookup hit {} / miss {} | failover moves {}",
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
             ));
-            report.push_str(&format!(
-                "\ncountry: lookup hit {} / miss {} | asn: lookup hit {} / miss {}",
-                self.sticky.country_hit,
-                self.sticky.country_miss,
-                self.sticky.asn_hit,
-                self.sticky.asn_miss
-            ));
         }
-        if !self.local_exits.is_empty() {
+        if self
+            .stickies
+            .iter()
+            .any(|s| matches!(s.block.via, crate::sticky::Via::Local))
+        {
             report.push_str(&format!(
                 "\nlocal-exit: opened {} / failed {} / closed {}",
                 self.local_stats.opened, self.local_stats.failed, self.local_stats.closed
+            ));
+        }
+        if !self.stickies.is_empty() {
+            report.push_str(&format!(
+                "\nsticky: blocks matched {} | resolve ok {} / fail {} | ips {} (purged {})",
+                self.sticky.block_hit,
+                self.sticky.resolve_ok,
+                self.sticky.resolve_fail,
+                self.sticky.resolved_ips,
+                self.sticky.purged_ips
             ));
         }
         for line in per_link {
@@ -624,54 +652,21 @@ impl Hub {
     }
 
     pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
-        // Retry throttled persistence even when no failover follows.
-        if let Some(state) = &mut self.exit_state {
-            state.flush_due(StdInstant::now());
-        }
-        // Country constrains candidates before ASN affinity, even in balance mode.
-        if let Some(route) = self.country_route(key.destination) {
-            let group = match route.asn {
-                Some(asn) => crate::geo::scoped_asn_key(route.packed, asn),
-                None => crate::geo::country_key(route.packed),
-            };
-            return self.sticky_epoch(group, Some(&route.candidates), route.exit_key(), true);
+        if self.policy != crate::cli::ExitPolicy::StickyAsn {
+            return self.pool.pick();
         }
         let Some(geo) = &self.geo else {
             return self.pool.pick();
         };
         let Some(asn) = geo.lookup(key.destination) else {
             // Uncovered /32 uses stateless rendezvous without persisted ownership.
-            self.sticky.lookup(false, false);
+            self.sticky.lookup(false);
             return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
                 .into_iter()
                 .find_map(|link| self.pool.ready_epoch(link));
         };
         let group = crate::geo::asn_key(asn);
-        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn), false)
-    }
-
-    /// Return assigned destination countries as a candidate constraint.
-    /// Unknown or unassigned countries leave normal selection unchanged.
-    fn country_route(&self, destination: Ipv4Addr) -> Option<CountryRoute> {
-        let packed = self.country.as_ref()?.lookup(destination)?;
-        let code = crate::geo::unpack_country(packed);
-        let candidates: Vec<usize> = self
-            .links
-            .iter()
-            .enumerate()
-            .filter(|(_, link)| link.params.countries.contains(&code))
-            .map(|(link, _)| link)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        Some(CountryRoute {
-            packed,
-            candidates,
-            // The ASN affinity applies only under exit-policy sticky-asn:
-            // without the ASN database the group is the country itself.
-            asn: self.geo.as_ref().and_then(|geo| geo.lookup(destination)),
-        })
+        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn))
     }
 
     /// Select a sticky owner without snap-back.
@@ -682,18 +677,17 @@ impl Hub {
         group: u64,
         candidates: Option<&[usize]>,
         key: crate::exit_state::ExitKey,
-        country: bool,
     ) -> Option<Epoch> {
         let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
-        if let Some(&owner) = self.exit_owners.get(&group) {
+        if let Some(&owner) = self.exit_owners.get(&group).filter(|&&owner| serves(owner)) {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
-                self.sticky.lookup(country, true);
+                self.sticky.lookup(true);
                 return Some(epoch);
             }
             // Checking owner keeps its group: serve new flows from a reserve
             // without migrating (spec: no migration on Checking).
             if self.pool.link_checking(owner) {
-                self.sticky.lookup(country, true);
+                self.sticky.lookup(true);
                 return crate::geo::rendezvous(group, &self.nodes)
                     .into_iter()
                     .filter(|&link| link != owner && serves(link))
@@ -709,7 +703,7 @@ impl Hub {
                 return None;
             }
         }
-        self.sticky.lookup(country, false);
+        self.sticky.lookup(false);
         let previous = self.exit_owners.get(&group).copied();
         let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
             .into_iter()
@@ -737,6 +731,21 @@ impl Hub {
         Some(epoch)
     }
 
+    /// Fold one resolver delivery into the block cache and the counters.
+    fn apply_sticky_update(&mut self, update: crate::sticky::Update) {
+        if update.ok {
+            self.sticky.resolve_ok += 1;
+            self.sticky.resolved_ips = update.ips.len() as u64;
+            self.sticky.purged_ips += update.purged as u64;
+            if let Some(block) = self.stickies.get_mut(update.index) {
+                block.resolved = update.ips;
+            }
+        } else {
+            self.sticky.resolve_fail += 1;
+            crate::warn!("sticky: name resolution failed — keeping the previous IP set");
+        }
+    }
+
     async fn start_local(
         &mut self,
         client: Ipv4Addr,
@@ -744,7 +753,11 @@ impl Hub {
         primary_tun: &str,
         params: &LinkParams,
     ) -> Result<()> {
-        if self.local_exits.is_empty() || self.local.is_some() {
+        let wants_local = self
+            .stickies
+            .iter()
+            .any(|s| matches!(s.block.via, crate::sticky::Via::Local));
+        if !wants_local || self.local.is_some() {
             return Ok(());
         }
         let epoch = Epoch {
@@ -853,6 +866,17 @@ impl Hub {
                 event = self.incoming.recv() => {
                     let (epoch, event) = event.context("server event channel stopped")?;
                     self.handle_event(epoch, event, tun, &params, &mut started, hooks).await?;
+                }
+                update = async {
+                    match &mut self.sticky_updates {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.sticky_updates.is_some() => {
+                    match update {
+                        Some(update) => self.apply_sticky_update(update),
+                        None => self.sticky_updates = None,
+                    }
                 }
                 event = async {
                     match &mut self.local {
@@ -1023,42 +1047,162 @@ impl Hub {
     }
 }
 
-/// Geo-driven exit inputs of one client run (spec §2-4): the ASN affinity
-/// table, the country constraint table and the one shared owner state.
+/// Geo-driven exit inputs of one client run: the ASN affinity table, the
+/// country table, the fallback strategy, the explicit sticky blocks and the
+/// shared owner state.
 #[derive(Default)]
 pub struct GeoExits {
     /// ASN database; None — sticky-asn degraded to weighted balance.
     pub geo: Option<crate::geo::Geo>,
-    /// Country database; None — no country routing.
+    /// Country database; None — no country data.
     pub country: Option<crate::geo::Geo>,
-    /// Packed countries whose destinations use local-exit.
-    pub local_exits: Vec<u32>,
+    /// Fallback strategy for traffic matched by no sticky block.
+    pub policy: crate::cli::ExitPolicy,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
 }
 
 /// Map a persisted typed owner key to its numeric rendezvous group.
-/// Restore only while the owner remains a candidate for its country.
 #[doc(hidden)]
-pub fn restored_group(
-    servers: &[LinkParams],
-    key: crate::exit_state::ExitKey,
-    link: usize,
-) -> Option<u64> {
-    let candidate = |code: &str| {
-        servers
-            .get(link)
-            .is_some_and(|params| params.countries.iter().any(|c| c == code))
-    };
+pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
     match key {
         crate::exit_state::ExitKey::Asn(asn) => Some(crate::geo::asn_key(asn)),
-        crate::exit_state::ExitKey::Country(code) if candidate(&code) => {
-            Some(crate::geo::country_key(crate::geo::pack_country(&code)?))
+        crate::exit_state::ExitKey::Sticky(canonical) => Some(crate::sticky::group_key(&canonical)),
+    }
+}
+
+/// Start the episodic name resolver when any sticky block selects by name.
+/// The task resolves every due block in order (first resolve immediately),
+/// purges IPs missing from two refreshes, and stops on shutdown or when the
+/// hub drops the receiving end.
+fn spawn_sticky_resolver(
+    stickies: &[crate::sticky::RuntimeSticky],
+    shutdown: &mut watch::Receiver<bool>,
+) -> (
+    Option<mpsc::Receiver<crate::sticky::Update>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let named: Vec<(usize, Vec<String>, Duration)> = stickies
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match &block.block.selector {
+            crate::sticky::Selector::Names(names) => {
+                Some((index, names.clone(), block.block.every))
+            }
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return (None, None);
+    }
+    let (tx, rx) = mpsc::channel(16);
+    let mut shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let mut caches: Vec<crate::sticky::ResolveCache> =
+            (0..named.len()).map(|_| Default::default()).collect();
+        let mut next: Vec<tokio::time::Instant> =
+            named.iter().map(|_| tokio::time::Instant::now()).collect();
+        // One blocking lookup per slot at a time: a stuck getaddrinfo (glibc
+        // bounds its own retries) delays its block instead of piling up
+        // blocking threads on every tick.
+        let mut in_flight: Vec<Option<tokio::task::JoinHandle<Option<Vec<Ipv4Addr>>>>> =
+            (0..named.len()).map(|_| None).collect();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                () = tokio::time::sleep_until(next.iter().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))) => {
+                    let now = tokio::time::Instant::now();
+                    for slot in 0..named.len() {
+                        if next[slot] > now {
+                            continue;
+                        }
+                        if let Some(handle) = &mut in_flight[slot] {
+                            if !handle.is_finished() {
+                                next[slot] = now + Duration::from_secs(1);
+                                continue;
+                            }
+                            let outcome = handle.await.unwrap_or(None);
+                            in_flight[slot] = None;
+                            deliver(&tx, &mut caches[slot], named[slot].0, outcome).await;
+                            next[slot] = now + named[slot].2;
+                            continue;
+                        }
+                        let names = named[slot].1.clone();
+                        in_flight[slot] = Some(tokio::task::spawn_blocking(move || {
+                            let mut ips = Vec::new();
+                            for name in &names {
+                                match resolve_blocking(name) {
+                                    Some(found) => ips.extend(found),
+                                    None => return None,
+                                }
+                            }
+                            Some(ips)
+                        }));
+                        // Re-check the join soon: the first refresh must land
+                        // right after startup, not one `every` later.
+                        next[slot] = now + Duration::from_millis(100);
+                    }
+                }
+            }
         }
-        crate::exit_state::ExitKey::ScopedAsn(code, asn) if candidate(&code) => Some(
-            crate::geo::scoped_asn_key(crate::geo::pack_country(&code)?, asn),
-        ),
-        _ => None,
+    });
+    (Some(rx), Some(task))
+}
+
+/// Fold one finished lookup into the cache and send the update upstream.
+async fn deliver(
+    tx: &mpsc::Sender<crate::sticky::Update>,
+    cache: &mut crate::sticky::ResolveCache,
+    index: usize,
+    outcome: Option<Vec<Ipv4Addr>>,
+) {
+    let (ips, ok) = match outcome {
+        Some(mut ips) => {
+            ips.sort_unstable();
+            ips.dedup();
+            (ips, true)
+        }
+        None => (Vec::new(), false),
+    };
+    let (set, purged) = if ok {
+        cache.refresh(&ips)
+    } else {
+        (Default::default(), 0)
+    };
+    let _ = tx
+        .send(crate::sticky::Update {
+            index,
+            ips: set,
+            purged,
+            ok,
+        })
+        .await; // a closed channel ends the task via the next send error path
+}
+
+/// One name → unique IPv4 addresses via the system resolver, on a blocking
+/// thread. An empty answer is `Some(vec![])`: the refresh still counts (that
+/// is how disappeared IPs purge). None on error keeps the previous cache.
+fn resolve_blocking(name: &str) -> Option<Vec<Ipv4Addr>> {
+    use std::net::ToSocketAddrs;
+    // Only a real answer counts as a refresh: a resolver error keeps the
+    // previous set instead of purging it (glibc reports NODATA and NXDOMAIN
+    // alike as errors, so absence ages out only via a successful empty set).
+    (name, 0).to_socket_addrs().ok().map(|addrs| {
+        addrs
+            .map(|addr| addr.ip())
+            .filter_map(|ip| match ip {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+impl Drop for Hub {
+    fn drop(&mut self) {
+        if let Some(task) = &self.sticky_task {
+            task.abort();
+        }
     }
 }
 
@@ -1069,14 +1213,37 @@ pub async fn run(
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
     exits: GeoExits,
+    sticky_blocks: Vec<crate::sticky::StickyBlock>,
 ) -> Result<()> {
     let GeoExits {
         geo,
         country,
-        local_exits,
+        policy: exits_policy,
         exit_state,
     } = exits;
     ensure!(!servers.is_empty(), "no servers configured");
+    let stickies: Vec<crate::sticky::RuntimeSticky> = sticky_blocks
+        .into_iter()
+        .map(crate::sticky::RuntimeSticky::new)
+        .collect();
+    let label_index: std::collections::HashMap<String, usize> = servers
+        .iter()
+        .enumerate()
+        .filter(|(_, params)| !params.label.is_empty())
+        .map(|(index, params)| (params.label.clone(), index))
+        .collect();
+    let sticky_via: Vec<crate::sticky::ResolvedVia> = stickies
+        .iter()
+        .map(|block| match &block.block.via {
+            crate::sticky::Via::Local => crate::sticky::ResolvedVia::Local,
+            crate::sticky::Via::Servers(labels) => crate::sticky::ResolvedVia::Links(
+                labels
+                    .iter()
+                    .map(|label| label_index[label])
+                    .collect::<Vec<usize>>(),
+            ),
+        })
+        .collect();
     if hooks.needs_auto_up() || hooks.needs_auto_down() {
         hooks.set_server_addrs(crate::client_routing::server_addrs(&servers).await?);
     }
@@ -1094,9 +1261,7 @@ pub async fn run(
             state
                 .owner_indices(&ids)
                 .into_iter()
-                .filter_map(|(key, link)| {
-                    restored_group(&servers, key, link).map(|group| (group, link))
-                })
+                .filter_map(|(key, link)| restored_group(key).map(|group| (group, link)))
                 .collect()
         }
         None => std::collections::HashMap::new(),
@@ -1104,10 +1269,15 @@ pub async fn run(
     // Startup grace covers exactly the restored owners: two connect budgets.
     let grace_until = (!exit_owners.is_empty()).then(|| StdInstant::now() + STARTUP_GRACE);
     let (events, incoming) = mpsc::channel(QUEUE);
+    let (sticky_updates, sticky_task) = spawn_sticky_resolver(&stickies, &mut shutdown);
     let mut hub = Hub {
         geo,
         country,
-        local_exits,
+        policy: exits_policy,
+        stickies,
+        sticky_via,
+        sticky_updates,
+        sticky_task,
         local: None,
         local_task: None,
         local_cleanup: None,
