@@ -123,7 +123,9 @@ fn job_command(command: crate::cli::JobCommand) -> Result<()> {
     }
     let code = crate::job::run_foreground(&spec, &env);
     if code != 0 {
-        // Propagate the job's code verbatim through the process exit.
+        // Propagate the job's code verbatim through the process exit;
+        // flush the log thread first — process::exit skips destructors.
+        logging::finish();
         std::process::exit(code);
     }
     Ok(())
