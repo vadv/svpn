@@ -47,7 +47,10 @@ sticky "ru" {
   via       = local     # мимо VPN: сайт видит ваш домашний IP
 }
 
-# ничего не совпало → fallback_sticky (balance | sticky-asn)
+# третья ветка схемы — то, что не поймали правила:
+fallback_sticky {
+  strategy = "sticky-asn"   # или "balance": сети по весам VPS,
+}                           # sticky-asn держит каждую за одним сервером
 ```
 
 Отказ VPS переносит его группы на следующий из `via` и не возвращает их

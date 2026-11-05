@@ -48,7 +48,10 @@ sticky "ru" {
   via       = local     # outside the VPN: the site sees your home IP
 }
 
-# nothing matched → fallback_sticky (balance | sticky-asn)
+// the diagram's third branch — whatever the rules did not catch:
+fallback_sticky {
+  strategy = "sticky-asn"   // or "balance": networks by VPS weights,
+}                           // sticky-asn keeps each on one server
 ```
 
 When a VPS dies its groups move to the next one in `via` and stay there
