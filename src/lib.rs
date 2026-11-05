@@ -24,6 +24,7 @@ pub mod framing;
 pub mod geo;
 pub mod hooks;
 pub mod hub;
+pub mod job;
 pub mod limits;
 pub mod link_io;
 pub mod local_exit;

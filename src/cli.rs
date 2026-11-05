@@ -45,6 +45,9 @@ pub struct ClientArgs {
     /// Explicit sticky groups (config-file only).
     #[arg(skip)]
     pub stickies: Vec<crate::sticky::StickyBlock>,
+    /// Scheduled background jobs (config-file only).
+    #[arg(skip)]
+    pub jobs: Vec<crate::job::JobSpec>,
     #[command(flatten)]
     pub hooks: hooks::Args,
     #[command(flatten)]

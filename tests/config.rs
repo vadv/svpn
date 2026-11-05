@@ -436,6 +436,77 @@ fn sticky_selectors_require_their_databases() {
     );
 }
 
+// ── job blocks ──
+
+#[test]
+fn job_blocks_parse_with_defaults() {
+    let args = parse(
+        concat!(
+            "server \"main\" {\n  address = \"a.example\"\n}\n",
+            "job \"geo-update\" {\n",
+            "  every = \"24h\"\n",
+            "  run = <<EOF\n",
+            "curl -fL \"https://example/dbip-$(date +%Y-%m).csv.gz\"\n",
+            "EOF\n",
+            "  reload = [\"geo\", \"country\"]\n",
+            "}\n",
+            "job \"probe\" {\n",
+            "  every = \"5m\"\n",
+            "  timeout = \"30s\"\n",
+            "  run = \"exit 0\"\n",
+            "}\n",
+        ),
+        Path::new("/configs"),
+        false,
+    )
+    .unwrap();
+    let jobs = &args.jobs;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].label, "geo-update");
+    assert_eq!(jobs[0].every, std::time::Duration::from_secs(86400));
+    assert_eq!(
+        jobs[0].timeout,
+        std::time::Duration::from_secs(600),
+        "default timeout"
+    );
+    assert!(
+        jobs[0].run.contains("$(date +%Y-%m)"),
+        "shell $( passes the sanitizer"
+    );
+    assert_eq!(
+        jobs[0].reload,
+        [svpn::job::Reload::Geo, svpn::job::Reload::Country]
+    );
+    assert_eq!(jobs[1].timeout, std::time::Duration::from_secs(30));
+    assert!(jobs[1].reload.is_empty());
+}
+
+#[test]
+fn job_blocks_reject_invalid_shapes() {
+    let base = "server \"a\" {\n  address = \"a.example\"\n}\n";
+    for job in [
+        // every missing / below the floor
+        "job \"x\" {\n  run = \"true\"\n}\n",
+        "job \"x\" {\n  every = \"30s\"\n  run = \"true\"\n}\n",
+        // run missing / blank
+        "job \"x\" {\n  every = \"5m\"\n}\n",
+        "job \"x\" {\n  every = \"5m\"\n  run = \" \"\n}\n",
+        // timeout out of bounds
+        "job \"x\" {\n  every = \"5m\"\n  timeout = \"0s\"\n  run = \"true\"\n}\n",
+        "job \"x\" {\n  every = \"5m\"\n  timeout = \"25h\"\n  run = \"true\"\n}\n",
+        // reload vocabulary and duplicates
+        "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n  reload = [\"dns\"]\n}\n",
+        "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n  reload = [\"geo\", \"geo\"]\n}\n",
+        // labels: duplicate, invalid charset, extra
+        "job \"x\" {\n  every = \"5m\"\n  run = \"true\"\n}\njob \"x\" {\n  every = \"5m\"\n  run = \"true\"\n}\n",
+        "job \"Bad Label\" {\n  every = \"5m\"\n  run = \"true\"\n}\n",
+        "job \"x\" \"y\" {\n  every = \"5m\"\n  run = \"true\"\n}\n",
+    ] {
+        let text = format!("{base}{job}");
+        assert!(parse(&text, Path::new("."), false).is_err(), "{job}");
+    }
+}
+
 // ── server hooks ──
 
 #[test]
