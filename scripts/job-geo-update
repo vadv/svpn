@@ -32,13 +32,13 @@ case "$SVPN_OS" in
   *) curl -fsSL --max-filesize 104857600 "$url" -o "$tmp.gz" ;;
 esac
 [ "$(wc -c <"$tmp.gz")" -le 104857600 ] || { echo "geo-update: download exceeds 100 MiB" >&2; exit 1; }
-# Cap the expanded file (~500 MiB in 512-byte blocks) before decompressing.
+# Cap the expanded file (~477 MiB: 976563 x 512-byte blocks) before decompressing.
 ulimit -f 976563 2>/dev/null || true
 gzip -dc "$tmp.gz" >"$tmp"
 rm -f "$tmp.gz"
 # Validate rows, not lines: a broken mirror must not replace the database
 # with a same-sized pile of garbage.
-rows=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+' "$tmp")
+rows=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+' "$tmp" || true)
 [ "$rows" -ge 100000 ] || { echo "geo-update: suspicious download ($rows valid rows)" >&2; exit 1; }
 mv "$tmp" "$db"
 echo "geo-update: $rows rows installed"

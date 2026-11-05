@@ -13,11 +13,12 @@ use svpn::{geo, session, stats};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-/// Write a minimal-but-valid ASN table: /17 blocks, ≥ the MIN_ROWS floor.
-fn write_geo_csv(path: &std::path::Path, asn_first: u32) {
+/// Write a valid ASN table with a chosen row count (≥ the MIN_ROWS floor);
+/// a different count is a genuinely different table for reload assertions.
+fn write_geo_csv(path: &std::path::Path, asn_first: u32, rows: u32) {
     use std::fmt::Write as _;
     let mut text = String::new();
-    for row in 0u32..(1 << 17) {
+    for row in 0u32..rows {
         let start = row << 15;
         let end = start | 0x7fff;
         let _ = writeln!(
@@ -107,7 +108,7 @@ fn reload_geo_loads_the_table_and_clears_pending() {
     let dir = std::env::temp_dir().join(format!("svpn-jobs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv = dir.join("asn.csv");
-    write_geo_csv(&csv, 64512);
+    write_geo_csv(&csv, 64512, 131072);
     let mut hub = jobs_hub(Some(csv.clone()));
     assert!(hub.geo.is_none());
     hub.reload_geo("geo-update");
@@ -125,7 +126,7 @@ fn reload_geo_failure_keeps_the_previous_table() {
     let dir = std::env::temp_dir().join(format!("svpn-jobs-keep-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv = dir.join("asn.csv");
-    write_geo_csv(&csv, 64512);
+    write_geo_csv(&csv, 64512, 131072);
     let mut hub = jobs_hub(Some(csv.clone()));
     hub.reload_geo("geo-update");
     assert!(hub.geo.is_some());
@@ -149,7 +150,7 @@ fn report_is_honest_about_degraded_state_and_counters() {
     let dir = std::env::temp_dir().join(format!("svpn-jobs-report-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv = dir.join("asn.csv");
-    write_geo_csv(&csv, 64512);
+    write_geo_csv(&csv, 64512, 131072);
     let mut hub = jobs_hub(Some(csv));
     let report = hub.stats_report(Duration::from_secs(1));
     assert!(report.contains("geo: missing (job geo-update)"), "{report}");
@@ -171,15 +172,19 @@ fn report_is_honest_about_degraded_state_and_counters() {
 fn failed_and_timed_out_jobs_never_reload_the_table() {
     let dir = std::env::temp_dir().join(format!("svpn-jobs-fail-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // The job "installed" a different, valid database and then failed:
-    // routing must not change — a failed script's disk output is untrusted.
+    // Two genuinely different tables: the hub serves good.csv; the job
+    // "installed" swapped.csv and then failed. A failed or timed-out job
+    // must not swap the in-memory table; only a successful one may.
     let good = dir.join("good.csv");
     let swapped = dir.join("swapped.csv");
-    write_geo_csv(&good, 64512);
-    write_geo_csv(&swapped, 100);
-    let mut hub = jobs_hub(Some(swapped.clone()));
+    write_geo_csv(&good, 64512, 131072);
+    write_geo_csv(&swapped, 100, 100500);
+    let mut hub = jobs_hub(Some(good.clone()));
     hub.reload_geo("geo-update");
     let before = hub.geo.as_ref().unwrap().rows();
+    // Point the reload source at the swapped file: if the handler reloaded
+    // on failure, rows() would change to the swapped table's count.
+    hub.geo_path = Some(swapped.clone());
     for build in [
         || JobStatus::Failed("exit 1".to_owned()),
         || JobStatus::Timeout,
@@ -200,18 +205,17 @@ fn failed_and_timed_out_jobs_never_reload_the_table() {
     assert_eq!(hub.job_stats.runs, 2);
     assert_eq!(hub.job_stats.failures, 1);
     assert_eq!(hub.job_stats.timeouts, 1);
-    // Only success swaps the table.
+    // Success reloads from the same source — this must swap the table.
     hub.handle_job_event(svpn::hub::JobEvent {
         label: "geo-update".to_owned(),
         status: JobStatus::Ok,
         tail: String::new(),
         reload: vec![Reload::Geo],
     });
-    assert_eq!(
+    assert_ne!(
         hub.geo.as_ref().unwrap().rows(),
         before,
-        "same file, same rows"
+        "a successful job must reload the swapped table"
     );
     std::fs::remove_dir_all(dir).unwrap();
-    let _ = good;
 }
