@@ -78,6 +78,13 @@ fn local_hub() -> Hub {
         sticky_via: vec![svpn::sticky::ResolvedVia::Local],
         sticky_updates: None,
         sticky_task: None,
+        job_events: None,
+        job_task: None,
+        job_stats: JobStats::default(),
+        geo_path: None,
+        country_path: None,
+        geo_pending: None,
+        country_pending: None,
         stickies: vec![svpn::sticky::RuntimeSticky::new(
             svpn::sticky::StickyBlock {
                 label: "local".to_owned(),

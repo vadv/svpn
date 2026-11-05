@@ -98,6 +98,66 @@ pub struct LocalExitState {
     pub ready: bool,
 }
 
+/// One finished job attempt, delivered to the hub loop.
+pub struct JobEvent {
+    pub label: String,
+    pub status: crate::job::JobStatus,
+    pub tail: String,
+    pub reload: Vec<crate::job::Reload>,
+}
+
+/// Everything the scheduler needs: specs, reload paths and the env contract.
+#[derive(Default)]
+pub struct JobContext {
+    pub specs: Vec<crate::job::JobSpec>,
+    pub geo_db: Option<std::path::PathBuf>,
+    pub country_db: Option<std::path::PathBuf>,
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+impl JobContext {
+    /// The documented environment contract; scripts never hardcode paths.
+    fn env(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            (
+                "SVPN_OS".to_owned(),
+                // The only musl target we ship is OpenWrt; scripts branch on it.
+                if cfg!(all(target_os = "linux", target_env = "musl")) {
+                    "openwrt".to_owned()
+                } else {
+                    std::env::consts::OS.to_owned()
+                },
+            ),
+            ("SVPN_JOB".to_owned(), String::new()),
+        ];
+        if let Some(path) = &self.geo_db {
+            env.push(("SVPN_GEO_DB".to_owned(), path.display().to_string()));
+        }
+        if let Some(path) = &self.country_db {
+            env.push(("SVPN_COUNTRY_DB".to_owned(), path.display().to_string()));
+        }
+        if let Some(dir) = &self.config_dir {
+            env.push(("SVPN_CONFIG_DIR".to_owned(), dir.display().to_string()));
+        }
+        env
+    }
+}
+
+/// Late-bound run inputs: sticky blocks and the job context.
+#[derive(Default)]
+pub struct Extras {
+    pub sticky_blocks: Vec<crate::sticky::StickyBlock>,
+    pub jobs: JobContext,
+}
+
+/// Periodic job counters for the stats report.
+#[derive(Default)]
+pub struct JobStats {
+    pub runs: u64,
+    pub failures: u64,
+    pub timeouts: u64,
+}
+
 /// First-match decision for one destination.
 enum Route {
     Local,
@@ -121,6 +181,18 @@ pub struct Hub {
     pub sticky_updates: Option<mpsc::Receiver<crate::sticky::Update>>,
     /// Episodic name resolver; aborted when the hub goes away.
     pub sticky_task: Option<tokio::task::JoinHandle<()>>,
+    /// Job completions; None when no jobs are configured.
+    pub job_events: Option<mpsc::Receiver<JobEvent>>,
+    /// Job scheduler; aborted when the hub goes away.
+    pub job_task: Option<tokio::task::JoinHandle<()>>,
+    /// Job counters for the stats report.
+    pub job_stats: JobStats,
+    /// Reload sources for the geo/country tables.
+    pub geo_path: Option<std::path::PathBuf>,
+    pub country_path: Option<std::path::PathBuf>,
+    /// A provider job exists but the table is not on disk yet.
+    pub geo_pending: Option<String>,
+    pub country_pending: Option<String>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
     pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -473,6 +545,18 @@ impl Hub {
                 self.sticky.lookup_hit, self.sticky.lookup_miss, self.sticky.failover_moves
             ));
         }
+        if self.job_task.is_some() || self.job_stats.runs > 0 {
+            report.push_str(&format!(
+                "\njobs: runs {} / failures {} / timeouts {}",
+                self.job_stats.runs, self.job_stats.failures, self.job_stats.timeouts
+            ));
+        }
+        if let Some(label) = &self.geo_pending {
+            report.push_str(&format!("\ngeo: missing (job {label})"));
+        }
+        if let Some(label) = &self.country_pending {
+            report.push_str(&format!("\ncountry: missing (job {label})"));
+        }
         if self
             .stickies
             .iter()
@@ -731,6 +815,62 @@ impl Hub {
         Some(epoch)
     }
 
+    /// Count one finished job, then reload whatever it asked for. A failed
+    /// reload keeps the previous table: the file on disk is the script's
+    /// responsibility, not ours to fix.
+    fn handle_job_event(&mut self, event: JobEvent) {
+        self.job_stats.runs += 1;
+        match &event.status {
+            crate::job::JobStatus::Ok => {}
+            crate::job::JobStatus::Failed(_) => self.job_stats.failures += 1,
+            crate::job::JobStatus::Timeout => self.job_stats.timeouts += 1,
+        }
+        for table in &event.reload {
+            match table {
+                crate::job::Reload::Geo => self.reload_geo(&event.label),
+                crate::job::Reload::Country => self.reload_country(&event.label),
+            }
+        }
+    }
+
+    /// Re-read the ASN table from the configured path; the previous table
+    /// stays on any error. No policy on top of the loader.
+    pub fn reload_geo(&mut self, label: &str) {
+        let Some(path) = self.geo_path.clone() else {
+            return;
+        };
+        match crate::geo::Geo::load(&path) {
+            Ok(table) => {
+                crate::info!(
+                    "geo database reloaded (job {label}): {} IPv4 ranges",
+                    table.rows()
+                );
+                self.geo = Some(table);
+                self.geo_pending = None;
+            }
+            // Broken file, not ours to fix; keep serving the previous table.
+            Err(error) => crate::error!("job {label}: geo reload failed: {error:#}"),
+        }
+    }
+
+    /// Re-read the country table from the configured path; same contract.
+    pub fn reload_country(&mut self, label: &str) {
+        let Some(path) = self.country_path.clone() else {
+            return;
+        };
+        match crate::geo::Geo::load_country(&path) {
+            Ok(table) => {
+                crate::info!(
+                    "country database reloaded (job {label}): {} IPv4 ranges",
+                    table.rows()
+                );
+                self.country = Some(table);
+                self.country_pending = None;
+            }
+            Err(error) => crate::error!("job {label}: country reload failed: {error:#}"),
+        }
+    }
+
     /// Fold one resolver delivery into the block cache and the counters.
     fn apply_sticky_update(&mut self, update: crate::sticky::Update) {
         if update.ok {
@@ -876,6 +1016,17 @@ impl Hub {
                     match update {
                         Some(update) => self.apply_sticky_update(update),
                         None => self.sticky_updates = None,
+                    }
+                }
+                job = async {
+                    match &mut self.job_events {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.job_events.is_some() => {
+                    match job {
+                        Some(job) => self.handle_job_event(job),
+                        None => self.job_events = None,
                     }
                 }
                 event = async {
@@ -1060,6 +1211,9 @@ pub struct GeoExits {
     pub policy: crate::cli::ExitPolicy,
     /// Sticky owner persistence; None — nothing sticky is active.
     pub exit_state: Option<crate::exit_state::ExitState>,
+    /// The table is missing but a provider job is fetching it (degraded start).
+    pub geo_pending: Option<String>,
+    pub country_pending: Option<String>,
 }
 
 /// Map a persisted typed owner key to its numeric rendezvous group.
@@ -1075,6 +1229,120 @@ pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
 /// The task resolves every due block in order (first resolve immediately),
 /// purges IPs missing from two refreshes, and stops on shutdown or when the
 /// hub drops the receiving end.
+/// Start the job scheduler when any job is configured. Attempts begin at
+/// startup (each one gated by `run_if`) and repeat every `every`; a still
+/// running job delays its next attempt instead of stacking.
+fn spawn_job_scheduler(
+    context: &JobContext,
+    shutdown: &mut watch::Receiver<bool>,
+) -> (
+    Option<mpsc::Receiver<JobEvent>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    if context.specs.is_empty() {
+        return (None, None);
+    }
+    let (tx, rx) = mpsc::channel(16);
+    let mut shutdown = shutdown.clone();
+    let specs = context.specs.clone();
+    let env = context.env();
+    let task = tokio::spawn(async move {
+        let mut next: Vec<tokio::time::Instant> =
+            specs.iter().map(|_| tokio::time::Instant::now()).collect();
+        let mut in_flight: Vec<Option<tokio::task::JoinHandle<(crate::job::JobStatus, String)>>> =
+            specs.iter().map(|_| None).collect();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                () = tokio::time::sleep_until(next.iter().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))) => {
+                    let now = tokio::time::Instant::now();
+                    for slot in 0..specs.len() {
+                        if next[slot] > now {
+                            continue;
+                        }
+                        if let Some(handle) = &mut in_flight[slot] {
+                            if !handle.is_finished() {
+                                next[slot] = now + Duration::from_secs(1);
+                                continue;
+                            }
+                            let (status, tail) = handle.await.unwrap_or((
+                                crate::job::JobStatus::Failed("scheduler join failed".to_owned()),
+                                String::new(),
+                            ));
+                            in_flight[slot] = None;
+                            let spec = &specs[slot];
+                            crate::job::log_run(spec, &status, &tail);
+                            if tx
+                                .send(JobEvent {
+                                    label: spec.label.clone(),
+                                    status,
+                                    tail,
+                                    reload: spec.reload.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return; // hub is gone
+                            }
+                            next[slot] = now + spec.every;
+                            continue;
+                        }
+                        let spec = &specs[slot];
+                        // The run_if gate: 0 — there is work, anything else —
+                        // a cheap skip; a broken check never blind-runs.
+                        if let Some(check) = &spec.run_if {
+                            let check_spec = crate::job::JobSpec {
+                                label: spec.label.clone(),
+                                every: spec.every,
+                                timeout: spec.timeout,
+                                run_if: None,
+                                run: check.clone(),
+                                reload: Vec::new(),
+                            };
+                            let mut check_env: Vec<(String, String)> = env.clone();
+                            for (key, value) in &mut check_env {
+                                if key == "SVPN_JOB" {
+                                    value.push_str(&spec.label);
+                                }
+                            }
+                            let (status, _tail) = crate::job::run(&check_spec, &check_env).await;
+                            match status {
+                                crate::job::JobStatus::Ok => {}
+                                crate::job::JobStatus::Failed(reason) => {
+                                    if reason.contains("spawn failed") {
+                                        crate::error!("job {}: run_if broken: {reason}", spec.label);
+                                    } else {
+                                        crate::info!("job: {} up-to-date, skipped", spec.label);
+                                    }
+                                    next[slot] = now + spec.every;
+                                    continue;
+                                }
+                                crate::job::JobStatus::Timeout => {
+                                    crate::error!("job {}: run_if timed out", spec.label);
+                                    next[slot] = now + spec.every;
+                                    continue;
+                                }
+                            }
+                        }
+                        let spec = spec.clone();
+                        let mut run_env: Vec<(String, String)> = env.clone();
+                        for (key, value) in &mut run_env {
+                            if key == "SVPN_JOB" {
+                                value.push_str(&spec.label);
+                            }
+                        }
+                        in_flight[slot] = Some(tokio::spawn(async move {
+                            crate::job::run(&spec, &run_env).await
+                        }));
+                        next[slot] = now + Duration::from_millis(100);
+                    }
+                }
+            }
+        }
+    });
+    (Some(rx), Some(task))
+}
+
 fn spawn_sticky_resolver(
     stickies: &[crate::sticky::RuntimeSticky],
     shutdown: &mut watch::Receiver<bool>,
@@ -1203,6 +1471,9 @@ impl Drop for Hub {
         if let Some(task) = &self.sticky_task {
             task.abort();
         }
+        if let Some(task) = &self.job_task {
+            task.abort();
+        }
     }
 }
 
@@ -1213,14 +1484,21 @@ pub async fn run(
     mut hooks: Hooks,
     mut shutdown: watch::Receiver<bool>,
     exits: GeoExits,
-    sticky_blocks: Vec<crate::sticky::StickyBlock>,
+    extras: Extras,
 ) -> Result<()> {
+    let Extras {
+        sticky_blocks,
+        jobs,
+    } = extras;
     let GeoExits {
         geo,
         country,
         policy: exits_policy,
         exit_state,
+        geo_pending,
+        country_pending,
     } = exits;
+    let (job_events, job_task) = spawn_job_scheduler(&jobs, &mut shutdown);
     ensure!(!servers.is_empty(), "no servers configured");
     let stickies: Vec<crate::sticky::RuntimeSticky> = sticky_blocks
         .into_iter()
@@ -1274,6 +1552,13 @@ pub async fn run(
         geo,
         country,
         policy: exits_policy,
+        job_events,
+        job_task,
+        job_stats: JobStats::default(),
+        geo_path: jobs.geo_db,
+        country_path: jobs.country_db,
+        geo_pending,
+        country_pending,
         stickies,
         sticky_via,
         sticky_updates,

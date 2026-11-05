@@ -144,6 +144,24 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         .stickies
         .iter()
         .any(|s| matches!(s.selector, sticky::Selector::Asn(_)));
+    let provider_of = |table: GeoTable| {
+        args.jobs
+            .iter()
+            .find(|job| {
+                job.reload.iter().any(|r| {
+                    matches!(
+                        (r, table),
+                        (crate::job::Reload::Geo, GeoTable::Geo)
+                            | (crate::job::Reload::Country, GeoTable::Country)
+                    )
+                })
+            })
+            .map(|job| job.label.clone())
+    };
+    let geo_provider = provider_of(GeoTable::Geo);
+    let country_provider = provider_of(GeoTable::Country);
+    let mut geo_pending = None;
+    let mut country_pending = None;
     let asn_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || asn_selectors;
     let asn = match (&args.geo_db, asn_needed) {
         (_, false) => {
@@ -161,11 +179,18 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
                 );
                 Some(geo)
             }
-            // Graceful degradation only for the automatic fallback: a broken
-            // database degrades sticky-asn to balance. An explicit asn
-            // selector keeps its promise or the run does not start; the
-            // country database below is strict for the same reason — a wrong
-            // table misroutes flows instead of losing affinity.
+            // A missing file with a provider job is a degraded start, not an
+            // error: the job fetches the table and reload activates it live.
+            // Other errors keep the old contract: graceful for the automatic
+            // fallback, strict for explicit asn selectors.
+            Err(error) if error.chain().any(is_not_found) && geo_provider.is_some() => {
+                crate::error!(
+                    "vpn: started degraded — geo database missing, job {label} fetching it",
+                    label = geo_provider.clone().unwrap_or_default()
+                );
+                geo_pending = geo_provider;
+                None
+            }
             Err(error) if !asn_selectors => {
                 crate::error!("{error:#} — falling back to balance");
                 None
@@ -179,15 +204,25 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         .iter()
         .any(|s| matches!(s.selector, sticky::Selector::Countries(_)));
     let country = match (&args.country_db, country_needed) {
-        (Some(path), true) => {
-            let country = geo::Geo::load_country(path)?;
-            crate::info!(
-                "country database {}: {} IPv4 ranges",
-                path.display(),
-                country.rows()
-            );
-            Some(country)
-        }
+        (Some(path), true) => match geo::Geo::load_country(path) {
+            Ok(country) => {
+                crate::info!(
+                    "country database {}: {} IPv4 ranges",
+                    path.display(),
+                    country.rows()
+                );
+                Some(country)
+            }
+            Err(error) if error.chain().any(is_not_found) && country_provider.is_some() => {
+                crate::error!(
+                    "vpn: started degraded — country database missing, job {label} fetching it",
+                    label = country_provider.clone().unwrap_or_default()
+                );
+                country_pending = country_provider;
+                None
+            }
+            Err(error) => return Err(error),
+        },
         (Some(_), false) => {
             crate::warn!("country db set without countries selectors — ignoring");
             None
@@ -217,6 +252,8 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         country,
         policy: args.exit_policy,
         exit_state,
+        geo_pending,
+        country_pending,
     })
 }
 
@@ -272,6 +309,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("install SIGTERM handler")?;
             let (stop, shutdown) = tokio::sync::watch::channel(false);
+            let jobs = hub::JobContext {
+                specs: args.jobs.clone(),
+                geo_db: args.geo_db.clone(),
+                country_db: args.country_db.clone(),
+                config_dir: args
+                    .config
+                    .as_deref()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+            };
             let client = hub::run(
                 servers,
                 None,
@@ -279,7 +325,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 hooks,
                 shutdown,
                 exits,
-                args.stickies.clone(),
+                hub::Extras {
+                    sticky_blocks: args.stickies.clone(),
+                    jobs,
+                },
             );
             tokio::pin!(client);
             tokio::select! {
@@ -331,7 +380,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             tokio::pin!(measure);
             let (_stop, shutdown) = tokio::sync::watch::channel(false);
             let Some(outcome) = tokio::select! {
-                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default(), Vec::new()) => {
+                result = hub::run(vec![params], Some(started), 0, hooks::Hooks::default(), shutdown, hub::GeoExits::default(), hub::Extras::default()) => {
                     result.context("VPN session ended before the measurement finished").map(|()| None)
                 }
                 result = &mut measure => result.map(Some),
@@ -885,4 +934,18 @@ pub fn validate_addresses(local: Ipv4Addr, peer: Ipv4Addr, mtu: u16) -> Result<(
         "MTU must be between 576 and 1400"
     );
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum GeoTable {
+    Geo,
+    Country,
+}
+
+/// True when the error root is a missing file (ENOENT), the degraded-start
+/// signal for provider jobs.
+fn is_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }

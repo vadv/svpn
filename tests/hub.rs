@@ -72,6 +72,13 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         sticky_via: Vec::new(),
         sticky_updates: None,
         sticky_task: None,
+        job_events: None,
+        job_task: None,
+        job_stats: JobStats::default(),
+        geo_path: None,
+        country_path: None,
+        geo_pending: None,
+        country_pending: None,
         local: None,
         local_task: None,
         local_cleanup: None,
@@ -403,7 +410,7 @@ async fn parallel_bootstrap_failures_exit_without_creating_a_tun() {
                 Hooks::default(),
                 shutdown,
                 GeoExits::default(),
-                Vec::new()
+                Extras::default()
             ),
             peer
         );
