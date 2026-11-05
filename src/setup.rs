@@ -9,6 +9,8 @@ use crate::{config, ssh};
 
 pub const SETUP_SCRIPT: &str = include_str!("../scripts/setup");
 pub const SERVER_UP: &str = include_str!("../scripts/server-up");
+const JOB_GEO_UPDATE: &str = include_str!("../scripts/job-geo-update");
+const JOB_COUNTRY_UPDATE: &str = include_str!("../scripts/job-country-update");
 pub const SERVER_DOWN: &str = include_str!("../scripts/server-down");
 
 /// Effective server up hook: an explicit command wins, otherwise the embedded example.
@@ -28,6 +30,8 @@ pub fn example(name: &str) -> Option<&'static str> {
         "client-down" => Some(crate::client_routing::DOWN),
         "server-up" => Some(SERVER_UP),
         "server-down" => Some(SERVER_DOWN),
+        "job-geo-update" => Some(JOB_GEO_UPDATE),
+        "job-country-update" => Some(JOB_COUNTRY_UPDATE),
         _ => None,
     }
 }

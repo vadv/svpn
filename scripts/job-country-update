@@ -1,0 +1,39 @@
+# Автообновление country-базы (DB-IP Country Lite, ежемесячно).
+# Скопируйте блок в vpn.hcl целиком. svpn сам решает, когда качать (run_if),
+# стартует не дожидаясь базы и подхватывает её вживую (reload).
+# Проверить руками: svpn job run country-update --config vpn.hcl
+job "country-update" {
+  every   = "1h"
+  timeout = "10m"
+  run_if  = <<EOF
+db=$SVPN_COUNTRY_DB
+[ -n "$db" ] || exit 1
+[ -f "$db" ] || exit 0
+# BSD stat and GNU stat shadow each other depending on PATH, and GNU `stat -f`
+# even exits 0 with filesystem garbage — so validate the answer, not the code.
+mtime=$(stat -f %m "$db" 2>/dev/null)
+case "$mtime" in ''|*[!0-9]*) mtime=$(stat -c %Y "$db") ;; esac
+file_month=$(date -u -d "@$mtime" +%Y-%m 2>/dev/null || date -u -r "$mtime" +%Y-%m)
+[ "$file_month" = "$(date +%Y-%m)" ] && exit 1
+exit 0
+EOF
+  run     = <<EOF
+set -eu
+db=$SVPN_COUNTRY_DB
+dir=$(dirname "$db")
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/country.XXXXXX")
+url="https://download.db-ip.com/free/dbip-country-lite-$(date +%Y-%m).csv.gz"
+case "$SVPN_OS" in
+  openwrt) wget -qO "$tmp.gz" "$url" ;;
+  *) curl -fsSL "$url" -o "$tmp.gz" ;;
+esac
+gzip -dc "$tmp.gz" >"$tmp"
+rm -f "$tmp.gz"
+lines=$(wc -l <"$tmp")
+[ "$lines" -ge 100000 ] || { echo "country-update: suspiciously small download ($lines rows)" >&2; rm -f "$tmp"; exit 1; }
+mv "$tmp" "$db"
+echo "country-update: $lines rows installed"
+EOF
+  reload  = ["country"]
+}
