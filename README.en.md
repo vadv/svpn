@@ -11,7 +11,7 @@ separate configuration on the VPS.
 flowchart TD
     app["🖥️ Application"] --> tun["Client TUN<br/>10.77.0.2"]
     tun --> rules("📋 Sticky rules —<br/>ordered as written,<br/>first match wins")
-    rules -->|"a name from a rule<br/>claude.ai"| vps1["🖥️ VPS-1 · NL<br/>🎯 pinned by the rule<br/>🕵️ looks like ssh"]
+    rules -->|"a name from a rule<br/>git.example.com"| vps1["🖥️ VPS-1 · NL<br/>🎯 pinned by the rule<br/>🕵️ looks like ssh"]
     rules -->|"a country from a rule<br/>RU"| local2["🏠 via = local<br/>outside the VPN"]
     local2 --> home["🌍 home IP is visible"]
     rules -->|"everything else"| fb["🎲 fallback_sticky:<br/>balance or sticky-asn —<br/>networks by VPS weights"]
@@ -32,13 +32,13 @@ flowchart TD
     class net1,net2 edge
 ```
 
-The diagram is literally the config. Its three branches are three `sticky`
-rules, checked top to bottom; the first match decides where the address
-goes:
+The diagram's three branches are literally the config: `sticky` rules are
+checked top to bottom, the first match deciding where the address goes.
+Replace the domains, countries and addresses with your own:
 
 ```hcl
-sticky "claude" {
-  names = ["claude.ai"]
+sticky "work" {
+  names = ["git.example.com", "ci.example.com"]
   via   = ["nl"]        # pinned to one VPS
   every = "5m"          # names re-resolve on their own
 }
