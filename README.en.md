@@ -168,12 +168,26 @@ VPS goes down its networks move to the remaining ones and return once it is back
 
 ## Country and ASN databases — only for sticky modes
 
-You do not need databases for a plain VPN. To pin exits by country or ASN
-(sticky blocks in ADVANCED), download them on the client:
+You do not need databases for a plain VPN. They are needed to pin exits by
+country or ASN (sticky blocks in ADVANCED). SVPN downloads and updates them
+by itself — paste the ready job templates into the config and restart:
+
+```bash
+svpn example job-geo-update     # a ready job block: paste the output into vpn.hcl
+svpn example job-country-update
+```
+
+Startup does not wait for the database: when it is missing, the VPN starts
+degraded (the `balance` fallback), the job fetches the file in the
+background and the sticky modes activate live, without a restart. Manual
+check: `svpn job run geo-update --config vpn.hcl` (the exit code is the
+job's).
+
+Once by hand (when jobs are not wanted):
 
 ```bash
 sudo install -d -m 700 /etc/svpn
-YEAR_MONTH=$(date +%Y-%m)
+YEAR_MONTH=$(date -u +%Y-%m)
 
 curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
 gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
@@ -184,8 +198,7 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
 Country DB answers “which country is this address”, ASN DB answers “which
-network is it”. Enabling these modes and the automatic updates
-(`svpn example job-geo-update`) are covered in ADVANCED.
+network is it”. Enabling the modes is covered in ADVANCED.
 
 ## Next steps
 

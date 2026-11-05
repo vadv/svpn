@@ -164,12 +164,25 @@ sticky "home" {
 
 ## Базы Country и ASN — только для sticky-режимов
 
-Для обычного VPN базы не нужны. Если хотите закреплять выход по стране или
-по ASN (sticky-блоки в ADVANCED), скачайте их на клиенте:
+Для обычного VPN базы не нужны. Они нужны, чтобы закреплять выход по стране
+или по ASN (sticky-блоки в ADVANCED). SVPN скачает и будет обновлять их сам —
+добавьте в конфиг готовые job-шаблоны и перезапустите:
+
+```bash
+svpn example job-geo-update     # готовый job-блок: скопируйте вывод в vpn.hcl
+svpn example job-country-update
+```
+
+Старт не ждёт базу: если её ещё нет, VPN поднимется в degraded-режиме
+(fallback `balance`), job докачает файл в фоне и sticky-режим включится
+вживую, без перезапуска. Ручная проверка: `svpn job run geo-update --config
+vpn.hcl` (код выхода — коду job'а).
+
+Один раз руками (если job'ы не нужны):
 
 ```bash
 sudo install -d -m 700 /etc/svpn
-YEAR_MONTH=$(date +%Y-%m)
+YEAR_MONTH=$(date -u +%Y-%m)
 
 curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
 gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
@@ -180,8 +193,7 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
 Country DB отвечает на вопрос «какая страна у адреса», ASN DB — «какая сеть».
-Подключение этих режимов и автообновление баз (`svpn example job-geo-update`)
-описано в ADVANCED.
+Подключение режимов — в ADVANCED.
 
 ## Что дальше
 
