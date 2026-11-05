@@ -9,7 +9,7 @@ fn spec(run: &str, timeout: Duration) -> JobSpec {
         label: "test".to_owned(),
         every: Duration::from_secs(60),
         timeout,
-        skip_if: None,
+        run_if: None,
         run: run.to_owned(),
         reload: Vec::new(),
     }

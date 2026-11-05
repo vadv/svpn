@@ -615,9 +615,9 @@ impl<'a> Top<'a> {
                 !timeout.is_zero() && timeout <= crate::job::MAX_TIMEOUT,
                 "{ctx}: timeout must be 1s..=24h"
             );
-            let skip_if = split.take_string("skip_if")?;
-            if let Some(check) = &skip_if {
-                ensure!(!check.trim().is_empty(), "{ctx}: skip_if must not be empty");
+            let run_if = split.take_string("run_if")?;
+            if let Some(check) = &run_if {
+                ensure!(!check.trim().is_empty(), "{ctx}: run_if must not be empty");
             }
             let run = split
                 .take_string("run")?
@@ -639,7 +639,7 @@ impl<'a> Top<'a> {
                 label,
                 every,
                 timeout,
-                skip_if,
+                run_if,
                 run,
                 reload,
             });

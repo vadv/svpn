@@ -50,9 +50,10 @@ pub struct JobSpec {
     pub every: Duration,
     /// SIGKILL bound for the whole process group.
     pub timeout: Duration,
-    /// Exit 0 of this check skips the attempt (systemd ExecCondition with
-    /// freshness polarity). None — every attempt reaches `run`.
-    pub skip_if: Option<String>,
+    /// Exit 0 means there is work: the attempt proceeds to `run`. Any other
+    /// outcome (non-zero, spawn failure, timeout) skips the attempt; a broken
+    /// check additionally logs an error instead of blindly running.
+    pub run_if: Option<String>,
     /// The script, executed as `/bin/sh -c`.
     pub run: String,
     /// Tables to re-read from disk after exit 0.
