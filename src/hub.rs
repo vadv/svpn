@@ -116,8 +116,21 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    /// Build the context from parsed client arguments (config-driven parts).
+    pub fn from_args(args: &crate::cli::ClientArgs) -> Self {
+        Self {
+            specs: args.jobs.clone(),
+            geo_db: args.geo_db.clone(),
+            country_db: args.country_db.clone(),
+            config_dir: args
+                .config
+                .as_deref()
+                .and_then(|path| path.parent().map(|dir| dir.to_path_buf())),
+        }
+    }
+
     /// The documented environment contract; scripts never hardcode paths.
-    fn env(&self) -> Vec<(String, String)> {
+    pub fn env(&self) -> Vec<(String, String)> {
         let mut env = vec![
             (
                 "SVPN_OS".to_owned(),

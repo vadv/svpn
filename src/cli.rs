@@ -83,6 +83,11 @@ pub enum Mode {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Scheduled background jobs from the config (systemd-style).
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
     /// Speed measurement over the VPN: session as client, segments through TUN (iperf3-like CLI).
     Perf {
         /// Exactly one server, using the client syntax but without weight.
@@ -132,6 +137,25 @@ pub enum Mode {
         /// TCP fallback port; 0 — ephemeral.
         #[arg(long)]
         tcp_port: Option<u16>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum JobCommand {
+    /// Run one job now, in the foreground; the exit code is the job's.
+    Run {
+        /// Job label from the config.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Config file with the job definition.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
+    /// List the jobs declared in the config.
+    List {
+        /// Config file with the job definitions.
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
     },
 }
 

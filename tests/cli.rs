@@ -123,6 +123,27 @@ fn country_db_flag_parses_cwd_relative() {
     );
 }
 
+// ── job commands ──
+
+#[test]
+fn job_commands_require_config() {
+    for args in [
+        vec!["svpn", "job", "run", "geo-update", "--config", "vpn.hcl"],
+        vec!["svpn", "job", "list", "--config", "vpn.hcl"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    // --config before the subcommand stays forbidden, as everywhere else.
+    assert!(Cli::try_parse_from(["svpn", "--config", "vpn.hcl", "job", "list"]).is_err());
+    for args in [
+        vec!["svpn", "job", "run", "geo-update"], // no config
+        vec!["svpn", "job", "frobnicate", "--config", "c"], // unknown subcommand
+        vec!["svpn", "job"],                      // no subcommand
+    ] {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}
+
 // ── config exclusivity ──
 
 #[test]

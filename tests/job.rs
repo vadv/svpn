@@ -75,3 +75,33 @@ async fn spawn_failure_is_a_reported_failure() {
     let (status, _) = svpn::job::run(&spec("exit 0", Duration::from_secs(10)), &[]).await;
     assert_eq!(status, JobStatus::Ok);
 }
+
+// ── run_foreground (svpn job run) ──
+
+#[test]
+fn foreground_exit_code_is_the_jobs_own() {
+    let code = svpn::job::run_foreground(&spec("exit 3", Duration::from_secs(10)), &[]);
+    assert_eq!(code, 3);
+    let code = svpn::job::run_foreground(&spec("exit 0", Duration::from_secs(10)), &[]);
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn foreground_timeout_reports_124() {
+    let started = std::time::Instant::now();
+    let code = svpn::job::run_foreground(&spec("sleep 30 & wait", Duration::from_secs(1)), &[]);
+    assert_eq!(code, 124);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn foreground_env_contract_is_present() {
+    let code = svpn::job::run_foreground(
+        &spec(
+            "[ \"$SVPN_JOB\" = test ] && [ \"$SVPN_MARKER\" = yes ]",
+            Duration::from_secs(10),
+        ),
+        &[("SVPN_MARKER".to_owned(), "yes".to_owned())],
+    );
+    assert_eq!(code, 0, "env must reach the foreground script");
+}

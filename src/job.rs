@@ -162,6 +162,43 @@ pub async fn run(spec: &JobSpec, env: &[(String, String)]) -> (JobStatus, String
     (status, tail)
 }
 
+/// The scheduler-free, fully transparent path for `svpn job run`: inherited
+/// stdio, the same env contract, the same process-group kill at the timeout.
+/// Returns the job's exit code; 124 when the timeout killed it (as `timeout`).
+pub fn run_foreground(spec: &JobSpec, env: &[(String, String)]) -> i32 {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("/bin/sh");
+    use std::os::unix::process::CommandExt;
+    command
+        .args(["-c", &spec.run])
+        .process_group(0)
+        .env("SVPN_JOB", &spec.label)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("svpn: job {}: spawn failed: {error}", spec.label);
+            return 127;
+        }
+    };
+    let deadline = std::time::Instant::now() + spec.timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(1),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+                let _ = child.wait();
+                return 124;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return 1,
+        }
+    }
+}
+
 /// Log one finished run: status plus the capped tail, line-prefixed.
 pub fn log_run(spec: &JobSpec, status: &JobStatus, tail: &str) {
     match status {
