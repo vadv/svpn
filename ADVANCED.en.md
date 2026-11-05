@@ -128,15 +128,82 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 
 Country Lite determines the destination country (needed by `countries`
 selectors); ASN Lite determines the network (needed by `asn` selectors and
-`sticky-asn`). SVPN loads the CSV files at startup and does not re-read them
-live. Update the files and restart the service:
+`sticky-asn`). SVPN loads the CSV files at startup; after a manual update
+restart the service (`sudo systemctl restart svpn`) — or let a background
+job own the updates (next section): it replaces the file and svpn re-reads
+the table itself.
+
+Nothing manual anymore: background jobs keep the databases current (next
+section).
+
+## Background jobs
+
+`job` blocks are a transparent systemd-style scheduler: svpn runs your
+script on a timer and does not interpret the result. Ready-made templates
+exist for the databases:
 
 ```bash
-sudo systemctl restart svpn
+svpn example job-geo-update       # a ready job block: paste into vpn.hcl
+svpn example job-country-update   # the country database, same shape
 ```
 
-For ASN there is `scripts/update-asn-db.sh` in the source tree. It downloads
-a new database, validates it and keeps the previous one as `asn.csv.prev`.
+The template already does everything: checks freshness (`run_if`), downloads
+into a temporary file (safe under concurrent runs), validates the size and
+installs the database atomically. svpn picks it up **live, without a
+restart**.
+
+```hcl
+job "geo-update" {
+  every   = "1h"     // attempt interval; the first one at startup
+  timeout = "10m"    // SIGKILL bound (default 10m)
+  run_if  = <<EOF    // exit 0 — there is work; anything else — a cheap skip
+    …freshness check…
+  EOF
+  run     = <<EOF    // /bin/sh -c, like hooks
+    …the script…
+  EOF
+  reload  = ["geo"]  // after exit 0: re-read the tables (geo / country)
+}
+```
+
+Semantics:
+
+- **Attempts**: application start and then every `every`. A running job is
+  never stacked — its next attempt waits. A failure is logged and counted
+  (`jobs: runs / failures / timeouts` in the report); the retry follows the
+  schedule.
+- **Degraded start**: the database is missing but a job with
+  `reload = ["geo"]` exists — the start is not blocked: sticky-asn behaves
+  as balance, the log says
+  `vpn: degraded start — geo database missing, job … fetching it`, and every
+  report carries `geo: missing (job …)` until the job delivers.
+- **Reload**: a file that does not parse keeps the previous table in memory;
+  the disk is never touched — the file's content is your script's
+  responsibility.
+- **Environment** (never hardcode paths):
+
+| variable | meaning |
+|---|---|
+| `SVPN_OS` | `linux` / `macos` / `openwrt` |
+| `SVPN_GEO_DB`, `SVPN_COUNTRY_DB` | database paths from the config |
+| `SVPN_CONFIG_DIR` | the config file's directory |
+| `SVPN_JOB` | the job label |
+
+- **Output**: the tail (~16 lines) lands in the log prefixed `job[name]:` —
+  scripts may print secrets, the full output is not stored.
+- **Sleep/suspend stretches intervals** — the timers are monotonic, as in
+  systemd.
+
+Manual control:
+
+```bash
+svpn job list --config vpn.hcl            # declared jobs
+svpn job run geo-update --config vpn.hcl  # run now, output on screen,
+                                          # exit code is the job's (124 = timeout)
+```
+
+`superseded: scripts/update-asn-db.sh — replaced by the
+svpn example job-geo-update template; the script is removed.`
 
 ## Server hooks
 

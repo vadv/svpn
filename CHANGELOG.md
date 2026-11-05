@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Background jobs (EPIC-022).
+
+- `job` blocks in the HCL config: transparent systemd-style scheduled
+  scripts. Attempts start with the application and repeat every `every`;
+  a running job never stacks; output lands in the log as a capped tail.
+- `run_if` condition (systemd ExecCondition polarity): exit 0 means there
+  is work, anything else is a cheap skip; a broken check never blind-runs.
+- Degraded start: a missing database with a provider job does not block
+  startup — sticky-asn falls back to balance, the reports carry
+  `geo: missing (job …)`, and the job's reload activates the table live.
+- `svpn job run NAME` (foreground, the exit code is the job's; 124 on
+  timeout) and `svpn job list`.
+- `svpn example job-geo-update` / `job-country-update`: ready-to-paste
+  templates — freshness checks, mktemp staging, row-count self-checks and
+  atomic installs into the configured paths.
+- Jobs receive `SVPN_OS`, `SVPN_GEO_DB`, `SVPN_COUNTRY_DB`,
+  `SVPN_CONFIG_DIR` and `SVPN_JOB`.
+- `scripts/update-asn-db.sh` is superseded by the job templates and
+  removed.
+
 ## v1.0.0
 
 HCL configuration and explicit sticky routing.
