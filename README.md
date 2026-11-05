@@ -68,7 +68,7 @@ fallback_sticky {
 ### 1. Установите SVPN на клиент
 
 ```bash
-VERSION=1.0.0
+VERSION=1.0.1
 curl -fLO "https://github.com/vadv/svpn/releases/download/v${VERSION}/svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 tar -xzf "svpn-${VERSION}-linux-x86_64-gnu.tar.gz"
 sudo install -m 755 svpn /usr/local/bin/svpn

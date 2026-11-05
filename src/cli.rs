@@ -72,7 +72,7 @@ pub enum Mode {
     /// Connect to one or more servers sharing a client TUN.
     #[command(name = "multi")]
     Client(ClientArgs),
-    /// Install the server binary on configured GNU Linux VPSs.
+    /// Install the server binary on Debian/Ubuntu/Rocky/CentOS Stream VPSs.
     Setup {
         #[command(flatten)]
         client: ClientArgs,
