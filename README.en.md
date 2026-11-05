@@ -136,6 +136,33 @@ sudo svpn setup --config vpn.hcl      # provision both VPSs
 sudo -E svpn multi --config vpn.hcl   # run
 ```
 
+The order of `sticky` blocks is the priority, exactly as in the diagram
+above: the first match wins. SVPN re-resolves the names itself, every
+`every`:
+
+```hcl
+sticky "claude" {
+  names = ["claude.ai"]
+  via   = ["nl"]        # pinned to one VPS
+  every = "5m"
+}
+
+sticky "home" {
+  names = ["printer.lan", "nas.home"]
+  via   = local          # outside the VPN, the site sees your home IP
+  every = "5m"
+}
+
+# By country — after downloading the country database (section below):
+# sticky "ru" {
+#   countries = ["RU"]
+#   via       = local
+# }
+```
+
+Traffic matched by no block is distributed across all servers by weights;
+details in [ADVANCED.en.md](ADVANCED.en.md).
+
 Traffic is distributed between the servers by weight (equal by default). When a
 VPS goes down its networks move to the remaining ones and return once it is back.
 
