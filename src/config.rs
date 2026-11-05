@@ -55,6 +55,9 @@ pub fn load(path: &Path, multi: bool) -> Result<ClientArgs> {
         Ok(args)
     })
     .map(|mut args| {
+        // Keep the supplied path: the job env contract and the state default
+        // below both derive from it (parse rebuilds ClientArgs with None).
+        args.config = Some(path.to_path_buf());
         // Sticky owners persist even without any database: default the state
         // file next to the config itself.
         if args.exit_state.is_none()

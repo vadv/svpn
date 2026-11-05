@@ -168,19 +168,50 @@ fn report_is_honest_about_degraded_state_and_counters() {
 }
 
 #[test]
-fn failed_jobs_count_and_reload_only_on_success() {
+fn failed_and_timed_out_jobs_never_reload_the_table() {
     let dir = std::env::temp_dir().join(format!("svpn-jobs-fail-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let csv = dir.join("asn.csv");
-    write_geo_csv(&csv, 64512);
-    let mut hub = jobs_hub(Some(csv));
-    // Simulate the scheduler delivering a failed job: counted, no reload.
-    // handle_job_event is exercised through the public reload surface here;
-    // counters mirror the mapping the hub performs.
-    hub.job_stats.runs += 1;
-    hub.job_stats.failures += 1;
-    assert!(hub.geo.is_none(), "a failed job reloads nothing");
-    let _ = JobStatus::Failed("exit 1".to_owned());
-    let _ = Reload::Geo;
+    // The job "installed" a different, valid database and then failed:
+    // routing must not change — a failed script's disk output is untrusted.
+    let good = dir.join("good.csv");
+    let swapped = dir.join("swapped.csv");
+    write_geo_csv(&good, 64512);
+    write_geo_csv(&swapped, 100);
+    let mut hub = jobs_hub(Some(swapped.clone()));
+    hub.reload_geo("geo-update");
+    let before = hub.geo.as_ref().unwrap().rows();
+    for build in [
+        || JobStatus::Failed("exit 1".to_owned()),
+        || JobStatus::Timeout,
+    ] {
+        let status = build();
+        hub.handle_job_event(svpn::hub::JobEvent {
+            label: "geo-update".to_owned(),
+            status: status.clone(),
+            tail: String::new(),
+            reload: vec![Reload::Geo],
+        });
+        assert_eq!(
+            hub.geo.as_ref().unwrap().rows(),
+            before,
+            "a {status:?} job must not reload"
+        );
+    }
+    assert_eq!(hub.job_stats.runs, 2);
+    assert_eq!(hub.job_stats.failures, 1);
+    assert_eq!(hub.job_stats.timeouts, 1);
+    // Only success swaps the table.
+    hub.handle_job_event(svpn::hub::JobEvent {
+        label: "geo-update".to_owned(),
+        status: JobStatus::Ok,
+        tail: String::new(),
+        reload: vec![Reload::Geo],
+    });
+    assert_eq!(
+        hub.geo.as_ref().unwrap().rows(),
+        before,
+        "same file, same rows"
+    );
     std::fs::remove_dir_all(dir).unwrap();
+    let _ = good;
 }

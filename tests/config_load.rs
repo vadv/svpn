@@ -86,6 +86,41 @@ fn relative_paths_join_the_config_directory_exactly_once() {
 }
 
 #[test]
+fn config_path_survives_loading_for_the_job_env_contract() {
+    use std::fs;
+    let base = std::env::temp_dir().join(format!("svpn config env {}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    // A bare filename: the parent must normalize to ".", not vanish.
+    let original = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&base).unwrap();
+    fs::write(
+        "vpn.hcl",
+        concat!(
+            "server \"main\" {\n",
+            "  address = \"vpn.example\"\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let loaded = load(std::path::Path::new("vpn.hcl"), false).unwrap();
+    assert_eq!(
+        loaded.config.as_deref(),
+        Some(std::path::Path::new("vpn.hcl")),
+        "the supplied path stays after loading"
+    );
+    let context = svpn::hub::JobContext::from_args(&loaded);
+    let env = context.env();
+    assert!(
+        env.iter()
+            .any(|(key, value)| key == "SVPN_CONFIG_DIR" && value == "."),
+        "bare filename parent normalizes to '.': {env:?}"
+    );
+    fs::remove_file("vpn.hcl").unwrap();
+    std::env::set_current_dir(original).unwrap();
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn symlink_uses_its_directory_for_global_record_and_hook_paths() {
     use std::{fs, os::unix::fs::symlink};
     let base = std::env::temp_dir().join(format!("svpn config symlink {}", std::process::id()));

@@ -14,7 +14,8 @@ db=$SVPN_COUNTRY_DB
 mtime=$(stat -f %m "$db" 2>/dev/null)
 case "$mtime" in ''|*[!0-9]*) mtime=$(stat -c %Y "$db") ;; esac
 file_month=$(date -u -d "@$mtime" +%Y-%m 2>/dev/null || date -u -r "$mtime" +%Y-%m)
-[ "$file_month" = "$(date +%Y-%m)" ] && exit 1
+[ -n "$file_month" ] || exit 1
+[ "$file_month" = "$(date -u +%Y-%m)" ] && exit 1
 exit 0
 EOF
   run     = <<EOF
@@ -23,17 +24,24 @@ db=$SVPN_COUNTRY_DB
 dir=$(dirname "$db")
 mkdir -p "$dir"
 tmp=$(mktemp "$dir/country.XXXXXX")
-url="https://download.db-ip.com/free/dbip-country-lite-$(date +%Y-%m).csv.gz"
+# No partial files left behind on any failure path.
+trap 'rm -f "$tmp" "$tmp.gz"' EXIT
+url="https://download.db-ip.com/free/dbip-country-lite-$(date -u +%Y-%m).csv.gz"
 case "$SVPN_OS" in
-  openwrt) wget -qO "$tmp.gz" "$url" ;;
-  *) curl -fsSL "$url" -o "$tmp.gz" ;;
+  openwrt) wget -q -Q 104857600 -O "$tmp.gz" "$url" ;;
+  *) curl -fsSL --max-filesize 104857600 "$url" -o "$tmp.gz" ;;
 esac
+[ "$(wc -c <"$tmp.gz")" -le 104857600 ] || { echo "country-update: download exceeds 100 MiB" >&2; exit 1; }
+# Cap the expanded file (~500 MiB in 512-byte blocks) before decompressing.
+ulimit -f 976563 2>/dev/null || true
 gzip -dc "$tmp.gz" >"$tmp"
 rm -f "$tmp.gz"
-lines=$(wc -l <"$tmp")
-[ "$lines" -ge 100000 ] || { echo "country-update: suspiciously small download ($lines rows)" >&2; rm -f "$tmp"; exit 1; }
+# Validate rows, not lines: a broken mirror must not replace the database
+# with a same-sized pile of garbage.
+rows=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,"[A-Z][A-Z]"' "$tmp")
+[ "$rows" -ge 100000 ] || { echo "country-update: suspicious download ($rows valid rows)" >&2; exit 1; }
 mv "$tmp" "$db"
-echo "country-update: $lines rows installed"
+echo "country-update: $rows rows installed"
 EOF
   reload  = ["country"]
 }

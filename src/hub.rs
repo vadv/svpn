@@ -122,10 +122,10 @@ impl JobContext {
             specs: args.jobs.clone(),
             geo_db: args.geo_db.clone(),
             country_db: args.country_db.clone(),
-            config_dir: args
-                .config
-                .as_deref()
-                .and_then(|path| path.parent().map(|dir| dir.to_path_buf())),
+            config_dir: args.config.as_deref().map(|path| {
+                let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+                parent.unwrap_or(std::path::Path::new(".")).to_path_buf()
+            }),
         }
     }
 
@@ -831,18 +831,22 @@ impl Hub {
     /// Count one finished job, then reload whatever it asked for. A failed
     /// reload keeps the previous table: the file on disk is the script's
     /// responsibility, not ours to fix.
-    fn handle_job_event(&mut self, event: JobEvent) {
+    #[doc(hidden)]
+    pub fn handle_job_event(&mut self, event: JobEvent) {
         self.job_stats.runs += 1;
         match &event.status {
-            crate::job::JobStatus::Ok => {}
+            crate::job::JobStatus::Ok => {
+                // Only a successful job reloads: a failed script must not
+                // change routing (its file on disk is not ours to trust).
+                for table in &event.reload {
+                    match table {
+                        crate::job::Reload::Geo => self.reload_geo(&event.label),
+                        crate::job::Reload::Country => self.reload_country(&event.label),
+                    }
+                }
+            }
             crate::job::JobStatus::Failed(_) => self.job_stats.failures += 1,
             crate::job::JobStatus::Timeout => self.job_stats.timeouts += 1,
-        }
-        for table in &event.reload {
-            match table {
-                crate::job::Reload::Geo => self.reload_geo(&event.label),
-                crate::job::Reload::Country => self.reload_country(&event.label),
-            }
         }
     }
 
@@ -1262,7 +1266,11 @@ fn spawn_job_scheduler(
     let task = tokio::spawn(async move {
         let mut next: Vec<tokio::time::Instant> =
             specs.iter().map(|_| tokio::time::Instant::now()).collect();
-        let mut in_flight: Vec<Option<tokio::task::JoinHandle<(crate::job::JobStatus, String)>>> =
+        // The whole attempt — run_if gate plus the payload — lives inside the
+        // slot's own task: a slow or stuck check delays only its own job and
+        // never the scheduler loop or shutdown. None means run_if skipped.
+        type Attempt = Option<(crate::job::JobStatus, String)>;
+        let mut in_flight: Vec<Option<tokio::task::JoinHandle<Attempt>>> =
             specs.iter().map(|_| None).collect();
         loop {
             tokio::select! {
@@ -1278,11 +1286,15 @@ fn spawn_job_scheduler(
                                 next[slot] = now + Duration::from_secs(1);
                                 continue;
                             }
-                            let (status, tail) = handle.await.unwrap_or((
+                            let outcome = handle.await.unwrap_or(Some((
                                 crate::job::JobStatus::Failed("scheduler join failed".to_owned()),
                                 String::new(),
-                            ));
+                            )));
                             in_flight[slot] = None;
+                            next[slot] = now + specs[slot].every;
+                            let Some((status, tail)) = outcome else {
+                                continue; // run_if decided there is no work
+                            };
                             let spec = &specs[slot];
                             crate::job::log_run(spec, &status, &tail);
                             if tx
@@ -1297,55 +1309,45 @@ fn spawn_job_scheduler(
                             {
                                 return; // hub is gone
                             }
-                            next[slot] = now + spec.every;
                             continue;
                         }
-                        let spec = &specs[slot];
-                        // The run_if gate: 0 — there is work, anything else —
-                        // a cheap skip; a broken check never blind-runs.
-                        if let Some(check) = &spec.run_if {
-                            let check_spec = crate::job::JobSpec {
-                                label: spec.label.clone(),
-                                every: spec.every,
-                                timeout: spec.timeout,
-                                run_if: None,
-                                run: check.clone(),
-                                reload: Vec::new(),
-                            };
-                            let mut check_env: Vec<(String, String)> = env.clone();
-                            for (key, value) in &mut check_env {
-                                if key == "SVPN_JOB" {
-                                    value.push_str(&spec.label);
-                                }
-                            }
-                            let (status, _tail) = crate::job::run(&check_spec, &check_env).await;
-                            match status {
-                                crate::job::JobStatus::Ok => {}
-                                crate::job::JobStatus::Failed(reason) => {
-                                    if reason.contains("spawn failed") {
-                                        crate::error!("job {}: run_if broken: {reason}", spec.label);
-                                    } else {
-                                        crate::info!("job: {} up-to-date, skipped", spec.label);
-                                    }
-                                    next[slot] = now + spec.every;
-                                    continue;
-                                }
-                                crate::job::JobStatus::Timeout => {
-                                    crate::error!("job {}: run_if timed out", spec.label);
-                                    next[slot] = now + spec.every;
-                                    continue;
-                                }
-                            }
-                        }
-                        let spec = spec.clone();
-                        let mut run_env: Vec<(String, String)> = env.clone();
-                        for (key, value) in &mut run_env {
+                        let spec = specs[slot].clone();
+                        let mut slot_env: Vec<(String, String)> = env.clone();
+                        for (key, value) in &mut slot_env {
                             if key == "SVPN_JOB" {
                                 value.push_str(&spec.label);
                             }
                         }
                         in_flight[slot] = Some(tokio::spawn(async move {
-                            crate::job::run(&spec, &run_env).await
+                            // The run_if gate: 0 — there is work, anything
+                            // else — a cheap skip; a broken check never
+                            // blind-runs the payload.
+                            if let Some(check) = &spec.run_if {
+                                let check_spec = crate::job::JobSpec {
+                                    label: spec.label.clone(),
+                                    every: spec.every,
+                                    timeout: spec.timeout,
+                                    run_if: None,
+                                    run: check.clone(),
+                                    reload: Vec::new(),
+                                };
+                                match crate::job::run(&check_spec, &slot_env).await.0 {
+                                    crate::job::JobStatus::Ok => {}
+                                    crate::job::JobStatus::Failed(reason) => {
+                                        if reason.contains("spawn failed") {
+                                            crate::error!("job {}: run_if broken: {reason}", spec.label);
+                                        } else {
+                                            crate::info!("job: {} up-to-date, skipped", spec.label);
+                                        }
+                                        return None;
+                                    }
+                                    crate::job::JobStatus::Timeout => {
+                                        crate::error!("job {}: run_if timed out", spec.label);
+                                        return None;
+                                    }
+                                }
+                            }
+                            Some(crate::job::run(&spec, &slot_env).await)
                         }));
                         next[slot] = now + Duration::from_millis(100);
                     }
