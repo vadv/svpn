@@ -169,13 +169,13 @@ def fake_setup(config, mode, version):
 def fake_scenarios(config):
     version = command(["svpn", "--version"]).stdout.split()[-1]
     plant_fakes()
-    if remote("test -x /usr/local/bin/svpn", check=False).returncode != 0:
-        # Bootstrap window: the real runs were skipped, so seed the newer-binary
-        # state the downgrade report below relies on.
-        remote(
-            f"printf '#!/bin/sh\\necho svpn {version}\\n' > /usr/local/bin/svpn"
-            " && chmod 755 /usr/local/bin/svpn"
-        )
+    # Always normalize the installed binary to the client version: the
+    # downgrade report compares against whatever the real runs left on the
+    # server (which can be a stale published release after a version bump),
+    # while the assertion below expects the client's own version.
+    remote(
+        f"printf '#!/bin/sh\\necho svpn {version}\\n' > /usr/local/bin/svpn && chmod 755 /usr/local/bin/svpn"
+    )
 
     result = fake_setup(config, "fallback", version)
     assert "status=success version=0.9.5" in result.stdout, result.stdout
