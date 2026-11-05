@@ -94,8 +94,8 @@ sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /full/path/
 ```
 
 The command downloads the SVPN release on the VPS itself, installs the binary
-and verifies the installation. Debian 12 and Rocky 10 on x86_64 and aarch64
-are supported.
+and verifies the installation. Debian/Ubuntu (apt) and Rocky/CentOS Stream
+(dnf) on x86_64 and aarch64 are supported.
 
 In auto mode the embedded `scripts/client-up`, `scripts/client-down`,
 `scripts/server-up` and `scripts/server-down` from the current binary run.

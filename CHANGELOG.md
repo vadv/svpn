@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- setup: preflight и установка пакетов принимают семейства дистрибутивов —
+  Debian/Ubuntu (apt) и Rocky/CentOS Stream (dnf) — вместо пинов
+  `debian:12`/`rocky:10`. Реальный фильтр совместимости — проверки
+  arch/loader/glibc/AES в preflight.
+
 ## v1.0.0
 
 Background jobs (EPIC-022).

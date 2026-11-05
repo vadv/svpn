@@ -93,7 +93,8 @@ sudo svpn setup --server 203.0.113.10 --ssh-user root --ssh-identity /полны
 ```
 
 Команда скачает релиз SVPN прямо на VPS, установит бинарник и проверит
-установку. Поддерживаются Debian 12 и Rocky 10 на x86_64 и aarch64.
+установку. Поддерживаются Debian/Ubuntu (apt) и Rocky/CentOS Stream (dnf) на
+x86_64 и aarch64.
 
 В auto выполняются встроенные `scripts/client-up`, `scripts/client-down`,
 `scripts/server-up` и `scripts/server-down` из текущего бинарника. Точный

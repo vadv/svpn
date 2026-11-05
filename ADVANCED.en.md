@@ -329,8 +329,8 @@ detects the environment, installs the missing approved packages (`curl`,
 SVPN release from GitHub on the VPS itself and installs the binary. The
 configuration is never modified; setup creates no hook files.
 
-Supported environments: Debian 12 and Rocky 10 (GNU libc) on x86_64 and
-aarch64 with hardware AES. SSH access as `root` or as a regular user with
+Supported environments: Debian/Ubuntu and Rocky/CentOS Stream (GNU libc) on
+x86_64 and aarch64 with hardware AES. SSH access as `root` or as a regular user with
 passwordless `sudo -n`; passwords and interactive sudo are not supported.
 OpenWrt, Alpine and musl are not covered.
 
