@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 import integration
 import matrix
 import suite_bootstrap
+import suite_jobs
 import suite_pool
 import suite_recovery
 import suite_reselect
@@ -53,6 +54,10 @@ test_recovery_without_alternative_closes_within_budget
 STICKY_BASELINE = """
 test_sticky_dst test_balance_diff test_failover_move test_restart_restore
 test_country_asn_scope test_local_egress_and_vpn
+""".split()
+JOBS_BASELINE = """
+test_missing_database_degrades_then_reloads_live test_run_if_skips_when_the_database_is_fresh
+test_failed_job_keeps_serving_degraded
 """.split()
 STICKY_DNS_BASELINE = """
 test_name_pin test_first_match_over_later_blocks test_failover_without_snapback
@@ -93,11 +98,19 @@ def integration_groups():
         "recovery": suite_recovery,
         "sticky-asn": suite_sticky_asn,
         "sticky": suite_sticky,
+        "jobs": suite_jobs,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
     tests = [test for _, test in integration.TESTS]
-    original = BASELINE + RESELECT_BASELINE + RECOVERY_BASELINE + STICKY_BASELINE + STICKY_DNS_BASELINE
+    original = (
+        BASELINE
+        + RESELECT_BASELINE
+        + RECOVERY_BASELINE
+        + STICKY_BASELINE
+        + STICKY_DNS_BASELINE
+        + JOBS_BASELINE
+    )
     assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
     assert len(tests) == len(set(tests)) == len(by_fn), "a test is assigned twice or dropped"
@@ -118,6 +131,7 @@ def integration_groups():
         "recovery": 3,
         "sticky-asn": 6,
         "sticky": 5,
+        "jobs": 3,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]

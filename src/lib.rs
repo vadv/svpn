@@ -240,7 +240,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
             // fallback, strict for explicit asn selectors.
             Err(error) if error.chain().any(is_not_found) && geo_provider.is_some() => {
                 crate::error!(
-                    "vpn: started degraded — geo database missing, job {label} fetching it",
+                    "vpn: degraded start — geo database missing, job {label} fetching it",
                     label = geo_provider.clone().unwrap_or_default()
                 );
                 geo_pending = geo_provider;
@@ -270,7 +270,7 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
             }
             Err(error) if error.chain().any(is_not_found) && country_provider.is_some() => {
                 crate::error!(
-                    "vpn: started degraded — country database missing, job {label} fetching it",
+                    "vpn: degraded start — country database missing, job {label} fetching it",
                     label = country_provider.clone().unwrap_or_default()
                 );
                 country_pending = country_provider;

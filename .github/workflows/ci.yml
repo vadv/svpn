@@ -108,7 +108,9 @@ jobs:
           - suite: integration
             group: udp
           - suite: integration
-            group: sticky-asn
+            group: sticky
+          - suite: integration
+            group: jobs-asn
           - suite: integration
             group: sticky
           - suite: integration
