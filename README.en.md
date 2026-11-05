@@ -32,16 +32,30 @@ flowchart TD
     class net1,net2 edge
 ```
 
-The client picks the path before encryption. The `sticky` rules in the config
-are checked in order: the first match decides where the address goes.
-`via = ["nl"]` pins it to one VPS (when that VPS dies its groups move to the
-next one in the list and stay there when it returns); `via = local` sends it
-outside the VPN — the site sees your home IP. When nothing matches,
-`fallback_sticky` takes over: `balance` spreads flows by weights, and
-`sticky-asn` pins every destination network (ASN) to one VPS so a service
-sees a stable external IP. Tunnel traffic is disguised: the client itself
-picks what to look like on the channel and switches to TCP when UDP is
-blocked.
+The diagram is literally the config. Its three branches are three `sticky`
+rules, checked top to bottom; the first match decides where the address
+goes:
+
+```hcl
+sticky "claude" {
+  names = ["claude.ai"]
+  via   = ["nl"]        # pinned to one VPS
+  every = "5m"          # names re-resolve on their own
+}
+
+sticky "ru" {
+  countries = ["RU"]
+  via       = local     # outside the VPN: the site sees your home IP
+}
+
+# nothing matched → fallback_sticky (balance | sticky-asn)
+```
+
+When a VPS dies its groups move to the next one in `via` and stay there
+when it returns — the external IP never flips back. `sticky-asn` pins every
+destination network to one VPS so a service sees a stable IP. Tunnel
+traffic is disguised: the client itself picks what to look like on the
+channel and switches to TCP when UDP is blocked.
 
 ## Quick start
 
@@ -136,35 +150,11 @@ sudo svpn setup --config vpn.hcl      # provision both VPSs
 sudo -E svpn multi --config vpn.hcl   # run
 ```
 
-The order of `sticky` blocks is the priority, exactly as in the diagram
-above: the first match wins. SVPN re-resolves the names itself, every
-`every`:
-
-```hcl
-sticky "claude" {
-  names = ["claude.ai"]
-  via   = ["nl"]        # pinned to one VPS
-  every = "5m"
-}
-
-sticky "home" {
-  names = ["printer.lan", "nas.home"]
-  via   = local          # outside the VPN, the site sees your home IP
-  every = "5m"
-}
-
-# By country — after downloading the country database (section below):
-# sticky "ru" {
-#   countries = ["RU"]
-#   via       = local
-# }
-```
-
-Traffic matched by no block is distributed across all servers by weights;
-details in [ADVANCED.en.md](ADVANCED.en.md).
-
-Traffic is distributed between the servers by weight (equal by default). When a
-VPS goes down its networks move to the remaining ones and return once it is back.
+`sticky` rules referencing these labels (`"nl"`, `"de"`) go into the same
+config — the example from the diagram above is ready to paste. Traffic
+matched by no block is distributed across the servers by weights (equal by
+default); a failing VPS moves over to the rest. Details in
+[ADVANCED.en.md](ADVANCED.en.md).
 
 ## Country and ASN databases — only for sticky modes
 
