@@ -466,14 +466,6 @@ def test_local_egress_and_vpn():
         baseline = opened(path)
         source = target_tcp_echo(2, LOCAL_TARGET)
         assert source == "172.30.77.3", source
-        # TEMP-DIAG: прямой проб тем же способом, каким ходит прокси (SO_BINDTODEVICE eth0).
-        print(command(["ip", "route", "get", LOCAL_TARGET, "oif", "eth0"]).stdout.strip(), flush=True)
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.settimeout(3)
-        probe.setsockopt(socket.SOL_SOCKET, 25, b"eth0\0")  # SO_BINDTODEVICE
-        probe.sendto(b"probe", (LOCAL_TARGET, 9000))
-        print("DIRECT-UDP-PROBE:", probe.recvfrom(2048), flush=True)
-        probe.close()
         udp_echo(LOCAL_TARGET)
         command(["ping", "-n", "-c", "1", "-W", "2", LOCAL_TARGET])
         by_source = target_tcp_echo(4, BY_TARGET)

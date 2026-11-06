@@ -92,17 +92,16 @@ pub async fn tcp_connect(
     }
 }
 
-/// Исходящий UDP: один connected-сокет на поток — демультиплексация ответов.
-pub fn udp_connect(device: Option<&str>, target: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+/// Исходящий UDP: один unconnected-сокет на поток. Цель может ответить
+/// с другого адреса (weak-host: основной адрес интерфейса), connected-сокет
+/// такое ядро отбрасывает молча; демультиплексация — по локальному порту.
+pub fn udp_socket(device: Option<&str>, target: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     let socket = bound_socket(
         socket2::Domain::for_address(target),
         socket2::Type::DGRAM,
         device,
     )?;
     socket.set_nonblocking(true)?;
-    // connect на socket2 синхронный: подключаем до конверсии, чтобы
-    // tokio-сокет уже имел peer и recv не принимал чужие пакеты.
-    socket.connect(&socket2::SockAddr::from(target))?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = tokio::net::UdpSocket::from_std(std_socket)?;
     Ok(socket)

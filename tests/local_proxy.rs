@@ -398,6 +398,42 @@ async fn tcp_admission_limit_drops_syn() {
 // ── UDP ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn udp_reply_from_foreign_source() {
+    // Regression (e2e sticky-asn, CI run 42192114357): цель ответила с
+    // другого адреса хоста (weak-host: primary вместо целевого) —
+    // connected-сокет ядро молча дропал, клиент получал timeout.
+    // Linux отдаёт весь 127/8, macOS — только 127.0.0.1, поэтому там
+    // чужой source моделируется другим портом того же адреса.
+    let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_port = receiver.local_addr().unwrap().port();
+    let foreign_addr = if cfg!(target_os = "linux") {
+        "127.0.0.2:0"
+    } else {
+        "127.0.0.1:0"
+    };
+    let foreign = tokio::net::UdpSocket::bind(foreign_addr).await.unwrap();
+    let echo = tokio::spawn(async move {
+        let mut buffer = [0u8; 1500];
+        while let Ok((length, peer)) = receiver.recv_from(&mut buffer).await {
+            let _ = foreign.send_to(&buffer[..length], peer).await;
+        }
+    });
+    let mut proxy = start_with_ready(Limits::default()).await;
+    let source = client(46000);
+    let destination = addr(Ipv4Addr::LOCALHOST, target_port);
+
+    send(&proxy, 41, udp_datagram(source, destination, b"weak-host")).await;
+    let (_, reply) = expect_packet(&mut proxy, |(_, bytes)| bytes.len() == 28 + 9).await;
+    assert_eq!(
+        &reply[12..16],
+        &Ipv4Addr::LOCALHOST.octets(),
+        "src = цель, а не фактический отправитель"
+    );
+    assert_eq!(&reply[28..], b"weak-host");
+    echo.abort();
+}
+
+#[tokio::test]
 async fn udp_roundtrip_and_idle_close() {
     let (echo, echo_port) = spawn_udp_echo().await;
     let mut proxy = start_with_ready(Limits {

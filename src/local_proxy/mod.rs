@@ -562,10 +562,10 @@ async fn udp_flow(
     target: SocketAddr,
     idle: Duration,
 ) {
-    let socket = match egress::udp_connect(device.as_deref(), target) {
+    let socket = match egress::udp_socket(device.as_deref(), target) {
         Ok(socket) => socket,
         Err(error) => {
-            crate::debug!("local-proxy: udp connect {target} failed — {error}");
+            crate::debug!("local-proxy: udp socket {target} failed — {error}");
             let _ = flows.try_send(FlowMsg::Closed(flow_key(client, target, 17)));
             return;
         }
@@ -577,13 +577,15 @@ async fn udp_flow(
             _ = shutdown.changed() => break Ok(()),
             datagram = datagrams.recv() => {
                 let Some(datagram) = datagram else { break Ok(()) };
-                if socket.send(&datagram).await.is_err() {
+                // Unconnected-сокет: цель может ответить с иного адреса (weak-host),
+                // поэтому шлём send_to и принимаем любой source — см. egress::udp_socket.
+                if socket.send_to(&datagram, target).await.is_err() {
                     break Err("wan send failed");
                 }
             }
-            received = socket.recv(&mut buffer) => {
+            received = socket.recv_from(&mut buffer) => {
                 match received {
-                    Ok(length) => {
+                    Ok((length, _)) => {
                         crate::debug!("local-proxy: udp {target} → {client} reply {length} bytes");
                         // Ответ инжектируется как цель→клиент.
                         if inject
