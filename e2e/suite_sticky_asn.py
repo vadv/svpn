@@ -471,7 +471,8 @@ def test_local_egress_and_vpn():
         by_source = target_tcp_echo(4, BY_TARGET)
         assert by_source == "172.30.77.3", by_source
         tcp_echo(3, peer=PEER)
-        until(lambda: local_opened(path) == (4, 0, 0), seconds=20)
+        # 2 opened TCP flows (local + sticky by-target) close on FIN; UDP idles, ICMP is sessionless.
+        until(lambda: local_opened(path) == (4, 0, 2), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
         local_tuns = {
             item["ifname"]
