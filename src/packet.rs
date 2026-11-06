@@ -188,8 +188,8 @@ pub fn tcp_reset_for(packet: &Packet) -> Option<[u8; 40]> {
     tcp_reset(packet.flow, packet.tcp.as_ref()?)
 }
 
-/// CLOSED-endpoint reset rules applied to a stored `TcpMeta` (последний
-/// клиентский сегмент): те же правила, что у `tcp_reset_for`, без сырого пакета.
+/// Same CLOSED-endpoint reset rules as `tcp_reset_for`, applied to a
+/// stored `TcpMeta` (the client's last segment) instead of a raw packet.
 pub fn tcp_reset(flow: FlowKey, tcp: &TcpMeta) -> Option<[u8; 40]> {
     if tcp.flags & 0x04 != 0 {
         return None;

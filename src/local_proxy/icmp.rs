@@ -29,7 +29,7 @@ pub struct IcmpRequest {
     pub icmp: Vec<u8>,
 }
 
-/// Свободный proxy-id: занятые не более `limits.icmp`, счётчик быстро
+/// Свободный proxy-id (занятых не больше `limits.icmp`): счётчик быстро
 /// находит пропуск.
 pub fn alloc_proxy_id(ids: &HashMap<u16, FlowKey>, next: &mut u16) -> Option<u16> {
     for _ in 0..=u16::MAX {

@@ -354,8 +354,8 @@ async fn tcp_connect_refused_resets_and_closes() {
         tcp_segment(source, destination, 2001, server_seq + 1, ACK, b""),
     )
     .await;
-    // До Closed клиент получает RST (0x04) — иначе он завис бы на
-    // полуоткрытом сокете после SYN-ACK.
+    // До Closed клиент получает RST — иначе после SYN-ACK его сокет
+    // зависает.
     let (_, rst) = expect_packet(&mut proxy, |(_, _)| true).await;
     let (flags, _, _, _) = tcp_reply(&rst);
     assert_eq!(flags & 0x04, 0x04, "ожидался RST, flags: {flags:08b}");
@@ -395,8 +395,8 @@ async fn tcp_admission_limit_drops_syn() {
         tcp_segment(source, destination, 4000, 0, SYN, b""),
     )
     .await;
-    // Admission-отказ уже-владеемого Hub потока: SYN-ACK нет, но поток
-    // закрывается событием Closed (иначе route в Hub утёк бы навсегда).
+    // Admission-отказ потока, которым уже владеет Hub: без SYN-ACK, но с
+    // Closed — иначе route в Hub течёт.
     let (closed_id, key) = expect_closed(&mut proxy).await;
     assert_eq!(closed_id, 13);
     assert_eq!(key.destination_port, echo_port);
@@ -526,8 +526,7 @@ async fn udp_admission_limit_drops_datagram() {
     let one = addr(Ipv4Addr::LOCALHOST, sink_port);
     let two = addr(Ipv4Addr::LOCALHOST, black_hole_port);
     send(&proxy, 31, udp_datagram(source, one, b"x")).await;
-    // Второй кортеж — отказ admission: поток уже владеется Hub, поэтому
-    // закрывается событием Closed, а не молчаливым дропом.
+    // Второй кортеж — отказ admission: Closed вместо молчаливого дропа.
     send(&proxy, 32, udp_datagram(source, two, b"y")).await;
     let (closed_id, key) = expect_closed(&mut proxy).await;
     assert_eq!(closed_id, 32);
@@ -558,7 +557,7 @@ async fn icmp_dropped_without_events() {
 fn parse_route_table_prefers_default_lowest_metric() {
     // Regression: старый код читал колонку Gateway вместо Destination
     // (fields.nth(1)), из-за чего default-маршрут с ненулевым gateway
-    // пропускался и WAN-интерфейс не находился вовсе.
+    // пропускался, и WAN-интерфейс не находился.
     use svpn::local_proxy::egress::parse_route_table;
     let table = "\
 Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT

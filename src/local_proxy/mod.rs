@@ -89,8 +89,8 @@ const SYN_TTL: Duration = Duration::from_secs(120);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_IDLE: Duration = Duration::from_secs(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
-/// Ответ из WAN больше MTU TUN не фрагментируется (smoltcp не фрагментирует
-/// TX) и будет дропнут на записи в TUN — буфер покрывает любой датаграмм.
+/// Ответ WAN длиннее MTU TUN не фрагментируется (smoltcp не фрагментирует
+/// TX) и дропнется при записи в TUN — буфер покрывает любую датаграмму.
 const UDP_BUFFER: usize = 65535;
 
 /// Пределы аллокации до создания потоков; превышение дропается со счётчиком.
@@ -158,8 +158,7 @@ pub async fn start_with(
     let (stats_tx, latest) = watch::channel(Stats::default());
     let delivery = Arc::new(Delivery::default());
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    // RAW ICMP — только с WAN-устройством (продакшн); тестовый вход без
-    // device дропает echo предсказуемо.
+    // RAW ICMP требует WAN-устройство; тестовый вход без device дропает echo.
     let icmp_socket = device
         .as_ref()
         .and_then(|device| match egress::icmp_socket(Some(device)) {
@@ -205,8 +204,8 @@ struct ProxyArgs {
 /// Сообщение от per-flow задач владельцу: поток завершился.
 enum FlowMsg {
     Closed(FlowKey),
-    /// Соединение не состоялось (connect fail или обрыв relay): клиенту нужен
-    /// reset до ухода потока — иначе он зависнет на полуоткрытом сокете.
+    /// Connect не состоялся или relay оборвался: до Closed клиенту уходит
+    /// RST, иначе его сокет зависает.
     Reset {
         id: u64,
         key: FlowKey,
@@ -219,12 +218,12 @@ type UdpKey = (SocketAddr, SocketAddr);
 struct State {
     /// FlowKey → последний Hub id: для `Event::Packet`/`Closed` обратно.
     ids: HashMap<FlowKey, u64>,
-    /// Принятые TCP-потоки: защищает их `ids` от prune по SYN_TTL.
+    /// Принятые TCP-потоки: их ids живёт до Closed, prune по SYN_TTL не трогает.
     established: HashSet<FlowKey>,
     /// SYN-дедуп и admission: ключи не старше SYN_TTL.
     syns: HashMap<FlowKey, std::time::Instant>,
     udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>>,
-    /// Последний TCP-сегмент клиента — seed для client-facing reset на обрыве.
+    /// Последний сегмент клиента: seed RST при обрыве (`packet::tcp_reset`).
     tcp_last: HashMap<FlowKey, TcpMeta>,
     /// Ping-потоки: flow (identifier клиента в `source_port`) → слот.
     icmp: HashMap<FlowKey, icmp::IcmpSlot>,
@@ -303,10 +302,9 @@ async fn run_proxy(
     // stream — кадры из стека наружу.
     let (stack_in, stack_out) = stack.split();
     tokio::pin!(stack_out);
-    // Стек-инжект — отдельная задача: `send().await` на полной очереди стека
-    // блокировал цикл, который обязан параллельно читать `udp_read` — при
-    // burst UDP-ответов наступал deadlock. Цикл делает неблокирующий
-    // `try_send` в этот канал.
+    // Инжект в стек — отдельная задача: send().await при полной очереди стека
+    // блокировал цикл, который обязан читать udp_read (burst UDP-ответов давал
+    // deadlock). Цикл шлёт только try_send.
     let (stack_tx, mut stack_rx) = mpsc::channel::<Vec<u8>>(crate::hub::QUEUE);
     let stack_in_task = tokio::spawn(async move {
         let mut stack_in = stack_in;
@@ -451,8 +449,8 @@ async fn proxy_loop(
                 proxy.state.syns.remove(&key);
                 proxy.state.established.insert(key);
                 let Some(id) = proxy.state.ids.get(&key).copied() else {
-                    // Не бывает: id вставляется в pump до того, как стек
-                    // выдаёт сокет слушателю.
+                    // id есть всегда: pump вставляет его раньше, чем стек
+                    // отдаёт сокет.
                     proxy.delivery.dropped();
                     continue;
                 };
@@ -465,8 +463,8 @@ async fn proxy_loop(
                 match message {
                     FlowMsg::Closed(key) => close_flow(proxy, key).await,
                     FlowMsg::Reset { id, key } => {
-                        // Reset до close_flow: id-маппинг ещё жив, и пакет
-                        // дойдёт клиенту, пока route в Hub не забыт.
+                        // Сначала RST, потом close_flow: событию нужен
+                        // ещё живой id.
                         if let Some(meta) = proxy.state.tcp_last.get(&key)
                             && let Some(rst) = packet::tcp_reset(key, meta)
                         {
@@ -529,9 +527,9 @@ async fn pump(proxy: &mut Proxy<'_>, stack_tx: &mpsc::Sender<Vec<u8>>, packet: P
     match parsed.flow.protocol {
         6 => {
             if parsed.can_open {
-                // Резервация живёт до Closed: syns (SYN без хендшейка) и
-                // established (принятый сокет) вместе — admission и дедуп
-                // смотрят на живое состояние, а не на короткоживущий syns-слот.
+                // Резерв до Closed: syns — SYN без хендшейка,
+                // established — принятый сокет; admission и дедуп смотрят
+                // на оба.
                 if proxy.state.syns.contains_key(&parsed.flow)
                     || proxy.state.established.contains(&parsed.flow)
                 {
@@ -540,8 +538,8 @@ async fn pump(proxy: &mut Proxy<'_>, stack_tx: &mpsc::Sender<Vec<u8>>, packet: P
                 }
                 if proxy.state.syns.len() + proxy.state.established.len() >= proxy.limits.tcp {
                     proxy.state.stats.open_failed_flows += 1;
-                    // Hub уже владеет этим потоком (open_local вставил route);
-                    // без Closed route утечёт навсегда.
+                    // Hub уже вставил route (open_local); без Closed
+                    // он зависнет.
                     let _ = proxy
                         .events
                         .send((
@@ -663,7 +661,7 @@ fn emit(proxy: &mut Proxy<'_>, frame: Vec<u8>) {
     }
 }
 
-/// Убрать поток из state и уведомить Hub событием Closed (надёжно, с await).
+/// Убрать поток из state; Closed ждёт места в очереди, а не дропается.
 async fn close_flow(proxy: &mut Proxy<'_>, key: FlowKey) {
     if let Some(id) = proxy.state.ids.remove(&key) {
         proxy.state.stats.closed_flows += 1;
@@ -719,7 +717,7 @@ fn relay_tcp(
             }
             Err(error) => {
                 crate::debug!("local-proxy: relay {client} ↔ {target} ended — {error}");
-                // Обрыв mid-stream: клиент должен получить RST, а не зависнуть.
+                // Обрыв mid-stream — клиенту RST.
                 let _ = flows.send(FlowMsg::Reset { id, key });
             }
         }
@@ -735,8 +733,7 @@ async fn relay_udp(
     if !proxy.state.udp.contains_key(&pair) {
         if proxy.state.udp.len() >= proxy.limits.udp {
             proxy.state.stats.open_failed_flows += 1;
-            // Hub уже владеет потоком (open_local вставил route); без Closed
-            // route утечёт навсегда.
+            // Hub уже вставил route (open_local); без Closed он зависнет.
             if let Some(id) = proxy.state.ids.remove(&key) {
                 proxy.state.stats.closed_flows += 1;
                 let _ = proxy
@@ -836,7 +833,7 @@ async fn udp_flow(
     let _ = flows.send(FlowMsg::Closed(key));
 }
 
-/// IPv6-адресов из TUN не бывает (svpn — IPv4-VPN), отображение defensively.
+/// IPv6 из TUN не приходит (svpn — IPv4); на всякий случай — UNSPECIFIED.
 fn flow_key(source: SocketAddr, destination: SocketAddr, protocol: u8) -> FlowKey {
     let v4 = |addr: &SocketAddr| match addr {
         SocketAddr::V4(addr) => *addr.ip(),
