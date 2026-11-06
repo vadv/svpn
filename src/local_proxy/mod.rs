@@ -1,6 +1,7 @@
-//! Linux local exit через TCP/UDP proxy: userspace-стек netstack-smoltcp
-//! терминирует потоки клиента, Tokio-сокеты с `SO_BINDTODEVICE` выносят их
-//! в WAN-интерфейс. Замена second-TUN local serve за фичей `local-proxy`.
+//! Linux local exit через TCP/UDP/ICMP-echo proxy: userspace-стек
+//! netstack-smoltcp терминирует потоки клиента, Tokio-сокеты с
+//! `SO_BINDTODEVICE` выносят их в WAN-интерфейс. Замена second-TUN local
+//! serve за фичей `local-proxy`.
 //!
 //! Интеграция с Hub сохраняет контракт `local_exit`: канал исходящих
 //! `Packet{id, bytes}` внутрь, события `(Epoch, Event)` наружу. Hub работает
@@ -13,6 +14,7 @@
 //! коннекта; пересмотреть после апстрим-фикса или форка.
 
 mod egress;
+pub mod icmp;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -96,6 +98,8 @@ const UDP_BUFFER: usize = 65535;
 pub struct Limits {
     pub tcp: usize,
     pub udp: usize,
+    /// Одновременные ping-потоки (echo request).
+    pub icmp: usize,
     /// Простой UDP-потока до закрытия (тесты ужимают).
     pub udp_idle: Duration,
 }
@@ -105,6 +109,7 @@ impl Default for Limits {
         Self {
             tcp: 512,
             udp: 512,
+            icmp: 256,
             udp_idle: UDP_IDLE,
         }
     }
@@ -153,6 +158,17 @@ pub async fn start_with(
     let (stats_tx, latest) = watch::channel(Stats::default());
     let delivery = Arc::new(Delivery::default());
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    // RAW ICMP — только с WAN-устройством (продакшн); тестовый вход без
+    // device дропает echo предсказуемо.
+    let icmp_socket = device
+        .as_ref()
+        .and_then(|device| match egress::icmp_socket(Some(device)) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                crate::warn!("local-proxy: ICMP echo unavailable — {error}");
+                None
+            }
+        });
 
     let task = tokio::spawn(run_proxy(
         ProxyArgs {
@@ -164,6 +180,7 @@ pub async fn start_with(
         runner,
         udp_socket,
         listener,
+        icmp_socket,
         outgoing_rx,
         events_tx,
         stats_tx,
@@ -201,6 +218,10 @@ struct State {
     /// SYN-дедуп и admission: ключи не старше SYN_TTL.
     syns: HashMap<FlowKey, std::time::Instant>,
     udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>>,
+    /// Ping-потоки: flow (identifier клиента в `source_port`) → слот.
+    icmp: HashMap<FlowKey, icmp::IcmpSlot>,
+    icmp_ids: HashMap<u16, FlowKey>,
+    icmp_next: u16,
     stats: Stats,
 }
 
@@ -222,6 +243,28 @@ impl State {
             }
         }
     }
+
+    /// Закрытие простаивающих ping-потоков: слоты, proxy-id и события Closed.
+    fn prune_icmp(&mut self) -> Vec<(u64, FlowKey)> {
+        let now = std::time::Instant::now();
+        let expired: Vec<FlowKey> = self
+            .icmp
+            .iter()
+            .filter(|(_, slot)| now.duration_since(slot.seen) >= icmp::ICMP_IDLE)
+            .map(|(key, _)| *key)
+            .collect();
+        let mut closed = Vec::new();
+        for key in expired {
+            if let Some(slot) = self.icmp.remove(&key) {
+                self.icmp_ids.remove(&slot.proxy_id);
+            }
+            if let Some(id) = self.ids.remove(&key) {
+                self.stats.closed_flows += 1;
+                closed.push((id, key));
+            }
+        }
+        closed
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +274,7 @@ async fn run_proxy(
     runner: netstack_smoltcp::Runner,
     udp_socket: netstack_smoltcp::UdpSocket,
     listener: netstack_smoltcp::TcpListener,
+    icmp_socket: Option<tokio::net::UdpSocket>,
     mut outgoing: mpsc::Receiver<Packet>,
     events: mpsc::Sender<(Epoch, Event)>,
     stats: watch::Sender<Stats>,
@@ -264,11 +308,21 @@ async fn run_proxy(
     });
 
     let (flows_tx, mut flows_rx) = mpsc::channel::<FlowMsg>(crate::hub::QUEUE);
+    let (icmp_tx, icmp_rx) = mpsc::channel::<icmp::IcmpRequest>(crate::hub::QUEUE);
+    let (icmp_replies_tx, mut icmp_replies_rx) = mpsc::channel::<Vec<u8>>(crate::hub::QUEUE);
+    let icmp_relay = icmp_socket.map(|socket| {
+        let delivery = delivery.clone();
+        let replies = icmp_replies_tx.clone();
+        tokio::spawn(async move { icmp::relay(socket, icmp_rx, replies, delivery).await })
+    });
     let mut state = State {
         ids: HashMap::new(),
         established: HashSet::new(),
         syns: HashMap::new(),
         udp: HashMap::new(),
+        icmp: HashMap::new(),
+        icmp_ids: HashMap::new(),
+        icmp_next: 0,
         stats: Stats::default(),
     };
     let mut timer = tokio::time::interval(STATS_INTERVAL);
@@ -283,6 +337,7 @@ async fn run_proxy(
         state: &mut state,
         flows: &flows_tx,
         inject: &inject_tx,
+        icmp: icmp_relay.is_some().then_some(icmp_tx),
         shutdown: &shutdown,
     };
     let result = proxy_loop(
@@ -292,6 +347,7 @@ async fn run_proxy(
         &mut stack_out,
         &mut udp_read,
         &mut listener,
+        &mut icmp_replies_rx,
         &mut flows_rx,
         &mut runner_task,
         &mut timer,
@@ -302,6 +358,10 @@ async fn run_proxy(
     let _ = shutdown.send_replace(true);
     injector.abort();
     let _ = injector.await;
+    if let Some(relay) = icmp_relay {
+        relay.abort();
+        let _ = relay.await;
+    }
     runner_task.abort();
     let _ = runner_task.await;
     let mut snapshot = proxy.state.stats.clone();
@@ -321,6 +381,8 @@ struct Proxy<'a> {
     state: &'a mut State,
     flows: &'a mpsc::Sender<FlowMsg>,
     inject: &'a mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
+    /// Канал ping-запросов в relay-задачу; None — без WAN (ICMP дропается).
+    icmp: Option<mpsc::Sender<icmp::IcmpRequest>>,
     shutdown: &'a watch::Sender<bool>,
 }
 
@@ -332,6 +394,7 @@ async fn proxy_loop(
     stack_out: &mut futures::stream::SplitStream<Stack>,
     udp_read: &mut (impl futures::Stream<Item = (Vec<u8>, SocketAddr, SocketAddr)> + Unpin),
     listener: &mut netstack_smoltcp::TcpListener,
+    icmp_replies: &mut mpsc::Receiver<Vec<u8>>,
     flows: &mut mpsc::Receiver<FlowMsg>,
     runner_task: &mut JoinHandle<std::io::Result<()>>,
     timer: &mut Interval,
@@ -383,8 +446,25 @@ async fn proxy_loop(
                         .remove(&(addr_of(&key, true), addr_of(&key, false)));
                 }
             }
+            reply = icmp_replies.recv(), if proxy.icmp.is_some() => {
+                let Some(reply) = reply else {
+                    bail!("icmp relay ended");
+                };
+                icmp::handle_reply(
+                    proxy.events,
+                    proxy.epoch,
+                    &mut proxy.state.icmp,
+                    &mut proxy.state.icmp_ids,
+                    &proxy.state.ids,
+                    proxy.delivery,
+                    &reply,
+                );
+            }
             _ = timer.tick() => {
                 proxy.state.prune_syns();
+                for (id, key) in proxy.state.prune_icmp() {
+                    let _ = proxy.events.try_send((proxy.epoch, Event::Closed { id, key }));
+                }
                 // rx-счётчики и дропы берём из Delivery: Hub пишет их на
                 // каждой удачной записи в клиентский TUN.
                 let mut snapshot = proxy.state.stats.clone();
@@ -434,8 +514,64 @@ async fn pump(
         17 => {
             proxy.state.ids.insert(parsed.flow, packet.id);
         }
-        // ICMP через proxy не ходит: дроп со счётчиком, клиентский ICMP
-        // обрабатывает свой слой.
+        // Echo request: переписать identifier на proxy-id и отправить в WAN
+        // через raw-сокет; ответы возвращаются icmp::handle_reply.
+        1 => {
+            let Some(sender) = proxy.icmp.as_ref() else {
+                proxy.delivery.dropped();
+                return;
+            };
+            if !parsed.can_open {
+                proxy.delivery.dropped();
+                return;
+            }
+            let flow = parsed.flow;
+            match proxy.state.icmp.get_mut(&flow) {
+                Some(slot) => slot.seen = std::time::Instant::now(),
+                None => {
+                    if proxy.state.icmp.len() >= proxy.limits.icmp {
+                        proxy.state.stats.open_failed_flows += 1;
+                        proxy.delivery.dropped();
+                        return;
+                    }
+                    let Some(proxy_id) =
+                        icmp::alloc_proxy_id(&proxy.state.icmp_ids, &mut proxy.state.icmp_next)
+                    else {
+                        proxy.state.stats.open_failed_flows += 1;
+                        proxy.delivery.dropped();
+                        return;
+                    };
+                    proxy.state.icmp.insert(
+                        flow,
+                        icmp::IcmpSlot {
+                            proxy_id,
+                            seen: std::time::Instant::now(),
+                        },
+                    );
+                    proxy.state.icmp_ids.insert(proxy_id, flow);
+                    proxy.state.stats.opened_flows += 1;
+                }
+            }
+            proxy.state.ids.insert(flow, packet.id);
+            let Some(proxy_id) = proxy.state.icmp.get(&flow).map(|slot| slot.proxy_id) else {
+                proxy.delivery.dropped();
+                return;
+            };
+            let Some(request) = icmp::rewrite_echo_request(&packet.bytes, proxy_id) else {
+                proxy.delivery.dropped();
+                return;
+            };
+            let target = SocketAddr::new(IpAddr::V4(flow.destination), 0);
+            match sender.try_send(icmp::IcmpRequest {
+                target,
+                icmp: request,
+            }) {
+                Ok(()) => proxy.state.stats.inner_tx_packets += 1,
+                Err(_) => proxy.delivery.dropped(),
+            }
+            return; // в стек ICMP не идёт
+        }
+        // Неизвестный протокол: дроп со счётчиком.
         _ => {
             proxy.delivery.dropped();
             return;

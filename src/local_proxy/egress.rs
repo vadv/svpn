@@ -52,9 +52,10 @@ pub fn wan_device(_tun: &str) -> Result<String> {
 fn bound_socket(
     domain: socket2::Domain,
     kind: socket2::Type,
+    protocol: Option<socket2::Protocol>,
     device: Option<&str>,
 ) -> io::Result<socket2::Socket> {
-    let socket = socket2::Socket::new(domain, kind, None)?;
+    let socket = socket2::Socket::new(domain, kind, protocol)?;
     // Привязка к устройству существует только на Linux; вне Linux (тесты на
     // host) device всегда None.
     #[cfg(target_os = "linux")]
@@ -77,6 +78,7 @@ pub async fn tcp_connect(
     let socket = bound_socket(
         socket2::Domain::for_address(target),
         socket2::Type::STREAM,
+        None,
         device,
     )?;
     socket.set_keepalive(true)?;
@@ -99,6 +101,25 @@ pub fn udp_socket(device: Option<&str>, target: SocketAddr) -> io::Result<tokio:
     let socket = bound_socket(
         socket2::Domain::for_address(target),
         socket2::Type::DGRAM,
+        None,
+        device,
+    )?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    let socket = tokio::net::UdpSocket::from_std(std_socket)?;
+    Ok(socket)
+}
+
+/// Исходящий ICMP echo: один RAW-сокет на прокси. Тип — `UdpSocket`:
+/// send_to/recv_from работают и на raw, ядро строит IP-заголовок при
+/// отправке, приём возвращает весь пакет. Ответ может прийти с любого
+/// адреса хоста (weak-host), демультиплексация — по identifier, не по
+/// адресу. Требует CAP_NET_RAW (на роутере есть — TUN и так от root).
+pub fn icmp_socket(device: Option<&str>) -> io::Result<tokio::net::UdpSocket> {
+    let socket = bound_socket(
+        socket2::Domain::IPV4,
+        socket2::Type::RAW,
+        Some(socket2::Protocol::ICMPV4),
         device,
     )?;
     socket.set_nonblocking(true)?;
