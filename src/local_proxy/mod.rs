@@ -451,10 +451,15 @@ async fn pump(
 /// Стек → Hub: пакет потока с известным id, иначе дроп.
 fn emit(proxy: &mut Proxy<'_>, frame: Vec<u8>) {
     let Some(parsed) = packet::parse(&frame, false) else {
+        crate::debug!(
+            "local-proxy: emit drop — unparseable frame ({} bytes)",
+            frame.len()
+        );
         proxy.delivery.dropped();
         return;
     };
     let Some(id) = proxy.state.ids.get(&parsed.flow).copied() else {
+        crate::debug!("local-proxy: emit drop — no flow id for {:?}", parsed.flow);
         proxy.delivery.dropped();
         return;
     };
@@ -534,6 +539,7 @@ fn relay_udp(proxy: &mut Proxy<'_>, (payload, client, target): (Vec<u8>, SocketA
         });
         proxy.state.udp.insert(pair, sender);
         proxy.state.stats.opened_flows += 1;
+        crate::debug!("local-proxy: udp flow {client} → {target} opened");
     }
     let Some(sender) = proxy.state.udp.get(&pair) else {
         proxy.delivery.dropped();
@@ -578,6 +584,7 @@ async fn udp_flow(
             received = socket.recv(&mut buffer) => {
                 match received {
                     Ok(length) => {
+                        crate::debug!("local-proxy: udp {target} → {client} reply {length} bytes");
                         // Ответ инжектируется как цель→клиент.
                         if inject
                             .try_send((buffer[..length].to_vec(), target, client))
