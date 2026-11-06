@@ -329,7 +329,7 @@ async fn tcp_handshake_data_close() {
 }
 
 #[tokio::test]
-async fn tcp_connect_refused_closes_flow() {
+async fn tcp_connect_refused_resets_and_closes() {
     // Свободный порт: bind + drop.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -345,7 +345,7 @@ async fn tcp_connect_refused_closes_flow() {
     )
     .await;
     // SYN-ACK стек выпускает до accept; после ACK клиента accept отдаёт
-    // поток, connect в refused-порт падает → Closed.
+    // поток, connect в refused-порт падает.
     let (_, syn_ack) = expect_packet(&mut proxy, |(_, _)| true).await;
     let (_, server_seq, _, _) = tcp_reply(&syn_ack);
     send(
@@ -354,6 +354,11 @@ async fn tcp_connect_refused_closes_flow() {
         tcp_segment(source, destination, 2001, server_seq + 1, ACK, b""),
     )
     .await;
+    // До Closed клиент получает RST (0x04) — иначе он завис бы на
+    // полуоткрытом сокете после SYN-ACK.
+    let (_, rst) = expect_packet(&mut proxy, |(_, _)| true).await;
+    let (flags, _, _, _) = tcp_reply(&rst);
+    assert_eq!(flags & 0x04, 0x04, "ожидался RST, flags: {flags:08b}");
     let (closed_id, key) = expect_closed(&mut proxy).await;
     assert_eq!(closed_id, 9);
     assert_eq!(key.destination_port, port);
@@ -390,7 +395,11 @@ async fn tcp_admission_limit_drops_syn() {
         tcp_segment(source, destination, 4000, 0, SYN, b""),
     )
     .await;
-    expect_silence(&mut proxy, 300).await;
+    // Admission-отказ уже-владеемого Hub потока: SYN-ACK нет, но поток
+    // закрывается событием Closed (иначе route в Hub утёк бы навсегда).
+    let (closed_id, key) = expect_closed(&mut proxy).await;
+    assert_eq!(closed_id, 13);
+    assert_eq!(key.destination_port, echo_port);
     wait_stat(&proxy, |stats| stats.open_failed_flows >= 1).await;
     echo.abort();
 }
@@ -430,6 +439,30 @@ async fn udp_reply_from_foreign_source() {
         "src = цель, а не фактический отправитель"
     );
     assert_eq!(&reply[28..], b"weak-host");
+    echo.abort();
+}
+
+#[tokio::test]
+async fn udp_empty_reply_reaches_client() {
+    // Regression: netstack-smoltcp 0.2.5 глотал пустую UDP-датаграмму
+    // (0 байт payload) в WriteHalf::start_send — нулевой ответ цели терялся.
+    // Форк vadv/netstack-smoltcp строит заголовки с пустым payload.
+    let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let echo = tokio::spawn(async move {
+        let mut buffer = [0u8; 1500];
+        while let Ok((_, peer)) = receiver.recv_from(&mut buffer).await {
+            let _ = receiver.send_to(&[], peer).await;
+        }
+    });
+    let mut proxy = start_with_ready(Limits::default()).await;
+    let source = client(48000);
+    let destination = addr(Ipv4Addr::LOCALHOST, port);
+
+    send(&proxy, 51, udp_datagram(source, destination, b"ping")).await;
+    let (_, reply) =
+        expect_packet(&mut proxy, |(_, bytes)| bytes.len() == 28 && bytes[9] == 17).await;
+    assert_eq!(&reply[12..16], &Ipv4Addr::LOCALHOST.octets(), "src = цель");
     echo.abort();
 }
 
@@ -493,9 +526,12 @@ async fn udp_admission_limit_drops_datagram() {
     let one = addr(Ipv4Addr::LOCALHOST, sink_port);
     let two = addr(Ipv4Addr::LOCALHOST, black_hole_port);
     send(&proxy, 31, udp_datagram(source, one, b"x")).await;
-    // Второй кортеж — отказ admission.
+    // Второй кортеж — отказ admission: поток уже владеется Hub, поэтому
+    // закрывается событием Closed, а не молчаливым дропом.
     send(&proxy, 32, udp_datagram(source, two, b"y")).await;
-    expect_silence(&mut proxy, 300).await;
+    let (closed_id, key) = expect_closed(&mut proxy).await;
+    assert_eq!(closed_id, 32);
+    assert_eq!(key.destination_port, black_hole_port);
     wait_stat(&proxy, |stats| stats.open_failed_flows >= 1).await;
 }
 
@@ -513,4 +549,23 @@ async fn icmp_dropped_without_events() {
     echo_request[20] = 8; // echo request
     send(&proxy, 41, echo_request).await;
     expect_silence(&mut proxy, 300).await;
+}
+
+// ── WAN-парсер ──────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parse_route_table_prefers_default_lowest_metric() {
+    // Regression: старый код читал колонку Gateway вместо Destination
+    // (fields.nth(1)), из-за чего default-маршрут с ненулевым gateway
+    // пропускался и WAN-интерфейс не находился вовсе.
+    use svpn::local_proxy::egress::parse_route_table;
+    let table = "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 00000000 0101A8C0 0003 0 0 100 00000000 0 0 0
+wlan0 00000000 FE01A8C0 0003 0 0 50 00000000 0 0 0
+tun0 00000000 00000000 0003 0 0 0 00000000 0 0 0
+eth0 0001A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0
+";
+    assert_eq!(parse_route_table(table, "tun0").as_deref(), Some("wlan0"));
 }

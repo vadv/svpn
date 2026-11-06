@@ -39,6 +39,9 @@ hcl-rs = "0.20.0"
 [patch.crates-io]
 # shortcut: PR57 ещё не в релизе; убрать fork после upstream-релиза с этим исправлением.
 sctp-proto = { git = "https://github.com/vadv/sctp-proto", rev = "3266f9709a842f7fbde632a952bd086f3bcbb067" }
+# Пустая UDP-датаграмма (0 байт payload) — легальна; upstream-форк глотал её в
+# WriteHalf::start_send. Убрать fork после принятия фикса в cavivie/netstack-smoltcp.
+netstack-smoltcp = { git = "https://github.com/vadv/netstack-smoltcp", rev = "8a704716b9e68f43aa88e612c5c0eb50af451235" }
 
 [lints.rust]
 unsafe_code = "forbid"

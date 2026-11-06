@@ -19,7 +19,7 @@ pub fn parse_route_table(text: &str, skip: &str) -> Option<String> {
     for line in text.lines().skip(1) {
         let mut fields = line.split_whitespace();
         let (Some(iface), Some(destination), Some(metric)) =
-            (fields.next(), fields.nth(1), fields.nth(3))
+            (fields.next(), fields.next(), fields.nth(4))
         else {
             continue;
         };

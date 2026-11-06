@@ -1995,8 +1995,7 @@ dependencies = [
 [[package]]
 name = "netstack-smoltcp"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5abcddf2ae2d1642c492c1043041548200a176a3b5c3db6e5169ab1ed8d62b8"
+source = "git+https://github.com/vadv/netstack-smoltcp?rev=8a704716b9e68f43aa88e612c5c0eb50af451235#8a704716b9e68f43aa88e612c5c0eb50af451235"
 dependencies = [
  "etherparse",
  "futures",

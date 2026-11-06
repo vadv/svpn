@@ -185,7 +185,12 @@ pub fn dword(bytes: &[u8], offset: usize) -> Option<u32> {
 /// (SYN included) with `RST|ACK, seq = 0, ack = seq + payload_len + SYN + FIN`
 /// (wrapping). A reset is never answered.
 pub fn tcp_reset_for(packet: &Packet) -> Option<[u8; 40]> {
-    let tcp = packet.tcp.as_ref()?;
+    tcp_reset(packet.flow, packet.tcp.as_ref()?)
+}
+
+/// CLOSED-endpoint reset rules applied to a stored `TcpMeta` (последний
+/// клиентский сегмент): те же правила, что у `tcp_reset_for`, без сырого пакета.
+pub fn tcp_reset(flow: FlowKey, tcp: &TcpMeta) -> Option<[u8; 40]> {
     if tcp.flags & 0x04 != 0 {
         return None;
     }
@@ -197,7 +202,7 @@ pub fn tcp_reset_for(packet: &Packet) -> Option<[u8; 40]> {
             + u32::from(tcp.flags & 0x01 != 0);
         (0x14, 0, tcp.seq.wrapping_add(length))
     };
-    Some(tcp_segment(reverse(packet.flow), flags, seq, ack))
+    Some(tcp_segment(reverse(flow), flags, seq, ack))
 }
 
 /// Best-effort RST toward the client for a retired flow, seeded with the

@@ -13,7 +13,7 @@
 //! ретрансмиссия SYN-ACK невозможна — потеря SYN-ACK роняет одну попытку
 //! коннекта; пересмотреть после апстрим-фикса или форка.
 
-mod egress;
+pub mod egress;
 pub mod icmp;
 
 use std::{
@@ -35,7 +35,7 @@ use tokio::{
 use crate::{
     control::Stats,
     link_io::{Delivery, Epoch, Event, Packet},
-    packet::{self, FlowKey},
+    packet::{self, FlowKey, TcpMeta},
 };
 
 /// Владелец фоновой задачи: graceful shutdown с дедлайном, abort при Drop.
@@ -205,6 +205,12 @@ struct ProxyArgs {
 /// Сообщение от per-flow задач владельцу: поток завершился.
 enum FlowMsg {
     Closed(FlowKey),
+    /// Соединение не состоялось (connect fail или обрыв relay): клиенту нужен
+    /// reset до ухода потока — иначе он зависнет на полуоткрытом сокете.
+    Reset {
+        id: u64,
+        key: FlowKey,
+    },
 }
 
 /// Ключ UDP-потока — пара адресов клиент→цель.
@@ -218,6 +224,8 @@ struct State {
     /// SYN-дедуп и admission: ключи не старше SYN_TTL.
     syns: HashMap<FlowKey, std::time::Instant>,
     udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>>,
+    /// Последний TCP-сегмент клиента — seed для client-facing reset на обрыве.
+    tcp_last: HashMap<FlowKey, TcpMeta>,
     /// Ping-потоки: flow (identifier клиента в `source_port`) → слот.
     icmp: HashMap<FlowKey, icmp::IcmpSlot>,
     icmp_ids: HashMap<u16, FlowKey>,
@@ -240,6 +248,7 @@ impl State {
             // потоки чистятся только по Closed.
             if !self.established.contains(&key) {
                 self.ids.remove(&key);
+                self.tcp_last.remove(&key);
             }
         }
     }
@@ -293,7 +302,20 @@ async fn run_proxy(
     // split() возвращает (sink, stream): sink — пакеты в стек,
     // stream — кадры из стека наружу.
     let (stack_in, stack_out) = stack.split();
-    tokio::pin!(stack_out, stack_in);
+    tokio::pin!(stack_out);
+    // Стек-инжект — отдельная задача: `send().await` на полной очереди стека
+    // блокировал цикл, который обязан параллельно читать `udp_read` — при
+    // burst UDP-ответов наступал deadlock. Цикл делает неблокирующий
+    // `try_send` в этот канал.
+    let (stack_tx, mut stack_rx) = mpsc::channel::<Vec<u8>>(crate::hub::QUEUE);
+    let stack_in_task = tokio::spawn(async move {
+        let mut stack_in = stack_in;
+        while let Some(bytes) = stack_rx.recv().await {
+            if stack_in.send(bytes).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut runner_task = tokio::spawn(runner);
     let (inject_tx, mut inject_rx) =
@@ -307,7 +329,7 @@ async fn run_proxy(
         }
     });
 
-    let (flows_tx, mut flows_rx) = mpsc::channel::<FlowMsg>(crate::hub::QUEUE);
+    let (flows_tx, mut flows_rx) = mpsc::unbounded_channel::<FlowMsg>();
     let (icmp_tx, icmp_rx) = mpsc::channel::<icmp::IcmpRequest>(crate::hub::QUEUE);
     let (icmp_replies_tx, mut icmp_replies_rx) = mpsc::channel::<Vec<u8>>(crate::hub::QUEUE);
     let icmp_relay = icmp_socket.map(|socket| {
@@ -320,6 +342,7 @@ async fn run_proxy(
         established: HashSet::new(),
         syns: HashMap::new(),
         udp: HashMap::new(),
+        tcp_last: HashMap::new(),
         icmp: HashMap::new(),
         icmp_ids: HashMap::new(),
         icmp_next: 0,
@@ -343,7 +366,7 @@ async fn run_proxy(
     let result = proxy_loop(
         &mut proxy,
         &mut outgoing,
-        &mut stack_in,
+        &stack_tx,
         &mut stack_out,
         &mut udp_read,
         &mut listener,
@@ -358,6 +381,8 @@ async fn run_proxy(
     let _ = shutdown.send_replace(true);
     injector.abort();
     let _ = injector.await;
+    stack_in_task.abort();
+    let _ = stack_in_task.await;
     if let Some(relay) = icmp_relay {
         relay.abort();
         let _ = relay.await;
@@ -379,7 +404,7 @@ struct Proxy<'a> {
     delivery: &'a Arc<Delivery>,
     stats: &'a watch::Sender<Stats>,
     state: &'a mut State,
-    flows: &'a mpsc::Sender<FlowMsg>,
+    flows: &'a mpsc::UnboundedSender<FlowMsg>,
     inject: &'a mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
     /// Канал ping-запросов в relay-задачу; None — без WAN (ICMP дропается).
     icmp: Option<mpsc::Sender<icmp::IcmpRequest>>,
@@ -390,12 +415,12 @@ struct Proxy<'a> {
 async fn proxy_loop(
     proxy: &mut Proxy<'_>,
     outgoing: &mut mpsc::Receiver<Packet>,
-    stack_in: &mut futures::stream::SplitSink<Stack, Vec<u8>>,
+    stack_tx: &mpsc::Sender<Vec<u8>>,
     stack_out: &mut futures::stream::SplitStream<Stack>,
     udp_read: &mut (impl futures::Stream<Item = (Vec<u8>, SocketAddr, SocketAddr)> + Unpin),
     listener: &mut netstack_smoltcp::TcpListener,
     icmp_replies: &mut mpsc::Receiver<Vec<u8>>,
-    flows: &mut mpsc::Receiver<FlowMsg>,
+    flows: &mut mpsc::UnboundedReceiver<FlowMsg>,
     runner_task: &mut JoinHandle<std::io::Result<()>>,
     timer: &mut Interval,
 ) -> Result<()> {
@@ -403,7 +428,7 @@ async fn proxy_loop(
         tokio::select! {
             packet = outgoing.recv() => {
                 let Some(packet) = packet else { return Ok(()) };
-                pump(proxy, stack_in, packet).await;
+                pump(proxy, stack_tx, packet).await;
             }
             frame = stack_out.next() => {
                 let Some(frame) = frame else {
@@ -415,35 +440,46 @@ async fn proxy_loop(
                 let Some(datagram) = datagram else {
                     bail!("netstack-smoltcp UDP stream ended");
                 };
-                relay_udp(proxy, datagram);
+                relay_udp(proxy, datagram).await;
             }
             accepted = listener.next() => {
                 let Some((stream, client, target)) = accepted else {
                     bail!("netstack-smoltcp TCP listener ended");
                 };
-                // Хендшейк завершён: SYN-слот свободен, id защищён от prune.
+                // Сокет принят: SYN-слот свободен, id защищён от prune.
                 let key = flow_key(client, target, 6);
                 proxy.state.syns.remove(&key);
                 proxy.state.established.insert(key);
-                relay_tcp(proxy, stream, client, target);
+                let Some(id) = proxy.state.ids.get(&key).copied() else {
+                    // Не бывает: id вставляется в pump до того, как стек
+                    // выдаёт сокет слушателю.
+                    proxy.delivery.dropped();
+                    continue;
+                };
+                relay_tcp(proxy, stream, client, target, id);
             }
             message = flows.recv() => {
-                let Some(FlowMsg::Closed(key)) = message else {
+                let Some(message) = message else {
                     bail!("flow channel closed");
                 };
-                if let Some(id) = proxy.state.ids.remove(&key) {
-                    proxy.state.stats.closed_flows += 1;
-                    let _ = proxy
-                        .events
-                        .try_send((proxy.epoch, Event::Closed { id, key }));
-                }
-                proxy.state.syns.remove(&key);
-                proxy.state.established.remove(&key);
-                if key.protocol == 17 {
-                    proxy
-                        .state
-                        .udp
-                        .remove(&(addr_of(&key, true), addr_of(&key, false)));
+                match message {
+                    FlowMsg::Closed(key) => close_flow(proxy, key).await,
+                    FlowMsg::Reset { id, key } => {
+                        // Reset до close_flow: id-маппинг ещё жив, и пакет
+                        // дойдёт клиенту, пока route в Hub не забыт.
+                        if let Some(meta) = proxy.state.tcp_last.get(&key)
+                            && let Some(rst) = packet::tcp_reset(key, meta)
+                        {
+                            let _ = proxy
+                                .events
+                                .send((
+                                    proxy.epoch,
+                                    Event::Packet(Packet { id, bytes: rst.to_vec() }),
+                                ))
+                                .await;
+                        }
+                        close_flow(proxy, key).await;
+                    }
                 }
             }
             reply = icmp_replies.recv(), if proxy.icmp.is_some() => {
@@ -463,7 +499,10 @@ async fn proxy_loop(
             _ = timer.tick() => {
                 proxy.state.prune_syns();
                 for (id, key) in proxy.state.prune_icmp() {
-                    let _ = proxy.events.try_send((proxy.epoch, Event::Closed { id, key }));
+                    let _ = proxy
+                        .events
+                        .send((proxy.epoch, Event::Closed { id, key }))
+                        .await;
                 }
                 // rx-счётчики и дропы берём из Delivery: Hub пишет их на
                 // каждой удачной записи в клиентский TUN.
@@ -482,11 +521,7 @@ async fn proxy_loop(
 }
 
 /// Hub → стек: дедуп SYN, admission, учёт id.
-async fn pump(
-    proxy: &mut Proxy<'_>,
-    stack_in: &mut futures::stream::SplitSink<Stack, Vec<u8>>,
-    packet: Packet,
-) {
+async fn pump(proxy: &mut Proxy<'_>, stack_tx: &mpsc::Sender<Vec<u8>>, packet: Packet) {
     let Some(parsed) = packet::parse(&packet.bytes, true) else {
         proxy.delivery.dropped();
         return;
@@ -494,12 +529,29 @@ async fn pump(
     match parsed.flow.protocol {
         6 => {
             if parsed.can_open {
-                if proxy.state.syns.contains_key(&parsed.flow) {
+                // Резервация живёт до Closed: syns (SYN без хендшейка) и
+                // established (принятый сокет) вместе — admission и дедуп
+                // смотрят на живое состояние, а не на короткоживущий syns-слот.
+                if proxy.state.syns.contains_key(&parsed.flow)
+                    || proxy.state.established.contains(&parsed.flow)
+                {
                     proxy.delivery.dropped();
                     return;
                 }
-                if proxy.state.syns.len() >= proxy.limits.tcp {
+                if proxy.state.syns.len() + proxy.state.established.len() >= proxy.limits.tcp {
                     proxy.state.stats.open_failed_flows += 1;
+                    // Hub уже владеет этим потоком (open_local вставил route);
+                    // без Closed route утечёт навсегда.
+                    let _ = proxy
+                        .events
+                        .send((
+                            proxy.epoch,
+                            Event::Closed {
+                                id: packet.id,
+                                key: parsed.flow,
+                            },
+                        ))
+                        .await;
                     proxy.delivery.dropped();
                     return;
                 }
@@ -510,6 +562,9 @@ async fn pump(
                 proxy.state.stats.opened_flows += 1;
             }
             proxy.state.ids.insert(parsed.flow, packet.id);
+            if let Some(meta) = parsed.tcp {
+                proxy.state.tcp_last.insert(parsed.flow, meta);
+            }
         }
         17 => {
             proxy.state.ids.insert(parsed.flow, packet.id);
@@ -577,7 +632,7 @@ async fn pump(
             return;
         }
     }
-    if stack_in.send(packet.bytes).await.is_err() {
+    if stack_tx.try_send(packet.bytes).is_err() {
         proxy.delivery.dropped();
         return;
     }
@@ -608,11 +663,32 @@ fn emit(proxy: &mut Proxy<'_>, frame: Vec<u8>) {
     }
 }
 
+/// Убрать поток из state и уведомить Hub событием Closed (надёжно, с await).
+async fn close_flow(proxy: &mut Proxy<'_>, key: FlowKey) {
+    if let Some(id) = proxy.state.ids.remove(&key) {
+        proxy.state.stats.closed_flows += 1;
+        let _ = proxy
+            .events
+            .send((proxy.epoch, Event::Closed { id, key }))
+            .await;
+    }
+    proxy.state.syns.remove(&key);
+    proxy.state.established.remove(&key);
+    proxy.state.tcp_last.remove(&key);
+    if key.protocol == 17 {
+        proxy
+            .state
+            .udp
+            .remove(&(addr_of(&key, true), addr_of(&key, false)));
+    }
+}
+
 fn relay_tcp(
     proxy: &mut Proxy<'_>,
     stream: netstack_smoltcp::TcpStream,
     client: SocketAddr,
     target: SocketAddr,
+    id: u64,
 ) {
     let key = flow_key(client, target, 6);
     let device = proxy.device.clone();
@@ -624,7 +700,7 @@ fn relay_tcp(
                 Ok(outbound) => outbound,
                 Err(error) => {
                     crate::debug!("local-proxy: connect {target} failed — {error}");
-                    let _ = flows.try_send(FlowMsg::Closed(key));
+                    let _ = flows.send(FlowMsg::Reset { id, key });
                     return;
                 }
             };
@@ -636,21 +712,38 @@ fn relay_tcp(
                 result.map(|_| ()).map_err(|error| error.to_string())
             }
         };
-        if let Err(error) = result {
-            crate::debug!("local-proxy: relay {client} ↔ {target} ended — {error}");
+        match result {
+            Ok(()) => {
+                // Half-close отработан copy_bidirectional; поток закрыт чисто.
+                let _ = flows.send(FlowMsg::Closed(key));
+            }
+            Err(error) => {
+                crate::debug!("local-proxy: relay {client} ↔ {target} ended — {error}");
+                // Обрыв mid-stream: клиент должен получить RST, а не зависнуть.
+                let _ = flows.send(FlowMsg::Reset { id, key });
+            }
         }
-        // Half-close отработан copy_bidirectional; поток для клиента закрыт.
-        let _ = flows.try_send(FlowMsg::Closed(key));
     });
 }
 
-fn relay_udp(proxy: &mut Proxy<'_>, (payload, client, target): (Vec<u8>, SocketAddr, SocketAddr)) {
+async fn relay_udp(
+    proxy: &mut Proxy<'_>,
+    (payload, client, target): (Vec<u8>, SocketAddr, SocketAddr),
+) {
     let key = flow_key(client, target, 17);
     let pair = (client, target);
     if !proxy.state.udp.contains_key(&pair) {
         if proxy.state.udp.len() >= proxy.limits.udp {
             proxy.state.stats.open_failed_flows += 1;
-            proxy.state.ids.remove(&key);
+            // Hub уже владеет потоком (open_local вставил route); без Closed
+            // route утечёт навсегда.
+            if let Some(id) = proxy.state.ids.remove(&key) {
+                proxy.state.stats.closed_flows += 1;
+                let _ = proxy
+                    .events
+                    .send((proxy.epoch, Event::Closed { id, key }))
+                    .await;
+            }
             proxy.delivery.dropped();
             return;
         }
@@ -692,7 +785,7 @@ async fn udp_flow(
     device: Option<String>,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     shutdown: &mut watch::Receiver<bool>,
-    flows: mpsc::Sender<FlowMsg>,
+    flows: mpsc::UnboundedSender<FlowMsg>,
     inject: mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
     client: SocketAddr,
     target: SocketAddr,
@@ -702,7 +795,7 @@ async fn udp_flow(
         Ok(socket) => socket,
         Err(error) => {
             crate::debug!("local-proxy: udp socket {target} failed — {error}");
-            let _ = flows.try_send(FlowMsg::Closed(flow_key(client, target, 17)));
+            let _ = flows.send(FlowMsg::Closed(flow_key(client, target, 17)));
             return;
         }
     };
@@ -740,7 +833,7 @@ async fn udp_flow(
     if let Err(reason) = result {
         crate::debug!("local-proxy: udp flow {client} → {target} ended — {reason}");
     }
-    let _ = flows.try_send(FlowMsg::Closed(key));
+    let _ = flows.send(FlowMsg::Closed(key));
 }
 
 /// IPv6-адресов из TUN не бывает (svpn — IPv4-VPN), отображение defensively.

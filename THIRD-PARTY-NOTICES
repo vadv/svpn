@@ -1,4 +1,4 @@
-Cargo.lock sha256: 064b2ae55ef0047c8cee180864fc7ec698783c9650a3414227c1864dd0040ee2
+Cargo.lock sha256: e8b05ff4865478233c0efbba34a689de57b68e084a8264da28f7399ac6d8fed6
 THIRD-PARTY NOTICES — SVPN v0.2.0
 Prepared from the union of the three release target dependency graphs.
 Some notices cover source components not linked into every binary.
@@ -37866,7 +37866,7 @@ SOFTWARE.
 
 ========================================================================
 netstack-smoltcp 0.2.5
-Source: registry+https://github.com/rust-lang/crates.io-index
+Source: git+https://github.com/vadv/netstack-smoltcp?rev=8a704716b9e68f43aa88e612c5c0eb50af451235#8a704716b9e68f43aa88e612c5c0eb50af451235
 Declared license: MIT OR Apache-2.0
 Repository: https://github.com/cavivie/netstack-smoltcp
 Package authors: cavivie <cavivie@gmail.com>
