@@ -2,7 +2,7 @@
 name = "svpn"
 version = "1.0.1"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 description = "IPv4 TUN VPN with SSH control"
 publish = false
 license = "MIT"
@@ -16,21 +16,22 @@ getrandom = "0.3"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
-nix = { version = "0.31.3", default-features = false, features = ["fs", "net", "signal"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "signal"] }
 quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio", "futures-io", "log"] }
 rlimit = "0.10"
-route_manager = "0.2.16"
 russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2", "rsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 sha2 = "0.11.1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "signal", "sync", "time"] }
 mimalloc = "0.1"
 tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
 zeroize = "1"
+netstack-smoltcp = "0.2.5"
+futures = { version = "0.3", default-features = false }
 
 rcgen = "0.14.10"
 hcl-rs = "0.20.0"
@@ -38,6 +39,9 @@ hcl-rs = "0.20.0"
 [patch.crates-io]
 # shortcut: PR57 ещё не в релизе; убрать fork после upstream-релиза с этим исправлением.
 sctp-proto = { git = "https://github.com/vadv/sctp-proto", rev = "3266f9709a842f7fbde632a952bd086f3bcbb067" }
+# Пустая UDP-датаграмма (0 байт payload) — легальна; upstream-форк глотал её в
+# WriteHalf::start_send. Убрать fork после принятия фикса в cavivie/netstack-smoltcp.
+netstack-smoltcp = { git = "https://github.com/vadv/netstack-smoltcp", rev = "8a704716b9e68f43aa88e612c5c0eb50af451235" }
 
 [lints.rust]
 unsafe_code = "forbid"

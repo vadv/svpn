@@ -109,7 +109,6 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
         geo_pending: None,
         country_pending: None,
         local: None,
-        local_task: None,
         local_cleanup: None,
         nodes: servers
             .iter()

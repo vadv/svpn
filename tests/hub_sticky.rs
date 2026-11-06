@@ -128,7 +128,6 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
         geo_pending: None,
         country_pending: None,
         local: None,
-        local_task: None,
         local_cleanup: None,
         nodes: vec![("a.example".to_owned(), 1), ("b.example".to_owned(), 1)],
         exit_owners: Default::default(),

@@ -91,6 +91,25 @@ Routing is exactly two mechanisms:
 `weight` is the share of groups a server owns: weights 3 and 1 give a rough
 3:1 distribution. Weights affect owner selection, not individual packets.
 
+### `via = local`: how the local egress works
+
+No second TUN is created. The local egress is a proxy inside `serve`: TCP
+and UDP flows are terminated by a userspace stack, ICMP echo by a single
+raw socket (the identifier is rewritten to a proxy-id). Outbound sockets
+are bound to the WAN interface (`SO_BINDTODEVICE`), which is picked
+automatically from the routing table; no NAT or nftables on the client.
+Server hooks on the VPSs keep working as before.
+
+Accepted decisions:
+
+- IPv4 only; ICMP is limited to echo (type 3/11/12 errors are not translated);
+- simultaneous TCP/UDP/ping flow limits: exceeding one drops the packet with
+  a counter; a TCP admission failure closes the flow with a `Closed` event,
+  a failed connect or a broken relay returns an RST to the client;
+- UDP and ping accept a reply from any address of the host (weak host);
+- production is Linux (`SO_BINDTODEVICE`, raw socket); without a WAN device
+  (the test entry point) egress flows are dropped.
+
 ### Selectors and the resolver
 
 - Exactly one selector per block: `names`, `countries`, `ips` or `asn` — all

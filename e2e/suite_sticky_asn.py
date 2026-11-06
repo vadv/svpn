@@ -471,14 +471,16 @@ def test_local_egress_and_vpn():
         by_source = target_tcp_echo(4, BY_TARGET)
         assert by_source == "172.30.77.3", by_source
         tcp_echo(3, peer=PEER)
-        until(lambda: local_opened(path) == (4, 0, 0), seconds=20)
+        # 2 opened TCP flows (local + sticky by-target) close on FIN; UDP idles, ICMP is sessionless.
+        until(lambda: local_opened(path) == (4, 0, 2), seconds=20)
         until(lambda: delta(path, baseline) == {SERVER: 0, SERVER2: 1}, seconds=20)
+        # Proxy architecture: no second TUN; only the primary svpn0 remains.
         local_tuns = {
             item["ifname"]
             for item in json.loads(command(["ip", "-j", "link", "show"]).stdout)
             if item["ifname"] in {"svpn0", "tun0"}
         }
-        assert local_tuns == {"svpn0", "tun0"}, local_tuns
+        assert local_tuns == {"svpn0"}, local_tuns
         process.send_signal(signal.SIGKILL)
         process.wait(timeout=5)
         until(
@@ -486,8 +488,14 @@ def test_local_egress_and_vpn():
             & {item["ifname"] for item in json.loads(command(["ip", "-j", "link", "show"]).stdout)},
             seconds=10,
         )
-        # SIGKILL skips down hooks; the next start reclaims the policy state.
-        assert "svpn_egress_" in command(["nft", "list", "tables"]).stdout
+        # SIGKILL the client: the kernel closes its sockets, servers see the
+        # control channel drop and their own down hooks retire the egress
+        # policy — no leaked tables survive the dead client.
+        for host in (SERVER, SERVER2):
+            until(
+                lambda h=host: "svpn_egress_" not in command(ssh_to(h) + ["nft", "list", "tables"]).stdout,
+                seconds=20,
+            )
         ping_local(TARGET)
     cleanup_verified(process, server_hosts=HOSTS)
 
@@ -501,7 +509,8 @@ def test_local_egress_and_vpn():
         until(lambda: local_opened(path)[0] == baseline[0] + 1, seconds=20)
     cleanup_verified(process, server_hosts=HOSTS)
     remove_full_tunnel_routes()
-    assert "svpn_egress_" not in command(["nft", "list", "tables"]).stdout
+    for host in (SERVER, SERVER2):
+        assert "svpn_egress_" not in command(ssh_to(host) + ["nft", "list", "tables"]).stdout
     print("PASS local-exit+VPN: full-tunnel TCP/UDP/ICMP and restart work")
 
 
