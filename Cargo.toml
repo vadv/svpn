@@ -2,7 +2,7 @@
 name = "svpn"
 version = "1.0.1"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 description = "IPv4 TUN VPN with SSH control"
 publish = false
 license = "MIT"

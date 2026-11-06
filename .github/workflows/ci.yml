@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-        rust: ["1.89.0", "1.99.0"]
+        rust: ["1.91.0", "1.99.0"]
     env:
       RUST_VERSION: ${{ matrix.rust }}
     steps:

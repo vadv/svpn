@@ -6,7 +6,9 @@ use std::{io, net::SocketAddr, time::Duration};
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(target_os = "linux"))]
+use anyhow::bail;
 
 /// Парсинг `/proc/net/route`: интерфейс default-маршрута с минимальной
 /// метрикой, кроме `skip` (TUN) и loopback. Колонки (hex): Iface Destination
