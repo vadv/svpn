@@ -116,6 +116,11 @@ pub struct Session {
     pub stats: Stats,
     /// Precomputed `drop[host]:` prefix — every loss logs its reason (#124).
     pub drop_prefix: String,
+    /// Capacity-refusal log rate limit: one line per second, the suppressed
+    /// count rides along on the next one.
+    pub drop_log_at: Option<StdInstant>,
+    /// Drops suppressed since the last capacity-refusal line.
+    pub drop_log_suppressed: u64,
     /// next health burst at; armed on Ready, re-armed per burst.
     pub health_at: Option<tokio::time::Instant>,
     pub flush_at: Option<tokio::time::Instant>,
@@ -579,6 +584,8 @@ async fn run_io(
         remeasure: remeasure_interval,
         next_challenge_at: None,
         drop_prefix,
+        drop_log_at: None,
+        drop_log_suppressed: 0,
     }
     .event_loop()
     .await

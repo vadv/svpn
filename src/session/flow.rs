@@ -211,6 +211,8 @@ impl Session {
         Ok(())
     }
 
+    /// shortcut: counts scan the whole map (O(capacity)); maintained
+    /// counters pay off only well beyond FLOW_CAP — measure before adding.
     pub fn flow_count(&self) -> usize {
         match &self.plane {
             Plane::Channels(plane) => plane.flows.keys().filter(|&&id| !is_probe_flow(id)).count(),
@@ -219,16 +221,75 @@ impl Session {
     }
 
     pub(crate) fn flow_limit_reached(&self, id: u64) -> bool {
-        let count = match &self.plane {
-            Plane::Channels(plane) => plane.flows.len(),
-            Plane::Tcp(plane) => plane.flows.len(),
+        let (count, ordinary) = match &self.plane {
+            Plane::Channels(plane) => (
+                plane.flows.len(),
+                plane.flows.keys().filter(|&&id| !is_probe_flow(id)).count(),
+            ),
+            Plane::Tcp(plane) => (
+                plane.flows.len(),
+                plane.flows.keys().filter(|&&id| !is_probe_flow(id)).count(),
+            ),
         };
-        let ordinary = self.flow_count();
         if is_probe_flow(id) {
             count - ordinary >= PROBE_FLOW_RESERVE
         } else {
             ordinary >= FLOW_CAP
         }
+    }
+
+    /// Flows that may still accumulate pending data — the single pending
+    /// backpressure count behind every admission check.
+    pub(crate) fn pending_flows(&self) -> usize {
+        match &self.plane {
+            Plane::Channels(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
+                .count(),
+            Plane::Tcp(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
+                .count(),
+        }
+    }
+
+    /// Oldest unproven ordinary flow: the only safe displacement victim —
+    /// evicting proven flows would break established connections.
+    fn oldest_unproven(&self) -> Option<u64> {
+        match &self.plane {
+            Plane::Channels(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| !flow.proven && !is_probe_flow(**id) && **id != PREFLIGHT_ID)
+                .min_by_key(|(_, flow)| flow.created)
+                .map(|(&id, _)| id),
+            Plane::Tcp(plane) => plane
+                .flows
+                .iter()
+                .filter(|(id, flow)| !flow.proven && !is_probe_flow(**id) && **id != PREFLIGHT_ID)
+                .min_by_key(|(_, flow)| flow.created)
+                .map(|(&id, _)| id),
+        }
+    }
+
+    /// Displacement admission: a new flow finds its slot by evicting the
+    /// oldest unproven flows first, so a zombie SYN flood can never refuse
+    /// or starve real handshakes. Best-effort — the caller's own capacity
+    /// check still decides when everything left is proven. Probes keep
+    /// their reserve and never displace ordinary flows.
+    pub(crate) async fn evict_for_admission(&mut self, id: u64) -> Result<()> {
+        if is_probe_flow(id) {
+            return Ok(());
+        }
+        while self.flow_limit_reached(0) || self.pending_flows() >= crate::selector::PENDING_FLOWS {
+            let Some(victim) = self.oldest_unproven() else {
+                break;
+            };
+            self.close_flow(victim, true).await?;
+        }
+        Ok(())
     }
 
     // ────────────────────────── Open, bind, commit ──────────────────────────
@@ -242,27 +303,29 @@ impl Session {
         resume: bool,
     ) -> Result<()> {
         ensure!(generation != 0, "zero binding generation");
-        let at_capacity = self.flow_limit_reached(flow_id);
         if channel.is_none() {
-            let Plane::Channels(plane) = &mut self.plane else {
-                bail!("flow_open outside channels mode")
-            };
-            ensure!(
-                !is_probe_flow(flow_id),
-                "server cannot originate preflight flow"
-            );
-            // Server-originated flow (s→c): the client registers it and picks a channel.
-            if plane.flows.contains_key(&flow_id) {
-                return Ok(());
-            }
-            if !flow.valid_for(self.client_ip) {
-                self.stats.count_drop(
-                    &self.drop_prefix,
-                    "server-originated flow outside client subnet",
+            {
+                let Plane::Channels(plane) = &self.plane else {
+                    bail!("flow_open outside channels mode")
+                };
+                ensure!(
+                    !is_probe_flow(flow_id),
+                    "server cannot originate preflight flow"
                 );
-                return Ok(());
+                // Server-originated flow (s→c): the client registers it and picks a channel.
+                if plane.flows.contains_key(&flow_id) {
+                    return Ok(());
+                }
+                if !flow.valid_for(self.client_ip) {
+                    self.stats.count_drop(
+                        &self.drop_prefix,
+                        "server-originated flow outside client subnet",
+                    );
+                    return Ok(());
+                }
             }
-            if at_capacity {
+            self.evict_for_admission(flow_id).await?;
+            if self.flow_limit_reached(flow_id) {
                 return self
                     .control
                     .send(Message::FlowReject {
@@ -273,7 +336,13 @@ impl Session {
                     .await;
             }
             let now = tokio::time::Instant::now();
-            plane.flows.insert(flow_id, Flow::new(flow, now));
+            // The server's accepted socket already speaks to the far end.
+            let mut registered = Flow::new(flow, now);
+            registered.proven = true;
+            let Plane::Channels(plane) = &mut self.plane else {
+                unreachable!()
+            };
+            plane.flows.insert(flow_id, registered);
             plane.by_key.insert(flow, flow_id);
             self.stats.opened_flows += 1;
             let Some(selector) = plane.selector.as_mut() else {

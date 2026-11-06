@@ -85,7 +85,7 @@ fn completed_close_deadline_is_not_extended_by_unrelated_packets() {
 #[tokio::test]
 async fn probes_do_not_reduce_the_user_allowance() {
     for fixed_tcp in [false, true] {
-        let mut session = server(fixed_tcp);
+        let (mut session, _events) = server(fixed_tcp);
         for index in 0..PROBE_FLOW_RESERVE {
             open(
                 &mut session,
@@ -101,6 +101,7 @@ async fn probes_do_not_reduce_the_user_allowance() {
                     let mut flow = Flow::new(key, Instant::now());
                     flow.active = true;
                     flow.data_started = true;
+                    flow.proven = true;
                     plane.flows.insert(id, flow);
                     plane.by_key.insert(key, id);
                 }
@@ -108,6 +109,7 @@ async fn probes_do_not_reduce_the_user_allowance() {
                     let mut flow = TcpFlow::new(key, Instant::now());
                     flow.active = true;
                     flow.data_started = true;
+                    flow.proven = true;
                     plane.flows.insert(id, flow);
                     plane.by_key.insert(key, id);
                 }
@@ -117,15 +119,19 @@ async fn probes_do_not_reduce_the_user_allowance() {
         open(&mut session, id, key(6000)).await;
         assert!(session.has_flow(id));
         assert_eq!(session.flow_count(), FLOW_CAP);
+        // In a full table the next binding displaces the only unproven
+        // flow — the one just opened (EPIC-023 displacement admission).
         open(&mut session, id + 1, key(6001)).await;
-        assert!(!session.has_flow(id + 1));
+        assert!(session.has_flow(id + 1));
+        assert!(!session.has_flow(id));
+        assert_eq!(session.flow_count(), FLOW_CAP);
     }
 }
 
 #[tokio::test]
 async fn probe_reserve_is_bounded_when_there_are_no_user_flows() {
     for fixed_tcp in [false, true] {
-        let mut session = server(fixed_tcp);
+        let (mut session, _events) = server(fixed_tcp);
         for index in 0..PROBE_FLOW_RESERVE {
             let id = FIRST_PROBE_ID + index as u64;
             open(&mut session, id, key(index as u16)).await;
@@ -165,8 +171,13 @@ fn key(port: u16) -> FlowKey {
     key
 }
 
-fn server(fixed_tcp: bool) -> Session {
-    let (mut session, _events) = link_session(fixed_tcp);
+fn server(
+    fixed_tcp: bool,
+) -> (
+    Session,
+    tokio::sync::mpsc::Receiver<(svpn::link_io::Epoch, svpn::link_io::Event)>,
+) {
+    let (mut session, events) = link_session(fixed_tcp);
     match &mut session.plane {
         Plane::Channels(plane) => {
             plane.server_ip = None;
@@ -175,7 +186,7 @@ fn server(fixed_tcp: bool) -> Session {
         }
         Plane::Tcp(plane) => plane.server_ip = None,
     }
-    session
+    (session, events)
 }
 
 async fn open(session: &mut Session, id: u64, key: FlowKey) {

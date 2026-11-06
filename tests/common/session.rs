@@ -5,8 +5,8 @@ use std::net::Ipv4Addr;
 
 use svpn::control::{Control, Stats};
 use svpn::link_io::{self, LinkIo};
-use svpn::packet::FlowKey;
-use svpn::selector::{Allowed, Selector};
+use svpn::packet::{self, FlowKey};
+use svpn::selector::{Allowed, Candidate, Selector};
 use svpn::session::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -86,6 +86,8 @@ fn link_session_cap_with(
             readiness: None,
             client_ip: Ipv4Addr::new(10, 77, 0, 2),
             drop_prefix: String::new(),
+            drop_log_at: None,
+            drop_log_suppressed: 0,
             mtu: 1400,
             plane,
             tcp_listener: None,
@@ -177,4 +179,85 @@ pub fn test_plane(selector: Option<Selector>) -> ChannelsPlane {
         by_key: HashMap::new(),
         next_client_flow_id: 1,
     }
+}
+
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn reply(flags: u8) -> Vec<u8> {
+    let mut bytes = super::tcp_packet(true);
+    bytes[33] = flags;
+    bytes
+}
+
+/// Make flow `id` active with committed transport: flushes are live.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn activate(session: &mut Session, id: u64) -> mpsc::Receiver<Vec<u8>> {
+    let (send, receive) = mpsc::channel(4);
+    match &mut session.plane {
+        Plane::Channels(plane) => {
+            let flow = plane.flows.get_mut(&id).unwrap();
+            flow.active = true;
+            flow.data_started = true;
+            flow.pending.clear();
+            if let Some(selector) = plane.selector.as_mut() {
+                let now = std::time::Instant::now();
+                selector.adopt(Candidate::Mosh, Some(10));
+                selector.poll(now);
+                selector.bind_succeeded(id, 1, now);
+                selector.committed(id, 1);
+                selector.take_queue(id);
+            }
+            flow.tcp = Some(FlowTcp {
+                cancel: None,
+                key: [1; 16],
+                token: None,
+                out: Some(send),
+                receiver: None,
+                task: None,
+            });
+        }
+        Plane::Tcp(plane) => {
+            let flow = plane.flows.get_mut(&id).unwrap();
+            flow.active = true;
+            flow.data_started = true;
+            flow.binding_deadline = None;
+            flow.pending.clear();
+            flow.outgoing = Some(send);
+        }
+    }
+    receive
+}
+
+/// Fill the table with FLOW_CAP active flows; `proven` decides whether
+/// displacement may reclaim them.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn fill(session: &mut Session, proven: bool) {
+    let now = tokio::time::Instant::now();
+    let mut key = packet::parse(&super::tcp_packet(false), true).unwrap().flow;
+    for id in 1..=FLOW_CAP as u64 {
+        key.source_port = 10000 + id as u16;
+        match &mut session.plane {
+            Plane::Channels(plane) => {
+                plane.by_key.insert(key, id);
+                plane.flows.insert(
+                    id,
+                    Flow {
+                        active: true,
+                        data_started: true,
+                        proven,
+                        ..Flow::new(key, now)
+                    },
+                );
+            }
+            Plane::Tcp(plane) => {
+                plane.by_key.insert(key, id);
+                let mut flow = TcpFlow::new(key, now);
+                flow.active = true;
+                flow.data_started = true;
+                flow.proven = proven;
+                flow.binding_deadline = None;
+                plane.flows.insert(id, flow);
+            }
+        }
+    }
+    session.last_link_id = FLOW_CAP as u64;
 }

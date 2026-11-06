@@ -231,6 +231,9 @@ pub struct Flow {
     pub generation: u64,
     /// Sticky: a transport has accepted user data; its delivery is uncertain.
     pub data_started: bool,
+    /// The far end answered with a non-RST packet toward the client. An
+    /// unproven TCP flow is a zombie SYN: FLOW_BUDGET bounds it.
+    pub proven: bool,
     pub recovery: Option<Recovery>,
     /// Binding channel; None until `flow_channel`/`flow_opened` agrees.
     pub channel: Option<u64>,
@@ -261,6 +264,7 @@ impl Flow {
             key,
             generation: 1,
             data_started: false,
+            proven: false,
             recovery: None,
             channel: None,
             echo_pending: None,
@@ -359,6 +363,7 @@ pub struct TcpFlow {
     pub key: FlowKey,
     pub generation: u64,
     pub data_started: bool,
+    pub proven: bool,
     pub recovery: Option<Recovery>,
     pub retry_at: Option<tokio::time::Instant>,
     pub binding_deadline: Option<tokio::time::Instant>,
@@ -386,6 +391,7 @@ impl TcpFlow {
             key,
             generation: 1,
             data_started: false,
+            proven: false,
             recovery: None,
             retry_at: None,
             binding_deadline: None,

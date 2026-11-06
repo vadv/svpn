@@ -4,7 +4,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::session::{assert_closed, link_session_cap, link_session_with, tcp_packet};
+use common::session::{
+    activate, assert_closed, fill, link_session_cap, link_session_with, reply, tcp_packet,
+};
 use svpn::control::{Control, Message};
 use svpn::link_io::{self, FIRST_PROBE_ID};
 use svpn::packet::{self, FlowKey};
@@ -25,6 +27,21 @@ async fn tcp_survives_udp_idle_and_keeps_forwarding_in_both_planes() {
         let key = packet::parse(&bytes, true).unwrap().flow;
         session.handle_tun_packet(&bytes, Some(1)).await.unwrap();
         let mut outgoing = activate(&mut session, 1);
+        // The far-end answer marks the flow proven; only then may a TCP
+        // flow outlive the UDP idle limit.
+        let greeting = reply(0x10);
+        session
+            .deliver_to_tun(Incoming {
+                generation: 1,
+                id: 1,
+                channel: None,
+                packet: greeting.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.try_recv().unwrap().1, link_io::Event::Packet(p) if p.bytes == greeting)
+        );
         advance(FLOW_IDLE + Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
         assert!(session.has_flow(1));
@@ -83,6 +100,21 @@ async fn either_half_close_and_repeated_fin_survive_until_both_directions_finish
             let key = packet::parse(&syn, true).unwrap().flow;
             session.handle_tun_packet(&syn, Some(1)).await.unwrap();
             let mut outgoing = activate(&mut session, 1);
+            // The handshake's far-end answer marks the flow proven.
+            let synack = reply(0x10);
+            session
+                .deliver_to_tun(Incoming {
+                    generation: 1,
+                    id: 1,
+                    channel: None,
+                    packet: synack.clone(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.try_recv().unwrap().1,
+                link_io::Event::Packet(p) if p.bytes == synack
+            ));
             for (step, from_client) in [client_first, client_first, !client_first]
                 .into_iter()
                 .enumerate()
@@ -246,7 +278,7 @@ fn fin_requires_exact_ack_and_handles_payload_wrap_and_retransmission() {
 async fn full_client_refuses_only_new_flows_and_reclaims_closed_slots() {
     for legacy in [false, true] {
         let (mut session, mut events) = link_session_cap(legacy, 4);
-        fill(&mut session);
+        fill(&mut session, true);
         if let Plane::Channels(plane) = &mut session.plane {
             plane
                 .selector
@@ -261,6 +293,11 @@ async fn full_client_refuses_only_new_flows_and_reclaims_closed_slots() {
         let key = packet::parse(&bytes, true).unwrap().flow;
         let id = FLOW_CAP as u64 + 1;
         session.handle_tun_packet(&bytes, Some(id)).await.unwrap();
+        // The refusal is visible: a reset toward the client, then closed.
+        assert!(matches!(
+            events.try_recv().unwrap().1,
+            link_io::Event::Packet(ref p) if packet::parse(&p.bytes, false).is_some_and(|r| r.is_rst)
+        ));
         assert_closed(events.try_recv().unwrap(), id, key);
         assert!(!session.has_flow(id));
         assert_eq!(session.flow_count(), FLOW_CAP);
@@ -293,7 +330,7 @@ async fn control_opens_respect_capacity_and_bounded_probe_reserve() {
         let (writer, reader) = tokio::io::duplex(4096);
         let control = Control::new(tokio::io::empty(), writer);
         let (mut session, _events) = link_session_with(mode == "legacy", control);
-        fill(&mut session);
+        fill(&mut session, true);
         let (commands, mut receive) = mpsc::channel(32);
         match &mut session.plane {
             Plane::Channels(plane) => {
@@ -369,79 +406,6 @@ async fn control_opens_respect_capacity_and_bounded_probe_reserve() {
 }
 
 // ── helpers ──
-
-fn reply(flags: u8) -> Vec<u8> {
-    let mut bytes = common::tcp_packet(true);
-    bytes[33] = flags;
-    bytes
-}
-
-fn activate(session: &mut Session, id: u64) -> mpsc::Receiver<Vec<u8>> {
-    let (send, receive) = mpsc::channel(4);
-    match &mut session.plane {
-        Plane::Channels(plane) => {
-            let flow = plane.flows.get_mut(&id).unwrap();
-            flow.active = true;
-            flow.data_started = true;
-            flow.pending.clear();
-            if let Some(selector) = plane.selector.as_mut() {
-                let now = std::time::Instant::now();
-                selector.adopt(Candidate::Mosh, Some(10));
-                selector.poll(now);
-                selector.bind_succeeded(id, 1, now);
-                selector.committed(id, 1);
-                selector.take_queue(id);
-            }
-            flow.tcp = Some(FlowTcp {
-                cancel: None,
-                key: [1; 16],
-                token: None,
-                out: Some(send),
-                receiver: None,
-                task: None,
-            });
-        }
-        Plane::Tcp(plane) => {
-            let flow = plane.flows.get_mut(&id).unwrap();
-            flow.active = true;
-            flow.data_started = true;
-            flow.binding_deadline = None;
-            flow.pending.clear();
-            flow.outgoing = Some(send);
-        }
-    }
-    receive
-}
-
-fn fill(session: &mut Session) {
-    let now = Instant::now();
-    let mut key = packet::parse(&tcp_packet(2), true).unwrap().flow;
-    for id in 1..=FLOW_CAP as u64 {
-        key.source_port = 10000 + id as u16;
-        match &mut session.plane {
-            Plane::Channels(plane) => {
-                plane.by_key.insert(key, id);
-                plane.flows.insert(
-                    id,
-                    Flow {
-                        active: true,
-                        data_started: true,
-                        ..Flow::new(key, now)
-                    },
-                );
-            }
-            Plane::Tcp(plane) => {
-                plane.by_key.insert(key, id);
-                let mut flow = TcpFlow::new(key, now);
-                flow.active = true;
-                flow.data_started = true;
-                flow.binding_deadline = None;
-                plane.flows.insert(id, flow);
-            }
-        }
-    }
-    session.last_link_id = FLOW_CAP as u64;
-}
 
 fn open(mode: &str, id: u64, flow: FlowKey) -> Message {
     if mode == "datagram" || mode == "reverse" {

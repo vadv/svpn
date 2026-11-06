@@ -140,7 +140,10 @@ impl Session {
             !self.client() && generation != 0 && key.valid_for(self.client_ip),
             "invalid TCP binding"
         );
+        // Displacement admission: unproven slots yield before a reject.
+        self.evict_for_admission(id).await?;
         let at_capacity = self.flow_limit_reached(id);
+        let at_pending_cap = self.pending_flows() >= crate::selector::PENDING_FLOWS;
         let Plane::Tcp(plane) = &mut self.plane else {
             bail!("TCP open outside TCP mode")
         };
@@ -160,13 +163,7 @@ impl Session {
             }
         } else if at_capacity
             || plane.by_key.get(&key).is_some_and(|&owner| owner != id)
-            || (!is_probe_flow(id)
-                && plane
-                    .flows
-                    .iter()
-                    .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
-                    .count()
-                    >= crate::selector::PENDING_FLOWS)
+            || (!is_probe_flow(id) && at_pending_cap)
         {
             return self
                 .control
