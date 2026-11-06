@@ -94,7 +94,6 @@ fn local_hub() -> Hub {
             },
         )],
         local: None,
-        local_task: None,
         local_cleanup: None,
         nodes: Vec::new(),
         exit_owners: Default::default(),

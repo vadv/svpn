@@ -27,7 +27,7 @@ pub mod hub;
 pub mod job;
 pub mod limits;
 pub mod link_io;
-pub mod local_exit;
+pub mod local_proxy;
 pub mod logging;
 mod mimic;
 pub mod packet;
@@ -71,7 +71,7 @@ pub use cli::{Cli, Mode};
 pub use cmdline::{parse_byte_size, parse_port_range, serve_command, shell_quote};
 pub(crate) use mimic::DEFAULT_PORT_RANGE;
 pub use mimic::{MimicArg, MimicPlan, plan_mimic};
-pub use tun::{if_index_of, is_busy_tun, validate_tun_name};
+pub use tun::{is_busy_tun, validate_tun_name};
 
 /// Binary entry point: parses CLI, sets up logging and the runtime.
 /// `svpn job run|list`: the manual, scheduler-free path over the same

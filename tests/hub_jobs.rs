@@ -86,7 +86,6 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
         geo_pending: Some("geo-update".to_owned()),
         country_pending: None,
         local: None,
-        local_task: None,
         local_cleanup: None,
         nodes: vec![("a.example".to_owned(), 1)],
         exit_owners: Default::default(),

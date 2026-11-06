@@ -21,7 +21,7 @@ use crate::{
     control::Stats,
     hooks::Hooks,
     link_io::{Delivery, Epoch, Event, LinkIo, Packet},
-    local_exit::{self, LocalPair, LocalServer},
+    local_proxy::{self, LocalServer},
     packet::{self, FlowKey},
     pool::Pool,
     server_spec::LinkParams,
@@ -88,8 +88,6 @@ pub struct LocalStats {
 }
 
 pub struct LocalExitState {
-    pub pair: LocalPair,
-    pub primary_client: Ipv4Addr,
     pub outgoing: mpsc::Sender<Packet>,
     pub events: Option<mpsc::Receiver<(Epoch, Event)>>,
     pub latest: watch::Receiver<Stats>,
@@ -208,7 +206,6 @@ pub struct Hub {
     pub country_pending: Option<String>,
     /// Local serve and client session, started with the live primary TUN.
     pub local: Option<LocalExitState>,
-    pub local_task: Option<tokio::task::JoinHandle<Result<()>>>,
     pub local_cleanup: Option<LocalServer>,
     /// Stable node ids (configured `server` strings) and weights, for rendezvous.
     pub nodes: Vec<(String, u32)>,
@@ -364,15 +361,11 @@ impl Hub {
             return Ok(None);
         }
         let outgoing = local.outgoing.clone();
-        let primary = local.primary_client;
-        let local_ip = local.pair.client;
         let delivery = local.delivery.clone();
         let id = self.routes.allocate()?;
-        let translated = packet::translate_v4(bytes, primary, local_ip)
-            .context("local-exit packet translation")?;
         match outgoing.try_send(Packet {
             id,
-            bytes: translated,
+            bytes: bytes.to_vec(),
         }) {
             Ok(()) => {
                 self.local_stats.opened += 1;
@@ -395,14 +388,10 @@ impl Hub {
             return Ok(None);
         };
         let outgoing = local.outgoing.clone();
-        let primary = local.primary_client;
-        let local_ip = local.pair.client;
         let delivery = local.delivery.clone();
-        let translated = packet::translate_v4(bytes, primary, local_ip)
-            .context("local-exit packet translation")?;
         match outgoing.try_send(Packet {
             id,
-            bytes: translated,
+            bytes: bytes.to_vec(),
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => delivery.dropped(),
@@ -436,13 +425,8 @@ impl Hub {
                 let Some(local) = &self.local else {
                     return Ok(());
                 };
-                let primary = local.primary_client;
-                let local_ip = local.pair.client;
                 let delivery = local.delivery.clone();
-                let bytes = match packet::translate_v4(&packet.bytes, local_ip, primary) {
-                    Some(bytes) => bytes,
-                    None => return Ok(()),
-                };
+                let bytes = packet.bytes;
                 let current = packet::parse(&bytes, false).is_some_and(|parsed| {
                     matches!(self.routes.by_key.get(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
                 });
@@ -457,10 +441,6 @@ impl Hub {
                 finish_write(&delivery, bytes.len(), result)?;
             }
             Event::Closed { id, key } => {
-                let Some(local) = &self.local else {
-                    return Ok(());
-                };
-                let key = translate_key(key, local.pair.client, local.primary_client);
                 self.close_local(id, key, false);
             }
         }
@@ -649,7 +629,7 @@ impl Hub {
                         .as_ref()
                         .context("missing configured client TUN")?
                         .name()?;
-                    self.start_local(tun_addr, peer_addr, &name, params).await?;
+                    self.start_local(&name, params).await?;
                     hooks.start(name, tun_addr, peer_addr)?;
                     if !hooks.starting() {
                         self.announce_started(params, started);
@@ -903,13 +883,7 @@ impl Hub {
         }
     }
 
-    async fn start_local(
-        &mut self,
-        client: Ipv4Addr,
-        peer: Ipv4Addr,
-        primary_tun: &str,
-        params: &LinkParams,
-    ) -> Result<()> {
+    async fn start_local(&mut self, primary_tun: &str, params: &LinkParams) -> Result<()> {
         let wants_local = self
             .stickies
             .iter()
@@ -921,54 +895,27 @@ impl Hub {
             link: usize::MAX,
             generation: 1,
         };
-        let local = local_exit::start(
-            epoch,
-            (peer, client),
-            primary_tun,
-            params.mtu,
-            params.server_up.clone(),
-            params.server_down.clone(),
-            None,
-        )
-        .await?;
-        let local_exit::LocalExit {
-            control,
-            config,
-            io,
-            pair,
-            outgoing,
-            events,
-            latest,
-            delivery,
-            server,
-        } = local;
-        let task = tokio::spawn(session::run_link(
-            control,
-            pair.server,
-            pair.client,
-            params.mtu,
-            config,
-            io,
-        ));
-        self.local = Some(LocalExitState {
-            pair,
-            primary_client: client,
-            outgoing,
-            events: Some(events),
-            latest,
-            delivery,
-            server,
-            ready: false,
-        });
-        self.local_task = Some(task);
+        // Proxy-режим: без второго TUN и хуков, пакеты идут в userspace-стек
+        // и наружу через WAN-сокеты. Адреса не транслируются.
+        match local_proxy::start(epoch, primary_tun, params.mtu).await {
+            Ok(proxy) => {
+                self.local = Some(LocalExitState {
+                    outgoing: proxy.outgoing,
+                    events: Some(proxy.events),
+                    latest: proxy.latest,
+                    delivery: proxy.delivery,
+                    server: proxy.server,
+                    ready: false,
+                });
+            }
+            Err(error) => {
+                crate::warn!("local-proxy: {error:#} — local exit disabled");
+            }
+        }
         Ok(())
     }
 
     pub async fn shutdown_local(&mut self) -> Result<()> {
-        if let Some(task) = self.local_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
         if let Some(server) = self.local_cleanup.take() {
             server.shutdown().await?;
         }
@@ -1059,20 +1006,6 @@ impl Hub {
                         Some(event) => self.handle_local_event(event, tun).await?,
                         None => self.local_stopped("event channel closed".to_owned(), tun).await?,
                     }
-                }
-                result = async {
-                    match &mut self.local_task {
-                        Some(task) => task.await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.local_task.is_some() => {
-                    self.local_task = None;
-                    let reason = match result {
-                        Ok(Ok(())) => "session ended".to_owned(),
-                        Ok(Err(error)) => format!("{error:#}"),
-                        Err(error) => format!("local client task: {error}"),
-                    };
-                    self.local_stopped(reason, tun).await?;
                 }
                 task = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     let (epoch, result) = task.context("link tasks stopped")?.context("server task panicked")?;
@@ -1579,7 +1512,6 @@ pub async fn run(
         sticky_updates,
         sticky_task,
         local: None,
-        local_task: None,
         local_cleanup: None,
         nodes,
         exit_owners,
@@ -1654,17 +1586,6 @@ pub fn report_timer(seconds: u32) -> Option<tokio::time::Interval> {
     Some(timer)
 }
 
-fn translate_key(mut key: FlowKey, from: Ipv4Addr, to: Ipv4Addr) -> FlowKey {
-    if key.source == from {
-        key.source = to;
-    }
-    if key.destination == from {
-        key.destination = to;
-    }
-    key
-}
-
-/// Every counted loss names its reason in the log (#124).
 fn drop_note(delivery: &Delivery, links: &[Link], link: Option<usize>, reason: &str) {
     delivery.dropped();
     match link {
