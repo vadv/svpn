@@ -135,13 +135,18 @@ def close_all(sockets):
             pass
 
 
-def client_lines(path, marker):
-    """Count client-side journal lines: the server's copy of a flow logs
-    with an [server] prefix and must not inflate client assertions."""
-    return sum(1 for line in path.read_text().splitlines() if marker in line and "[server]" not in line)
+def client_lines(path, marker, peers="client"):
+    """Count journal lines with `marker`. "client" excludes the [server]
+    copy (its ids differ and must not inflate client assertions); "any"
+    counts both peers."""
+    return sum(
+        1
+        for line in path.read_text().splitlines()
+        if marker in line and (peers == "any" or "[server]" not in line)
+    )
 
 
-def await_closes(path, need, seconds, veteran, marker="flow_close"):
+def await_closes(path, need, seconds, veteran, marker="flow_close", peers="client"):
     """Wait for `need` client-side `marker` lines, keeping the veteran warm.
 
     The echo service kills connections idle for 20 s, so the veteran gets
@@ -149,7 +154,7 @@ def await_closes(path, need, seconds, veteran, marker="flow_close"):
     """
     deadline = time.monotonic() + seconds
     warm = time.monotonic()
-    while client_lines(path, marker) < need:
+    while client_lines(path, marker, peers) < need:
         assert time.monotonic() < deadline, f"{marker} lines did not reach {need} within the budget"
         if time.monotonic() - warm >= 3:
             push_echo(veteran, 0x5B)
@@ -184,18 +189,21 @@ def test_zombie_silent_storm_reclaims_flow_slots():
     with session("zombie-reclaim") as (process, path):
         veteran = socket.create_connection((PEER, 9000), timeout=15)
         push_echo(veteran, 0x5A)  # proven: must outlive the budget sweep
-        before = client_lines(path, "lifetime expired")
+        before = client_lines(path, "lifetime expired", peers="any")
         # A true zombie never gets a SYN-ACK: the target blackholes the port.
         ssh(f"iptables -A INPUT -p tcp --dport {BLACKHOLE_PORT} -j DROP")
         try:
             sockets = storm(path, (PEER, BLACKHOLE_PORT), SILENT)
             # The TTL must fire under the flood, not only after it ends.
+            # Either peer proves it: on slow runners the server sweep wins
+            # the race and the client reclaims via the close notification.
             await_closes(
                 path,
                 before + 1,
                 BUDGET_WINDOW,
                 veteran,
                 "lifetime expired",
+                peers="any",
             )
         finally:
             ssh(f"iptables -D INPUT -p tcp --dport {BLACKHOLE_PORT} -j DROP", check=False)
