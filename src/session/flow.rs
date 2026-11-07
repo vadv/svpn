@@ -257,18 +257,31 @@ impl Session {
 
     /// Oldest unproven ordinary flow: the only safe displacement victim —
     /// evicting proven flows would break established connections.
-    fn oldest_unproven(&self) -> Option<u64> {
+    /// Oldest unproven ordinary flow: the only safe displacement victim.
+    /// `pending_only` frees a full pending pool without touching active
+    /// slots — otherwise one SYN could sweep the whole table.
+    fn oldest_unproven(&self, pending_only: bool) -> Option<u64> {
         match &self.plane {
             Plane::Channels(plane) => plane
                 .flows
                 .iter()
-                .filter(|(id, flow)| !flow.proven && !is_probe_flow(**id) && **id != PREFLIGHT_ID)
+                .filter(|(id, flow)| {
+                    !flow.proven
+                        && (!pending_only || !flow.active)
+                        && !is_probe_flow(**id)
+                        && **id != PREFLIGHT_ID
+                })
                 .min_by_key(|(_, flow)| flow.created)
                 .map(|(&id, _)| id),
             Plane::Tcp(plane) => plane
                 .flows
                 .iter()
-                .filter(|(id, flow)| !flow.proven && !is_probe_flow(**id) && **id != PREFLIGHT_ID)
+                .filter(|(id, flow)| {
+                    !flow.proven
+                        && (!pending_only || !flow.active)
+                        && !is_probe_flow(**id)
+                        && **id != PREFLIGHT_ID
+                })
                 .min_by_key(|(_, flow)| flow.created)
                 .map(|(&id, _)| id),
         }
@@ -283,8 +296,14 @@ impl Session {
         if is_probe_flow(id) {
             return Ok(());
         }
-        while self.flow_limit_reached(0) || self.pending_flows() >= crate::selector::PENDING_FLOWS {
-            let Some(victim) = self.oldest_unproven() else {
+        loop {
+            // A full pending pool is freed only by pending victims: evicting
+            // active unproven slots would not relieve it and could mass-evict.
+            let pending_full = self.pending_flows() >= crate::selector::PENDING_FLOWS;
+            if !pending_full && !self.flow_limit_reached(0) {
+                break;
+            }
+            let Some(victim) = self.oldest_unproven(pending_full) else {
                 break;
             };
             self.close_flow(victim, true).await?;

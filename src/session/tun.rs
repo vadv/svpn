@@ -42,7 +42,8 @@ impl Session {
             if let Some(reset) =
                 packet::parse(bytes, true).and_then(|packet| packet::tcp_reset_for(&packet))
             {
-                self.write_tun_packet(0, reset.to_vec()).await?;
+                self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                    .await?;
             }
         } else {
             self.stats
@@ -219,7 +220,8 @@ impl Session {
                     && let Some(reset) =
                         packet::parse(bytes, true).and_then(|packet| packet::tcp_reset_for(&packet))
                 {
-                    self.write_tun_packet(0, reset.to_vec()).await?;
+                    self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                        .await?;
                 }
                 if let Some(id) = explicit_id {
                     self.notify_closed(id, packet.flow).await?;
@@ -227,8 +229,16 @@ impl Session {
                 return Ok(());
             }
         }
-        let full = self.flow_limit_reached(0);
-        let at_pending_cap = self.pending_flows() >= crate::selector::PENDING_FLOWS;
+        // Capacity scans run only where a TCP flow is about to be opened;
+        // an established flow's packets must not scan the whole table.
+        let (full, at_pending_cap) = if known || !is_client || !packet.can_open {
+            (false, false)
+        } else {
+            (
+                self.flow_limit_reached(0),
+                self.pending_flows() >= crate::selector::PENDING_FLOWS,
+            )
+        };
         match &mut self.plane {
             Plane::Channels(plane) => {
                 let now = tokio::time::Instant::now();
@@ -278,7 +288,7 @@ impl Session {
                 };
                 flow_state.last_seen = now;
                 flow_state.reset_requested |= is_client && packet.is_rst;
-                flow_state.proven |= !is_client && !packet.is_rst;
+                flow_state.proven |= packet::proves_flow(packet, !is_client);
                 flow_state.tcp_close.observe(packet, is_client, now);
                 if !fresh {
                     if let Some(selector) = plane.selector.as_mut() {
@@ -324,7 +334,8 @@ impl Session {
                                 && let Some(reset) = packet::parse(bytes, true)
                                     .and_then(|packet| packet::tcp_reset_for(&packet))
                             {
-                                self.write_tun_packet(0, reset.to_vec()).await?;
+                                self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                                    .await?;
                             }
                             if let Some(id) = explicit_id {
                                 self.notify_closed(id, packet.flow).await?;
@@ -357,7 +368,7 @@ impl Session {
                 if let Some(flow_state) = plane.flows.get_mut(&id) {
                     flow_state.last_seen = now;
                     flow_state.reset_requested |= is_client && packet.is_rst;
-                    flow_state.proven |= !is_client && !packet.is_rst;
+                    flow_state.proven |= packet::proves_flow(packet, !is_client);
                     flow_state.tcp_close.observe(packet, is_client, now);
                 }
                 let Some(flow_state) = plane.flows.get_mut(&id) else {
@@ -519,13 +530,13 @@ impl Session {
             Plane::Channels(plane) => {
                 if let Some(flow) = plane.flows.get_mut(&incoming.id) {
                     flow.data_started = true;
-                    flow.proven |= !from_client && !packet.is_rst;
+                    flow.proven |= packet::proves_flow(&packet, !from_client);
                 }
             }
             Plane::Tcp(plane) => {
                 if let Some(flow) = plane.flows.get_mut(&incoming.id) {
                     flow.data_started = true;
-                    flow.proven |= !from_client && !packet.is_rst;
+                    flow.proven |= packet::proves_flow(&packet, !from_client);
                 }
             }
         }

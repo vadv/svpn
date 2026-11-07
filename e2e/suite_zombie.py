@@ -12,10 +12,14 @@ test_zombie_storm_keeps_flows_moving floods one blackholed port with
 flow survives byte-exact and a brand new handshake still passes
 (displacement admission evicts unproven zombies), with zero refusals.
 
-test_zombie_silent_storm_reclaims_flow_slots floods the echo port
-without sending data: the far side accepts but never speaks back, so
-the flows stay unproven — the incident's zombie shape — and must be
-reclaimed by the 30 s TTL while proven flows keep working.
+test_zombie_silent_storm_reclaims_flow_slots floods the blackholed
+port without any reply: the handshakes never complete, so the flows
+stay unproven — the incident's zombie shape. The 30 s TTL must fire
+under the flood, and once the storm stops the flow tables on both
+peers must drain back to their working set instead of hoarding the
+zombie slots (the pre-fix incident hoarded them for hours).
+Established-but-silent connections are proven (a completed handshake
+is proof of life) and live by the idle rules — not zombies.
 
 shortcut: the flood daemon behind the incident is not reproduced here
 (test storms instead), replace with the real generator if it is ever
@@ -24,6 +28,7 @@ identified.
 
 from __future__ import annotations
 
+import re
 import resource
 import socket
 import time
@@ -38,7 +43,9 @@ from _lib import (
 
 STORM = 4096  # FLOW_CAP in src/session.rs — displacement must engage at the cap
 SILENT = 512  # keeps the echo service's thread-per-connection load sane
-BUDGET_WINDOW = 45  # FLOW_BUDGET 30 s + the 2 s expire tick + slack
+BUDGET_WINDOW = 45  # seconds until the first TTL expiry is due
+DRAIN_WINDOW = 75  # seconds for the flow tables to empty after the storm
+FLOW_TABLE_BASELINE = 32  # working set (probes + veteran) after a drain
 FAIL_FAST = 15  # a refused dial must error well before the 30 s flow TTL
 BLACKHOLE_PORT = 7003
 
@@ -81,6 +88,45 @@ def storm(path, target, count):
     return sockets
 
 
+def active_flows(path):
+    """Flow-table size of each peer from the latest heartbeat stats."""
+
+    def latest(prefixed):
+        for line in reversed(path.read_text().splitlines()):
+            if ("[server]" in line) == prefixed and (hit := re.search(r"active_flows: (\d+)", line)):
+                return int(hit.group(1))
+        return None
+
+    return latest(False), latest(True)
+
+
+def await_drain(path, veteran):
+    """Wait for both peers' flow tables to return to the working set.
+
+        Kernel SYN retransmits re-open flows after each TTL close, so the
+        honest slot-reclaim metric is the steady-state table size, not a
+    close count: after the storm sockets are gone every re-opened zombie
+    expires within one more TTL.
+    """
+    deadline = time.monotonic() + DRAIN_WINDOW
+    warm = time.monotonic()
+    while True:
+        client, server = active_flows(path)
+        if (
+            client is not None
+            and server is not None
+            and client <= FLOW_TABLE_BASELINE
+            and server <= FLOW_TABLE_BASELINE
+        ):
+            return
+        assert time.monotonic() < deadline, (
+            f"flow tables did not drain within the budget: client={client} server={server}"
+        )
+        if time.monotonic() - warm >= 3:
+            push_echo(veteran, 0x5B)
+            warm = time.monotonic()
+
+
 def close_all(sockets):
     for sock in sockets:
         try:
@@ -89,16 +135,22 @@ def close_all(sockets):
             pass
 
 
-def await_closes(path, need, seconds, veteran):
-    """Wait for `need` flow_close lines, keeping the veteran warm.
+def client_lines(path, marker):
+    """Count client-side journal lines: the server's copy of a flow logs
+    with an [server] prefix and must not inflate client assertions."""
+    return sum(1 for line in path.read_text().splitlines() if marker in line and "[server]" not in line)
+
+
+def await_closes(path, need, seconds, veteran, marker="flow_close"):
+    """Wait for `need` client-side `marker` lines, keeping the veteran warm.
 
     The echo service kills connections idle for 20 s, so the veteran gets
     a byte exchange every few seconds while the budget window runs.
     """
     deadline = time.monotonic() + seconds
     warm = time.monotonic()
-    while path.read_text().count("flow_close") < need:
-        assert time.monotonic() < deadline, "flow slots were not reclaimed within the budget"
+    while client_lines(path, marker) < need:
+        assert time.monotonic() < deadline, f"{marker} lines did not reach {need} within the budget"
         if time.monotonic() - warm >= 3:
             push_echo(veteran, 0x5B)
             warm = time.monotonic()
@@ -118,8 +170,9 @@ def test_zombie_storm_keeps_flows_moving():
             push_echo(fresh, 0x5C)
         finally:
             ssh(f"iptables -D INPUT -p tcp --dport {BLACKHOLE_PORT} -j DROP", check=False)
-        journal = path.read_text()
-        assert "flow limit reached" not in journal, "new handshakes were refused under the zombie storm"
+        assert client_lines(path, "flow limit reached") == 0, (
+            "new handshakes were refused under the zombie storm"
+        )
         assert process.poll() is None, "the client died during the zombie storm"
         close_all(sockets)
         veteran.close()
@@ -131,19 +184,28 @@ def test_zombie_silent_storm_reclaims_flow_slots():
     with session("zombie-reclaim") as (process, path):
         veteran = socket.create_connection((PEER, 9000), timeout=15)
         push_echo(veteran, 0x5A)  # proven: must outlive the budget sweep
-        before = path.read_text().count("flow_close")
-        sockets = storm(path, (PEER, 9000), SILENT)
-
-        def closes():
-            return path.read_text().count("flow_close")
-
-        await_closes(path, before + SILENT, BUDGET_WINDOW, veteran)
-        assert closes() >= before + SILENT, "zombie flows outlived the flow budget"
+        before = client_lines(path, "lifetime expired")
+        # A true zombie never gets a SYN-ACK: the target blackholes the port.
+        ssh(f"iptables -A INPUT -p tcp --dport {BLACKHOLE_PORT} -j DROP")
+        try:
+            sockets = storm(path, (PEER, BLACKHOLE_PORT), SILENT)
+            # The TTL must fire under the flood, not only after it ends.
+            await_closes(
+                path,
+                before + 1,
+                BUDGET_WINDOW,
+                veteran,
+                "lifetime expired",
+            )
+        finally:
+            ssh(f"iptables -D INPUT -p tcp --dport {BLACKHOLE_PORT} -j DROP", check=False)
+        close_all(sockets)  # stop the kernel SYN retransmit churn at the source
+        await_drain(path, veteran)
         push_echo(veteran, 0x5B)
-        journal = path.read_text()
-        assert "flow limit reached" not in journal, "new handshakes were refused under the zombie storm"
+        assert client_lines(path, "flow limit reached") == 0, (
+            "new handshakes were refused under the zombie storm"
+        )
         assert process.poll() is None, "the client died during the zombie storm"
-        close_all(sockets)
         veteran.close()
         print("PASS silent zombie flows reclaim slots within the budget")
 
@@ -168,7 +230,7 @@ def test_failed_handshake_fails_fast():
         assert time.monotonic() - start < FAIL_FAST, "a refused handshake did not fail fast"
 
         def closes():
-            return path.read_text().count("flow_close")
+            return client_lines(path, "flow_close")
 
         # a target RST must not close flows early (it may be out of window),
         # so the slot is reclaimed by the flow TTL — allow the budget window

@@ -140,8 +140,11 @@ impl Session {
             !self.client() && generation != 0 && key.valid_for(self.client_ip),
             "invalid TCP binding"
         );
-        // Displacement admission: unproven slots yield before a reject.
-        self.evict_for_admission(id).await?;
+        // Displacement admission: unproven slots yield before a reject —
+        // never for a binding that already owns its slot.
+        if !self.has_flow(id) {
+            self.evict_for_admission(id).await?;
+        }
         let at_capacity = self.flow_limit_reached(id);
         let at_pending_cap = self.pending_flows() >= crate::selector::PENDING_FLOWS;
         let Plane::Tcp(plane) = &mut self.plane else {
