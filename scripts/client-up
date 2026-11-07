@@ -6,14 +6,65 @@ PATH=${SVPN_ROUTE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 export PATH
 umask 077
 
-state_dir=${SVPN_ROUTE_STATE_DIR:-/var/run/svpn}
-state="$state_dir/full-tunnel-$SVPN_SESSION_ID"
+# Reply routing ids are derived from SVPN_PEER_ADDR the same way the server
+# hook derives svpn_egress_$n: deterministic per session address, no config.
+n=$(printf '%s\n' "${SVPN_PEER_ADDR:-}" | cut -d. -f3)
+case $n in
+    ''|*[!0-9]*)
+        echo "svpn: cannot derive reply routing ids from SVPN_PEER_ADDR" >&2
+        exit 1
+        ;;
+esac
+table_id=$((10000 + n))
+pref_direct=$table_id
+pref_main=$((11000 + n))
+mark=$(printf '0x%08x' "$((0x00020000 + n))")
 
-state_field() {
-    sed -n "s/^$1 //p" "$state"
+# Routing objects are owned by kernel signatures, not by a state file: every
+# route carries routing protocol 30 (an unallocated id, see
+# /etc/iproute2/rt_protos), rules use exact RPDB selectors, the nft table a
+# fixed name. A killed session leaves only reclaimable objects and the next
+# up reclaims them without manual help.
+proto=30
+
+linux_owned_tables() {
+    # Tables still holding our proto $proto routes, main included. This is
+    # the only ownership proof for a routing table: a number derived from
+    # SVPN_PEER_ADDR proves nothing after the address changes.
+    ip -4 route show table all proto "$proto" | awk '
+        {
+            table = "main"
+            for (i = 1; i < NF; i++)
+                if ($i == "table")
+                    table = $(i + 1)
+            if (!seen[table]++)
+                print table
+        }
+    '
 }
 
-linux_route_to() {
+linux_reclaim() {
+    for table in $(linux_owned_tables); do
+        ip route flush table "$table" proto "$proto" >/dev/null
+    done
+    ip rule del pref "$pref_direct" fwmark "$mark/$mark" lookup "$table_id" 2>/dev/null || true
+    ip rule del pref "$pref_main" fwmark "$mark/$mark" lookup main 2>/dev/null || true
+    nft delete table inet svpn-local-services 2>/dev/null || true
+    if [ -n "$(ip rule show pref "$pref_direct")" ]; then
+        echo "svpn: routing rule preference $pref_direct is already in use" >&2
+        return 1
+    fi
+    if [ -n "$(ip rule show pref "$pref_main")" ]; then
+        echo "svpn: routing rule preference $pref_main is already in use" >&2
+        return 1
+    fi
+    if [ -n "$(ip route show table "$table_id")" ]; then
+        echo "svpn: routing table $table_id is already in use" >&2
+        return 1
+    fi
+}
+
+linux_pin_server() {
     server=$1
     route=$(ip -4 route get "$server")
     [ -n "$route" ] || {
@@ -27,9 +78,9 @@ linux_route_to() {
         return 1
     }
     if [ -n "$route_gw" ]; then
-        ip route replace "$server/32" via "$route_gw" dev "$route_wan"
+        ip route replace "$server/32" via "$route_gw" dev "$route_wan" proto "$proto"
     else
-        ip route replace "$server/32" dev "$route_wan"
+        ip route replace "$server/32" dev "$route_wan" proto "$proto"
     fi
 }
 
@@ -37,18 +88,88 @@ linux_cleanup() {
     down_tun=$1
     down_servers=$2
     for server in $down_servers; do
-        ip route del "$server/32" 2>/dev/null || true
+        ip route del "$server/32" proto "$proto" 2>/dev/null || true
     done
-    ip route del 0.0.0.0/1 dev "$down_tun" 2>/dev/null || true
-    ip route del 128.0.0.0/1 dev "$down_tun" 2>/dev/null || true
+    ip route del 0.0.0.0/1 dev "$down_tun" proto "$proto" 2>/dev/null || true
+    ip route del 128.0.0.0/1 dev "$down_tun" proto "$proto" 2>/dev/null || true
+    # Routes are flushed first, while the ownership marker (proto $proto
+    # routes in the table) still exists; rules and the nft table go last, so
+    # an interrupted cleanup never hides ownership from the next start.
+    # ip route flush succeeds on an empty table, so this must not fail.
+    ip route flush table "$table_id" proto "$proto"
+    ip rule del pref "$pref_direct" fwmark "$mark/$mark" lookup "$table_id" 2>/dev/null || true
+    ip rule del pref "$pref_main" fwmark "$mark/$mark" lookup main 2>/dev/null || true
+    nft delete table inet svpn-local-services 2>/dev/null || true
 }
 
 linux_up() {
+    direct_wan=
     for server in ${SVPN_SERVER_ADDRS:-}; do
-        linux_route_to "$server"
+        route_wan=
+        route_gw=
+        linux_pin_server "$server"
+        if [ -z "$direct_wan" ]; then
+            direct_wan=$route_wan
+        elif [ "$direct_wan" != "$route_wan" ]; then
+            echo "svpn: automatic local-service routing requires one underlay" >&2
+            return 1
+        fi
     done
-    ip route replace 0.0.0.0/1 dev "$SVPN_TUN_NAME"
-    ip route replace 128.0.0.0/1 dev "$SVPN_TUN_NAME"
+    [ -n "$direct_wan" ] || {
+        echo "svpn: cannot determine the direct underlay" >&2
+        return 1
+    }
+    # The WAN default must come from the main table, not from the per-server
+    # lookup: an on-link server has no gateway, but replies to remote clients
+    # still need the real default nexthop. A WAN with no default at all is
+    # treated as on-link (point-to-point links).
+    wan_default=$(ip -4 route show default | awk -v dev="$direct_wan" '
+        {
+            for (i = 1; i < NF; i++)
+                if ($i == "dev" && $(i + 1) == dev)
+                    { print; exit }
+        }
+    ')
+    direct_gw=$(printf '%s\n' "$wan_default" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+    # Reply rules first: a crash between any two steps below leaves only
+    # reclaimable objects, never an unowned table $table_id.
+    ip rule add pref "$pref_direct" fwmark "$mark/$mark" lookup "$table_id"
+    ip rule add pref "$pref_main" fwmark "$mark/$mark" lookup main suppress_prefixlength 1
+    nft add table inet svpn-local-services
+    nft -f - <<EOF
+table inet svpn-local-services {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        # Label the connection on its original direction from the WAN; an
+        # overlapping foreign mark never matches the full owned value.
+        iifname "$direct_wan" ct direction original ct mark 0 ct mark set $mark
+        # Restore the packet mark only on replies: original-direction
+        # packets (including forwarded DNAT requests) keep routing via main.
+        ct direction reply ct mark & $mark == $mark meta mark set meta mark | $mark
+    }
+    chain output {
+        type route hook output priority mangle; policy accept;
+        ct direction reply ct mark & $mark == $mark meta mark set meta mark | $mark
+    }
+}
+EOF
+    if [ -n "$direct_gw" ]; then
+        ip route replace default via "$direct_gw" dev "$direct_wan" table "$table_id" proto "$proto"
+    else
+        ip route replace default dev "$direct_wan" table "$table_id" proto "$proto"
+    fi
+    ip route replace 0.0.0.0/1 dev "$SVPN_TUN_NAME" proto "$proto"
+    ip route replace 128.0.0.0/1 dev "$SVPN_TUN_NAME" proto "$proto"
+}
+
+macos_cleanup() {
+    down_tun=$1
+    down_servers=$2
+    for server in $down_servers; do
+        route -n delete -inet -host "$server" 2>/dev/null || true
+    done
+    route -n delete -inet 0.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
+    route -n delete -inet 128.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
 }
 
 macos_route_to() {
@@ -67,16 +188,6 @@ macos_route_to() {
     fi
 }
 
-macos_cleanup() {
-    down_tun=$1
-    down_servers=$2
-    for server in $down_servers; do
-        route -n delete -inet -host "$server" 2>/dev/null || true
-    done
-    route -n delete -inet 0.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
-    route -n delete -inet 128.0.0.0/1 -interface "$down_tun" 2>/dev/null || true
-}
-
 macos_up() {
     for server in ${SVPN_SERVER_ADDRS:-}; do
         macos_route_to "$server"
@@ -86,22 +197,12 @@ macos_up() {
 }
 
 cleanup() {
-    [ -f "$state" ] || return 0
-    down_os=$(state_field os)
-    down_tun=$(state_field tun)
-    down_servers=$(state_field servers)
-    case "$down_os" in
-        linux) linux_cleanup "$down_tun" "$down_servers" ;;
-        macos) macos_cleanup "$down_tun" "$down_servers" ;;
-        *)
-            echo "svpn: unsupported OS for route cleanup: $down_os" >&2
-            return 1
-            ;;
+    case "$os" in
+        linux) linux_cleanup "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" ;;
+        macos) macos_cleanup "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" ;;
     esac
-    rm -f "$state"
 }
 
-cleanup
 os=${SVPN_OS:-}
 case "$os" in
     linux|macos) ;;
@@ -110,11 +211,17 @@ case "$os" in
         exit 1
         ;;
 esac
-mkdir -p "$state_dir"
-state_tmp="$state.$$"
-printf 'os %s\ntun %s\nservers %s\n' "$os" "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}" >"$state_tmp"
-mv -f "$state_tmp" "$state"
-# Any failure or interruption rolls back only this session's routes.
+if [ "$os" = linux ]; then
+    if ! command -v nft >/dev/null 2>&1; then
+        echo "svpn: nft is required for automatic local-service routing" >&2
+        exit 1
+    fi
+    linux_reclaim
+else
+    # route -n add is not idempotent: clear this config's leftovers first.
+    macos_cleanup "$SVPN_TUN_NAME" "${SVPN_SERVER_ADDRS:-}"
+fi
+# Any failure or interruption rolls back the objects installed here.
 trap 'cleanup' EXIT
 trap 'exit 1' HUP INT TERM
 case "$os" in
