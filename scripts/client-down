@@ -1,26 +1,49 @@
 #!/bin/sh
 # Automatic client route cleanup. Called only when no manual down hook is set.
+# Idempotent: deletes only SVPN-owned objects (proto 30 routes, exact rule
+# selectors and the nft table name), foreign rules and routes are never
+# touched. A crash mid-cleanup leaves objects the next start reclaims.
 set -eu
 # Hooks may run with a deliberately empty PATH; use the trusted system tools.
 PATH=${SVPN_ROUTE_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
 export PATH
 umask 077
 
-state_dir=${SVPN_ROUTE_STATE_DIR:-/var/run/svpn}
-state="$state_dir/full-tunnel-$SVPN_SESSION_ID"
+# Reply routing ids are derived from SVPN_PEER_ADDR the same way the server
+# hook derives svpn_egress_$n: deterministic per session address, no config.
+n=$(printf '%s\n' "${SVPN_PEER_ADDR:-}" | cut -d. -f3)
+case $n in
+    ''|*[!0-9]*)
+        echo "svpn: cannot derive reply routing ids from SVPN_PEER_ADDR" >&2
+        exit 1
+        ;;
+esac
+table_id=$((10000 + n))
+pref_direct=$table_id
+pref_main=$((11000 + n))
+mark=$(printf '0x%08x' "$((0x00020000 + n))")
 
-[ -f "$state" ] || exit 0
-os=$(sed -n 's/^os //p' "$state")
-tun=$(sed -n 's/^tun //p' "$state")
-servers=$(sed -n 's/^servers //p' "$state")
+# Ownership signature shared with client-up: routing protocol 30.
+proto=30
+
+os=${SVPN_OS:-}
+tun=${SVPN_TUN_NAME:-}
+servers=${SVPN_SERVER_ADDRS:-}
 
 case "$os" in
     linux)
         for server in $servers; do
-            ip route del "$server/32" 2>/dev/null || true
+            ip route del "$server/32" proto "$proto" 2>/dev/null || true
         done
-        ip route del 0.0.0.0/1 dev "$tun" 2>/dev/null || true
-        ip route del 128.0.0.0/1 dev "$tun" 2>/dev/null || true
+        ip route del 0.0.0.0/1 dev "$tun" proto "$proto" 2>/dev/null || true
+        ip route del 128.0.0.0/1 dev "$tun" proto "$proto" 2>/dev/null || true
+        # Routes are flushed while the ownership marker still exists; rules
+        # and the nft table go last. ip route flush succeeds on an empty
+        # table, so this must not fail.
+        ip route flush table "$table_id" proto "$proto"
+        ip rule del pref "$pref_direct" fwmark "$mark/$mark" lookup "$table_id" 2>/dev/null || true
+        ip rule del pref "$pref_main" fwmark "$mark/$mark" lookup main 2>/dev/null || true
+        nft delete table inet svpn-local-services 2>/dev/null || true
         ;;
     macos)
         for server in $servers; do
@@ -34,4 +57,3 @@ case "$os" in
         exit 1
         ;;
 esac
-rm -f "$state"
