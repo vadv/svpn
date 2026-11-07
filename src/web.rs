@@ -332,13 +332,12 @@ async fn read_head(stream: &mut TcpStream) -> Result<Option<String>> {
 /// The Host header must name the loopback: a browser page on another origin
 /// must not be able to read the dashboard state.
 fn host_is_local(head: &str) -> bool {
-    let Some(host) = head
-        .lines()
-        .skip(1)
-        .find_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
-        .map(|(_, value)| value.trim())
-    else {
+    let Some(host) = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim())
+    }) else {
         return false;
     };
     let host = host.rsplit_once(':').map_or(host, |(name, _)| name);

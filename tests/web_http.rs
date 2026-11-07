@@ -105,6 +105,22 @@ async fn foreign_host_header_is_rejected() {
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
 }
 
+/// A browser sends more headers before Host: the check must find Host and
+/// not the first header with a colon.
+#[tokio::test]
+async fn browser_headers_are_accepted() {
+    let addr = start().await;
+    let answer = request(
+        addr,
+        &format!(
+            "GET /api/state HTTP/1.1\r\nAccept-Encoding: identity\r\nUser-Agent: Mozilla/5.0\r\n\
+             Host: {addr}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+}
+
 #[tokio::test]
 async fn dashboard_refuses_a_public_address() {
     let error = web::bind("0.0.0.0:8080".parse().unwrap()).await;
