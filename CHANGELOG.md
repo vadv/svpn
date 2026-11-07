@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.1
+
+Базы geo/country: автообновление одним флагом.
+
+- `auto_job_update = true` в блоках `geo`/`country` — встроенные job-пресеты
+  (свежесть, докачка во временный файл, проверка размера, атомарная
+  установка, live reload) вместо копипасты шаблонов (#31).
+- `svpn example job-geo-update` печатает встроенный job-блок как отправную
+  точку для кастомизации; скрипты `scripts/job-*-update` удалены.
+
 ## v1.1.0
 
 Local exit, flow table, local services.
