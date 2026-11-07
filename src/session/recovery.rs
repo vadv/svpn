@@ -37,7 +37,13 @@ impl Session {
             !self.client() && generation != 0 && key.valid_for(self.client_ip),
             "invalid flow binding"
         );
+        // Displacement admission: unproven slots yield before a reject —
+        // never for a binding that already owns its slot.
+        if !self.has_flow(id) {
+            self.evict_for_admission(id).await?;
+        }
         let at_capacity = self.flow_limit_reached(id);
+        let at_pending_cap = self.pending_flows() >= crate::selector::PENDING_FLOWS;
         let Plane::Channels(plane) = &mut self.plane else {
             unreachable!()
         };
@@ -58,15 +64,7 @@ impl Session {
             }
         } else if resume || plane.by_key.get(&key).is_some_and(|&owner| owner != id) {
             Some(Reason::Unsupported)
-        } else if at_capacity
-            || (!is_probe_flow(id)
-                && plane
-                    .flows
-                    .iter()
-                    .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
-                    .count()
-                    >= crate::selector::PENDING_FLOWS)
-        {
+        } else if at_capacity || (!is_probe_flow(id) && at_pending_cap) {
             Some(Reason::ResourceExhausted)
         } else {
             None

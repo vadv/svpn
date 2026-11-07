@@ -188,6 +188,19 @@ pub fn tcp_reset_for(packet: &Packet) -> Option<[u8; 40]> {
     tcp_reset(packet.flow, packet.tcp.as_ref()?)
 }
 
+/// Proof of life for admission: on TCP only a segment no stack sends before
+/// the handshake completes — no SYN, no RST, in either direction; on
+/// protocols without a handshake only a reply from the target counts.
+pub fn proves_flow(packet: &Packet, from_target: bool) -> bool {
+    if packet.is_rst {
+        return false;
+    }
+    match packet.tcp.as_ref() {
+        Some(tcp) => tcp.flags & 0x02 == 0,
+        None => from_target,
+    }
+}
+
 /// Same CLOSED-endpoint reset rules as `tcp_reset_for`, applied to a
 /// stored `TcpMeta` (the client's last segment) instead of a raw packet.
 pub fn tcp_reset(flow: FlowKey, tcp: &TcpMeta) -> Option<[u8; 40]> {

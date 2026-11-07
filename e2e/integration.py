@@ -13,6 +13,7 @@ import suite_sticky
 import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
+import suite_zombie
 
 # diag_dwell129.py imports PEER, session, ssh, command and until from this module.
 from _lib import SERVER, command, ssh
@@ -27,6 +28,7 @@ GROUPS = (
     "sticky-asn",
     "sticky",
     "jobs",
+    "zombie",
 )
 
 # The pre-split registry interleaved the groups; keep the exact overall sequence.
@@ -49,6 +51,7 @@ _SEQUENCE = (
     + ("sticky-asn",) * 6
     + ("sticky",) * 5
     + ("jobs",) * 3
+    + ("zombie",) * 3
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,
@@ -60,6 +63,7 @@ _SUITES = {
     "sticky-asn": suite_sticky_asn,
     "sticky": suite_sticky,
     "jobs": suite_jobs,
+    "zombie": suite_zombie,
 }
 _PENDING = {group: iter(suite.TESTS) for group, suite in _SUITES.items()}
 TESTS = []
@@ -76,7 +80,11 @@ def scrub_firewall():
         for target in ("OUTPUT",):
             while command(["iptables", "-w", "-D", target] + rule, check=False).returncode == 0:
                 pass
-    for script in ("iptables -w -D OUTPUT -p udp -j DROP", "iptables -w -D INPUT -p udp -j DROP"):
+    for script in (
+        "iptables -w -D OUTPUT -p udp -j DROP",
+        "iptables -w -D INPUT -p udp -j DROP",
+        "iptables -w -D INPUT -p tcp --dport 7003 -j DROP",
+    ):
         while ssh(script, check=False).returncode == 0:
             pass
 

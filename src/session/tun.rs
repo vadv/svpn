@@ -42,7 +42,8 @@ impl Session {
             if let Some(reset) =
                 packet::parse(bytes, true).and_then(|packet| packet::tcp_reset_for(&packet))
             {
-                self.write_tun_packet(0, reset.to_vec()).await?;
+                self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                    .await?;
             }
         } else {
             self.stats
@@ -52,6 +53,28 @@ impl Session {
             self.notify_closed(id, packet.flow).await?;
         }
         Ok(())
+    }
+
+    /// Count a drop and log at most once per second, folding suppressed
+    /// occurrences into the next line: a full-table storm must not flood
+    /// the journal (2026-11-06: 8252 identical lines).
+    fn count_drop_throttled(&mut self, reason: &str) {
+        self.stats.dropped_packets += 1;
+        let now = StdInstant::now();
+        if self
+            .drop_log_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            self.drop_log_suppressed += 1;
+            return;
+        }
+        let suppressed = std::mem::take(&mut self.drop_log_suppressed);
+        self.drop_log_at = Some(now);
+        if suppressed == 0 {
+            crate::error!("{} {reason}", self.drop_prefix);
+        } else {
+            crate::error!("{} {reason} ({suppressed} suppressed)", self.drop_prefix);
+        }
     }
 
     pub async fn handle_tun_packet(
@@ -183,16 +206,39 @@ impl Session {
             Plane::Channels(plane) => plane.by_key.contains_key(&packet.flow),
             Plane::Tcp(plane) => plane.by_key.contains_key(&packet.flow),
         };
-        if is_client && packet.can_open && !known && self.flow_limit_reached(0) {
-            self.stats.opened_flows += 1;
-            self.stats.open_failed_flows += 1;
-            self.stats
-                .count_drop(&self.drop_prefix, "flow limit reached");
-            if let Some(id) = explicit_id {
-                self.notify_closed(id, packet.flow).await?;
+        if is_client && packet.can_open && !known {
+            // Displacement admission: unproven zombies yield their slots
+            // before the table may ever refuse a new handshake.
+            self.evict_for_admission(0).await?;
+            if self.flow_limit_reached(0) {
+                self.stats.opened_flows += 1;
+                self.stats.open_failed_flows += 1;
+                self.count_drop_throttled("flow limit reached");
+                // A silent refusal hangs the client's connect until timeout;
+                // reset instead so the kernel reports the failure at once.
+                if packet.tcp.is_some()
+                    && let Some(reset) =
+                        packet::parse(bytes, true).and_then(|packet| packet::tcp_reset_for(&packet))
+                {
+                    self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                        .await?;
+                }
+                if let Some(id) = explicit_id {
+                    self.notify_closed(id, packet.flow).await?;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
+        // Capacity scans run only where a TCP flow is about to be opened;
+        // an established flow's packets must not scan the whole table.
+        let (full, at_pending_cap) = if known || !is_client || !packet.can_open {
+            (false, false)
+        } else {
+            (
+                self.flow_limit_reached(0),
+                self.pending_flows() >= crate::selector::PENDING_FLOWS,
+            )
+        };
         match &mut self.plane {
             Plane::Channels(plane) => {
                 let now = tokio::time::Instant::now();
@@ -242,6 +288,7 @@ impl Session {
                 };
                 flow_state.last_seen = now;
                 flow_state.reset_requested |= is_client && packet.is_rst;
+                flow_state.proven |= packet::proves_flow(packet, !is_client);
                 flow_state.tcp_close.observe(packet, is_client, now);
                 if !fresh {
                     if let Some(selector) = plane.selector.as_mut() {
@@ -279,16 +326,17 @@ impl Session {
                                 .reject_unowned_tun_packet(bytes, packet, explicit_id)
                                 .await;
                         }
-                        if plane.flows.keys().filter(|id| !is_probe_flow(**id)).count()
-                            >= super::FLOW_CAP
-                            || plane
-                                .flows
-                                .iter()
-                                .filter(|(id, flow)| !is_probe_flow(**id) && !flow.active)
-                                .count()
-                                >= crate::selector::PENDING_FLOWS
-                        {
+                        if full || at_pending_cap {
                             self.stats.open_failed_flows += 1;
+                            self.count_drop_throttled("flow limit reached");
+                            // Same visible refusal as the admission gate.
+                            if packet.tcp.is_some()
+                                && let Some(reset) = packet::parse(bytes, true)
+                                    .and_then(|packet| packet::tcp_reset_for(&packet))
+                            {
+                                self.write_tun_packet(explicit_id.unwrap_or(0), reset.to_vec())
+                                    .await?;
+                            }
                             if let Some(id) = explicit_id {
                                 self.notify_closed(id, packet.flow).await?;
                             }
@@ -320,6 +368,7 @@ impl Session {
                 if let Some(flow_state) = plane.flows.get_mut(&id) {
                     flow_state.last_seen = now;
                     flow_state.reset_requested |= is_client && packet.is_rst;
+                    flow_state.proven |= packet::proves_flow(packet, !is_client);
                     flow_state.tcp_close.observe(packet, is_client, now);
                 }
                 let Some(flow_state) = plane.flows.get_mut(&id) else {
@@ -481,11 +530,13 @@ impl Session {
             Plane::Channels(plane) => {
                 if let Some(flow) = plane.flows.get_mut(&incoming.id) {
                     flow.data_started = true;
+                    flow.proven |= packet::proves_flow(&packet, !from_client);
                 }
             }
             Plane::Tcp(plane) => {
                 if let Some(flow) = plane.flows.get_mut(&incoming.id) {
                     flow.data_started = true;
+                    flow.proven |= packet::proves_flow(&packet, !from_client);
                 }
             }
         }
@@ -510,13 +561,15 @@ impl Session {
     }
 
     pub async fn expire_flows(&mut self, now: tokio::time::Instant) -> Result<()> {
+        // Unproven TCP flows are zombie SYNs: FLOW_BUDGET bounds them even
+        // after a flush; proven flows keep the idle and protocol rules.
         let expired: Vec<_> = match &self.plane {
             Plane::Channels(plane) => plane
                 .flows
                 .iter()
                 .filter(|(id, flow)| {
                     **id != PREFLIGHT_ID
-                        && ((!flow.data_started
+                        && (((!flow.data_started || (flow.key.protocol == 6 && !flow.proven))
                             && now.duration_since(flow.created) >= crate::selector::FLOW_BUDGET)
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))
@@ -532,7 +585,7 @@ impl Session {
                 .iter()
                 .filter(|(id, flow)| {
                     **id != PREFLIGHT_ID
-                        && ((!flow.data_started
+                        && (((!flow.data_started || (flow.key.protocol == 6 && !flow.proven))
                             && now.duration_since(flow.created) >= crate::selector::FLOW_BUDGET)
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))

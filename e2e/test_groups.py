@@ -24,6 +24,7 @@ import suite_sticky
 import suite_sticky_asn
 import suite_tcp_auto
 import suite_udp
+import suite_zombie
 from test_artifacts import check
 
 # Independent snapshot of the pre-split runner: keep every case and its order.
@@ -63,6 +64,10 @@ STICKY_DNS_BASELINE = """
 test_name_pin test_first_match_over_later_blocks test_failover_without_snapback
 test_ip_change_purges_stale_pins test_restart_restores_pinned_owner
 """.split()
+ZOMBIE_BASELINE = """
+test_zombie_storm_keeps_flows_moving test_zombie_silent_storm_reclaims_flow_slots
+test_failed_handshake_fails_fast
+""".split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
     ("obfs", ("--mimic", "obfs")),
@@ -99,6 +104,7 @@ def integration_groups():
         "sticky-asn": suite_sticky_asn,
         "sticky": suite_sticky,
         "jobs": suite_jobs,
+        "zombie": suite_zombie,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
@@ -110,6 +116,7 @@ def integration_groups():
         + STICKY_BASELINE
         + STICKY_DNS_BASELINE
         + JOBS_BASELINE
+        + ZOMBIE_BASELINE
     )
     assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
@@ -132,6 +139,7 @@ def integration_groups():
         "sticky-asn": 6,
         "sticky": 5,
         "jobs": 3,
+        "zombie": 3,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]

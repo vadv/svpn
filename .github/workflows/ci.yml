@@ -129,6 +129,8 @@ jobs:
           - suite: integration
             group: jobs
           - suite: integration
+            group: zombie
+          - suite: integration
             group: tcp-auto
           - suite: matrix
             group: udp
