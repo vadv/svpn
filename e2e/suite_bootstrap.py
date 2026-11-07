@@ -403,12 +403,21 @@ def test_client_stats():
         path,
     ):
         tcp_echo(1)
+
+        def state():
+            answer = urllib.request.urlopen("http://127.0.0.1:18080/api/state", timeout=5)
+            return json.loads(answer.read())
+
+        def traffic(stats):
+            return stats["inner_tx_bytes"] + stats["inner_rx_bytes"]
+
         until(lambda: "dashboard: http://127.0.0.1:18080" in path.read_text())
-        state = json.loads(urllib.request.urlopen("http://127.0.0.1:18080/api/state", timeout=5).read())
-        assert state["servers"], state
-        assert state["policy"] == "balance", state
-        assert state["servers"][0]["state"] == "ready", state
-        assert state["servers"][0]["stats"]["inner_rx_bytes"] >= 0, state
+        # The snapshot is refreshed once a second: wait for the live state.
+        until(lambda: state()["servers"][0]["state"] == "ready")
+        until(lambda: traffic(state()["servers"][0]["stats"]) > 0)
+        snapshot = state()
+        assert snapshot["servers"], snapshot
+        assert snapshot["policy"] == "balance", snapshot
         page = urllib.request.urlopen("http://127.0.0.1:18080/", timeout=5).read().decode()
         assert "<h1>svpn</h1>" in page, page
     cleanup_verified(process)
