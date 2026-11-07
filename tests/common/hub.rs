@@ -24,6 +24,14 @@ pub fn dashboard_hub() -> Hub {
         },
         tokio::time::Instant::now(),
     );
+    // The live counters of the first session: the hub only accumulates them
+    // once per stats report, the dashboard reads them as they are.
+    let (stats, latest) = watch::channel(svpn::control::Stats {
+        inner_rx_bytes: 4242,
+        inner_rx_packets: 7,
+        active_flows: 3,
+        ..Default::default()
+    });
     Hub {
         links: servers
             .iter()
@@ -36,7 +44,7 @@ pub fn dashboard_hub() -> Hub {
                     link,
                     generation: 1,
                 }),
-                latest: None,
+                latest: (link == 0).then(|| latest.clone()),
                 stats: svpn::stats::Snapshot::default(),
                 last_reason: String::new(),
                 assigned: Arc::default(),

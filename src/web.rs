@@ -109,7 +109,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             weight: link.params.weight,
             state: crate::hub::link_state(&hub.pool, link, index),
             reason: link.last_reason.clone(),
-            stats: link.stats.totals().clone(),
+            stats: link_counters(link),
         })
         .collect();
     let rules = hub
@@ -188,6 +188,16 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         local,
         flows,
         jobs: hub.job_stats,
+    }
+}
+
+/// Live counters of one link: the session publishes them, the hub only
+/// accumulates them once per stats report. A dead link falls back to the
+/// totals the hub collected last.
+fn link_counters(link: &crate::hub::Link) -> Stats {
+    match &link.latest {
+        Some(latest) => latest.borrow().clone(),
+        None => link.stats.totals().clone(),
     }
 }
 

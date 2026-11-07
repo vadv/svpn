@@ -44,8 +44,19 @@ fn snapshot_reports_server_state_and_node_ids() {
 }
 
 #[test]
-fn snapshot_carries_link_counters() {
+fn snapshot_carries_live_link_counters() {
+    let hub = hub();
+    let snapshot = web::snapshot(&hub);
+    // The running session publishes them; the hub only sums them up later.
+    assert_eq!(snapshot.servers[0].stats.inner_rx_bytes, 4242);
+    assert_eq!(snapshot.servers[0].stats.inner_rx_packets, 7);
+    assert_eq!(snapshot.servers[0].stats.active_flows, 3);
+}
+
+#[test]
+fn snapshot_falls_back_to_the_collected_totals_of_a_dead_link() {
     let mut hub = hub();
+    hub.links[0].latest = None;
     let mut stats = svpn::stats::Snapshot::default();
     stats.observe(svpn::control::Stats {
         inner_tx_bytes: 100,
