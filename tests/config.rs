@@ -588,3 +588,58 @@ fn server_hooks_heredoc_and_cli_parity() {
     assert_eq!(params[0].server_up.as_deref(), Some("echo cli-up"));
     assert_eq!(params[0].server_down.as_deref(), Some("echo cli-down"));
 }
+
+// ── auto_job_update presets ──
+
+const AUTO: &str = "server \"main\" {\n  address = \"vpn.example\"\n}\ntunnel {\n  peer_name = \"svpn0\"\n}\ngeo {\n  db = \"/etc/svpn/asn.csv\"\n  auto_job_update = true\n}\n";
+
+#[test]
+fn auto_job_update_synthesizes_the_preset_job() {
+    let parsed = parse(AUTO, Path::new("/config"), false).unwrap();
+    assert_eq!(parsed.jobs.len(), 1);
+    let job = &parsed.jobs[0];
+    assert_eq!(job.label, "geo-update");
+    assert_eq!(job.reload, vec![svpn::job::Reload::Geo]);
+    assert!(job.run_if.as_deref().unwrap().contains("$SVPN_GEO_DB"));
+}
+
+#[test]
+fn auto_job_update_without_db_is_rejected() {
+    let text = "server \"main\" {\n  address = \"vpn.example\"\n}\ntunnel {\n  peer_name = \"svpn0\"\n}\ngeo {\n  auto_job_update = true\n}\n";
+    let err = parse(text, Path::new("/config"), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("auto_job_update requires db"), "{err}");
+}
+
+#[test]
+fn auto_job_update_is_off_by_default_and_must_be_boolean() {
+    let text = AUTO.replace("auto_job_update = true", "auto_job_update = false");
+    assert_eq!(
+        parse(&text, Path::new("/config"), false)
+            .unwrap()
+            .jobs
+            .len(),
+        0
+    );
+    let text = AUTO.replace("auto_job_update = true", "auto_job_update = \"yes\"");
+    let err = parse(&text, Path::new("/config"), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("must be a boolean"), "{err}");
+}
+
+#[test]
+fn pasted_example_collides_with_the_preset_label() {
+    // A user who pasted the example template AND kept auto_job_update gets
+    // one clear error instead of two racing updaters.
+    let example = svpn::setup::example("job-geo-update").unwrap();
+    let text = format!("{AUTO}\n{example}");
+    let err = parse(&text, Path::new("/config"), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("duplicate job label geo-update"), "{err}");
+}

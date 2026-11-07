@@ -163,18 +163,20 @@ default); a failing VPS moves over to the rest. Details in
 
 You do not need databases for a plain VPN. They are needed to pin exits by
 country or ASN (sticky blocks in ADVANCED). SVPN downloads and updates them
-by itself — paste the ready job templates into the config and restart:
+by itself — enable `auto_job_update` in the database blocks and restart:
 
-```bash
-svpn example job-geo-update     # a ready job block: paste the output into vpn.hcl
-svpn example job-country-update
+```hcl
+geo     { db = "/etc/svpn/asn.csv";     auto_job_update = true }
+country { db = "/etc/svpn/country.csv"; auto_job_update = true }
 ```
 
 Startup does not wait for the database: when it is missing, the VPN starts
 degraded (the `balance` fallback), the job fetches the file in the
 background and the sticky modes activate live, without a restart. Manual
 check: `svpn job run geo-update --config vpn.hcl` (the exit code is the
-job's).
+job's). For your own mirror or schedule, `svpn example job-geo-update`
+prints the same job block as a starting point (paste it AND turn
+`auto_job_update` off, or the labels collide).
 
 Once by hand (when jobs are not wanted):
 
@@ -201,7 +203,8 @@ Everything beyond the quick-start pair of servers is covered in
 - `sticky` blocks: pinning exits by DNS names, IPs, ASNs and countries;
 - `via = local` — sending selected addresses outside the VPN;
 - `fallback_sticky` — how the pool serves the remaining traffic;
-- Country and ASN databases and their background auto-update (`job` blocks);
+- Country and ASN databases and their background auto-update
+  (`auto_job_update`);
 - hooks and environment variables;
 - transport: mimic, TCP fallback, UDP port range;
 - systemd and readiness checks;
