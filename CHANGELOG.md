@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.0
+
+Local exit, flow table, local services.
+
+- Local exit: вместо второго TUN — userspace TCP/UDP proxy на клиенте;
+  `local = true` и `fallback_sticky` адреса обслуживаются локально,
+  трафик остальных подсетей идёт через туннель как раньше (#28).
+- Flow table: zombie-proof admission — вытеснение застрявших записей и
+  proven TTL вместо отдельных lifecycle-событий (#29).
+- Local services (Linux, автоматический client routing): ответы локальных
+  сервисов и DNAT-бэкендов уходят через WAN при полном туннеле — reply-only
+  connmark, `lookup main suppress_prefixlength 1` вместо снапшота,
+  владение объектами через routing protocol 30 без state-файлов, reclaim
+  после SIGKILL и смены peer-адреса (#30).
+
 ## v1.0.1
 
 - setup: preflight и установка пакетов принимают семейства дистрибутивов —
