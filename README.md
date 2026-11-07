@@ -162,17 +162,19 @@ sudo -E svpn multi --config vpn.hcl   # запустить
 
 Для обычного VPN базы не нужны. Они нужны, чтобы закреплять выход по стране
 или по ASN (sticky-блоки в ADVANCED). SVPN скачает и будет обновлять их сам —
-добавьте в конфиг готовые job-шаблоны и перезапустите:
+включите `auto_job_update` в блоках баз и перезапустите:
 
-```bash
-svpn example job-geo-update     # готовый job-блок: скопируйте вывод в vpn.hcl
-svpn example job-country-update
+```hcl
+geo     { db = "/etc/svpn/asn.csv";     auto_job_update = true }
+country { db = "/etc/svpn/country.csv"; auto_job_update = true }
 ```
 
 Старт не ждёт базу: если её ещё нет, VPN поднимется в degraded-режиме
 (fallback `balance`), job докачает файл в фоне и sticky-режим включится
 вживую, без перезапуска. Ручная проверка: `svpn job run geo-update --config
-vpn.hcl` (код выхода — коду job'а).
+vpn.hcl` (код выхода — коду job'а). Для своего зеркала или графика —
+`svpn example job-geo-update` выводит этот же job-блок как отправную точку
+(копируйте И выключите `auto_job_update`, иначе labels столкнутся).
 
 Один раз руками (если job'ы не нужны):
 
@@ -198,7 +200,7 @@ Country DB отвечает на вопрос «какая страна у ад�
 - `sticky`-блоки: закрепление выхода по DNS-именам, IP, ASN и странам;
 - `via = local` — пускать избранные адреса мимо VPN;
 - `fallback_sticky` — как пул обслуживает остальной трафик;
-- базы Country и ASN и их фоновое автообновление (`job`-блоки);
+- базы Country и ASN и их фоновое автообновление (`auto_job_update`);
 - hooks и переменные окружения;
 - транспорт: mimic, TCP fallback, диапазон UDP-портов;
 - systemd и проверка состояния;

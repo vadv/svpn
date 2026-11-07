@@ -158,7 +158,22 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
 
     let stickies = top.stickies()?;
     StickyBlock::validate_all(&stickies, &server_label_refs)?;
-    let jobs = top.jobs()?;
+    let mut jobs = top.jobs()?;
+    let geo_db = top.take_path("geo", "db", base)?;
+    let country_db = top.take_path("country", "db", base)?;
+    // auto_job_update turns the database block into its own updater: the
+    // preset lands in the same scheduler as hand-written jobs.
+    if top.take_bool("geo", "auto_job_update")?.unwrap_or(false) {
+        ensure!(geo_db.is_some(), "geo: auto_job_update requires db");
+        jobs.push(crate::job::preset_update(crate::job::Reload::Geo));
+    }
+    if top
+        .take_bool("country", "auto_job_update")?
+        .unwrap_or(false)
+    {
+        ensure!(country_db.is_some(), "country: auto_job_update requires db");
+        jobs.push(crate::job::preset_update(crate::job::Reload::Country));
+    }
     crate::job::JobSpec::validate_all(&jobs)?;
 
     let args = ClientArgs {
@@ -171,8 +186,8 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         exit_policy: top
             .take_exit_policy("fallback_sticky", "strategy")?
             .unwrap_or_default(),
-        geo_db: top.take_path("geo", "db", base)?,
-        country_db: top.take_path("country", "db", base)?,
+        geo_db,
+        country_db,
         exit_state: top.take_path("fallback_sticky", "state", base)?,
         stickies,
         jobs,
@@ -291,6 +306,16 @@ impl<'a> Split<'a> {
                 .map(str::to_owned)
                 .map(Some)
                 .with_context(|| format!("{}: attribute {key} must be a string", self.ctx)),
+        }
+    }
+
+    fn take_bool(&mut self, key: &str) -> Result<Option<bool>> {
+        match self.take_value(key)? {
+            None => Ok(None),
+            Some(value) => value
+                .as_bool()
+                .map(Some)
+                .with_context(|| format!("{}: attribute {key} must be a boolean", self.ctx)),
         }
     }
 
@@ -492,6 +517,9 @@ impl<'a> Top<'a> {
 
     fn take_string(&mut self, section: &str, key: &str) -> Result<Option<String>> {
         self.take(section, key, Split::take_string)
+    }
+    fn take_bool(&mut self, section: &str, key: &str) -> Result<Option<bool>> {
+        self.take(section, key, Split::take_bool)
     }
     fn take_path(&mut self, section: &str, key: &str, base: &Path) -> Result<Option<PathBuf>> {
         self.take(section, key, |s, k| Split::take_path(s, k, base))

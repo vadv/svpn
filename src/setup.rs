@@ -9,8 +9,6 @@ use crate::{config, ssh};
 
 pub const SETUP_SCRIPT: &str = include_str!("../scripts/setup");
 pub const SERVER_UP: &str = include_str!("../scripts/server-up");
-const JOB_GEO_UPDATE: &str = include_str!("../scripts/job-geo-update");
-const JOB_COUNTRY_UPDATE: &str = include_str!("../scripts/job-country-update");
 pub const SERVER_DOWN: &str = include_str!("../scripts/server-down");
 
 /// Effective server up hook: an explicit command wins, otherwise the embedded example.
@@ -24,15 +22,61 @@ pub fn down_or_default(command: Option<String>) -> String {
 }
 
 /// Embedded hook example available for inspection before running SVPN.
-pub fn example(name: &str) -> Option<&'static str> {
-    match name {
-        "client-up" => Some(crate::client_routing::UP),
-        "client-down" => Some(crate::client_routing::DOWN),
-        "server-up" => Some(SERVER_UP),
-        "server-down" => Some(SERVER_DOWN),
-        "job-geo-update" => Some(JOB_GEO_UPDATE),
-        "job-country-update" => Some(JOB_COUNTRY_UPDATE),
-        _ => None,
+/// The job examples are rendered from the built-in presets, so a template
+/// can never drift from what `auto_job_update = true` actually runs.
+pub fn example(name: &str) -> Option<String> {
+    let text = match name {
+        "client-up" => crate::client_routing::UP.to_owned(),
+        "client-down" => crate::client_routing::DOWN.to_owned(),
+        "server-up" => SERVER_UP.to_owned(),
+        "server-down" => SERVER_DOWN.to_owned(),
+        "job-geo-update" => job_update_example(&crate::job::preset_update(crate::job::Reload::Geo)),
+        "job-country-update" => {
+            job_update_example(&crate::job::preset_update(crate::job::Reload::Country))
+        }
+        _ => return None,
+    };
+    Some(text)
+}
+
+/// Full `job` block rendered from an update preset: the customization path
+/// for users who need their own mirror or schedule. Everyone else just sets
+/// `auto_job_update = true` in the database block and never sees this.
+fn job_update_example(spec: &crate::job::JobSpec) -> String {
+    let (tag, name) = match spec.reload.first() {
+        Some(crate::job::Reload::Geo) => ("geo", "ASN"),
+        _ => ("country", "Country"),
+    };
+    format!(
+        "# Автообновление {tag}-базы (DB-IP {name} Lite, ежемесячно).\n\
+# Стандартный путь — без копирования этого блока:\n\
+#   {tag} {{ db = \"/etc/svpn/{tag}.csv\"; auto_job_update = true }}\n\
+# Блок ниже — отправная точка кастомизации (свой mirror, свой график).\n\
+# Проверить руками: svpn job run {label} --config vpn.hcl\n\
+job \"{label}\" {{\n\
+  every   = \"{every}\"\n\
+  timeout = \"{timeout}\"\n\
+  run_if  = <<EOF\n{run_if}EOF\n\
+  run     = <<EOF\n{run}EOF\n\
+  reload  = [\"{tag}\"]\n\
+}}\n",
+        label = spec.label,
+        every = duration_hcl(spec.every),
+        timeout = duration_hcl(spec.timeout),
+        run_if = spec.run_if.as_deref().unwrap_or(""),
+        run = spec.run,
+    )
+}
+
+/// `1h` / `10m` / `90s`: the compact spelling used in examples.
+fn duration_hcl(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 

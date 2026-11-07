@@ -105,3 +105,42 @@ fn foreground_env_contract_is_present() {
     );
     assert_eq!(code, 0, "env must reach the foreground script");
 }
+
+// ── auto_job_update presets ──
+
+#[test]
+fn geo_preset_matches_the_documented_contract() {
+    let spec = svpn::job::preset_update(svpn::job::Reload::Geo);
+    assert_eq!(spec.label, "geo-update");
+    assert_eq!(spec.every, Duration::from_secs(3600));
+    assert_eq!(spec.timeout, Duration::from_secs(600));
+    assert_eq!(spec.reload, vec![svpn::job::Reload::Geo]);
+    let check = spec.run_if.as_deref().unwrap();
+    assert!(check.contains("db=$SVPN_GEO_DB"));
+    // BSD stat with the GNU fallback: the answer is validated, not the code.
+    assert!(check.contains("stat -f %m") && check.contains("stat -c %Y"));
+    let run = &spec.run;
+    assert!(run.contains("dbip-asn-lite"));
+    assert!(run.contains(r"geo.XXXXXX"));
+    assert!(run.contains("104857600"));
+    assert!(run.contains("ulimit -f 976563"));
+    assert!(run.contains(r",[0-9]+'")); // ASN rows end in a number
+    assert!(run.contains(r#""$rows" -ge 100000"#));
+    // Atomic install only after validation; no partial files on failure.
+    assert!(run.contains(r#"trap 'rm -f "$tmp" "$tmp.gz"' EXIT"#));
+    assert!(run.rfind("mv \"$tmp\" \"$db\"").unwrap() > run.find("valid rows").unwrap() - 100);
+}
+
+#[test]
+fn country_preset_matches_the_documented_contract() {
+    let spec = svpn::job::preset_update(svpn::job::Reload::Country);
+    assert_eq!(spec.label, "country-update");
+    assert_eq!(spec.reload, vec![svpn::job::Reload::Country]);
+    let check = spec.run_if.as_deref().unwrap();
+    assert!(check.contains("db=$SVPN_COUNTRY_DB"));
+    let run = &spec.run;
+    assert!(run.contains("dbip-country-lite"));
+    assert!(run.contains(r"country.XXXXXX"));
+    // Country rows end with a two-letter code; ASN rows carry a number.
+    assert!(run.contains("[A-Z][A-Z]$"));
+}

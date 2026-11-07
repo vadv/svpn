@@ -158,18 +158,20 @@ section).
 ## Background jobs
 
 `job` blocks are a transparent systemd-style scheduler: svpn runs your
-script on a timer and does not interpret the result. Ready-made templates
-exist for the databases:
+script on a timer and does not interpret the result. For the databases it
+is one flag, no blocks at all:
 
-```bash
-svpn example job-geo-update       # a ready job block: paste into vpn.hcl
-svpn example job-country-update   # the country database, same shape
+```hcl
+geo     { db = "/etc/svpn/asn.csv";     auto_job_update = true }
+country { db = "/etc/svpn/country.csv"; auto_job_update = true }
 ```
 
-The template already does everything: checks freshness (`run_if`), downloads
-into a temporary file (safe under concurrent runs), validates the size and
-installs the database atomically. svpn picks it up **live, without a
-restart**.
+The built-in job already does everything: checks freshness (`run_if`),
+downloads into a temporary file (safe under concurrent runs), validates the
+size and installs the database atomically. svpn picks it up **live, without a
+restart**. For your own mirror or schedule take the sample block
+`svpn example job-geo-update` — the same built-in job printed as config
+(and turn `auto_job_update` off, or the labels collide):
 
 ```hcl
 job "geo-update" {

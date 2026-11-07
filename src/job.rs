@@ -75,6 +75,79 @@ impl JobSpec {
     }
 }
 
+/// Built-in database update preset behind `geo/country { auto_job_update = true }`.
+/// Single source: `svpn example job-*-update` renders this back into a full
+/// job block for customization, so the template cannot drift from the preset.
+pub fn preset_update(kind: Reload) -> JobSpec {
+    let (label, db_env, tag, dbip, row_re) = match kind {
+        Reload::Geo => (
+            "geo-update",
+            "SVPN_GEO_DB",
+            "geo",
+            "asn",
+            r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+",
+        ),
+        Reload::Country => (
+            "country-update",
+            "SVPN_COUNTRY_DB",
+            "country",
+            "country",
+            r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[A-Z][A-Z]$",
+        ),
+    };
+    // Exit 0 means the database is stale: missing, or its month is not this
+    // month. BSD stat and GNU stat shadow each other depending on PATH, and
+    // GNU `stat -f` even exits 0 with filesystem garbage — validate the
+    // answer, not the exit code.
+    let run_if = format!(
+        r#"db=${db_env}
+[ -n "$db" ] || exit 1
+[ -f "$db" ] || exit 0
+mtime=$(stat -f %m "$db" 2>/dev/null)
+case "$mtime" in ''|*[!0-9]*) mtime=$(stat -c %Y "$db") ;; esac
+file_month=$(date -u -d "@$mtime" +%Y-%m 2>/dev/null || date -u -r "$mtime" +%Y-%m)
+[ -n "$file_month" ] || exit 1
+[ "$file_month" = "$(date -u +%Y-%m)" ] && exit 1
+exit 0
+"#
+    );
+    // Staged download with size caps, row validation and an atomic install:
+    // a broken mirror must not replace the database with garbage, and no
+    // partial files are left behind on any failure path.
+    let run = format!(
+        r#"set -eu
+db=${db_env}
+dir=$(dirname "$db")
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/{tag}.XXXXXX")
+trap 'rm -f "$tmp" "$tmp.gz"' EXIT
+url="https://download.db-ip.com/free/dbip-{dbip}-lite-$(date -u +%Y-%m).csv.gz"
+case "$SVPN_OS" in
+  openwrt) wget -q -Q 104857600 -O "$tmp.gz" "$url" ;;
+  *) curl -fsSL --max-filesize 104857600 "$url" -o "$tmp.gz" ;;
+esac
+[ "$(wc -c <"$tmp.gz")" -le 104857600 ] || {{ echo "{label}: download exceeds 100 MiB" >&2; exit 1; }}
+# Cap the expanded file (~477 MiB: 976563 x 512-byte blocks) before decompressing.
+ulimit -f 976563 2>/dev/null || true
+gzip -dc "$tmp.gz" >"$tmp"
+rm -f "$tmp.gz"
+# Validate rows, not lines: a same-sized pile of garbage must not pass.
+rows=$(grep -cE '{row_re}' "$tmp" || true)
+[ "$rows" -ge 100000 ] || {{ echo "{label}: suspicious download ($rows valid rows)" >&2; exit 1; }}
+mv "$tmp" "$db"
+echo "{label}: $rows rows installed"
+"#
+    );
+    JobSpec {
+        label: label.to_owned(),
+        every: Duration::from_secs(3600),
+        timeout: DEFAULT_TIMEOUT,
+        run_if: Some(run_if),
+        run,
+        reload: vec![kind],
+    }
+}
+
 /// How one run ended. The script is trusted: no interpretation beyond the
 /// process status.
 #[derive(Clone, Debug, PartialEq, Eq)]
