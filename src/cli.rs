@@ -5,7 +5,7 @@ use crate::{DEFAULT_PORT_RANGE, MimicArg, hooks, logging, parse_byte_size, parse
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand, error::ErrorKind, parser::ValueSource,
 };
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -30,6 +30,9 @@ pub struct ClientArgs {
     /// Client statistics interval in seconds; 0 disables periodic reports.
     #[arg(long, default_value_t = 30, value_name = "SECONDS")]
     pub stats_interval: u32,
+    /// Read-only dashboard on this address (loopback only); off by default.
+    #[arg(long, value_name = "ADDR")]
+    pub web_listen: Option<SocketAddr>,
     /// Exit selection: balance (default) or sticky-asn (stable exit per destination ASN).
     #[arg(long, value_enum, default_value_t = ExitPolicy::Balance)]
     pub exit_policy: ExitPolicy,

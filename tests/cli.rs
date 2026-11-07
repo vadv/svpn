@@ -14,6 +14,35 @@ fn client(args: &[&str]) -> ClientArgs {
     }
 }
 
+// ── dashboard address ──
+
+#[test]
+fn dashboard_address_comes_from_the_flag_or_the_config() {
+    let args = client(&["--server", "203.0.113.1", "--web-listen", "127.0.0.1:8080"]);
+    assert_eq!(args.web_listen, Some("127.0.0.1:8080".parse().unwrap()));
+    assert_eq!(client(&["--server", "203.0.113.1"]).web_listen, None);
+
+    let config = svpn::config::parse(
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+         dashboard {\n  listen = \"127.0.0.1:8080\"\n}\n",
+        std::path::Path::new("."),
+        false,
+    )
+    .expect("dashboard config");
+    assert_eq!(config.web_listen, Some("127.0.0.1:8080".parse().unwrap()));
+
+    let error = match svpn::config::parse(
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+         dashboard {\n  listen = \"nowhere\"\n}\n",
+        std::path::Path::new("."),
+        false,
+    ) {
+        Ok(_) => panic!("bad address must be refused"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("dashboard"), "{error:#}");
+}
+
 // ── cardinality and weights ──
 
 #[test]

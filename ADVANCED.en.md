@@ -389,6 +389,44 @@ used addresses with `ip addr`.
 By default it is a path beside the geo database with a `.state.json` suffix.
 State survives restarts. No snap-back is performed.
 
+## Web dashboard
+
+The client (not the server) can serve its state to a browser. It is off by
+default and listens on loopback only:
+
+```bash
+svpn multi --config vpn.hcl --web-listen 127.0.0.1:8080
+```
+
+or in the config:
+
+```hcl
+dashboard {
+  listen = "127.0.0.1:8080"
+}
+```
+
+What it shows: the state of every pool server (`ready`, `checking`,
+`connecting`, `backoff`, `failed`) with its last reason, traffic and flow
+counters per server, sticky rules with their owners, pinned groups, the list
+of active flows with where each one goes (a server or `local`), and the
+sticky resolver and background job counters.
+
+Two addresses:
+
+- `http://127.0.0.1:8080/` — the page with the tables (refreshes every second);
+- `http://127.0.0.1:8080/api/state` — the same snapshot as JSON.
+
+The dashboard is read-only: it cannot change routes or sticky groups. A
+non-loopback address is refused — the client will not listen in the open. On a
+router, reach it through an SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@router
+```
+
+and open `http://127.0.0.1:8080/` in your local browser.
+
 ## Using only part of the features
 
 Only sticky by names, no databases:

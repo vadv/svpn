@@ -1,0 +1,162 @@
+//! Dashboard snapshot: servers, rules, groups and live flows.
+
+mod common;
+
+use std::{net::Ipv4Addr, time::Duration};
+
+use svpn::{
+    hub::{Hub, Owner, Target},
+    link_io::Epoch,
+    packet::FlowKey,
+    sticky::{ResolvedVia, RuntimeSticky, Selector, StickyBlock, Via},
+    web,
+};
+
+fn hub() -> Hub {
+    common::hub::dashboard_hub()
+}
+
+fn flow(protocol: u8, source_port: u16, destination_port: u16) -> FlowKey {
+    FlowKey {
+        protocol,
+        source: Ipv4Addr::new(10, 77, 0, 2),
+        destination: Ipv4Addr::new(1, 2, 3, 4),
+        source_port,
+        destination_port,
+    }
+}
+
+// ── servers ──
+
+#[test]
+fn snapshot_reports_server_state_and_node_ids() {
+    let mut hub = hub();
+    hub.links[1].last_reason = "handshake failed".to_owned();
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.policy, "balance");
+    assert_eq!(snapshot.servers.len(), 2);
+    assert_eq!(snapshot.servers[0].state, "ready");
+    assert_eq!(snapshot.servers[0].id, "192.0.2.1");
+    assert_eq!(snapshot.servers[1].state, "failed");
+    assert_eq!(snapshot.servers[1].reason, "handshake failed");
+    assert!(!snapshot.asn_table);
+    assert!(!snapshot.country_table);
+}
+
+#[test]
+fn snapshot_carries_link_counters() {
+    let mut hub = hub();
+    let mut stats = svpn::stats::Snapshot::default();
+    stats.observe(svpn::control::Stats {
+        inner_tx_bytes: 100,
+        inner_rx_bytes: 200,
+        active_flows: 3,
+        ..svpn::control::Stats::default()
+    });
+    hub.links[0].stats = stats;
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.servers[0].stats.inner_tx_bytes, 100);
+    assert_eq!(snapshot.servers[0].stats.inner_rx_bytes, 200);
+    assert_eq!(snapshot.servers[0].stats.active_flows, 3);
+}
+
+// ── rules and groups ──
+
+#[test]
+fn snapshot_shows_sticky_rule_with_its_owner() {
+    let mut hub = hub();
+    let block = StickyBlock {
+        label: "gaming".to_owned(),
+        selector: Selector::Asn(vec![64500]),
+        via: Via::Servers(vec!["192.0.2.2".to_owned()]),
+        every: Duration::from_secs(60),
+    };
+    let group = svpn::sticky::group_key(&block.canonical_key());
+    hub.exit_owners.insert(group, 1);
+    hub.stickies.push(RuntimeSticky::new(block));
+    hub.sticky_via.push(ResolvedVia::Links(vec![1]));
+
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.rules.len(), 1);
+    let rule = &snapshot.rules[0];
+    assert_eq!(rule.label, "gaming");
+    assert_eq!(rule.selector, "asn: 64500");
+    assert_eq!(rule.via, "servers: 192.0.2.2");
+    assert_eq!(rule.every_secs, 60);
+    assert_eq!(rule.owner.as_deref(), Some("192.0.2.2"));
+    assert_eq!(snapshot.groups.len(), 1);
+    assert_eq!(snapshot.groups[0].group, "gaming");
+    assert_eq!(snapshot.groups[0].server, "192.0.2.2");
+}
+
+#[test]
+fn snapshot_names_asn_groups() {
+    let mut hub = hub();
+    hub.exit_owners.insert(64500, 0);
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.groups.len(), 1);
+    assert_eq!(snapshot.groups[0].group, "asn 64500");
+    assert_eq!(snapshot.groups[0].server, "192.0.2.1");
+}
+
+// ── flows ──
+
+#[test]
+fn snapshot_maps_live_flows_to_their_server() {
+    let mut hub = hub();
+    hub.routes.by_key.insert(
+        flow(6, 40000, 443),
+        Target::Remote(Owner {
+            epoch: Epoch {
+                link: 1,
+                generation: 1,
+            },
+            id: 7,
+        }),
+    );
+    hub.routes
+        .by_key
+        .insert(flow(17, 9000, 53), Target::Direct(9));
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.flows.len(), 2);
+    // Sorted by protocol: tcp before udp.
+    assert_eq!(snapshot.flows[0].protocol, "tcp");
+    assert_eq!(snapshot.flows[0].via, "192.0.2.2");
+    assert_eq!(snapshot.flows[0].destination, "1.2.3.4:443");
+    assert_eq!(snapshot.flows[1].protocol, "udp");
+    assert_eq!(snapshot.flows[1].via, "local");
+}
+
+// ── json ──
+
+#[test]
+fn snapshot_serializes_to_json() {
+    let hub = hub();
+    let json = serde_json::to_value(web::snapshot(&hub)).expect("snapshot serializes");
+    for key in [
+        "generated_at",
+        "policy",
+        "servers",
+        "sticky",
+        "rules",
+        "groups",
+        "local",
+        "flows",
+        "jobs",
+    ] {
+        assert!(json.get(key).is_some(), "missing key {key}");
+    }
+    assert_eq!(json["servers"].as_array().map(Vec::len), Some(2));
+    assert_eq!(json["local"]["enabled"], serde_json::json!(false));
+    assert_eq!(json["rules"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
+fn empty_hub_has_no_flows_or_groups() {
+    let hub = hub();
+    let json = serde_json::to_value(web::snapshot(&hub)).expect("snapshot serializes");
+    assert_eq!(json["flows"].as_array().map(Vec::len), Some(0));
+    assert_eq!(json["groups"].as_array().map(Vec::len), Some(0));
+    assert_eq!(json["jobs"]["runs"], serde_json::json!(0));
+    assert_eq!(json["sticky"]["lookup_hit"], serde_json::json!(0));
+}

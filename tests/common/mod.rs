@@ -1,9 +1,12 @@
 //! Shared packet fixtures for integration tests.
 
+pub mod hub;
 pub mod selector;
 pub mod session;
 
-use svpn::packet::internet_checksum;
+use std::net::Ipv4Addr;
+
+use svpn::{logging, packet::internet_checksum, server_spec::LinkParams};
 
 #[allow(dead_code)] // unused by some of the including test targets
 pub fn udp_packet(reverse: bool) -> Vec<u8> {
@@ -41,4 +44,32 @@ pub fn echo_reply(request: &[u8]) -> Vec<u8> {
     let checksum = internet_checksum(&reply[20..]);
     reply[22..24].copy_from_slice(&checksum.to_be_bytes());
     reply
+}
+
+/// Link parameters of a fake server link.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn link_params(server: Ipv4Addr, weight: u32) -> LinkParams {
+    LinkParams {
+        label: String::new(),
+        server: server.to_string(),
+        weight,
+        identity: None,
+        user: None,
+        ssh_port: 22,
+        host_key: None,
+        remote_bin: "svpn".to_string(),
+        peer_tun_name: None,
+        log_level: logging::Level::Info,
+        udp_port_range: (0, 0),
+        mimic: Vec::new(),
+        remeasure_interval: None,
+        tcp_port: None,
+        tun_addr: Ipv4Addr::new(10, 77, 0, 2),
+        peer_addr: Ipv4Addr::new(10, 77, 0, 1),
+        addr_auto: false,
+        mtu: 1280,
+        tun_name: None,
+        server_up: None,
+        server_down: None,
+    }
 }

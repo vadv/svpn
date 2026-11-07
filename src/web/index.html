@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>svpn</title>
+<style>
+:root { color-scheme: dark; }
+body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #111; color: #e8e8e8; }
+h1 { font-size: 1.2rem; margin: 0 0 .2rem; }
+h2 { font-size: .95rem; margin: 1.4rem 0 .4rem; color: #9ad; }
+.meta { color: #999; font-size: .8rem; margin-bottom: 1rem; }
+table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #2a2a2a; }
+th { color: #8ab; font-weight: 500; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.state { padding: .05rem .4rem; border-radius: .2rem; font-size: .75rem; }
+.ready { background: #143d1f; color: #7ee08a; }
+.checking, .connecting { background: #3d3514; color: #e0d07e; }
+.backoff { background: #3d2b14; color: #e0a87e; }
+.failed { background: #3d1414; color: #e07e7e; }
+.cards { display: flex; flex-wrap: wrap; gap: .6rem; }
+.card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: .3rem; padding: .5rem .8rem; }
+.card b { display: block; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+.card span { color: #999; font-size: .75rem; }
+.empty { color: #777; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>svpn</h1>
+<div class="meta" id="meta">loading…</div>
+
+<h2>Servers</h2>
+<table id="servers"><thead><tr>
+<th>#</th><th>state</th><th>server</th><th>label</th><th>w</th>
+<th class="num">rx MiB</th><th class="num">tx MiB</th><th class="num">rx/s</th><th class="num">tx/s</th>
+<th class="num">flows</th><th class="num">opened</th><th class="num">failed</th><th class="num">closed</th>
+<th class="num">drops</th><th>reason</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Rules</h2>
+<table id="rules"><thead><tr>
+<th>label</th><th>selector</th><th>via</th><th>owner</th><th class="num">resolved</th><th class="num">every</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Pinned groups</h2>
+<table id="groups"><thead><tr><th>group</th><th>server</th></tr></thead><tbody></tbody></table>
+
+<h2>Flows</h2>
+<table id="flows"><thead><tr>
+<th>proto</th><th>source</th><th>destination</th><th>via</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Counters</h2>
+<div class="cards" id="cards"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const mib = (bytes) => (bytes / 1048576).toFixed(1);
+const rate = (bytes, seconds) => (seconds > 0 ? (bytes * 8 / seconds / 1000000).toFixed(2) : "0.00");
+let previous = null;
+
+function rows(body, cells, empty) {
+  body.innerHTML = "";
+  if (cells.length === 0) {
+    body.innerHTML = `<tr><td class="empty" colspan="${empty}">none</td></tr>`;
+    return;
+  }
+  for (const cell of cells) {
+    const tr = document.createElement("tr");
+    for (const item of cell) {
+      const td = document.createElement("td");
+      if (item instanceof HTMLElement) {
+        td.appendChild(item);
+      } else if (item && item.num !== undefined) {
+        td.className = "num";
+        td.textContent = item.num;
+      } else {
+        td.textContent = item === null || item === undefined ? "" : String(item);
+      }
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+}
+
+function stateCell(state) {
+  const span = document.createElement("span");
+  span.className = "state " + state;
+  span.textContent = state;
+  return span;
+}
+
+function card(title, value) {
+  const div = document.createElement("div");
+  div.className = "card";
+  const b = document.createElement("b");
+  b.textContent = value;
+  const s = document.createElement("span");
+  s.textContent = title;
+  div.appendChild(b);
+  div.appendChild(s);
+  return div;
+}
+
+async function refresh() {
+  let state;
+  try {
+    const answer = await fetch("/api/state", { cache: "no-store" });
+    state = await answer.json();
+  } catch (error) {
+    $("meta").textContent = "dashboard unreachable: " + error;
+    return;
+  }
+  const now = state.generated_at;
+  const seconds = previous ? Math.max(now - previous.now, 1) : 0;
+  $("meta").textContent =
+    `policy ${state.policy} · asn table ${state.asn_table ? "yes" : "no"} · ` +
+    `country table ${state.country_table ? "yes" : "no"} · updated ${new Date(now * 1000).toLocaleTimeString()}`;
+
+  rows($("servers").tBodies[0], state.servers.map((server, index) => {
+    const stats = server.stats;
+    const before = previous && previous.servers[index] ? previous.servers[index].stats : null;
+    const rxRate = before ? rate(stats.inner_rx_bytes - before.inner_rx_bytes, seconds) : "-";
+    const txRate = before ? rate(stats.inner_tx_bytes - before.inner_tx_bytes, seconds) : "-";
+    return [
+      server.index,
+      stateCell(server.state),
+      server.server,
+      server.label,
+      server.weight,
+      { num: mib(stats.inner_rx_bytes) },
+      { num: mib(stats.inner_tx_bytes) },
+      { num: rxRate },
+      { num: txRate },
+      { num: stats.active_flows },
+      { num: stats.opened_flows },
+      { num: stats.open_failed_flows },
+      { num: stats.closed_flows },
+      { num: stats.dropped_packets },
+      server.reason,
+    ];
+  }), 15);
+
+  rows($("rules").tBodies[0], state.rules.map((rule) => [
+    rule.label,
+    rule.selector,
+    rule.via,
+    rule.owner === null ? "-" : rule.owner,
+    { num: rule.resolved_ips },
+    { num: rule.every_secs + "s" },
+  ]), 6);
+
+  rows($("groups").tBodies[0], state.groups.map((group) => [group.group, group.server]), 2);
+
+  rows($("flows").tBodies[0], state.flows.map((flow) => [
+    flow.protocol,
+    flow.source,
+    flow.destination,
+    flow.via,
+  ]), 4);
+
+  const cards = $("cards");
+  cards.innerHTML = "";
+  const sticky = state.sticky;
+  cards.appendChild(card("sticky hit", sticky.lookup_hit));
+  cards.appendChild(card("sticky miss", sticky.lookup_miss));
+  cards.appendChild(card("failover moves", sticky.failover_moves));
+  cards.appendChild(card("block hits", sticky.block_hit));
+  cards.appendChild(card("resolver ok", sticky.resolve_ok));
+  cards.appendChild(card("resolver fail", sticky.resolve_fail));
+  cards.appendChild(card("local flows", state.local.active_flows));
+  cards.appendChild(card("local opened", state.local.opened));
+  cards.appendChild(card("local failed", state.local.failed));
+  cards.appendChild(card("job runs", state.jobs.runs));
+  cards.appendChild(card("job failures", state.jobs.failures));
+  cards.appendChild(card("job timeouts", state.jobs.timeouts));
+
+  previous = { now, servers: state.servers };
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

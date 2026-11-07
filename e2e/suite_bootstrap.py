@@ -10,6 +10,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 from _lib import (
     CLIENT,
@@ -396,7 +397,23 @@ def test_client_stats():
             time.sleep(2.2)
             assert "stats: last " not in path.read_text(), path.read_text()
         cleanup_verified(process)
+    # The dashboard reports the same state as the periodic log report.
+    with session("stats-dashboard", args=CLIENT + ["--web-listen", "127.0.0.1:18080"]) as (
+        process,
+        path,
+    ):
+        tcp_echo(1)
+        until(lambda: "dashboard: http://127.0.0.1:18080" in path.read_text())
+        state = json.loads(urllib.request.urlopen("http://127.0.0.1:18080/api/state", timeout=5).read())
+        assert state["servers"], state
+        assert state["policy"] == "balance", state
+        assert state["servers"][0]["state"] == "ready", state
+        assert state["servers"][0]["stats"]["inner_rx_bytes"] >= 0, state
+        page = urllib.request.urlopen("http://127.0.0.1:18080/", timeout=5).read().decode()
+        assert "<h1>svpn</h1>" in page, page
+    cleanup_verified(process)
     print("PASS client stats: periodic rich INFO report, 0 disables, error hides")
+    print("PASS dashboard: loopback json and html with the live state")
 
 
 def test_secondary_server_address():

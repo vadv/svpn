@@ -24,6 +24,11 @@ impl Snapshot {
         self.total.active_flows = 0;
     }
 
+    /// Cumulative counters of the current link generation.
+    pub fn totals(&self) -> &Stats {
+        &self.total
+    }
+
     pub fn sample(&mut self) -> (Stats, Stats) {
         let delta = difference(&self.total, &self.reported);
         self.reported = self.total.clone();
