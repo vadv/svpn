@@ -423,7 +423,9 @@ What it shows:
   pauses only the table; the overview stays live.
 - Job state, last successful attempt, failure reason and next run; ASN/Country
   database loading time in this process, range counts and update outcomes. Failed
-  updates retain the previous table.
+  updates retain the previous table. A non-zero `run_if` exit skips the attempt;
+  a gate spawn failure or timeout is a failed attempt, visible in the job state,
+  database update error and corresponding counter.
 - Pinned groups and technical counters in collapsible diagnostics.
 
 Rule bytes are cumulative for this client process: TX is a complete inner IP

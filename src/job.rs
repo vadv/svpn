@@ -50,9 +50,9 @@ pub struct JobSpec {
     pub every: Duration,
     /// SIGKILL bound for the whole process group.
     pub timeout: Duration,
-    /// Exit 0 means there is work: the attempt proceeds to `run`. Any other
-    /// outcome (non-zero, spawn failure, timeout) skips the attempt; a broken
-    /// check additionally logs an error instead of blindly running.
+    /// Exit 0 proceeds to `run`; non-zero exits skip the attempt. A spawn
+    /// failure or timeout also prevents the payload, but records a failed
+    /// attempt instead of an up-to-date skip.
     pub run_if: Option<String>,
     /// The script, executed as `/bin/sh -c`.
     pub run: String,

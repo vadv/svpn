@@ -167,7 +167,70 @@ async fn scheduler_reports_completion_without_script_output() {
     task.unwrap().await.unwrap();
 }
 
+#[tokio::test]
+async fn scheduler_reports_run_if_timeout_as_a_failed_update() {
+    check_gate_failure("sleep 10", JobStatus::Timeout).await;
+}
+
+#[tokio::test]
+async fn scheduler_reports_run_if_spawn_failure_as_a_failed_update() {
+    // An embedded NUL fails spawn without changing the system shell or environment.
+    check_gate_failure("\0", JobStatus::Failed("run_if: spawn failed".into())).await;
+}
+
 // ── helpers ──
+
+async fn check_gate_failure(check: &str, expected: JobStatus) {
+    let mut spec = spec("update");
+    spec.run_if = Some(check.into());
+    spec.run = "exit 99".into();
+    spec.timeout = Duration::from_millis(100);
+    spec.reload = vec![Reload::Geo, Reload::Country];
+    let context = JobContext {
+        specs: vec![spec],
+        ..Default::default()
+    };
+    let mut hub = common::hub::dashboard_hub();
+    hub.job_stats = JobStats::new(&context.specs, false, false);
+    let (shutdown, mut stop) = watch::channel(false);
+    let (events, task) = jobs::spawn_scheduler(&context, &mut stop);
+    let mut events = events.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(started, JobEvent::Started { .. }));
+    hub.handle_job_event(started);
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let JobEvent::Finished { status, reload, .. } = &event else {
+        panic!("a broken gate must finish with an error, not skip");
+    };
+    assert_eq!(status, &expected, "the payload must not run");
+    assert_eq!(reload, &[Reload::Geo, Reload::Country]);
+    let timeout = expected == JobStatus::Timeout;
+    hub.handle_job_event(event);
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.jobs.runs, 1);
+    assert_eq!(snapshot.jobs.failures, u64::from(!timeout));
+    assert_eq!(snapshot.jobs.timeouts, u64::from(timeout));
+    let progress = &snapshot.jobs.details[0];
+    assert_eq!(progress.state, if timeout { "timeout" } else { "failed" });
+    assert!(progress.finished_at.is_some());
+    assert!(progress.next_at.is_some());
+    assert_eq!(progress.success_at, None);
+    for database in &snapshot.databases {
+        assert!(database.status.attempted_at.is_some());
+        assert!(database.status.error.contains("previous table retained"));
+    }
+}
 
 fn spec(label: &str) -> JobSpec {
     JobSpec {

@@ -191,10 +191,11 @@ function renderChart() {
   $("chart-tx").setAttribute("d", result.tx);
   $("chart-max").textContent = `${result.max.toFixed(2)} Mbit/s`;
   $("chart-end").textContent = new Date(latest.generated_at_ms).toLocaleTimeString();
-  $("legend-rx").textContent = `↓ Receive ${rate(result.latest?.rx)} Mbit/s`;
-  $("legend-tx").textContent = `↑ Send ${rate(result.latest?.tx)} Mbit/s`;
+  const current = point ? result.latest : null;
+  $("legend-rx").textContent = `↓ Receive ${rate(current?.rx)} Mbit/s`;
+  $("legend-tx").textContent = `↑ Send ${rate(current?.tx)} Mbit/s`;
   const collected = Math.max(0, Math.floor((history.at(-1).time - history[0].time) / 1000));
-  $("chart-note").textContent = result.latest?.rx == null ? "Collecting fresh samples…" : collected < 30 ? `${collected}s collected · 5-minute window` : "Inner IP · VPN links only";
+  $("chart-note").textContent = current?.rx == null ? "Collecting fresh samples…" : collected < 30 ? `${collected}s collected · 5-minute window` : "Inner IP · VPN links only";
 }
 
 function render() {
@@ -224,15 +225,19 @@ async function refresh() {
     if (!latest || state.started_at !== latest.started_at || state.generated_at_ms > latest.generated_at_ms) {
       const resumed = isStale();
       if (latest && state.started_at !== latest.started_at) { history = []; point = null; latest = null; }
-      point = measure(resumed ? null : latest, state);
+      point = measure(resumed || !point ? null : latest, state);
       apiError = false;
       history = keepHistory(history, point);
       latest = state;
       lastChange = performance.now();
       render();
+    } else if (apiError) {
+      apiError = false;
+      render();
     } else freshness();
   } catch {
     apiError = true;
+    point = null;
     freshness();
   } finally {
     setTimeout(refresh, 1000); // One outstanding request, even when the API is slow.

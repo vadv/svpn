@@ -393,16 +393,19 @@ pub fn spawn_scheduler(
                                 match crate::job::run(&check_spec, &slot_env).await.0 {
                                     crate::job::JobStatus::Ok => {}
                                     crate::job::JobStatus::Failed(reason) => {
-                                        if reason.contains("spawn failed") {
+                                        if reason == "spawn failed" {
                                             crate::error!("job {}: run_if broken: {reason}", spec.label);
-                                        } else {
-                                            crate::info!("job: {} up-to-date, skipped", spec.label);
+                                            return Ok((
+                                                crate::job::JobStatus::Failed(format!("run_if: {reason}")),
+                                                String::new(),
+                                            ));
                                         }
+                                        crate::info!("job: {} up-to-date, skipped", spec.label);
                                         return Err(format!("run_if did not request work ({reason})"));
                                     }
                                     crate::job::JobStatus::Timeout => {
                                         crate::error!("job {}: run_if timed out", spec.label);
-                                        return Err("run_if timed out; payload not run".to_owned());
+                                        return Ok((crate::job::JobStatus::Timeout, String::new()));
                                     }
                                 }
                             }
