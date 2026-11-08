@@ -1,4 +1,4 @@
-Cargo.lock sha256: 46ec330b789f669fcfb5d95e7eeafec1fa17630ea87c1189452c8ac0f0c1c791
+Cargo.lock sha256: 15cb8bd50358f3b18b1b4092e10e5a621de0260900f05c63a8cd5401c32ec07a
 THIRD-PARTY NOTICES — SVPN v0.2.0
 Prepared from the union of the three release target dependency graphs.
 Some notices cover source components not linked into every binary.
