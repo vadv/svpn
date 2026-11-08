@@ -110,6 +110,8 @@ code { font:inherit; overflow-wrap:anywhere; }
 .rule-tag { color:var(--faint); font-size:10px; }
 .toolbar { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:9px 14px; }
 .toolbar .hint { margin-left:auto; color:var(--faint); font-size:10px; letter-spacing:.04em; }
+#flow-asn { max-width:min(360px,65vw); }
+.toolbar .note { min-width:0; overflow-wrap:anywhere; }
 .pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:9px 14px; border-top:1px solid var(--line-soft); color:var(--muted); font-size:10px; }
 .pagination div { display:flex; gap:8px; align-items:center; }
 .pagination .note { max-width:100%; overflow-wrap:anywhere; }
@@ -244,13 +246,14 @@ body.stale .rail-health { color:var(--warn); }
 </div>
 </section>
 <section class="panel" id="servers-panel" aria-labelledby="servers-title"><div class="heading"><div><h2 id="servers-title">Servers</h2><p class="muted" id="recent-errors">Waiting for the next sample to calculate changes</p></div><span class="aside">Totals since client start</span></div>
-<div class="scroll"><table id="servers"><thead><tr><th>Server</th><th>State</th><th class="num">RX Mbit/s</th><th class="num">TX Mbit/s</th><th class="num">Flows</th><th class="num">Total RX / TX</th><th>Diagnostics</th></tr></thead><tbody></tbody></table></div></section>
+<div class="scroll"><table id="servers"><thead><tr><th>Server</th><th>State</th><th title="Configured candidates; Auto means automatic selection">Mimic</th><th class="num">RX Mbit/s</th><th class="num">TX Mbit/s</th><th class="num">Flows</th><th class="num">Total RX / TX</th><th>Diagnostics</th></tr></thead><tbody></tbody></table></div></section>
 <section class="panel" id="rules-panel" aria-labelledby="rules-title"><div class="heading"><div><h2 id="rules-title">Rules &amp; exits</h2><p class="muted">Config order · first match wins · flow attribution stays pinned</p></div><span class="aside">IP bytes since client start</span></div>
 <div class="scroll"><table id="rules"><thead><tr><th>Rule / match</th><th>Current exit</th><th>Allowed exits</th><th class="num">Flows</th><th class="num">RX received</th><th class="num">TX sent</th><th>Resolver</th></tr></thead><tbody></tbody></table></div>
 <div class="pagination"><span class="note">TX: accepted by the hub queue. RX: delivered to the client TUN. Includes IP headers; excludes VPN framing and VPN-transport retries. Queued TX does not prove remote delivery.</span></div></section>
 <section class="panel" id="flows-panel" aria-labelledby="flows-title"><div class="heading"><div><h2 id="flows-title">Flows</h2><p class="muted" id="flow-status">Live ownership table</p></div><button type="button" id="pause" aria-pressed="false" disabled>Pause table</button></div>
-<div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP or port" placeholder="Search IP or port…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label><span class="hint">Press / to search · Esc to clear</span></div>
-<div class="scroll"><table id="flows"><thead><tr><th>Protocol</th><th>Source</th><th>Destination</th><th>Exit</th><th>Rule</th></tr></thead><tbody></tbody></table></div>
+<div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP, port, country or ASN organization" placeholder="Search IP, country, ASN or organization…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label><label>Country <select id="flow-country" disabled><option value="">All countries</option></select></label><label>ASN <select id="flow-asn" disabled><option value="">All ASNs</option></select></label><span class="hint">Press / to search · Esc to clear</span></div>
+<div class="toolbar"><button type="button" id="asn-load" disabled>Load ASN names</button><span class="note" id="asn-status" role="status">ASN names not loaded</span></div>
+<div class="scroll"><table id="flows"><thead><tr><th>Protocol</th><th>Source</th><th>Destination</th><th>Country</th><th>ASN / organization</th><th>Exit</th><th>Rule</th></tr></thead><tbody></tbody></table></div>
 <div class="pagination"><span id="flow-count">No snapshot yet</span><div><button type="button" id="previous" disabled>Previous</button><span id="flow-page">1 / 1</span><button type="button" id="next" disabled>Next</button></div></div></section>
 <section class="panel" id="data-panel" aria-labelledby="database-title"><div class="heading"><div><h2 id="database-title">Databases &amp; jobs</h2><p class="muted">Failed updates keep the previous in-memory table · script output is not exposed</p></div></div>
 <div class="scroll"><table id="databases"><thead><tr><th>Database</th><th>State</th><th class="num">IPv4 ranges</th><th>Loaded into memory</th><th>Last update attempt</th><th>Update / reload status</th></tr></thead><tbody></tbody></table></div>

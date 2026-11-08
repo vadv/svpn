@@ -195,13 +195,84 @@ export function nearestSample(history, time, serverId = "") {
   return best && { time: best.time, rx: best.rx ?? null, tx: best.tx ?? null };
 }
 
-export function flowPage(flows, { query = "", protocol = "", via = "", page = 0 } = {}) {
+export function asnLabel(asn, names = {}) {
+  return asn == null ? "Unknown" : `AS${asn}${names[asn] ? ` · ${names[asn]}` : ""}`;
+}
+
+export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0 } = {}) {
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&
-    (!needle || `${flow.source} ${flow.destination}`.toLowerCase().includes(needle)));
+    (!country || (flow.country ?? "unknown") === country) && (!asn || String(flow.asn ?? "unknown") === asn) &&
+    (!needle || `${flow.source} ${flow.destination} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)}`.toLowerCase().includes(needle)));
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   page = Math.max(0, Math.min(page, pages - 1));
   return { rows: filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), count: filtered.length, total: flows.length, page, pages };
+}
+
+function ipv4Number(field) {
+  const parts = field.trim().replace(/^"(.*)"$/, "$1").split(".");
+  if (parts.length !== 4 || parts.some(part => !/^(0|[1-9]\d{0,2})$/.test(part) || Number(part) > 255)) return null;
+  return parts.reduce((ip, part) => ip * 256 + Number(part), 0);
+}
+
+// Keep one organization per IPv4 ASN, not per IP range. The return value is
+// the newly retained name length, so the streaming reader can bound memory.
+export function addAsnName(names, line) {
+  if (line.length > 4096) throw new Error("ASN CSV line too long");
+  const first = line.indexOf(","), second = line.indexOf(",", first + 1), third = line.indexOf(",", second + 1);
+  if (first < 0 || second < 0 || third < 0 || line.slice(0, first).includes(":")) return 0;
+  const raw = line.slice(second + 1, third).trim().replace(/^"(.*)"$/, "$1");
+  if (!/^\d{1,10}$/.test(raw)) return 0;
+  const asn = Number(raw);
+  if (asn > 0xffffffff || Object.hasOwn(names, asn)) return 0;
+  const start = ipv4Number(line.slice(0, first)), end = ipv4Number(line.slice(first + 1, second));
+  if (start === null || end === null || start > end) return 0;
+  let name = line.slice(third + 1).trim();
+  if (name.startsWith('"')) {
+    const match = /^"((?:[^"]|"")*)"(?:\s*,.*|\s*)$/.exec(name);
+    if (!match) return 0;
+    name = match[1].replaceAll('""', '"').trim();
+  } else {
+    name = name.split(",", 1)[0].trim();
+    if (name.includes('"')) return 0;
+  }
+  if (!name || name.length > 1024) return 0;
+  names[asn] = name;
+  return name.length;
+}
+
+export async function readAsnNames(body) {
+  if (!body) throw new Error("ASN CSV stream unavailable");
+  const reader = body.getReader(), decoder = new TextDecoder("utf-8", { fatal: true });
+  const names = Object.create(null);
+  let pending = "", total = 0, count = 0, chars = 0;
+  function line(value) {
+    const added = addAsnName(names, value);
+    if (added) {
+      count++; chars += added;
+      if (count > 200000 || chars > 8 * 1024 * 1024) throw new Error("ASN names exceed browser cache limit");
+    }
+  }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > 128 * 1024 * 1024) throw new Error("ASN CSV too large");
+      pending += decoder.decode(value, { stream: true });
+      let start = 0, end;
+      while ((end = pending.indexOf("\n", start)) !== -1) { line(pending.slice(start, end)); start = end + 1; }
+      pending = pending.slice(start);
+      if (pending.length > 4096) throw new Error("ASN CSV line too long");
+    }
+    pending += decoder.decode();
+    if (pending) line(pending);
+    if (!count) throw new Error("No IPv4 ASN organization names in this CSV");
+    return { names, count };
+  } catch (error) {
+    await reader.cancel().catch(() => {}); // Preserve the original decode/network error.
+    throw error;
+  } finally { reader.releaseLock(); }
 }
 
 export function selector(rule) {

@@ -21,7 +21,7 @@ async fn start() -> std::net::SocketAddr {
     let addr = listener.local_addr().expect("dashboard addr");
     tokio::spawn(async move {
         let _sender = tx;
-        let _ = web::serve(listener, rx).await;
+        let _ = web::serve(listener, rx, None).await;
     });
     addr
 }

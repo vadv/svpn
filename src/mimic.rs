@@ -21,7 +21,9 @@ pub const DEFAULT_PORT_RANGE: &str = "60000-60009";
 /// CLI value of `--mimic`: what the traffic pretends to be. UDP strategies
 /// are datagram look-alikes; ssh/banner/none are camouflage levels of the TCP fallback.
 /// Kept apart from protocol types to keep clap-derive out of control/framing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MimicArg {
     Quic,

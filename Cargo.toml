@@ -26,7 +26,7 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 sha2 = "0.11.1"
 socket2 = { version = "0.6", features = ["all"] }
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "signal", "sync", "time"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "io-std", "process", "signal", "sync", "time"] }
 mimalloc = "0.1"
 tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
 zeroize = "1"

@@ -4,8 +4,11 @@
 //! shapes it and (in `serve`) hands the latest one over HTTP. Nothing here
 //! changes routing.
 
+pub mod asn;
+
 use std::{
     net::SocketAddr,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,6 +35,8 @@ pub struct ServerView {
     pub label: String,
     pub server: String,
     pub weight: u32,
+    /// Configured camouflage candidates; empty means automatic selection.
+    pub mimic: Vec<crate::mimic::MimicArg>,
     /// ready, checking, connecting, backoff or failed.
     pub state: &'static str,
     /// Why the link last failed.
@@ -100,6 +105,9 @@ pub struct FlowView {
     pub protocol: &'static str,
     pub source: String,
     pub destination: String,
+    /// Destination metadata from the loaded tables, independent of routing policy.
+    pub country: Option<String>,
+    pub asn: Option<u32>,
     /// Server node id, or `local`.
     pub via: String,
 }
@@ -139,6 +147,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             label: link.params.label.clone(),
             server: link.params.server.clone(),
             weight: link.params.weight,
+            mimic: link.params.mimic.clone(),
             state: crate::hub::link_state(&hub.pool, link, index),
             reason: link.last_reason.clone(),
             stats: link_counters(link),
@@ -205,6 +214,15 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             protocol: protocol_name(key.protocol),
             source: endpoint(key.source, key.source_port),
             destination: endpoint(key.destination, key.destination_port),
+            country: hub
+                .country
+                .as_ref()
+                .and_then(|table| table.lookup(key.destination))
+                .map(crate::geo::unpack_country),
+            asn: hub
+                .geo
+                .as_ref()
+                .and_then(|table| table.lookup(key.destination)),
             via: match flow.target {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
@@ -335,6 +353,8 @@ pub const MAX_HEAD: usize = 8 * 1024;
 
 /// One user, one tab: a stalled peer must not hold the listener or an FD.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound sockets and file buffers even when several browsers download the CSV.
+pub const MAX_CONNECTIONS: usize = 8;
 
 /// Bind the dashboard socket. Only loopback is allowed: the dashboard is
 /// private state and the browser of another host must not reach it.
@@ -348,25 +368,42 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
         .with_context(|| format!("bind dashboard {addr}"))
 }
 
-/// Serve the dashboard until the process ends. Requests are handled in order:
-/// aborting this task on shutdown also drops the in-flight connection.
-pub async fn serve(listener: TcpListener, snapshots: watch::Receiver<Snapshot>) -> Result<()> {
+/// Serve until shutdown. Bounded concurrent requests let CSV downloads run
+/// without holding up snapshots. Dropping the JoinSet closes every connection.
+pub async fn serve(
+    listener: TcpListener,
+    snapshots: watch::Receiver<Snapshot>,
+    geo_path: Option<PathBuf>,
+) -> Result<()> {
+    let mut requests = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await.context("dashboard accept")?;
-        if !peer.ip().is_loopback() {
-            continue;
-        }
-        match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, &snapshots)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => crate::warn!("dashboard: {error:#}"),
-            Err(_) => crate::warn!("dashboard: request timed out"),
+        tokio::select! {
+            finished = requests.join_next(), if !requests.is_empty() => match finished {
+                Some(Ok(Err(error))) => crate::warn!("dashboard: {error:#}"),
+                Some(Err(error)) => crate::warn!("dashboard request task: {error}"),
+                _ => {}
+            },
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted.context("dashboard accept")?;
+                if !peer.ip().is_loopback() || requests.len() >= MAX_CONNECTIONS { continue; }
+                let snapshots = snapshots.clone();
+                let path = geo_path.clone();
+                requests.spawn(async move { handle(stream, &snapshots, path.as_deref()).await });
+            }
         }
     }
 }
 
 /// Answer the read-only snapshot and the embedded page/modules, nothing else.
-async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) -> Result<()> {
-    let Some(head) = read_head(&mut stream).await? else {
+async fn handle(
+    mut stream: TcpStream,
+    snapshots: &watch::Receiver<Snapshot>,
+    geo_path: Option<&Path>,
+) -> Result<()> {
+    let Some(head) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut stream))
+        .await
+        .context("dashboard read timeout")??
+    else {
         return Ok(());
     };
     let mut lines = head.lines();
@@ -397,6 +434,21 @@ async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) ->
         "/api/state" => {
             let json = serde_json::to_vec(&*snapshots.borrow())?;
             respond(&mut stream, 200, "application/json", &json).await
+        }
+        "/api/asn.csv" => {
+            let loaded = snapshots.borrow().asn_table;
+            match geo_path {
+                Some(path) if loaded => asn::serve_csv(&mut stream, path).await,
+                _ => {
+                    respond(
+                        &mut stream,
+                        404,
+                        "text/plain; charset=utf-8",
+                        b"ASN database not loaded",
+                    )
+                    .await
+                }
+            }
         }
         "/" => {
             respond(
@@ -483,15 +535,30 @@ async fn respond(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        stream
+            .write_all(response_head(status, content_type, body.len() as u64).as_bytes())
+            .await
+            .context("write head")?;
+        stream.write_all(body).await.context("write body")?;
+        stream.flush().await.context("flush body")?;
+        Ok(())
+    })
+    .await
+    .context("dashboard write timeout")?
+}
+
+fn response_head(status: u16, content_type: &str, length: u64) -> String {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let allow = if status == 405 { "allow: GET\r\n" } else { "" };
-    let head = format!(
+    format!(
         "HTTP/1.1 {status} {reason}\r\n\
          {allow}\
          content-type: {content_type}\r\n\
@@ -501,15 +568,8 @@ async fn respond(
          content-security-policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\
          referrer-policy: no-referrer\r\n\
          connection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .context("write head")?;
-    stream.write_all(body).await.context("write body")?;
-    stream.flush().await.context("flush body")?;
-    Ok(())
+        length
+    )
 }
 
 /// Embedded assets: no runtime files, external hosts or frontend dependencies.

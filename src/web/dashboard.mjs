@@ -1,10 +1,11 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, selector, localState } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, readAsnNames, selector, localState } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
 let latest = null, point = null, history = [], lastChange = 0, apiError = false;
 let frozen = null, page = 0, flowSignature = "";
 const serverRows = new Map();
+let asnNames = Object.create(null), asnCount = 0, asnState = "idle", asnError = "", asnAbort = null, asnIdleTimer = null;
 
 function node(tag, text = "", className = "") {
   const element = document.createElement(tag);
@@ -137,8 +138,8 @@ function renderServers() {
     if (!row) {
       const tr = node("tr"), details = node("details"), result = node("p");
       details.append(node("summary", "Details"), result);
-      row = { id: server.id, tr, identity: cell(""), state: cell(""), rx: cell("", true), tx: cell("", true), flows: cell("", true), total: cell("", true), result };
-      tr.append(row.identity, row.state, row.rx, row.tx, row.flows, row.total, cell(details));
+      row = { id: server.id, tr, identity: cell(""), state: cell(""), mimic: cell(""), rx: cell("", true), tx: cell("", true), flows: cell("", true), total: cell("", true), result };
+      tr.append(row.identity, row.state, row.mimic, row.rx, row.tx, row.flows, row.total, cell(details));
       serverRows.set(server.id, row);
     }
     // Keep details and keyboard focus stable while values update.
@@ -147,13 +148,14 @@ function renderServers() {
     row.identity.replaceChildren(title(name(server.id), server.server));
     const state = badge(server.state);
     row.state.replaceChildren(state);
+    row.mimic.textContent = server.mimic?.length ? server.mimic.join(" · ") : "Auto";
     if (server.reason && server.state !== "ready") row.state.append(node("small", server.reason, "reason"));
     row.flows.textContent = latest.flows.filter(flow => flow.via === server.id).length;
     row.total.replaceChildren(node("div", bytes(server.stats.inner_rx_bytes)), node("small", bytes(server.stats.inner_tx_bytes)));
     const stats = server.stats;
     row.result.textContent = `Weight ${server.weight} · ${stats.opened_flows} opened / ${stats.open_failed_flows} failed / ${stats.closed_flows} closed · ${stats.dropped_packets} drops since start. ${server.reason ? `Last failure: ${server.reason}` : "No recorded failure."}`;
   });
-  if (!latest.servers.length) table("servers", [], 7, "No servers configured");
+  if (!latest.servers.length) table("servers", [], 8, "No servers configured");
   if (point?.drops != null) $("recent-errors").textContent = `Since previous sample: ${point.drops} drops · ${point.failed} failed opens (VPN links)`;
   else $("recent-errors").textContent = "Waiting for two fresh samples to calculate changes";
 }
@@ -180,18 +182,26 @@ function renderFlows() {
   if (!state) return;
   options($("flow-exit"), [["", "All exits"], ...state.servers.map(server => [server.id, name(server.id, state)]),
     ...(state.local.enabled || state.flows.some(flow => flow.via === "local") ? [["local", "Local"]] : [])]);
-  const result = flowPage(state.flows, { query: $("flow-search").value, protocol: $("flow-protocol").value, via: $("flow-exit").value, page });
+  const names = state.asn_names ?? {};
+  const countries = [...new Set(state.flows.map(flow => flow.country ?? "unknown"))].sort();
+  const asns = [...new Set(state.flows.map(flow => String(flow.asn ?? "unknown")))].sort((a, b) => a === "unknown" ? 1 : b === "unknown" ? -1 : Number(a) - Number(b));
+  options($("flow-country"), [["", "All countries"], ...countries.map(country => [country, country === "unknown" ? "Unknown" : country])]);
+  options($("flow-asn"), [["", "All ASNs"], ...asns.map(asn => [asn, asn === "unknown" ? "Unknown" : asnLabel(asn, names)])]);
+  const result = flowPage(state.flows, { query: $("flow-search").value, protocol: $("flow-protocol").value, via: $("flow-exit").value,
+    country: $("flow-country").value, asn: $("flow-asn").value, names, page });
   page = result.page;
-  const labels = result.rows.map(flow => [flow.protocol.toUpperCase(), flow.source, flow.destination, name(flow.via, state),
+  const labels = result.rows.map(flow => [flow.protocol.toUpperCase(), flow.source, flow.destination,
+    flow.country ?? "Unknown", asnLabel(flow.asn, names), name(flow.via, state),
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule"]);
   const signature = JSON.stringify({ labels, empty: result.total === 0 });
   if (flowSignature !== signature) {
     const rows = result.rows.map((flow, index) => [
       cell(node("span", labels[index][0], `tag tag--${flow.protocol}`)),
       cell(node("code", labels[index][1])), cell(node("code", labels[index][2])),
-      cell(node("span", labels[index][3], "exit-tag")), cell(node("span", labels[index][4], "rule-tag")),
+      cell(labels[index][3]), cell(labels[index][4]),
+      cell(node("span", labels[index][5], "exit-tag")), cell(node("span", labels[index][6], "rule-tag")),
     ]);
-    table("flows", rows, 5, result.total ? "No flows match these filters" : "No active flows");
+    table("flows", rows, 7, result.total ? "No flows match these filters" : "No active flows");
     flowSignature = signature;
   }
   const start = result.count ? page * PAGE_SIZE + 1 : 0;
@@ -203,6 +213,52 @@ function renderFlows() {
   $("pause").textContent = frozen ? "Resume live table" : "Pause table";
   $("pause").setAttribute("aria-pressed", String(Boolean(frozen)));
   $("flow-status").textContent = frozen ? `Paused at ${new Date(frozen.generated_at_ms).toLocaleTimeString()} · filters still work · summary remains live` : "Live ownership table · 50 rows per page";
+}
+
+function renderAsnNames() {
+  const state = latest?.asn_table ? asnState : "unavailable";
+  $("asn-load").disabled = state === "loading" || state === "unavailable";
+  $("asn-load").textContent = state === "ready" ? "Reload ASN names" : "Load ASN names";
+  $("asn-status").textContent = state === "ready" ? `${asnCount.toLocaleString()} names in this browser · freed after 5 min in a hidden tab`
+    : state === "loading" ? "Downloading and parsing ASN CSV in this browser… · numbers remain available"
+    : state === "error" ? `ASN names unavailable: ${asnError} · retry with Load ASN names`
+    : state === "unavailable" ? "ASN names require a loaded geo-db CSV"
+    : state === "evicted" ? "ASN names freed after 5 min hidden · use Load ASN names"
+    : "ASN names not loaded";
+}
+
+function clearAsnNames(state) {
+  const request = asnAbort;
+  asnAbort = null; request?.abort();
+  asnNames = Object.create(null); asnCount = 0; asnState = state; asnError = "";
+  if (latest) latest = { ...latest, asn_names: asnNames };
+}
+
+async function loadAsnNames() {
+  if (!latest?.asn_table || asnState === "loading") return;
+  const request = new AbortController();
+  asnAbort = request; asnState = "loading"; asnError = "";
+  renderAsnNames();
+  try {
+    const response = await fetch("/api/asn.csv", { cache: "no-store", signal: AbortSignal.any([request.signal, AbortSignal.timeout(120000)]) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await readAsnNames(response.body);
+    if (asnAbort !== request) return;
+    asnNames = result.names; asnCount = result.count; asnState = "ready";
+    latest = { ...latest, asn_names: asnNames };
+  } catch (error) {
+    if (asnAbort !== request) return;
+    asnState = "error"; asnError = error.message;
+  } finally {
+    if (asnAbort === request) { asnAbort = null; renderAsnNames(); renderFlows(); }
+  }
+}
+
+function asnVisibility() {
+  clearTimeout(asnIdleTimer);
+  if (document.hidden) {
+    asnIdleTimer = setTimeout(() => { clearAsnNames("evicted"); renderAsnNames(); renderFlows(); }, 300000);
+  } else if (latest?.asn_table && asnState === "idle") void loadAsnNames();
 }
 
 function renderJobs() {
@@ -253,7 +309,7 @@ function renderChart() {
 }
 
 function render() {
-  for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit"]) $(id).disabled = false;
+  for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"])  $(id).disabled = false;
   const ready = latest.servers.filter(server => server.state === "ready").length;
   $("ready").textContent = `${ready} / ${latest.servers.length}`;
   $("active").textContent = latest.flows.length;
@@ -268,8 +324,9 @@ function render() {
   $("warnings").hidden = !warnings.length;
   document.body.dataset.health = warnings.length ? "warn" : "ok";
   $("rail-health").textContent = warnings.length ? `${warnings.length} warning${warnings.length === 1 ? "" : "s"} to review` : ready === latest.servers.length ? "All links ready" : "Pool recovering";
-  renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderJobs(); renderCounters(); renderChart(); freshness();
+  renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderAsnNames(); renderJobs(); renderCounters(); renderChart(); freshness();
   $("footer").textContent = `Client started ${time(latest.started_at / 1000)} · no external assets · history stays in this tab only`;
+  if (latest.asn_table && asnState === "idle" && !document.hidden) void loadAsnNames();
 }
 
 async function refresh() {
@@ -280,17 +337,19 @@ async function refresh() {
     if (!Number.isFinite(state.generated_at_ms) || !Array.isArray(state.servers) || !Array.isArray(state.flows)) throw new Error("Invalid snapshot");
     if (!latest || state.started_at !== latest.started_at || state.generated_at_ms > latest.generated_at_ms) {
       const resumed = isStale();
-      if (latest && state.started_at !== latest.started_at) { history = []; point = null; latest = null; }
+      if (latest && state.started_at !== latest.started_at) { clearAsnNames("idle"); history = []; point = null; latest = null; }
       point = measure(resumed || !point ? null : latest, state);
       apiError = false;
       history = keepHistory(history, point);
-      latest = state;
+      latest = { ...state, asn_names: asnNames };
       lastChange = performance.now();
       render();
-    } else if (apiError) {
+    } else {
+      const recovered = apiError;
       apiError = false;
-      render();
-    } else freshness();
+      if (recovered) render();
+      else freshness();
+    }
   } catch {
     apiError = true;
     point = null;
@@ -303,8 +362,16 @@ async function refresh() {
 function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidden = true; }
 
 $("chart-server").addEventListener("change", () => { renderChart(); freshness(); });
-for (const id of ["flow-search", "flow-protocol", "flow-exit"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
-$("pause").addEventListener("click", () => { if (latest) { frozen = frozen ? null : latest; page = 0; renderFlows(); } });
+for (const id of ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
+$("asn-load").addEventListener("click", () => void loadAsnNames());
+document.addEventListener("visibilitychange", asnVisibility);
+asnVisibility();
+$("pause").addEventListener("click", () => {
+  if (!latest) return;
+  // Freeze only names used by these rows, not the full browser dictionary.
+  frozen = frozen ? null : { ...latest, asn_names: Object.fromEntries(latest.flows.filter(flow => asnNames[flow.asn]).map(flow => [flow.asn, asnNames[flow.asn]])) };
+  page = 0; renderFlows();
+});
 $("previous").addEventListener("click", () => { page--; renderFlows(); });
 $("next").addEventListener("click", () => { page++; renderFlows(); });
 

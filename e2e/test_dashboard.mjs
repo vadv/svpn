@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, processRss, uptimeSeconds, duration, flowPage, selector, localState } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, processRss, uptimeSeconds, duration, flowPage, asnLabel, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -212,6 +212,79 @@ test("flow filters combine, pagination is bounded and disappearing pages clamp",
   assert.equal(missing.pages, 1);
   assert.equal(missing.rows.length, 0);
   assert.equal(flowPage(flows, { page: -1 }).page, 0);
+});
+
+test("destination country/ASN filters combine and search includes organization names", () => {
+  const base = { source: "10.0.0.1:40000", destination: "1.2.3.4:443", protocol: "tcp", via: "nl" };
+  const flows = [
+    { ...base, country: "US", asn: 13335 }, { ...base, country: "DE", asn: 13335 },
+    { ...base, country: "US", asn: 15169 }, { ...base, country: null, asn: null },
+    { ...base, country: null, asn: 0 },
+  ];
+  const names = { 13335: "Cloudflare, Inc.", 15169: "Google LLC" };
+  assert.equal(flowPage(flows, { country: "US", asn: "13335", via: "nl", protocol: "tcp", names }).count, 1);
+  assert.equal(flowPage(flows, { query: "CLOUDFLARE", names }).count, 2);
+  assert.equal(flowPage(flows, { query: "AS15169", names }).count, 1);
+  assert.equal(flowPage(flows, { country: "unknown", asn: "unknown" }).count, 1);
+  assert.equal(flowPage(flows, { asn: "0" }).count, 1, "zero is not conflated with missing data");
+  assert.equal(flowPage(flows, { country: "DE", asn: "15169" }).count, 0);
+  assert.equal(asnLabel(13335, names), "AS13335 · Cloudflare, Inc.");
+  assert.equal(asnLabel(139341), "AS139341");
+  assert.equal(asnLabel(null), "Unknown");
+});
+
+test("browser ASN parser handles DB-IP quoting, boundaries and duplicate ranges", () => {
+  const names = Object.create(null);
+  for (const line of [
+    '1.0.0.0,1.0.0.255,13335,"Cloudflare, Inc."',
+    '1.1.1.0,1.1.1.255,13335,Duplicate must not replace first name',
+    '2.0.0.0,2.0.0.255,"139341","ACME ""Network"""',
+    '0.0.0.0,0.0.0.255,0,Reserved',
+    '255.255.255.0,255.255.255.255,4294967295,Last ASN',
+    '2001:db8::,2001:db8::ffff,42,IPv6 ignored',
+    '5.0.0.0,5.0.0.255,4294967296,Too large',
+    '5.0.0.0,5.0.0.255,-1,Negative',
+    '5.0.0.0,5.0.0.255,1e3,Not an integer',
+    '5.0.0.0,5.0.0.255,42,"Unterminated',
+    '5.0.0.0,5.0.0.255,42,', 'start,end,asn,name', '',
+    'not an IP,not an IP,42,Invalid', '256.0.0.0,256.0.0.255,42,Invalid',
+    '01.0.0.0,01.0.0.255,42,Invalid', '5.0.0.255,5.0.0.0,42,Reversed',
+    '5.0.0.0,5.0.0.255,42,"Fourth, column",ignored extra column',
+  ]) addAsnName(names, line);
+  assert.deepEqual({ ...names }, { 0: "Reserved", 42: "Fourth, column", 13335: "Cloudflare, Inc.", 139341: 'ACME "Network"', 4294967295: "Last ASN" });
+  assert.throws(() => addAsnName(names, "x".repeat(4097)), /line too long/);
+});
+
+test("browser CSV decoder streams UTF-8 and records across arbitrary chunks", async () => {
+  const text = '\ufeff1.0.0.0,1.0.0.255,13335,"Café, ""Network"""\r\n2.0.0.0,2.0.0.255,15169,Google LLC';
+  const body = new ReadableStream({ start(controller) {
+    for (const byte of new TextEncoder().encode(text)) controller.enqueue(new Uint8Array([byte]));
+    controller.close();
+  } });
+  const result = await readAsnNames(body);
+  assert.equal(result.count, 2);
+  assert.equal(result.names[13335], 'Café, "Network"');
+  assert.equal(result.names[15169], 'Google LLC');
+});
+
+test("browser CSV errors cancel the download and release its reader", async () => {
+  for (const bytes of [new Uint8Array([255]), new TextEncoder().encode('x'.repeat(4097))]) {
+    let cancelled = false;
+    const body = new ReadableStream({ start(controller) { controller.enqueue(bytes); }, cancel() { cancelled = true; } });
+    await assert.rejects(readAsnNames(body));
+    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
+  }
+  await assert.rejects(readAsnNames(new Response('bad CSV').body), /No IPv4/);
+  await assert.rejects(readAsnNames(new Response(new Uint8Array([0xc3])).body));
+  const broken = new ReadableStream({ start(controller) { controller.error(new Error('CSV interrupted')); } });
+  await assert.rejects(readAsnNames(broken), /CSV interrupted/);
+  await assert.rejects(readAsnNames(null), /unavailable/);
+  let cancelled = false, released = false;
+  const huge = { getReader: () => ({ read: async () => ({ done: false, value: { byteLength: 128 * 1024 * 1024 + 1 } }),
+    cancel: async () => { cancelled = true; }, releaseLock: () => { released = true; } }) };
+  await assert.rejects(readAsnNames(huge), /too large/);
+  assert.ok(cancelled && released);
 });
 
 test("selectors, local states and byte units are explicit", () => {

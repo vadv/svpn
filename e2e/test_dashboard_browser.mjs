@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const chrome = process.env.CHROME || (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/google-chrome");
 assert.ok(fs.existsSync(chrome), `Chrome not found: ${chrome}; set CHROME to an installed browser`);
 const epoch = Date.now();
-let scenario = "normal", generation = 1, sequence = 0, lastFrame;
+let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0;
 
 function frame() {
   const degraded = scenario === "degraded";
@@ -21,13 +21,14 @@ function frame() {
   const started = epoch - 7200000 + generation * 1000;
   const servers = ["nl.example.test", "de.example.test"].map((id, i) => ({
     index: i, id, server: id, label: scenario === "xss" && i === 0 ? '<img src=x onerror="window.pwned=1">' : i ? "DE" : "NL",
-    weight: 1, state: degraded && i ? "backoff" : "ready", reason: degraded && i ? "handshake timeout" : "",
+    weight: 1, mimic: i ? ["webrtc", "ssh"] : [], state: degraded && i ? "backoff" : "ready", reason: degraded && i ? "handshake timeout" : "",
     stats: { inner_rx_bytes: (i ? 460 : 820) * 1048576 + (degraded && i ? 0 : sequence * (i ? 125000 : 250000)),
       inner_tx_bytes: (i ? 91 : 64) * 1048576 + (degraded && i ? 0 : sequence * (i ? 12500 : 25000)), opened_flows: 85,
       open_failed_flows: degraded && i ? 3 : 0, closed_flows: 12, dropped_packets: degraded && i ? 2 : 0 },
   }));
   const flows = Array.from({ length: count }, (_, i) => ({
     protocol: i % 2 ? "tcp" : "udp", source: `10.77.0.2:${40000 + i}`, destination: `203.0.113.${i % 250 + 1}:443`,
+    country: i % 5 === 0 ? null : i % 2 ? "US" : "DE", asn: i % 5 === 0 ? null : i % 2 ? 13335 : 15169,
     via: degraded ? servers[0].id : i % 3 === 0 ? "local" : i % 3 === 1 ? servers[0].id : servers[1].id,
     rule: degraded ? i % 2 ? 0 : null : i % 3 === 0 ? 1 : i % 3 === 1 ? 0 : null,
   }));
@@ -49,11 +50,11 @@ function frame() {
     rss_bytes: 48 * 1048576 + sequence * 65536, peak_rss_bytes: 64 * 1048576,
     cpu_seconds: 12 + sequence * 0.18, cpus: 8,
   };
-  return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: false, country_table: true,
+  return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
     process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0, active_flows: flows.filter(flow => flow.via === "local").length },
     sticky: { lookup_hit: 81, lookup_miss: 2, failover_moves: 0, block_hit: 410, resolve_ok: 8, resolve_fail: 0, resolved_ips: 6, purged_ips: 0 },
-    databases: [{ kind: "geo", configured: false, loaded: false, rows: 0, pending: null, status: { loaded_at: null, attempted_at: null, error: "" } },
+    databases: [{ kind: "geo", configured: true, loaded: true, rows: 402389, pending: null, status: { loaded_at: null, attempted_at: null, error: "" } },
       { kind: "country", configured: true, loaded: true, rows: 65123, pending: null, status }],
     jobs: { runs: 8, failures: degraded ? 1 : 0, timeouts: 0, started_at: started, geo: {}, country: status,
       details: scenario === "empty" ? [] : [{ label: "country-update", every_secs: 3600, timeout_secs: 300, reload: ["country"], state: degraded ? "failed" : "ok",
@@ -93,6 +94,36 @@ try {
   assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false', 'dark theme switch');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
+  assert($('servers').textContent.includes('webrtc · ssh') && $('servers').textContent.includes('Auto'), 'configured mimic and auto mode are explicit');
+  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV parsed and cached in browser');
+  const requestsBefore = (await control('normal')).asn_requests;
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
+  input('flow-country', 'US'); input('flow-asn', '13335');
+  assert([...$('flows').tBodies[0].rows].every(row => row.cells[3].textContent === 'US' && row.cells[4].textContent.includes('AS13335 · Cloudflare')), 'country and ASN filters combine');
+  input('flow-search', 'cloudflare');
+  assert(!$('flows').textContent.includes('No flows match'), 'organization search works');
+  input('flow-search', ''); input('flow-country', 'unknown'); input('flow-asn', 'unknown');
+  assert([...$('flows').tBodies[0].rows].every(row => row.cells[3].textContent === 'Unknown' && row.cells[4].textContent === 'Unknown'), 'unknown Geo metadata has explicit filters');
+  input('flow-country', ''); input('flow-asn', '');
+  $('asn-load').click();
+  await until(() => $('asn-status').textContent.includes('Downloading and parsing'), 'explicit browser CSV reload');
+  await until(() => $('asn-status').textContent.includes('2 names in this browser') && !$('asn-load').disabled, 'browser names reload completes');
+  const realTimeout = window.setTimeout;
+  window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 300000 ? 30 : ms, ...args);
+  Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  document.dispatchEvent(new Event('visibilitychange'));
+  await until(() => $('asn-status').textContent.startsWith('ASN names freed after 5 min hidden'), 'hidden-tab idle eviction');
+  assert(!$('flows').textContent.includes('Cloudflare') && !$('asn-load').disabled, 'eviction releases dictionary and leaves numbers and reload available');
+  window.setTimeout = realTimeout; delete document.hidden;
+  document.dispatchEvent(new Event('visibilitychange'));
+  $('asn-load').click();
+  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'explicit load after eviction');
+  await control('names-error'); $('asn-load').click();
+  await until(() => $('asn-status').textContent.includes('HTTP 503'), 'CSV fetch error is explicit');
+  assert($('freshness').textContent === 'Live snapshots', 'CSV errors do not break live state polling');
+  await control('normal'); $('asn-load').click();
+  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
   await control('large');
   await until(() => $('active').textContent === '10003', 'large flow snapshot');
@@ -101,20 +132,26 @@ try {
   input('flow-search', '49999'); input('flow-protocol', 'tcp'); input('flow-exit', 'local');
   assert($('flows').tBodies[0].rows.length === 1 && $('flows').textContent.includes('49999'), 'combined flow filters');
   input('flow-search', ''); input('flow-protocol', ''); input('flow-exit', 'de.example.test');
+  input('flow-country', 'US'); input('flow-asn', '13335');
   $('next').click(); assert($('flow-page').textContent.startsWith('2 /'), 'next flow page');
   $('pause').click();
   const frozen = $('flows').textContent, frozenExits = $('flow-exit').textContent;
+  const frozenCountries = $('flow-country').textContent, frozenAsns = $('flow-asn').textContent;
   await control('empty');
   await until(() => $('active').textContent === '0', 'live servers removed while paused');
   assert($('flow-exit').value === 'de.example.test' && $('flow-exit').textContent === frozenExits, 'paused exit options and selection use the frozen snapshot');
+  assert($('flow-country').value === 'US' && $('flow-asn').value === '13335' && $('flow-country').textContent === frozenCountries && $('flow-asn').textContent === frozenAsns, 'pause freezes Geo metadata, names and filter options');
   assert($('flows').textContent === frozen && frozen.includes('DE'), 'paused server and rule labels survive live config changes');
   await control('normal');
   await until(() => $('active').textContent === '123', 'live summary while paused');
   assert($('flows').textContent === frozen && $('flow-count').textContent.includes('10003') && $('pause').getAttribute('aria-pressed') === 'true', 'flow table stays frozen');
   $('pause').click(); assert($('pause').getAttribute('aria-pressed') === 'false', 'resume live table');
-  input('flow-exit', '');
+  input('flow-exit', ''); input('flow-country', ''); input('flow-asn', '');
   await control('xss');
   await until(() => $('servers').textContent.includes('<img'), 'untrusted label rendered');
+  $('asn-load').click();
+  await until(() => $('asn-status').textContent.includes('2 names in this browser') && $('flows').textContent.includes('<img'), 'untrusted CSV names loaded in browser');
+  assert($('flows').textContent.includes('<img'), 'organization names render as text');
   assert(!document.querySelector('main img') && !window.pwned, 'snapshot text cannot inject HTML');
   const restart = await control('restart');
   await until(() => $('footer').textContent.includes(new Date(restart.started_at).toLocaleString()), 'client restart');
@@ -164,8 +201,16 @@ const server = http.createServer((request, response) => {
     scenario = url.searchParams.get("scenario");
     if (scenario === "restart") { generation++; scenario = "normal"; }
     response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000 }));
+    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000, asn_requests: namesRequests }));
     return;
+  }
+  if (url.pathname === "/api/asn.csv") {
+    namesRequests++;
+    if (scenario === "names-error") { response.writeHead(503); response.end("unavailable"); return; }
+    const organization = scenario === "xss" ? '<img src=x onerror="window.pwned=1">' : "Cloudflare, Inc.";
+    const csv = `1.0.0.0,1.0.0.255,13335,"${organization.replaceAll('"', '""')}"\n2.0.0.0,2.0.0.255,15169,Google LLC\n`;
+    response.setHeader("Content-Type", "text/csv; charset=utf-8");
+    setTimeout(() => response.end(csv), 500); return;
   }
   if (url.pathname === "/api/state") {
     response.setHeader("Content-Type", "application/json");
@@ -261,7 +306,7 @@ async function browser(query = "", screenshot, mobile = false) {
     assert.ok(layout.scroll <= width, `page overflows: ${JSON.stringify(layout)}`);
     assert.ok(layout.cardsFit, `cards and scroll containers fit viewport: ${JSON.stringify(layout)}`);
     assert.ok(layout.fontHeight >= 10, "chart axis labels are legible without SVG scaling");
-    if (query.includes("cold")) assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
+    if (query.includes("cold")) assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
     if (screenshot) {
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y: 0, width, height, scale: 1 } });

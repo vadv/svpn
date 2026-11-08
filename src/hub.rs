@@ -1368,8 +1368,9 @@ pub async fn run(
         Some(addr) => {
             let listener = crate::web::bind(addr).await?;
             let (tx, rx) = watch::channel(crate::web::snapshot(&hub));
+            let geo_path = hub.geo_path.clone();
             let task = tokio::spawn(async move {
-                if let Err(error) = crate::web::serve(listener, rx).await {
+                if let Err(error) = crate::web::serve(listener, rx, geo_path).await {
                     crate::error!("dashboard: {error:#}");
                 }
             });

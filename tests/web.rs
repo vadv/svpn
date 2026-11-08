@@ -5,7 +5,9 @@ mod common;
 use std::{net::Ipv4Addr, time::Duration};
 
 use svpn::{
+    MimicArg,
     control::Stats,
+    geo::{Geo, pack_country},
     hub::{Hub, Owner, Target},
     link_io::Epoch,
     packet::FlowKey,
@@ -43,6 +45,25 @@ fn snapshot_reports_server_state_and_node_ids() {
     assert_eq!(snapshot.servers[1].reason, "handshake failed");
     assert!(!snapshot.asn_table);
     assert!(!snapshot.country_table);
+}
+
+#[test]
+fn snapshot_reports_configured_mimic_without_debug_names() {
+    use MimicArg::*;
+    for (configured, expected) in [
+        (vec![], serde_json::json!([])),
+        (vec![WebRtc], serde_json::json!(["webrtc"])),
+        (
+            vec![Quic, Mosh, Obfs, Ssh],
+            serde_json::json!(["quic", "mosh", "obfs", "ssh"]),
+        ),
+        (vec![Banner, None], serde_json::json!(["banner", "none"])),
+    ] {
+        let mut hub = hub();
+        hub.links[0].params.mimic = configured;
+        let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+        assert_eq!(json["servers"][0]["mimic"], expected);
+    }
 }
 
 #[test]
@@ -170,6 +191,49 @@ fn snapshot_maps_live_flows_to_their_server() {
     assert_eq!(snapshot.flows[0].destination, "1.2.3.4:443");
     assert_eq!(snapshot.flows[1].protocol, "udp");
     assert_eq!(snapshot.flows[1].via, "local");
+    assert!(
+        snapshot
+            .flows
+            .iter()
+            .all(|flow| flow.country.is_none() && flow.asn.is_none())
+    );
+}
+
+#[test]
+fn destination_geo_is_independent_of_exit_policy_and_unknown_ranges_stay_null() {
+    let mut hub = hub();
+    let start = u32::from(Ipv4Addr::new(1, 2, 3, 0));
+    hub.geo = Some(Geo::from_ranges(vec![(start, start + 255, 13335)]));
+    hub.country = Some(Geo::from_ranges(vec![(
+        start,
+        start + 255,
+        pack_country("US").unwrap(),
+    )]));
+    hub.routes
+        .insert(flow(6, 40000, 443), Target::Direct(1), None);
+    let mut unknown = flow(17, 40001, 53);
+    unknown.destination = Ipv4Addr::new(203, 0, 113, 1);
+    hub.routes.insert(unknown, Target::Direct(2), None);
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["policy"], "balance");
+    assert_eq!(json["flows"][0]["country"], "US");
+    assert_eq!(json["flows"][0]["asn"], 13335);
+    assert_eq!(json["flows"][0]["via"], "local");
+    assert!(json["flows"][1]["country"].is_null());
+    assert!(json["flows"][1]["asn"].is_null());
+    hub.country = None;
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.flows[0].asn, Some(13335));
+    assert_eq!(snapshot.flows[0].country, None);
+    hub.geo = None;
+    hub.country = Some(Geo::from_ranges(vec![(
+        start,
+        start + 255,
+        pack_country("DE").unwrap(),
+    )]));
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.flows[0].country.as_deref(), Some("DE"));
+    assert_eq!(snapshot.flows[0].asn, None);
 }
 
 // ── json ──
