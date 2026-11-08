@@ -225,6 +225,28 @@ def matrix_groups():
     print("PASS matrix: 8 rows assigned once, original order and dispatch")
 
 
+def setup_snapshot_warning_order():
+    banner = "# Warning: table ip nat is managed by iptables-nft, do not touch!\n"
+    rules = "table ip nat {\n\tchain OUTPUT { type nat hook output priority -100; policy accept; }\n}\n"
+    with patch.object(
+        suite_setup,
+        "remote",
+        side_effect=[SimpleNamespace(stdout=banner + rules), SimpleNamespace(stdout=rules + banner)],
+    ):
+        before = suite_setup.snapshot()
+        suite_setup.assert_snapshot(before)
+    with patch.object(
+        suite_setup, "remote", return_value=SimpleNamespace(stdout=rules.replace("accept", "drop"))
+    ):
+        try:
+            suite_setup.assert_snapshot(before)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("a changed firewall policy was accepted")
+    print("PASS setup snapshots: nft warning order ignored, actual firewall rules pinned")
+
+
 def reselect_log_patterns():
     log = "[server] flow_open role=server id=7 generation=1 channel=2 transport=tcp"
     assert suite_reselect.tcp_flow_ids(log) == {"7"}
@@ -399,6 +421,7 @@ if __name__ == "__main__":
     integration_groups()
     dnsserver_wire_selftest()
     setup_suite_groups()
+    setup_snapshot_warning_order()
     matrix_groups()
     matrix_diagnostics()
     reselect_log_patterns()

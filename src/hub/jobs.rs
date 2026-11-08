@@ -250,6 +250,10 @@ impl Hub {
     }
 
     fn reload_table(&mut self, kind: Reload, label: &str) -> bool {
+        let name = match kind {
+            Reload::Geo => "geo",
+            Reload::Country => "country",
+        };
         let (path, state) = match kind {
             Reload::Geo => (&self.geo_path, &mut self.job_stats.geo),
             Reload::Country => (&self.country_path, &mut self.job_stats.country),
@@ -266,7 +270,7 @@ impl Hub {
         match table {
             Ok(table) => {
                 crate::info!(
-                    "database {kind:?} reloaded (job {label}): {} IPv4 ranges",
+                    "{name} database reloaded (job {label}): {} IPv4 ranges",
                     table.rows()
                 );
                 match kind {
@@ -284,7 +288,7 @@ impl Hub {
                 true
             }
             Err(error) => {
-                crate::error!("job {label}: {kind:?} reload failed: {error:#}");
+                crate::error!("job {label}: {name} reload failed: {error:#}");
                 state.error = "Reload failed; previous table retained".to_owned();
                 false
             }
