@@ -4,12 +4,13 @@
 //! file the hub itself — link tasks, the select loop, TUN reads and writes.
 
 use std::{
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant as StdInstant},
 };
 
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
@@ -36,6 +37,9 @@ pub use routes::{Owner, Routes, Target};
 // with resident packets only. 1024 absorbs CPU/Wi-Fi jitter without unbounded growth.
 pub const QUEUE: usize = 1024;
 
+/// How often the dashboard snapshot is refreshed, in seconds.
+pub const SNAPSHOT_INTERVAL: u32 = 1;
+
 /// Startup grace for restored sticky owners: two connect budgets
 /// (selector::ATTEMPT_BUDGET is 5 s each).
 pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
@@ -53,7 +57,7 @@ pub struct Link {
 }
 
 /// Sticky exit counters, surfaced in the periodic stats report.
-#[derive(Default)]
+#[derive(Default, Clone, Serialize)]
 pub struct StickyStats {
     pub lookup_hit: u64,
     pub lookup_miss: u64,
@@ -159,10 +163,12 @@ impl JobContext {
 pub struct Extras {
     pub sticky_blocks: Vec<crate::sticky::StickyBlock>,
     pub jobs: JobContext,
+    /// Read-only dashboard address; None keeps the dashboard off.
+    pub web_listen: Option<SocketAddr>,
 }
 
 /// Periodic job counters for the stats report.
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Serialize)]
 pub struct JobStats {
     pub runs: u64,
     pub failures: u64,
@@ -933,12 +939,16 @@ impl Hub {
         tun: &mut Option<AsyncDevice>,
         hooks: &mut Hooks,
         shutdown: &mut watch::Receiver<bool>,
+        dashboard: Option<watch::Sender<crate::web::Snapshot>>,
     ) -> Result<()> {
         // Interface addressing is deterministic, independent of connection timing.
         let params = self.links[0].params.clone();
         let mut buffer = vec![0u8; params.mtu as usize];
         let mut last_report = Instant::now();
         let mut reports = report_timer(stats_interval);
+        let mut dashboard_timer = dashboard
+            .as_ref()
+            .and_then(|_| report_timer(SNAPSHOT_INTERVAL));
         loop {
             let retry_at = self.pool.next_retry();
             tokio::select! {
@@ -1068,6 +1078,16 @@ impl Hub {
                     let report = self.stats_report(now.duration_since(last_report));
                     crate::info!("{report}");
                     last_report = now;
+                }
+                _ = async {
+                    match &mut dashboard_timer {
+                        Some(timer) => { timer.tick().await; }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(tx) = &dashboard {
+                        let _ = tx.send(crate::web::snapshot(self));
+                    }
                 }
                 _ = async {
                     match retry_at {
@@ -1437,6 +1457,7 @@ pub async fn run(
     let Extras {
         sticky_blocks,
         jobs,
+        web_listen,
     } = extras;
     let GeoExits {
         geo,
@@ -1548,9 +1569,33 @@ pub async fn run(
     }
     // This scope owns the TUN until every configured cleanup hook has finished.
     let mut tun = None;
+    let dashboard = match web_listen {
+        Some(addr) => {
+            let listener = crate::web::bind(addr).await?;
+            let (tx, rx) = watch::channel(crate::web::snapshot(&hub));
+            let task = tokio::spawn(async move {
+                if let Err(error) = crate::web::serve(listener, rx).await {
+                    crate::error!("dashboard: {error:#}");
+                }
+            });
+            crate::info!("dashboard: http://{addr}");
+            Some((tx, task))
+        }
+        None => None,
+    };
     let result = hub
-        .relay(started, stats_interval, &mut tun, &mut hooks, &mut shutdown)
+        .relay(
+            started,
+            stats_interval,
+            &mut tun,
+            &mut hooks,
+            &mut shutdown,
+            dashboard.as_ref().map(|(tx, _)| tx.clone()),
+        )
         .await;
+    if let Some((_, task)) = dashboard {
+        task.abort();
+    }
     if let Some(state) = &mut hub.exit_state {
         state.flush();
     }
@@ -1598,7 +1643,7 @@ fn drop_note(delivery: &Delivery, links: &[Link], link: Option<usize>, reason: &
     }
 }
 
-fn link_state(pool: &Pool, link: &Link, index: usize) -> &'static str {
+pub(crate) fn link_state(pool: &Pool, link: &Link, index: usize) -> &'static str {
     if link.epoch.is_some_and(|epoch| pool.is_ready(epoch)) {
         return "ready";
     }

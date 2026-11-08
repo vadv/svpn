@@ -24,6 +24,22 @@ impl Snapshot {
         self.total.active_flows = 0;
     }
 
+    /// Cumulative counters across all link generations.
+    pub fn totals(&self) -> &Stats {
+        &self.total
+    }
+
+    /// Counters for display: everything accumulated so far plus the live
+    /// generation's delta that `observe` has not folded into `total` yet.
+    /// Gauges come from the live generation, not from a sum.
+    pub fn projected(&self, live: &Stats) -> Stats {
+        let mut stats = self.total.clone();
+        add(&mut stats, &difference(live, &self.latest));
+        stats.active_flows = live.active_flows;
+        stats.active_candidate = live.active_candidate.clone();
+        stats
+    }
+
     pub fn sample(&mut self) -> (Stats, Stats) {
         let delta = difference(&self.total, &self.reported);
         self.reported = self.total.clone();

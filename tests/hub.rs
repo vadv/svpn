@@ -366,6 +366,29 @@ async fn report_timer_waits_a_full_period_and_does_not_catch_up_in_bursts() {
     assert_eq!(Instant::now() - start, Duration::from_secs(160));
 }
 
+/// A packet-driven wakeup just before the period must not consume the tick:
+/// relay publishes on the tick itself, without a second elapsed gate.
+#[tokio::test(start_paused = true)]
+async fn snapshot_timer_tick_survives_a_wakeup_just_before_the_period() {
+    let mut timer = report_timer(SNAPSHOT_INTERVAL).unwrap();
+    tokio::time::advance(
+        Duration::from_secs(u64::from(SNAPSHOT_INTERVAL)) - Duration::from_millis(3),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), timer.tick())
+            .await
+            .is_err()
+    );
+    tokio::time::advance(Duration::from_millis(3)).await;
+    timer.tick().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), timer.tick())
+            .await
+            .is_err()
+    );
+}
+
 // ── bootstrap ──
 
 #[tokio::test]

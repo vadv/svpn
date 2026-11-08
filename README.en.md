@@ -195,6 +195,20 @@ sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 Country DB answers “which country is this address”, ASN DB answers “which
 network is it”. Enabling the modes is covered in ADVANCED.
 
+## Web dashboard
+
+The client can show its state in a browser: pool servers and their traffic, sticky rules with their owners, active flows and counters. It listens on loopback only:
+
+```bash
+sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080
+```
+
+With a config, put `dashboard { listen = "127.0.0.1:8080" }` in `vpn.hcl`
+and run `svpn multi --config vpn.hcl`: `--config` cannot be combined with
+client flags. Details — in [ADVANCED.en.md](ADVANCED.en.md).
+
+On a router, look through an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 root@router`, then open `http://127.0.0.1:8080/`.
+
 ## Next steps
 
 Everything beyond the quick-start pair of servers is covered in

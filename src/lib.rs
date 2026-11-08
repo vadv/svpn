@@ -50,6 +50,7 @@ pub mod sticky;
 pub mod tcp;
 mod tun;
 pub mod udp;
+pub mod web;
 pub mod webrtc;
 
 use std::{
@@ -378,6 +379,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 hub::Extras {
                     sticky_blocks: args.stickies.clone(),
                     jobs,
+                    web_listen: args.web_listen,
                 },
             );
             tokio::pin!(client);

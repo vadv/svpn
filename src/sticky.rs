@@ -63,6 +63,32 @@ fn bad_net() -> anyhow::Error {
     anyhow::anyhow!("invalid IPv4 address or network")
 }
 
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Selector::Names(names) => write!(f, "name: {}", names.join(", ")),
+            Selector::Countries(codes) => write!(f, "cc: {}", codes.join(", ")),
+            Selector::Ips(nets) => {
+                let nets: Vec<String> = nets.iter().map(|net| net.canon()).collect();
+                write!(f, "ip: {}", nets.join(", "))
+            }
+            Selector::Asn(asns) => {
+                let asns: Vec<String> = asns.iter().map(u32::to_string).collect();
+                write!(f, "asn: {}", asns.join(", "))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Via::Servers(servers) => write!(f, "servers: {}", servers.join(", ")),
+            Via::Local => f.write_str("local"),
+        }
+    }
+}
+
 /// Group membership selector; exactly one per sticky block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selector {

@@ -189,6 +189,14 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         geo_db,
         country_db,
         exit_state: top.take_path("fallback_sticky", "state", base)?,
+        web_listen: match top.take_string("dashboard", "listen")? {
+            Some(text) => Some(
+                text.parse::<std::net::SocketAddr>()
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| format!("dashboard: invalid listen address {text}"))?,
+            ),
+            None => None,
+        },
         stickies,
         jobs,
         hooks,
@@ -467,6 +475,7 @@ impl<'a> Top<'a> {
                         | "geo"
                         | "country"
                         | "hooks"
+                        | "dashboard"
                         | "fallback_sticky"
                 ),
                 "config: unknown block {name}"
