@@ -149,7 +149,7 @@ fn snapshot_names_asn_groups() {
 #[test]
 fn snapshot_maps_live_flows_to_their_server() {
     let mut hub = hub();
-    hub.routes.by_key.insert(
+    hub.routes.insert(
         flow(6, 40000, 443),
         Target::Remote(Owner {
             epoch: Epoch {
@@ -158,10 +158,10 @@ fn snapshot_maps_live_flows_to_their_server() {
             },
             id: 7,
         }),
+        None,
     );
     hub.routes
-        .by_key
-        .insert(flow(17, 9000, 53), Target::Direct(9));
+        .insert(flow(17, 9000, 53), Target::Direct(9), None);
     let snapshot = web::snapshot(&hub);
     assert_eq!(snapshot.flows.len(), 2);
     // Sorted by protocol: tcp before udp.

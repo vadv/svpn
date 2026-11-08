@@ -105,6 +105,25 @@ async fn root_serves_html() {
 }
 
 #[tokio::test]
+async fn modules_are_embedded_javascript_and_cannot_be_framed_or_loaded_remotely() {
+    let addr = start().await;
+    for path in ["/dashboard.mjs", "/state.mjs"] {
+        let answer = get(addr, path).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.contains("content-type: text/javascript"), "{answer}");
+        assert!(answer.contains("script-src 'self'"), "{answer}");
+        assert!(answer.contains("frame-ancestors 'none'"), "{answer}");
+        assert!(answer.contains("cache-control: no-store"), "{answer}");
+        let foreign = request(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: evil.example\r\n\r\n"),
+        )
+        .await;
+        assert!(foreign.starts_with("HTTP/1.1 403"), "{foreign}");
+    }
+}
+
+#[tokio::test]
 async fn other_paths_are_not_found() {
     let addr = start().await;
     let answer = get(addr, "/nope").await;

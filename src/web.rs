@@ -41,13 +41,37 @@ pub struct ServerView {
 /// One sticky block: what it matches and which server serves it.
 #[derive(Serialize)]
 pub struct RuleView {
+    pub index: usize,
     pub label: String,
+    pub kind: &'static str,
+    pub local: bool,
+    /// Allowed remote node ids, distinct from the group's current owner.
+    pub candidates: Vec<String>,
+    pub traffic: TrafficView,
     pub selector: String,
     pub via: String,
     pub every_secs: u64,
     pub resolved_ips: usize,
     /// Server node id owning the group, if the group is pinned.
     pub owner: Option<String>,
+}
+
+/// Per-rule IP traffic since client start, including retired flows.
+#[derive(Default, Serialize)]
+pub struct TrafficView {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub active_flows: usize,
+}
+
+#[derive(Serialize)]
+pub struct DatabaseView {
+    pub kind: &'static str,
+    pub configured: bool,
+    pub loaded: bool,
+    pub pending: Option<String>,
+    pub rows: usize,
+    pub status: crate::hub::jobs::DatabaseStatus,
 }
 
 /// One pinned destination group and the server that serves it.
@@ -71,6 +95,7 @@ pub struct LocalView {
 /// One active client flow and where it goes.
 #[derive(Serialize)]
 pub struct FlowView {
+    pub rule: Option<usize>,
     pub protocol: &'static str,
     pub source: String,
     pub destination: String,
@@ -82,6 +107,10 @@ pub struct FlowView {
 #[derive(Serialize)]
 pub struct Snapshot {
     pub generated_at: u64,
+    pub generated_at_ms: u64,
+    pub started_at: u64,
+    pub fallback: TrafficView,
+    pub databases: Vec<DatabaseView>,
     /// balance or sticky-asn.
     pub policy: &'static str,
     pub asn_table: bool,
@@ -112,11 +141,39 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             stats: link_counters(link),
         })
         .collect();
+    let mut active = std::collections::HashMap::<Option<usize>, usize>::new();
+    for flow in hub.routes.by_key.values() {
+        *active.entry(flow.rule).or_default() += 1;
+    }
+    let traffic = |rule| {
+        let totals = hub.routes.traffic.get(&rule).copied().unwrap_or_default();
+        TrafficView {
+            rx_bytes: totals.rx_bytes,
+            tx_bytes: totals.tx_bytes,
+            active_flows: active.get(&rule).copied().unwrap_or(0),
+        }
+    };
     let rules = hub
         .stickies
         .iter()
-        .map(|runtime| RuleView {
+        .enumerate()
+        .map(|(index, runtime)| RuleView {
+            index,
             label: runtime.block.label.clone(),
+            kind: match &runtime.block.selector {
+                crate::sticky::Selector::Names(_) => "names",
+                crate::sticky::Selector::Countries(_) => "countries",
+                crate::sticky::Selector::Ips(_) => "ips",
+                crate::sticky::Selector::Asn(_) => "asn",
+            },
+            local: matches!(runtime.block.via, crate::sticky::Via::Local),
+            candidates: match hub.sticky_via.get(index) {
+                Some(crate::sticky::ResolvedVia::Links(links)) => {
+                    links.iter().map(|&link| node_id(hub, link)).collect()
+                }
+                _ => Vec::new(),
+            },
+            traffic: traffic(Some(index)),
             selector: runtime.block.selector.to_string(),
             via: runtime.block.via.to_string(),
             every_secs: runtime.block.every.as_secs(),
@@ -140,11 +197,12 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         .routes
         .by_key
         .iter()
-        .map(|(key, target)| FlowView {
+        .map(|(key, flow)| FlowView {
+            rule: flow.rule,
             protocol: protocol_name(key.protocol),
             source: endpoint(key.source, key.source_port),
             destination: endpoint(key.destination, key.destination_port),
-            via: match target {
+            via: match flow.target {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
             },
@@ -163,7 +221,10 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             active_flows: local.latest.borrow().active_flows,
         },
         None => LocalView {
-            enabled: false,
+            enabled: hub
+                .sticky_via
+                .iter()
+                .any(|via| matches!(via, crate::sticky::ResolvedVia::Local)),
             ready: false,
             opened: hub.local_stats.opened,
             failed: hub.local_stats.failed,
@@ -171,10 +232,36 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             active_flows: 0,
         },
     };
+    let generated = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     Snapshot {
-        generated_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs()),
+        generated_at: generated.as_secs(),
+        generated_at_ms: generated.as_millis().min(u128::from(u64::MAX)) as u64,
+        started_at: hub.job_stats.started_at,
+        fallback: traffic(None),
+        databases: vec![
+            DatabaseView {
+                kind: "geo",
+                configured: hub.geo_path.is_some()
+                    || hub.geo.is_some()
+                    || hub.geo_pending.is_some(),
+                loaded: hub.geo.is_some(),
+                pending: hub.geo_pending.clone(),
+                rows: hub.geo.as_ref().map_or(0, crate::geo::Geo::rows),
+                status: hub.job_stats.geo.clone(),
+            },
+            DatabaseView {
+                kind: "country",
+                configured: hub.country_path.is_some()
+                    || hub.country.is_some()
+                    || hub.country_pending.is_some(),
+                loaded: hub.country.is_some(),
+                pending: hub.country_pending.clone(),
+                rows: hub.country.as_ref().map_or(0, crate::geo::Geo::rows),
+                status: hub.job_stats.country.clone(),
+            },
+        ],
         policy: match hub.policy {
             crate::cli::ExitPolicy::Balance => "balance",
             crate::cli::ExitPolicy::StickyAsn => "sticky-asn",
@@ -187,7 +274,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         groups,
         local,
         flows,
-        jobs: hub.job_stats,
+        jobs: hub.job_stats.clone(),
     }
 }
 
@@ -273,7 +360,7 @@ pub async fn serve(listener: TcpListener, snapshots: watch::Receiver<Snapshot>) 
     }
 }
 
-/// Answer one request: `/api/state` as JSON, `/` as HTML, nothing else.
+/// Answer the read-only snapshot and the embedded page/modules, nothing else.
 async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) -> Result<()> {
     let Some(head) = read_head(&mut stream).await? else {
         return Ok(());
@@ -313,6 +400,24 @@ async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) ->
                 200,
                 "text/html; charset=utf-8",
                 PAGE.as_bytes(),
+            )
+            .await
+        }
+        "/dashboard.mjs" => {
+            respond(
+                &mut stream,
+                200,
+                "text/javascript; charset=utf-8",
+                include_bytes!("web/dashboard.mjs"),
+            )
+            .await
+        }
+        "/state.mjs" => {
+            respond(
+                &mut stream,
+                200,
+                "text/javascript; charset=utf-8",
+                include_bytes!("web/state.mjs"),
             )
             .await
         }
@@ -389,6 +494,8 @@ async fn respond(
          content-length: {}\r\n\
          cache-control: no-store\r\n\
          x-content-type-options: nosniff\r\n\
+         content-security-policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\
+         referrer-policy: no-referrer\r\n\
          connection: close\r\n\r\n",
         body.len()
     );
@@ -401,5 +508,5 @@ async fn respond(
     Ok(())
 }
 
-/// The dashboard page: a single file with the state tables.
+/// Embedded assets: no runtime files, external hosts or frontend dependencies.
 const PAGE: &str = include_str!("web/index.html");

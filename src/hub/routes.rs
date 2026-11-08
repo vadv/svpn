@@ -1,8 +1,9 @@
-//! Flow ownership: which owner serves which client flow.
+//! Flow ownership and first-match traffic attribution across link generations.
 
 use std::{collections::HashMap, net::Ipv4Addr};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -25,9 +26,25 @@ pub enum Target {
     Direct(u64),
 }
 
+/// Rule attribution is pinned with ownership, never re-evaluated on DNS refresh.
+pub struct RoutedFlow {
+    pub target: Target,
+    /// Config-order sticky index; None is the automatic fallback.
+    pub rule: Option<usize>,
+}
+
+/// Inner IP bytes: TX accepted by the hub queue, RX delivered to the client TUN.
+#[derive(Default, Clone, Copy, Serialize)]
+pub struct Traffic {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+}
+
 #[derive(Default)]
 pub struct Routes {
-    pub by_key: HashMap<FlowKey, Target>,
+    pub by_key: HashMap<FlowKey, RoutedFlow>,
+    /// Bounded by configured rules plus fallback; survives flow retirement.
+    pub traffic: HashMap<Option<usize>, Traffic>,
     pub next: u64,
 }
 
@@ -41,6 +58,24 @@ impl Routes {
         Ok(self.next)
     }
 
+    pub fn target(&self, key: &FlowKey) -> Option<&Target> {
+        self.by_key.get(key).map(|flow| &flow.target)
+    }
+
+    pub fn insert(&mut self, key: FlowKey, target: Target, rule: Option<usize>) {
+        self.by_key.insert(key, RoutedFlow { target, rule });
+    }
+
+    /// Call only after the queue/TUN accepted the full packet.
+    pub fn record(&mut self, key: FlowKey, tx: usize, rx: usize) {
+        if let Some(flow) = self.by_key.get(&key) {
+            let traffic = self.traffic.entry(flow.rule).or_default();
+            traffic.tx_bytes = traffic.tx_bytes.saturating_add(tx as u64);
+            traffic.rx_bytes = traffic.rx_bytes.saturating_add(rx as u64);
+        }
+    }
+
+    /// True only when the packet was accepted by the link queue.
     pub fn enqueue(
         &mut self,
         bytes: &[u8],
@@ -49,7 +84,7 @@ impl Routes {
         outgoing: &mpsc::Sender<Packet>,
         delivery: &Delivery,
         links: &[Link],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let parsed = match packet::parse(bytes, true) {
             Some(parsed) if parsed.flow.valid_for(client_ip) => parsed,
             Some(_) => {
@@ -59,7 +94,7 @@ impl Routes {
                     Some(epoch.link),
                     "foreign source in client TUN packet",
                 );
-                return Ok(());
+                return Ok(false);
             }
             None => {
                 drop_note(
@@ -68,10 +103,10 @@ impl Routes {
                     Some(epoch.link),
                     "unparseable packet from client TUN",
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
-        let (owner, fresh) = match self.by_key.get(&parsed.flow) {
+        let (owner, fresh) = match self.target(&parsed.flow) {
             Some(Target::Remote(owner)) if owner.epoch == epoch => (*owner, false),
             // A local-exit-owned flow never spills onto a server link.
             Some(Target::Direct(_)) | Some(Target::Remote(_)) => {
@@ -81,7 +116,7 @@ impl Routes {
                     Some(epoch.link),
                     "flow owned by another link or not openable",
                 );
-                return Ok(());
+                return Ok(false);
             }
             None if parsed.can_open => (
                 Owner {
@@ -97,26 +132,30 @@ impl Routes {
                     Some(epoch.link),
                     "flow owned by another link or not openable",
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
         match outgoing.try_send(Packet {
             id: owner.id,
             bytes: bytes.to_vec(),
         }) {
-            Ok(()) if fresh => {
-                self.by_key.insert(parsed.flow, Target::Remote(owner));
+            Ok(()) => {
+                if fresh {
+                    self.insert(parsed.flow, Target::Remote(owner), None);
+                }
+                Ok(true)
             }
-            Ok(()) => {}
             // A closed receiver is reported by its task; never fail other links here.
-            Err(_) => drop_note(delivery, links, Some(epoch.link), "link packet queue full"),
+            Err(_) => {
+                drop_note(delivery, links, Some(epoch.link), "link packet queue full");
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     pub fn accepts(&self, epoch: Epoch, packet: &Packet) -> bool {
         packet::parse(&packet.bytes, false).is_some_and(|p| {
-            self.by_key.get(&p.flow)
+            self.target(&p.flow)
                 == Some(&Target::Remote(Owner {
                     epoch,
                     id: packet.id,
@@ -125,7 +164,7 @@ impl Routes {
     }
 
     pub fn forget(&mut self, key: FlowKey, owner: Owner) {
-        if self.by_key.get(&key) == Some(&Target::Remote(owner)) {
+        if self.target(&key) == Some(&Target::Remote(owner)) {
             self.by_key.remove(&key);
         }
     }
@@ -133,7 +172,7 @@ impl Routes {
     /// Remove a local-exit owner only if its generation is still current.
     /// The caller may tombstone the tuple only when removal succeeds.
     pub fn forget_direct(&mut self, key: FlowKey, id: u64) -> bool {
-        if self.by_key.get(&key) == Some(&Target::Direct(id)) {
+        if self.target(&key) == Some(&Target::Direct(id)) {
             self.by_key.remove(&key);
             true
         } else {
@@ -146,8 +185,8 @@ impl Routes {
     /// failure of an unrelated link.
     pub fn remove_epoch(&mut self, epoch: Epoch) -> Vec<FlowKey> {
         let mut retired = Vec::new();
-        self.by_key.retain(|key, target| {
-            if matches!(target, Target::Remote(owner) if owner.epoch == epoch) {
+        self.by_key.retain(|key, flow| {
+            if matches!(flow.target, Target::Remote(owner) if owner.epoch == epoch) {
                 retired.push(*key);
                 false
             } else {

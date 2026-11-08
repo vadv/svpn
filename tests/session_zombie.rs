@@ -69,9 +69,7 @@ async fn proven_slots_are_never_displaced_and_the_refusal_resets() {
             "the refusal is a reset"
         );
         let mut routes = Routes::default();
-        routes
-            .by_key
-            .insert(key, Target::Remote(Owner { epoch, id }));
+        routes.insert(key, Target::Remote(Owner { epoch, id }), None);
         assert_eq!(reset.id, id, "the reset rides the flow's owner id");
         assert!(
             routes.accepts(epoch, &reset),

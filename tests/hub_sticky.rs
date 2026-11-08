@@ -161,7 +161,7 @@ fn dispatch_link(hub: &mut Hub, destination: Ipv4Addr, port: u16) -> Option<Opti
         source_port: port,
         destination_port: 9000,
     };
-    match hub.routes.by_key.get(&flow) {
+    match hub.routes.target(&flow) {
         Some(Target::Remote(owner)) => Some(Some(owner.epoch.link)),
         Some(Target::Direct(_)) => Some(None),
         None => None,

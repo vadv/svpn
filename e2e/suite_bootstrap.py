@@ -415,6 +415,7 @@ def test_client_stats():
         # The snapshot is refreshed once a second: wait for the live state.
         until(lambda: state()["servers"][0]["state"] == "ready")
         until(lambda: traffic(state()["servers"][0]["stats"]) > 0)
+        until(lambda: state()["fallback"]["rx_bytes"] > 0 and state()["fallback"]["tx_bytes"] > 0)
         snapshot = state()
         assert snapshot["servers"], snapshot
         assert snapshot["policy"] == "balance", snapshot

@@ -26,11 +26,11 @@ fn stale_close_cannot_forget_a_reused_tuple() {
         epoch: epoch(2),
         id: routes.allocate().unwrap(),
     };
-    routes.by_key.insert(key, Target::Remote(second));
+    routes.insert(key, Target::Remote(second), None);
     routes.forget(key, first);
     let retired = routes.remove_epoch(first.epoch);
     assert!(retired.is_empty(), "first owner was already forgotten");
-    assert_eq!(routes.by_key.get(&key), Some(&Target::Remote(second)));
+    assert_eq!(routes.target(&key), Some(&Target::Remote(second)));
     routes.forget(key, second);
     assert!(routes.by_key.is_empty());
 }
@@ -40,26 +40,29 @@ fn remove_epoch_returns_tcp_and_udp_keys_for_tombstoning() {
     let udp = packet::parse(&common::udp_packet(false), true).unwrap();
     let tcp = tcp_packet(false);
     let mut routes = Routes::default();
-    routes.by_key.insert(
+    routes.insert(
         udp.flow,
         Target::Remote(Owner {
             epoch: epoch(1),
             id: 1,
         }),
+        None,
     );
-    routes.by_key.insert(
+    routes.insert(
         packet::parse(&tcp, true).unwrap().flow,
         Target::Remote(Owner {
             epoch: epoch(1),
             id: 2,
         }),
+        None,
     );
-    routes.by_key.insert(
+    routes.insert(
         packet::parse(&common::udp_packet(true), true).unwrap().flow,
         Target::Remote(Owner {
             epoch: epoch(2),
             id: 3,
         }),
+        None,
     );
     let mut retired = routes.remove_epoch(epoch(1));
     retired.sort_by_key(|key| (key.protocol, key.source_port));
@@ -74,12 +77,13 @@ fn old_epoch_and_flow_id_cannot_deliver_after_tuple_reuse() {
     let bytes = common::udp_packet(true);
     let key = packet::parse(&bytes, false).unwrap().flow;
     let mut routes = Routes::default();
-    routes.by_key.insert(
+    routes.insert(
         key,
         Target::Remote(Owner {
             epoch: epoch(2),
             id: 9,
         }),
+        None,
     );
     assert!(!routes.accepts(
         epoch(1),
@@ -116,20 +120,20 @@ fn forget_direct_removes_only_the_current_generation() {
         .unwrap()
         .flow;
     let mut routes = Routes::default();
-    routes.by_key.insert(key, Target::Direct(2));
+    routes.insert(key, Target::Direct(2), None);
     // A late close of the previous generation leaves the new owner.
     assert!(!routes.forget_direct(key, 1));
-    assert_eq!(routes.by_key.get(&key), Some(&Target::Direct(2)));
+    assert_eq!(routes.target(&key), Some(&Target::Direct(2)));
     // A remote owner is never a direct generation either.
     let owner = Owner {
         epoch: epoch(1),
         id: routes.allocate().unwrap(),
     };
-    routes.by_key.insert(key, Target::Remote(owner));
+    routes.insert(key, Target::Remote(owner), None);
     assert!(!routes.forget_direct(key, owner.id));
-    assert_eq!(routes.by_key.get(&key), Some(&Target::Remote(owner)));
+    assert_eq!(routes.target(&key), Some(&Target::Remote(owner)));
     // Only the current direct generation removes and reports success.
-    routes.by_key.insert(key, Target::Direct(5));
+    routes.insert(key, Target::Direct(5), None);
     assert!(routes.forget_direct(key, 5));
     assert!(routes.by_key.is_empty());
 }
@@ -139,10 +143,10 @@ fn direct_owner_survives_epoch_removal_and_never_accepts_link_packets() {
     let bytes = common::udp_packet(false);
     let key = packet::parse(&bytes, false).unwrap().flow;
     let mut routes = Routes::default();
-    routes.by_key.insert(key, Target::Direct(7));
+    routes.insert(key, Target::Direct(7), None);
     // A dying link retires only its own owners: direct survives (spec §5.5).
     assert!(routes.remove_epoch(epoch(1)).is_empty());
-    assert_eq!(routes.by_key.get(&key), Some(&Target::Direct(7)));
+    assert_eq!(routes.target(&key), Some(&Target::Direct(7)));
     // Server-link packets of a direct-owned tuple are never accepted.
     assert!(!routes.accepts(
         epoch(1),
@@ -183,7 +187,7 @@ async fn full_queue_counts_loss_without_installing_a_new_owner() {
     assert_eq!(routes.by_key.len(), 1);
     let id = incoming.recv().await.unwrap().id;
     assert!(matches!(
-        routes.by_key.values().next(),
+        routes.by_key.values().next().map(|flow| &flow.target),
         Some(Target::Remote(Owner { id: seen, .. })) if *seen == id
     ));
     drop(incoming);

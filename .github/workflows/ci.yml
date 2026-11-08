@@ -100,6 +100,21 @@ jobs:
           key: "${{ matrix.rust || env.RUST_TOOLCHAIN || 'stable' }}-${{ runner.os }}-${{ runner.arch }}"
       - name: Test Rust without TUN privileges
         run: cargo "+$RUST_VERSION" test --locked --workspace --all-targets
+      - name: Test dashboard calculations without npm dependencies
+        run: node --test e2e/test_dashboard.mjs
+      - name: Test dashboard in headless Chrome
+        if: runner.os == 'Linux'
+        env:
+          DASHBOARD_SCREENSHOTS: e2e/.work/dashboard-screenshots
+        run: node e2e/test_dashboard_browser.mjs
+      - name: Retain fixture dashboard screenshots
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dashboard-${{ matrix.rust }}-${{ github.run_attempt }}
+          path: e2e/.work/dashboard-screenshots/*.png
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Test harness cleanup and log retention without Docker
         run: |
           bash -n e2e/run.sh

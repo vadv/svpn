@@ -407,11 +407,36 @@ dashboard {
 }
 ```
 
-What it shows: the state of every pool server (`ready`, `checking`,
-`connecting`, `backoff`, `failed`) with its last reason, traffic and flow
-counters per server, sticky rules with their owners, pinned groups, the list
-of active flows with where each one goes (a server or `local`), and the
-sticky resolver and background job counters.
+What it shows:
+
+- An overview: ready servers, RX/TX in Mbit/s, active connections and local-exit
+  readiness. `ready` means the link is ready, not an end-to-end internet check.
+- A five-minute VPN-pool RX/TX chart. History lives only in the open tab; changing
+  the selected server preserves it. This is inner IP traffic, not all WAN traffic
+  or local-exit throughput. Restarting the client clears the chart.
+- Compact server rows; expand details for addresses, weights, cumulative counters
+  and the last failure reason.
+- Sticky rules in first-match order: selectors, allowed exits, current owners,
+  connections and RX/TX. Local is explicit; resolved-IP counts apply only to DNS
+  rules. Traffic matching no sticky rule appears as Fallback.
+- Flows: address/port search, protocol/exit filters and 50-row pages. Freeze table
+  pauses only the table; the overview stays live.
+- Job state, last successful attempt, failure reason and next run; ASN/Country
+  database loading time in this process, range counts and update outcomes. Failed
+  updates retain the previous table.
+- Pinned groups and technical counters in collapsible diagnostics.
+
+Rule bytes are cumulative for this client process: TX is a complete inner IP
+packet accepted by the hub queue; RX is a packet written to the client TUN. This
+is not an acknowledgement from the remote application. Rejected/full queues,
+invalid packets and failed writes add no bytes. Attribution is pinned when a
+flow opens: DNS refresh does not reclassify a live flow, and close/reconnect does
+not reset totals. This accounting includes local exit; the VPN chart does not.
+
+An API failure or a snapshot unchanged for over five seconds visibly marks the
+screen stale. Rates become unknown, not zero. Recovery does not invent a rate
+across the missing interval. Cumulative counters are labelled since client start;
+recent error/drop increments are shown separately.
 
 Two addresses:
 
@@ -427,6 +452,20 @@ ssh -L 8080:127.0.0.1:8080 root@router
 ```
 
 and open `http://127.0.0.1:8080/` in your local browser.
+
+The page and JS modules are embedded in the binary: no npm packages, CDN, external
+fonts or services. Dashboard checks without npm dependencies:
+
+```bash
+node --test e2e/test_dashboard.mjs
+node e2e/test_dashboard_browser.mjs
+# Optional: save desktop/mobile renders
+DASHBOARD_SCREENSHOTS=/tmp/svpn-dashboard-preview node e2e/test_dashboard_browser.mjs
+```
+
+The browser check requires installed Chrome; override its path with `CHROME`.
+CI runs it on Linux. The static fixture server and its control endpoints exist
+only in the self-check, never in SVPN.
 
 ## Using only part of the features
 

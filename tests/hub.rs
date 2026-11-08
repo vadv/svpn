@@ -135,21 +135,25 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
     let (outgoing, mut incoming) = mpsc::channel(2);
     hub.links[0].outgoing = Some(outgoing);
     hub.routes
-        .by_key
-        .insert(parsed.flow, Target::Remote(Owner { epoch, id: 41 }));
+        .insert(parsed.flow, Target::Remote(Owner { epoch, id: 41 }), None);
     assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     let forwarded = incoming.try_recv().unwrap();
     assert_eq!(forwarded.id, 41);
     assert_eq!(forwarded.bytes, bytes);
     // A non-serving owner is still owned, not permission to synthesize a reset.
-    match hub.routes.by_key.get_mut(&parsed.flow) {
+    match hub
+        .routes
+        .by_key
+        .get_mut(&parsed.flow)
+        .map(|flow| &mut flow.target)
+    {
         Some(Target::Remote(owner)) => owner.epoch.generation = 2,
         _ => panic!("expected a remote owner"),
     }
     assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     assert!(incoming.try_recv().is_err());
     assert_eq!(
-        match hub.routes.by_key[&parsed.flow] {
+        match hub.routes.by_key[&parsed.flow].target {
             Target::Remote(owner) => owner.id,
             Target::Direct(_) => panic!("expected a remote owner"),
         },
@@ -182,7 +186,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
         epoch: first,
         id: original.id,
     };
-    assert_eq!(hub.routes.by_key[&key], Target::Remote(owner));
+    assert_eq!(hub.routes.by_key[&key].target, Target::Remote(owner));
     assert!(from_second.try_recv().is_err());
 
     let mut ack = syn.clone();
@@ -225,7 +229,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
         epoch: second,
         id: fresh.id,
     };
-    assert_eq!(hub.routes.by_key[&key], Target::Remote(fresh_owner));
+    assert_eq!(hub.routes.by_key[&key].target, Target::Remote(fresh_owner));
     hub.handle_event(
         first,
         Event::Closed { id: owner.id, key },
@@ -236,7 +240,7 @@ async fn retired_tcp_is_not_reassigned_between_ready_servers() {
     )
     .await
     .unwrap();
-    assert_eq!(hub.routes.by_key[&key], Target::Remote(fresh_owner));
+    assert_eq!(hub.routes.by_key[&key].target, Target::Remote(fresh_owner));
 }
 
 // ── stats reports ──

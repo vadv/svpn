@@ -2,184 +2,120 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>svpn</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>svpn · Client dashboard</title>
 <style>
-:root { color-scheme: dark; }
-body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #111; color: #e8e8e8; }
-h1 { font-size: 1.2rem; margin: 0 0 .2rem; }
-h2 { font-size: .95rem; margin: 1.4rem 0 .4rem; color: #9ad; }
-.meta { color: #999; font-size: .8rem; margin-bottom: 1rem; }
-table { border-collapse: collapse; width: 100%; font-size: .82rem; }
-th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #2a2a2a; }
-th { color: #8ab; font-weight: 500; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.state { padding: .05rem .4rem; border-radius: .2rem; font-size: .75rem; }
-.ready { background: #143d1f; color: #7ee08a; }
-.checking, .connecting { background: #3d3514; color: #e0d07e; }
-.backoff { background: #3d2b14; color: #e0a87e; }
-.failed { background: #3d1414; color: #e07e7e; }
-.cards { display: flex; flex-wrap: wrap; gap: .6rem; }
-.card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: .3rem; padding: .5rem .8rem; }
-.card b { display: block; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
-.card span { color: #999; font-size: .75rem; }
-.empty { color: #777; font-style: italic; }
+:root { color-scheme: dark; --bg:#0c121a; --panel:#131d29; --line:#263448; --text:#e8eff8; --muted:#a1b0c3; --blue:#69baff; --green:#81dfad; --amber:#ffd28a; --red:#ff9b9b; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,sans-serif; }
+main { max-width:1440px; margin:auto; padding:28px 32px 48px; }
+header,.heading,.toolbar,.pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+header { margin-bottom:22px; }
+h1 { margin:0; font-size:24px; letter-spacing:-.8px; }
+h2 { margin:0; font-size:16px; font-weight:650; }
+p { margin:5px 0 0; }
+small,.muted { color:var(--muted); font-size:12px; }
+.subtitle { color:var(--muted); font-size:13px; }
+.status { text-align:right; }
+.pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; background:#233146; color:var(--muted); }
+.pill.good { background:#18382e; color:var(--green); }
+.pill.warn { background:#3b3020; color:var(--amber); }
+.pill.bad { background:#40282e; color:var(--red); }
+.summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin:14px 0; }
+.card,.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+.card { padding:16px 18px; }
+.card .label { color:var(--muted); font-size:12px; }
+.card strong { display:block; font-size:25px; font-weight:600; letter-spacing:-.6px; margin:5px 0 2px; font-variant-numeric:tabular-nums; }
+.card strong.compact { font-size:21px; padding:3px 0; }
+.panel { margin-top:18px; overflow:hidden; }
+.heading { padding:17px 20px 13px; }
+.heading p { max-width:100%; }
+.notice { overflow-wrap:anywhere; border:1px solid #645035; border-radius:8px; padding:10px 15px; color:var(--amber); background:#28231c; margin:12px 0; }
+.notice.bad { color:var(--red); border-color:#684049; background:#2d2027; }
+[hidden] { display:none !important; }
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { padding:12px 20px; text-align:left; border-top:1px solid var(--line); vertical-align:top; }
+th { color:var(--muted); font-weight:500; font-size:11px; letter-spacing:.4px; text-transform:uppercase; background:#101925; }
+td.num,th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+td strong { font-weight:600; }
+td small { display:block; margin-top:3px; }
+.empty { color:var(--muted); text-align:center; padding:22px; }
+.reason { color:var(--amber); max-width:320px; overflow-wrap:anywhere; }
+code { font:12px ui-monospace,monospace; overflow-wrap:anywhere; }
+input,select,button { font:inherit; color:var(--text); border:1px solid #3b4d65; border-radius:6px; background:#0e1824; padding:7px 10px; }
+button { cursor:pointer; }
+button:hover:not(:disabled) { background:#233449; }
+button:disabled,input:disabled,select:disabled { opacity:.5; cursor:default; }
+input { min-width:200px; }
+select { max-width:260px; }
+:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+label { display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.toolbar { padding:0 20px 15px; justify-content:flex-start; }
+.pagination { padding:12px 20px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+.pagination div { display:flex; gap:8px; align-items:center; }
+details>summary { cursor:pointer; color:var(--blue); }
+td details { min-width:94px; }
+td details p { white-space:normal; min-width:180px; max-width:260px; font-size:12px; }
+.diagnostics>summary,.groups>summary { padding:16px 20px; font-weight:600; }
+.counters { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1px; background:var(--line); border-top:1px solid var(--line); }
+.counter { padding:13px 20px; background:var(--panel); }
+.counter strong { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
+.chart { padding:0 20px 14px; }
+.chart svg { display:block; width:100%; height:140px; overflow:visible; }
+.chart-axis { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:11px; margin:3px 0; }
+.chart .grid { stroke:var(--line); stroke-width:1; }
+.chart path { fill:none; stroke-width:2; stroke-linecap:round; vector-effect:non-scaling-stroke; }
+.chart .rx { stroke:var(--blue); }
+.chart .tx { stroke:var(--amber); }
+.legend { display:flex; flex-wrap:wrap; gap:18px; font-size:12px; color:var(--muted); }
+.legend .rx { color:var(--blue); }
+.legend .tx { color:var(--amber); }
+footer { margin-top:20px; color:var(--muted); font-size:12px; }
+body.stale main { border-top:3px solid var(--amber); padding-top:25px; }
+@media(max-width:900px) { main { padding:20px 16px; } .summary { grid-template-columns:repeat(3,minmax(0,1fr)); } th,td { padding:10px 14px; } .card { padding:13px; } }
+@media(max-width:560px) { .summary { grid-template-columns:repeat(2,minmax(0,1fr)); } .summary .card:last-child { grid-column:span 2; } .status { text-align:left; } .card strong { font-size:22px; } input { width:100%; } .toolbar label { flex-wrap:wrap; } .heading,.toolbar { padding-left:14px; padding-right:14px; } }
 </style>
 </head>
 <body>
-<h1>svpn</h1>
-<div class="meta" id="meta">loading…</div>
-
-<h2>Servers</h2>
-<table id="servers"><thead><tr>
-<th>#</th><th>state</th><th>server</th><th>label</th><th>w</th>
-<th class="num">rx MiB</th><th class="num">tx MiB</th><th class="num">rx/s</th><th class="num">tx/s</th>
-<th class="num">flows</th><th class="num">opened</th><th class="num">failed</th><th class="num">closed</th>
-<th class="num">drops</th><th>reason</th>
-</tr></thead><tbody></tbody></table>
-
-<h2>Rules</h2>
-<table id="rules"><thead><tr>
-<th>label</th><th>selector</th><th>via</th><th>owner</th><th class="num">resolved</th><th class="num">every</th>
-</tr></thead><tbody></tbody></table>
-
-<h2>Pinned groups</h2>
-<table id="groups"><thead><tr><th>group</th><th>server</th></tr></thead><tbody></tbody></table>
-
-<h2>Flows</h2>
-<table id="flows"><thead><tr>
-<th>proto</th><th>source</th><th>destination</th><th>via</th>
-</tr></thead><tbody></tbody></table>
-
-<h2>Counters</h2>
-<div class="cards" id="cards"></div>
-
-<script>
-const $ = (id) => document.getElementById(id);
-const mib = (bytes) => (bytes / 1048576).toFixed(1);
-const rate = (bytes, seconds) => (seconds > 0 ? (bytes * 8 / seconds / 1000000).toFixed(2) : "0.00");
-let previous = null;
-
-function rows(body, cells, empty) {
-  body.innerHTML = "";
-  if (cells.length === 0) {
-    body.innerHTML = `<tr><td class="empty" colspan="${empty}">none</td></tr>`;
-    return;
-  }
-  for (const cell of cells) {
-    const tr = document.createElement("tr");
-    for (const item of cell) {
-      const td = document.createElement("td");
-      if (item instanceof HTMLElement) {
-        td.appendChild(item);
-      } else if (item && item.num !== undefined) {
-        td.className = "num";
-        td.textContent = item.num;
-      } else {
-        td.textContent = item === null || item === undefined ? "" : String(item);
-      }
-      tr.appendChild(td);
-    }
-    body.appendChild(tr);
-  }
-}
-
-function stateCell(state) {
-  const span = document.createElement("span");
-  span.className = "state " + state;
-  span.textContent = state;
-  return span;
-}
-
-function card(title, value) {
-  const div = document.createElement("div");
-  div.className = "card";
-  const b = document.createElement("b");
-  b.textContent = value;
-  const s = document.createElement("span");
-  s.textContent = title;
-  div.appendChild(b);
-  div.appendChild(s);
-  return div;
-}
-
-async function refresh() {
-  let state;
-  try {
-    const answer = await fetch("/api/state", { cache: "no-store" });
-    state = await answer.json();
-  } catch (error) {
-    $("meta").textContent = "dashboard unreachable: " + error;
-    return;
-  }
-  const now = state.generated_at;
-  const seconds = previous ? Math.max(now - previous.now, 1) : 0;
-  $("meta").textContent =
-    `policy ${state.policy} · asn table ${state.asn_table ? "yes" : "no"} · ` +
-    `country table ${state.country_table ? "yes" : "no"} · updated ${new Date(now * 1000).toLocaleTimeString()}`;
-
-  rows($("servers").tBodies[0], state.servers.map((server, index) => {
-    const stats = server.stats;
-    const before = previous && previous.servers[index] ? previous.servers[index].stats : null;
-    const rxRate = before ? rate(stats.inner_rx_bytes - before.inner_rx_bytes, seconds) : "-";
-    const txRate = before ? rate(stats.inner_tx_bytes - before.inner_tx_bytes, seconds) : "-";
-    return [
-      server.index,
-      stateCell(server.state),
-      server.server,
-      server.label,
-      server.weight,
-      { num: mib(stats.inner_rx_bytes) },
-      { num: mib(stats.inner_tx_bytes) },
-      { num: rxRate },
-      { num: txRate },
-      { num: stats.active_flows },
-      { num: stats.opened_flows },
-      { num: stats.open_failed_flows },
-      { num: stats.closed_flows },
-      { num: stats.dropped_packets },
-      server.reason,
-    ];
-  }), 15);
-
-  rows($("rules").tBodies[0], state.rules.map((rule) => [
-    rule.label,
-    rule.selector,
-    rule.via,
-    rule.owner === null ? "-" : rule.owner,
-    { num: rule.resolved_ips },
-    { num: rule.every_secs + "s" },
-  ]), 6);
-
-  rows($("groups").tBodies[0], state.groups.map((group) => [group.group, group.server]), 2);
-
-  rows($("flows").tBodies[0], state.flows.map((flow) => [
-    flow.protocol,
-    flow.source,
-    flow.destination,
-    flow.via,
-  ]), 4);
-
-  const cards = $("cards");
-  cards.innerHTML = "";
-  const sticky = state.sticky;
-  cards.appendChild(card("sticky hit", sticky.lookup_hit));
-  cards.appendChild(card("sticky miss", sticky.lookup_miss));
-  cards.appendChild(card("failover moves", sticky.failover_moves));
-  cards.appendChild(card("block hits", sticky.block_hit));
-  cards.appendChild(card("resolver ok", sticky.resolve_ok));
-  cards.appendChild(card("resolver fail", sticky.resolve_fail));
-  cards.appendChild(card("local flows", state.local.active_flows));
-  cards.appendChild(card("local opened", state.local.opened));
-  cards.appendChild(card("local failed", state.local.failed));
-  cards.appendChild(card("job runs", state.jobs.runs));
-  cards.appendChild(card("job failures", state.jobs.failures));
-  cards.appendChild(card("job timeouts", state.jobs.timeouts));
-
-  previous = { now, servers: state.servers };
-}
-
-refresh();
-setInterval(refresh, 1000);
-</script>
+<main data-endpoint="/api/state">
+<header>
+<div><h1>svpn</h1><div class="subtitle">Client dashboard · read-only</div></div>
+<div class="status"><span class="pill" id="freshness">Connecting…</span><p class="muted" id="meta">Waiting for the first snapshot</p></div>
+</header>
+<noscript><div class="notice">JavaScript is required to display the client state.</div></noscript>
+<div id="stale-notice" class="notice bad" role="status" hidden>Data is stale. Values below are from the last successful snapshot, not the live client.</div>
+<div id="warnings" class="notice" role="status" hidden></div>
+<section class="summary" aria-label="Client summary">
+<div class="card"><div class="label">Servers ready</div><strong id="ready">—</strong><small>Link readiness, not an internet check</small></div>
+<div class="card"><div class="label">↓ VPN receive</div><strong id="rx">—</strong><small>Mbit/s · inner IP traffic</small></div>
+<div class="card"><div class="label">↑ VPN send</div><strong id="tx">—</strong><small>Mbit/s · excludes local exit</small></div>
+<div class="card"><div class="label">Active flows</div><strong id="active">—</strong><small id="active-note">TCP · UDP · ICMP</small></div>
+<div class="card"><div class="label">Local exit</div><strong class="compact" id="local">—</strong><small id="local-note">Waiting for state</small></div>
+</section>
+<section class="panel" aria-labelledby="traffic-title">
+<div class="heading"><div><h2 id="traffic-title">VPN traffic</h2><p class="muted">Last 5 minutes in this tab · local exit excluded · gaps mean no fresh samples</p></div><label>View <select id="chart-server" aria-label="Traffic graph server" disabled><option value="">All VPN servers</option></select></label></div>
+<div class="chart"><div class="chart-axis"><span id="chart-max">Mbit/s</span></div><svg viewBox="0 20 1000 140" preserveAspectRatio="none" role="img" aria-label="Receive and send rates in Mbit/s"><title>VPN receive and send rates</title>
+<line class="grid" x1="0" y1="24" x2="1000" y2="24"/><line class="grid" x1="0" y1="88" x2="1000" y2="88"/><line class="grid" x1="0" y1="152" x2="1000" y2="152"/>
+<path class="rx" id="chart-rx"/><path class="tx" id="chart-tx"/></svg><div class="chart-axis"><span>−5 min</span><span id="chart-end">Latest snapshot</span></div>
+<div class="legend"><span class="rx" id="legend-rx">↓ Receive —</span><span class="tx" id="legend-tx">↑ Send —</span><span id="chart-note">Waiting for connection…</span></div></div>
+</section>
+<section class="panel" aria-labelledby="servers-title"><div class="heading"><div><h2 id="servers-title">Servers</h2><p class="muted" id="recent-errors">Waiting for the next sample to calculate changes</p></div><span class="muted">Totals since client start</span></div>
+<div class="scroll"><table id="servers"><thead><tr><th>Server</th><th>State</th><th class="num">↓ Mbit/s</th><th class="num">↑ Mbit/s</th><th class="num">Flows</th><th class="num">Total RX / TX</th><th>Diagnostics</th></tr></thead><tbody></tbody></table></div></section>
+<section class="panel" aria-labelledby="rules-title"><div class="heading"><div><h2 id="rules-title">Rules &amp; exits</h2><p class="muted">Config order · first match wins · flow attribution stays pinned</p></div><span class="muted">IP bytes since client start</span></div>
+<div class="scroll"><table id="rules"><thead><tr><th>Rule / match</th><th>Current exit</th><th>Allowed exits</th><th class="num">Flows</th><th class="num">↓ Received</th><th class="num">↑ Sent</th><th>Resolver</th></tr></thead><tbody></tbody></table></div>
+<div class="pagination">TX: accepted by the hub queue. RX: delivered to the client TUN. Includes IP headers; excludes VPN framing and VPN-transport retries. Queued TX does not prove remote delivery.</div></section>
+<section class="panel" aria-labelledby="flows-title"><div class="heading"><div><h2 id="flows-title">Flows</h2><p class="muted" id="flow-status">Live ownership table</p></div><button type="button" id="pause" aria-pressed="false" disabled>Pause table</button></div>
+<div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP or port" placeholder="Search IP or port…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label></div>
+<div class="scroll"><table id="flows"><thead><tr><th>Protocol</th><th>Source</th><th>Destination</th><th>Exit</th><th>Rule</th></tr></thead><tbody></tbody></table></div>
+<div class="pagination"><span id="flow-count">No snapshot yet</span><div><button type="button" id="previous" disabled>Previous</button><span id="flow-page">1 / 1</span><button type="button" id="next" disabled>Next</button></div></div></section>
+<section class="panel" aria-labelledby="database-title"><div class="heading"><div><h2 id="database-title">Databases &amp; jobs</h2><p class="muted">Failed updates keep the previous in-memory table · script output is not exposed</p></div></div>
+<div class="scroll"><table id="databases"><thead><tr><th>Database</th><th>State</th><th class="num">IPv4 ranges</th><th>Loaded into memory</th><th>Last update attempt</th><th>Update / reload status</th></tr></thead><tbody></tbody></table></div>
+<div class="scroll"><table id="jobs"><thead><tr><th>Job</th><th>State</th><th>Last attempt</th><th>Last success</th><th>Next check</th><th>Result</th></tr></thead><tbody></tbody></table></div></section>
+<details class="panel groups"><summary>Pinned groups</summary><div class="scroll"><table id="groups"><thead><tr><th>Group</th><th>Current server</th></tr></thead><tbody></tbody></table></div></details>
+<details class="panel diagnostics"><summary>Diagnostics · Counters</summary><p class="toolbar muted">Cumulative since client start, not current incidents. No configuration or restart controls.</p><div class="counters" id="counters"></div></details>
+<footer id="footer">No external assets · no persistent browser history · loopback only</footer>
+</main>
+<script type="module" src="/dashboard.mjs"></script>
 </body>
 </html>
