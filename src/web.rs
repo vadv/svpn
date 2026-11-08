@@ -6,7 +6,7 @@
 
 use std::{
     net::SocketAddr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -191,12 +191,12 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
     }
 }
 
-/// Live counters of one link: the session publishes them, the hub only
-/// accumulates them once per stats report. A dead link falls back to the
-/// totals the hub collected last.
+/// Counters of one link, cumulative across generations: the totals the hub
+/// collected plus the live generation's unreported delta. A dead link has no
+/// delta left to add.
 fn link_counters(link: &crate::hub::Link) -> Stats {
     match &link.latest {
-        Some(latest) => latest.borrow().clone(),
+        Some(latest) => link.stats.projected(&latest.borrow()),
         None => link.stats.totals().clone(),
     }
 }
@@ -240,7 +240,10 @@ fn endpoint(address: std::net::Ipv4Addr, port: u16) -> String {
 // ── http ──
 
 /// Maximum request head we read before giving up.
-const MAX_HEAD: usize = 8 * 1024;
+pub const MAX_HEAD: usize = 8 * 1024;
+
+/// One user, one tab: a stalled peer must not hold the listener or an FD.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bind the dashboard socket. Only loopback is allowed: the dashboard is
 /// private state and the browser of another host must not reach it.
@@ -254,19 +257,19 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
         .with_context(|| format!("bind dashboard {addr}"))
 }
 
-/// Serve the dashboard until the process ends.
+/// Serve the dashboard until the process ends. Requests are handled in order:
+/// aborting this task on shutdown also drops the in-flight connection.
 pub async fn serve(listener: TcpListener, snapshots: watch::Receiver<Snapshot>) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await.context("dashboard accept")?;
         if !peer.ip().is_loopback() {
             continue;
         }
-        let snapshots = snapshots.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle(stream, &snapshots).await {
-                crate::warn!("dashboard: {error:#}");
-            }
-        });
+        match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, &snapshots)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::warn!("dashboard: {error:#}"),
+            Err(_) => crate::warn!("dashboard: request timed out"),
+        }
     }
 }
 
@@ -317,41 +320,52 @@ async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) ->
     }
 }
 
-/// Read the request head; None when the peer closed before sending one.
+/// Read the request head; None when the peer closed before a complete head.
+/// Bytes after the terminator are body, not headers, and are not returned.
 async fn read_head(stream: &mut TcpStream) -> Result<Option<String>> {
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(if head.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&head).into_owned())
-            });
+            return Ok(None);
         }
         head.extend_from_slice(&chunk[..read]);
-        if head.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            ensure!(end + 4 <= MAX_HEAD, "request head too large");
+            return Ok(Some(String::from_utf8_lossy(&head[..end + 4]).into_owned()));
         }
         ensure!(head.len() <= MAX_HEAD, "request head too large");
     }
-    Ok(Some(String::from_utf8_lossy(&head).into_owned()))
 }
 
 /// The Host header must name the loopback: a browser page on another origin
-/// must not be able to read the dashboard state.
+/// must not be able to read the dashboard state. HTTP/1.1 allows exactly one
+/// Host; an IPv6 literal keeps its brackets around the optional port.
 fn host_is_local(head: &str) -> bool {
-    let Some(host) = head.lines().skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("host")
-            .then(|| value.trim())
-    }) else {
+    let mut host = None;
+    for line in head.lines().skip(1).take_while(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return false;
+            }
+            host = Some(value.trim());
+        }
+    }
+    let Some(host) = host else {
         return false;
     };
-    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host,
+    };
+    match name.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => name.eq_ignore_ascii_case("localhost"),
+    }
 }
 
 async fn respond(
@@ -367,8 +381,10 @@ async fn respond(
         405 => "Method Not Allowed",
         _ => "Error",
     };
+    let allow = if status == 405 { "allow: GET\r\n" } else { "" };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
+         {allow}\
          content-type: {content_type}\r\n\
          content-length: {}\r\n\
          cache-control: no-store\r\n\

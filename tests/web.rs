@@ -5,12 +5,14 @@ mod common;
 use std::{net::Ipv4Addr, time::Duration};
 
 use svpn::{
+    control::Stats,
     hub::{Hub, Owner, Target},
     link_io::Epoch,
     packet::FlowKey,
     sticky::{ResolvedVia, RuntimeSticky, Selector, StickyBlock, Via},
     web,
 };
+use tokio::sync::watch;
 
 fn hub() -> Hub {
     common::hub::dashboard_hub()
@@ -54,11 +56,43 @@ fn snapshot_carries_live_link_counters() {
 }
 
 #[test]
+fn snapshot_keeps_cumulative_counters_across_reconnect() {
+    let mut hub = hub();
+    let live = hub.links[0]
+        .latest
+        .as_ref()
+        .expect("live session")
+        .borrow()
+        .clone();
+    assert_eq!(web::snapshot(&hub).servers[0].stats.inner_rx_bytes, 4242);
+
+    // A periodic log report folds live counters into the totals: showing
+    // total + live directly would double them here.
+    hub.links[0].stats.observe(live.clone());
+    assert_eq!(web::snapshot(&hub).servers[0].stats.inner_rx_bytes, 4242);
+
+    // Session ends: the hub observes the last value and resets the generation.
+    let last = hub.links[0].latest.take().expect("live session");
+    hub.links[0].stats.observe(last.borrow().clone());
+    hub.links[0].stats.reset();
+    assert_eq!(web::snapshot(&hub).servers[0].stats.inner_rx_bytes, 4242);
+
+    // A new generation starts its own counters at zero, but the dashboard
+    // must stay monotonic instead of dropping back to 10 bytes.
+    let (_, latest) = watch::channel(Stats {
+        inner_rx_bytes: 10,
+        ..Stats::default()
+    });
+    hub.links[0].latest = Some(latest);
+    assert_eq!(web::snapshot(&hub).servers[0].stats.inner_rx_bytes, 4252);
+}
+
+#[test]
 fn snapshot_falls_back_to_the_collected_totals_of_a_dead_link() {
     let mut hub = hub();
     hub.links[0].latest = None;
     let mut stats = svpn::stats::Snapshot::default();
-    stats.observe(svpn::control::Stats {
+    stats.observe(Stats {
         inner_tx_bytes: 100,
         inner_rx_bytes: 200,
         active_flows: 3,

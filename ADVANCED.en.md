@@ -395,10 +395,11 @@ The client (not the server) can serve its state to a browser. It is off by
 default and listens on loopback only:
 
 ```bash
-svpn multi --config vpn.hcl --web-listen 127.0.0.1:8080
+sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080
 ```
 
-or in the config:
+or in the config (run with `svpn multi --config vpn.hcl` only, without
+client flags):
 
 ```hcl
 dashboard {

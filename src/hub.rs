@@ -946,20 +946,10 @@ impl Hub {
         let mut buffer = vec![0u8; params.mtu as usize];
         let mut last_report = Instant::now();
         let mut reports = report_timer(stats_interval);
-        // The dashboard timer wakes the loop; the snapshot itself is built
-        // between iterations, where the hub can be read without the mutable
-        // borrow the select branches hold.
         let mut dashboard_timer = dashboard
             .as_ref()
             .and_then(|_| report_timer(SNAPSHOT_INTERVAL));
-        let mut last_snapshot = Instant::now();
         loop {
-            if let Some(tx) = &dashboard
-                && last_snapshot.elapsed() >= Duration::from_secs(u64::from(SNAPSHOT_INTERVAL))
-            {
-                last_snapshot = Instant::now();
-                let _ = tx.send(crate::web::snapshot(self));
-            }
             let retry_at = self.pool.next_retry();
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
@@ -1094,7 +1084,11 @@ impl Hub {
                         Some(timer) => { timer.tick().await; }
                         None => std::future::pending().await,
                     }
-                } => {}
+                } => {
+                    if let Some(tx) = &dashboard {
+                        let _ = tx.send(crate::web::snapshot(self));
+                    }
+                }
                 _ = async {
                     match retry_at {
                         Some(at) => tokio::time::sleep_until(at).await,

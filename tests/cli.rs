@@ -197,6 +197,7 @@ fn every_explicit_client_setting_conflicts_with_config_even_at_default() {
         ("--mimic", "mosh"),
         ("--tcp-port", "0"),
         ("--stats-interval", "30"),
+        ("--web-listen", "127.0.0.1:8080"),
         ("--up-script", "up"),
         ("--down-script", "down"),
         ("--up-command", "true"),

@@ -387,10 +387,11 @@ SVPN и не выполняет хуки: команда не активируе
 адресом на loopback — по умолчанию морды нет:
 
 ```bash
-svpn multi --config vpn.hcl --web-listen 127.0.0.1:8080
+sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080
 ```
 
-или в конфиге:
+или в конфиге (запуск — только `svpn multi --config vpn.hcl`, без
+клиентских флагов):
 
 ```hcl
 dashboard {

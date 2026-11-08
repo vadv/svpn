@@ -24,9 +24,9 @@ pub fn dashboard_hub() -> Hub {
         },
         tokio::time::Instant::now(),
     );
-    // The live counters of the first session: the hub only accumulates them
-    // once per stats report, the dashboard reads them as they are. The
-    // sender is dropped on purpose: the receiver keeps the last value.
+    // The live counters of the first session: the hub accumulates them once
+    // per stats report, the dashboard adds the unreported delta. The sender
+    // is dropped on purpose: the receiver keeps the last value.
     let (_, latest) = watch::channel(svpn::control::Stats {
         inner_rx_bytes: 4242,
         inner_rx_packets: 7,
