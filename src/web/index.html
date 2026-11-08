@@ -3,118 +3,262 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>svpn · Client dashboard</title>
+<title>svpn · state readout</title>
 <style>
-:root { color-scheme: dark; --bg:#0c121a; --panel:#131d29; --line:#263448; --text:#e8eff8; --muted:#a1b0c3; --blue:#69baff; --green:#81dfad; --amber:#ffd28a; --red:#ff9b9b; }
+:root { color-scheme:dark; --bg:#0a0b0b; --surface:#101213; --surface-2:#151819; --surface-3:#1b1f20; --line:#394042; --line-soft:#252b2c; --grid:#242a2b; --text:#e8ede9; --muted:#9da6a1; --faint:#6f7873; --accent:#c9f227; --accent-ink:#11140a; --rx:#59c9ff; --tx:#ff7b45; --rx-fill:rgba(89,201,255,.13); --tx-fill:rgba(255,123,69,.11); --good:#c9f227; --warn:#ffd166; --bad:#ff6b6b; --good-bg:rgba(201,242,39,.08); --warn-bg:rgba(255,209,102,.09); --bad-bg:rgba(255,107,107,.10); --neutral-bg:rgba(157,166,161,.08); }
+body[data-theme="light"] { color-scheme:light; --bg:#eceee9; --surface:#fafbf7; --surface-2:#f1f3ec; --surface-3:#e4e8dd; --line:#858e86; --line-soft:#c9cfc4; --grid:#d3d8cd; --text:#151a16; --muted:#4f5951; --faint:#69736b; --accent:#5f7100; --accent-ink:#fafbf7; --rx:#005b91; --tx:#a13d00; --rx-fill:rgba(0,91,145,.09); --tx-fill:rgba(161,61,0,.08); --good:#4b5d00; --warn:#7a5b00; --bad:#9c2020; --good-bg:rgba(75,93,0,.08); --warn-bg:rgba(122,91,0,.08); --bad-bg:rgba(156,32,32,.08); --neutral-bg:rgba(80,90,82,.08); }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,sans-serif; }
-main { max-width:1440px; margin:auto; padding:28px 32px 48px; }
-header,.heading,.toolbar,.pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-header { margin-bottom:22px; }
-h1 { margin:0; font-size:24px; letter-spacing:-.8px; }
-h2 { margin:0; font-size:16px; font-weight:650; }
+html { scroll-behavior:smooth; }
+body { margin:0; background:var(--bg); color:var(--text); font:12px/1.5 ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; font-variant-numeric:tabular-nums; -webkit-font-smoothing:antialiased; }
+h1,h2,strong,b { font-weight:700; }
+h1 { margin:0; font-size:19px; line-height:1.1; letter-spacing:.16em; text-transform:uppercase; }
+h2 { margin:0; font-size:13px; letter-spacing:.1em; text-transform:uppercase; }
 p { margin:5px 0 0; }
-small,.muted { color:var(--muted); font-size:12px; }
-.subtitle { color:var(--muted); font-size:13px; }
-.status { text-align:right; }
-.pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; background:#233146; color:var(--muted); }
-.pill.good { background:#18382e; color:var(--green); }
-.pill.warn { background:#3b3020; color:var(--amber); }
-.pill.bad { background:#40282e; color:var(--red); }
-.summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin:14px 0; }
-.card,.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; }
-.card { padding:16px 18px; }
-.card .label { color:var(--muted); font-size:12px; }
-.card strong { display:block; font-size:25px; font-weight:600; letter-spacing:-.6px; margin:5px 0 2px; font-variant-numeric:tabular-nums; }
-.card strong.compact { font-size:21px; padding:3px 0; }
-.panel { margin-top:18px; overflow:hidden; }
-.heading { padding:17px 20px 13px; }
-.heading p { max-width:100%; }
-.notice { overflow-wrap:anywhere; border:1px solid #645035; border-radius:8px; padding:10px 15px; color:var(--amber); background:#28231c; margin:12px 0; }
-.notice.bad { color:var(--red); border-color:#684049; background:#2d2027; }
+small,.muted { color:var(--muted); font-size:11px; }
+.faint { color:var(--faint); }
 [hidden] { display:none !important; }
-.scroll { overflow-x:auto; }
-table { width:100%; border-collapse:collapse; font-size:13px; }
-th,td { padding:12px 20px; text-align:left; border-top:1px solid var(--line); vertical-align:top; }
-th { color:var(--muted); font-weight:500; font-size:11px; letter-spacing:.4px; text-transform:uppercase; background:#101925; }
-td.num,th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
-td strong { font-weight:600; }
-td small { display:block; margin-top:3px; }
-.empty { color:var(--muted); text-align:center; padding:22px; }
-.reason { color:var(--amber); max-width:320px; overflow-wrap:anywhere; }
-code { font:12px ui-monospace,monospace; overflow-wrap:anywhere; }
-input,select,button { font:inherit; color:var(--text); border:1px solid #3b4d65; border-radius:6px; background:#0e1824; padding:7px 10px; }
-button { cursor:pointer; }
-button:hover:not(:disabled) { background:#233449; }
-button:disabled,input:disabled,select:disabled { opacity:.5; cursor:default; }
-input { min-width:200px; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+button,input,select { font:inherit; color:var(--text); background:var(--surface-2); border:1px solid var(--line); border-radius:0; }
+button { padding:6px 11px; cursor:pointer; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+button:hover:not(:disabled) { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+button:active:not(:disabled) { transform:translateY(1px); }
+button:disabled,input:disabled,select:disabled { opacity:.42; cursor:default; }
+input,select { padding:6px 9px; font-size:11px; }
+input { min-width:190px; }
 select { max-width:260px; }
-:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
-label { display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
-.toolbar { padding:0 20px 15px; justify-content:flex-start; }
-.pagination { padding:12px 20px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+label { display:inline-flex; align-items:center; gap:7px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+.app { display:grid; grid-template-columns:198px minmax(0,1fr); min-height:100vh; max-width:1680px; margin:auto; }
+.rail { position:sticky; top:0; height:100vh; display:flex; flex-direction:column; gap:22px; padding:18px 13px 15px; border-right:1px solid var(--line); background:var(--surface); }
+.brand { padding:0 4px 14px; border-bottom:2px solid var(--text); }
+.brand-sub { display:block; margin-top:6px; color:var(--accent); font-size:10px; letter-spacing:.12em; text-transform:uppercase; }
+.rail-live { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 8px; border:1px solid var(--line-soft); border-left:3px solid var(--accent); color:var(--muted); font-size:10px; letter-spacing:.08em; text-transform:uppercase; }
+.rail-live-tag { color:var(--faint); }
+.rail-nav { display:flex; flex-direction:column; gap:1px; min-width:0; }
+.rail-nav a { display:flex; align-items:center; gap:9px; padding:7px 8px; border-left:2px solid transparent; color:var(--muted); text-decoration:none; font-size:11px; letter-spacing:.04em; text-transform:uppercase; white-space:nowrap; }
+.rail-nav a:hover { color:var(--text); background:var(--surface-2); }
+.rail-nav a.is-active { color:var(--accent-ink); background:var(--accent); border-left-color:var(--accent); }
+.rail-nav a span { width:18px; flex:0 0 18px; color:var(--faint); font-size:10px; }
+.rail-nav a.is-active span { color:var(--accent-ink); }
+.rail-foot { margin-top:auto; padding:12px 4px 0; border-top:1px solid var(--line-soft); }
+.rail-foot p { margin:0 0 4px; color:var(--faint); font-size:10px; letter-spacing:.04em; text-transform:uppercase; }
+.rail-health { display:block; margin-bottom:9px; color:var(--good); font-size:11px; letter-spacing:.06em; text-transform:uppercase; }
+.content { min-width:0; padding:20px clamp(12px,2.4vw,32px) 38px; }
+header { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:14px; padding:0 0 14px; border-bottom:2px solid var(--line); }
+.stamp { color:var(--accent); font-size:10px; letter-spacing:.14em; text-transform:uppercase; }
+.subtitle { margin-top:4px; color:var(--muted); font-size:12px; letter-spacing:.02em; }
+.status { display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:flex-end; }
+.status-text { text-align:right; }
+.status-text p { margin:4px 0 0; max-width:380px; overflow-wrap:anywhere; }
+.pill { display:inline-block; padding:3px 8px; border:1px solid currentColor; background:var(--neutral-bg); color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; white-space:nowrap; }
+.pill.good { color:var(--good); background:var(--good-bg); }
+.pill.warn { color:var(--warn); background:var(--warn-bg); }
+.pill.bad { color:var(--bad); background:var(--bad-bg); }
+.notice { overflow-wrap:anywhere; padding:9px 12px; border:1px solid var(--line); border-left:3px solid var(--warn); background:var(--warn-bg); color:var(--warn); margin:12px 0 0; font-size:11px; letter-spacing:.02em; }
+.notice.bad { color:var(--bad); border-left-color:var(--bad); background:var(--bad-bg); }
+.system { margin-top:16px; border:1px solid var(--line); background:var(--surface); }
+.system-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:7px 11px; border-bottom:1px solid var(--line); background:var(--surface-3); font-size:10px; letter-spacing:.12em; text-transform:uppercase; }
+.system-head .clock { color:var(--muted); white-space:nowrap; }
+.system-head b { color:var(--text); font-weight:700; }
+.caret { display:inline-block; width:7px; height:12px; margin-left:7px; vertical-align:-2px; background:var(--accent); animation:blink 1.1s steps(1,end) infinite; }
+@keyframes blink { 50% { opacity:0; } }
+.proc { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); background:var(--line-soft); gap:1px; }
+.proc-cell { min-width:0; padding:11px 13px 10px; background:var(--surface); }
+.proc-cell+.proc-cell { border-left:1px solid var(--line-soft); }
+.proc-cell .label { display:block; color:var(--faint); font-size:10px; letter-spacing:.1em; text-transform:uppercase; }
+.proc-cell strong { display:block; margin-top:7px; color:var(--text); font-size:23px; line-height:1.1; letter-spacing:-.04em; white-space:nowrap; }
+.proc-cell small { display:block; margin-top:4px; min-height:16px; }
+.meter { height:5px; margin-top:8px; border:1px solid var(--line); background:var(--surface-2); }
+.meter i { display:block; width:0; height:100%; background:var(--accent); }
+.spark { display:block; width:100%; height:24px; margin-top:6px; overflow:visible; }
+.spark path { fill:none; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; vector-effect:non-scaling-stroke; }
+.spark .rx { stroke:var(--rx); }
+.spark .tx { stroke:var(--tx); }
+.spark .mem { stroke:var(--accent); }
+.spark .cpu { stroke:var(--tx); }
+.proc-note { margin:0; padding:7px 11px; border-top:1px solid var(--line-soft); color:var(--faint); font-size:10px; letter-spacing:.03em; overflow-wrap:anywhere; }
+.summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:1px; margin:14px 0 16px; border:1px solid var(--line); background:var(--line-soft); }
+.card { min-width:0; padding:12px 13px 10px; background:var(--surface); }
+.card .label { display:block; color:var(--faint); font-size:10px; letter-spacing:.1em; text-transform:uppercase; }
+.card strong { display:block; margin-top:7px; font-size:25px; line-height:1.1; letter-spacing:-.05em; white-space:nowrap; }
+.card strong.compact { font-size:18px; letter-spacing:-.02em; }
+.card .unit { display:inline; margin-left:5px; color:var(--faint); font-size:10px; font-weight:400; letter-spacing:0; }
+.card small { display:block; margin-top:5px; min-height:16px; color:var(--faint); font-size:10px; }
+.card--rx strong { color:var(--rx); }
+.card--tx strong { color:var(--tx); }
+.card--active strong { color:var(--accent); }
+.panel { margin-top:14px; border:1px solid var(--line); background:var(--surface); }
+.heading { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:10px 14px 9px; border-bottom:1px solid var(--line); }
+.heading p { margin:4px 0 0; max-width:100%; }
+.heading .aside { color:var(--faint); font-size:10px; letter-spacing:.08em; text-transform:uppercase; }
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:11.5px; }
+th,td { padding:8px 13px; text-align:left; border-top:1px solid var(--line-soft); vertical-align:top; }
+thead th { border-top:0; border-bottom:1px solid var(--line); background:var(--surface-3); color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; white-space:nowrap; }
+tbody tr:hover { background:var(--surface-2); }
+tbody tr[data-state="failed"],tbody tr[data-state="backoff"] { background:var(--bad-bg); }
+td.num,th.num { text-align:right; white-space:nowrap; }
+td strong { font-weight:700; }
+td small { display:block; margin-top:3px; color:var(--faint); }
+code { font:inherit; overflow-wrap:anywhere; }
+.empty { color:var(--muted); text-align:center; padding:20px; }
+.reason { color:var(--warn); max-width:320px; overflow-wrap:anywhere; }
+.tag { display:inline-block; padding:1px 6px; border:1px solid var(--line-soft); background:var(--surface-3); color:var(--muted); font-size:10px; letter-spacing:.06em; }
+.tag--tcp { color:var(--rx); }
+.tag--udp { color:var(--accent); }
+.tag--icmp { color:var(--tx); }
+.exit-tag { color:var(--text); }
+.rule-tag { color:var(--faint); font-size:10px; }
+.toolbar { display:flex; align-items:center; gap:9px; flex-wrap:wrap; padding:9px 14px; }
+.toolbar .hint { margin-left:auto; color:var(--faint); font-size:10px; letter-spacing:.04em; }
+.pagination { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:9px 14px; border-top:1px solid var(--line-soft); color:var(--muted); font-size:10px; }
 .pagination div { display:flex; gap:8px; align-items:center; }
-details>summary { cursor:pointer; color:var(--blue); }
+.pagination .note { max-width:100%; overflow-wrap:anywhere; }
+details>summary { cursor:pointer; color:var(--muted); font-size:11px; }
 td details { min-width:94px; }
-td details p { white-space:normal; min-width:180px; max-width:260px; font-size:12px; }
-.diagnostics>summary,.groups>summary { padding:16px 20px; font-weight:600; }
-.counters { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1px; background:var(--line); border-top:1px solid var(--line); }
-.counter { padding:13px 20px; background:var(--panel); }
-.counter strong { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
-.chart { padding:0 20px 14px; }
-.chart svg { display:block; width:100%; height:140px; overflow:visible; }
-.chart-axis { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:11px; margin:3px 0; }
-.chart .grid { stroke:var(--line); stroke-width:1; }
-.chart path { fill:none; stroke-width:2; stroke-linecap:round; vector-effect:non-scaling-stroke; }
-.chart .rx { stroke:var(--blue); }
-.chart .tx { stroke:var(--amber); }
-.legend { display:flex; flex-wrap:wrap; gap:18px; font-size:12px; color:var(--muted); }
-.legend .rx { color:var(--blue); }
-.legend .tx { color:var(--amber); }
-footer { margin-top:20px; color:var(--muted); font-size:12px; }
-body.stale main { border-top:3px solid var(--amber); padding-top:25px; }
-@media(max-width:900px) { main { padding:20px 16px; } .summary { grid-template-columns:repeat(3,minmax(0,1fr)); } th,td { padding:10px 14px; } .card { padding:13px; } }
-@media(max-width:560px) { .summary { grid-template-columns:repeat(2,minmax(0,1fr)); } .summary .card:last-child { grid-column:span 2; } .status { text-align:left; } .card strong { font-size:22px; } input { width:100%; } .toolbar label { flex-wrap:wrap; } .heading,.toolbar { padding-left:14px; padding-right:14px; } }
+td details summary { color:var(--accent); }
+td details p { white-space:normal; min-width:180px; max-width:280px; font-size:10px; color:var(--muted); }
+.diagnostics>summary,.groups>summary { padding:10px 14px; font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--text); }
+.counters { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:1px; background:var(--line-soft); border-top:1px solid var(--line-soft); }
+.counter { padding:10px 13px; background:var(--surface); }
+.counter strong { display:block; margin-top:3px; font-size:14px; }
+.chart { padding:10px 14px 12px; }
+.chart-axis { display:flex; justify-content:space-between; gap:12px; color:var(--faint); font-size:11px; margin:2px 0 5px; }
+.chart-plot { position:relative; }
+.chart svg { display:block; width:100%; height:172px; overflow:visible; }
+.chart .grid { stroke:var(--grid); stroke-width:1; vector-effect:non-scaling-stroke; }
+.chart .grid.v { stroke-dasharray:3 7; }
+.chart path { fill:none; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; vector-effect:non-scaling-stroke; }
+.chart path.rx { stroke:var(--rx); }
+.chart path.tx { stroke:var(--tx); }
+.chart path.area { stroke:none; stroke-width:0; }
+.chart path.area.rx { fill:var(--rx-fill); }
+.chart path.area.tx { fill:var(--tx-fill); }
+.chart .cursor { stroke:var(--accent); stroke-width:1; stroke-dasharray:3 5; vector-effect:non-scaling-stroke; }
+.chart-tooltip { position:absolute; top:6px; transform:translateX(-50%); pointer-events:none; padding:5px 8px; border:1px solid var(--line); background:var(--surface-3); color:var(--text); font-size:10px; white-space:nowrap; }
+.legend { display:flex; flex-wrap:wrap; align-items:center; gap:16px; margin-top:7px; font-size:10px; color:var(--muted); }
+.legend-item { display:inline-flex; align-items:center; gap:6px; }
+.legend-item i { width:12px; height:3px; background:currentColor; }
+.legend .rx { color:var(--rx); }
+.legend .tx { color:var(--tx); }
+.legend #chart-note { color:var(--faint); }
+footer { margin-top:18px; padding-top:10px; border-top:1px solid var(--line); color:var(--faint); font-size:10px; letter-spacing:.03em; }
+body.stale .content { border-top:3px solid var(--warn); padding-top:17px; }
+body.stale .rail-health { color:var(--warn); }
+@media(max-width:1120px) { .summary { grid-template-columns:repeat(3,minmax(0,1fr)); } .proc { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:900px) {
+  .app { display:block; }
+  .rail { position:static; height:auto; flex-direction:row; align-items:center; gap:10px; padding:9px 11px; border-right:0; border-bottom:1px solid var(--line); overflow:hidden; }
+  .brand { padding:0 8px 0 0; border-bottom:0; border-right:1px solid var(--line); flex:0 0 auto; }
+  .brand-sub,.rail-live,.rail-foot { display:none; }
+  .rail-nav { flex:1; flex-direction:row; gap:2px; overflow-x:auto; scrollbar-width:none; }
+  .rail-nav::-webkit-scrollbar { display:none; }
+  .rail-nav a { flex:0 0 auto; border-left:0; border-bottom:2px solid transparent; padding:6px 8px; }
+  .rail-nav a.is-active { border-left-color:transparent; border-bottom-color:var(--accent); }
+  .rail-nav a span { display:none; }
+  .content { padding:15px 12px 32px; }
+  .summary { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  th,td { padding:7px 10px; }
+}
+@media(max-width:560px) {
+  header { grid-template-columns:1fr; align-items:start; }
+  .status { width:100%; justify-content:flex-start; }
+  .status-text { text-align:left; }
+  .summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .summary .card:last-child { grid-column:span 2; }
+  .proc { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .proc-cell { padding:9px 10px; }
+  .proc-cell strong { font-size:19px; }
+  .card { padding:10px 10px 8px; }
+  .card strong { font-size:21px; }
+  input { width:100%; min-width:0; }
+  .toolbar label { flex-wrap:wrap; }
+  .toolbar .hint { display:none; }
+  .heading,.toolbar,.pagination,.chart { padding-left:10px; padding-right:10px; }
+  th,td { padding:7px 8px; }
+}
+@media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .caret { animation:none; } }
 </style>
 </head>
 <body>
-<main data-endpoint="/api/state">
+<main class="app" data-endpoint="/api/state">
+<aside class="rail" aria-label="Dashboard navigation">
+<div class="brand"><h1>svpn</h1><span class="brand-sub">state readout / ro</span></div>
+<div class="rail-live"><span>1 hz poll</span><span class="rail-live-tag">no control path</span></div>
+<nav class="rail-nav">
+<a href="#overview" data-section="overview" class="is-active"><span>01</span>Overview</a>
+<a href="#traffic" data-section="traffic"><span>02</span>Traffic</a>
+<a href="#servers-panel" data-section="servers-panel"><span>03</span>Servers</a>
+<a href="#rules-panel" data-section="rules-panel"><span>04</span>Rules &amp; exits</a>
+<a href="#flows-panel" data-section="flows-panel"><span>05</span>Flows</a>
+<a href="#data-panel" data-section="data-panel"><span>06</span>Databases &amp; jobs</a>
+<a href="#diagnostics-panel" data-section="diagnostics-panel"><span>07</span>Diagnostics</a>
+</nav>
+<div class="rail-foot"><span class="rail-health" id="rail-health">Waiting for state…</span><p>Loopback only · GET only</p><p>No external assets</p><p>History stays in this tab</p></div>
+</aside>
+<div class="content">
 <header>
-<div><h1>svpn</h1><div class="subtitle">Client dashboard · read-only</div></div>
-<div class="status"><span class="pill" id="freshness">Connecting…</span><p class="muted" id="meta">Waiting for the first snapshot</p></div>
+<div><div class="stamp">SVPN / CLIENT STATE / 01</div><div class="subtitle">Live snapshot of the tunnel, the server pool, routing decisions and this process.</div></div>
+<div class="status">
+<button type="button" id="theme-toggle" aria-pressed="false" aria-label="Switch colour theme">LIGHT</button>
+<div class="status-text"><span class="pill" id="freshness" aria-live="polite">Connecting…</span><p class="muted" id="meta">Waiting for the first snapshot</p></div>
+</div>
 </header>
 <noscript><div class="notice">JavaScript is required to display the client state.</div></noscript>
 <div id="stale-notice" class="notice bad" role="status" hidden>Data is stale. Values below are from the last successful snapshot, not the live client.</div>
 <div id="warnings" class="notice" role="status" hidden></div>
-<section class="summary" aria-label="Client summary">
-<div class="card"><div class="label">Servers ready</div><strong id="ready">—</strong><small>Link readiness, not an internet check</small></div>
-<div class="card"><div class="label">↓ VPN receive</div><strong id="rx">—</strong><small>Mbit/s · inner IP traffic</small></div>
-<div class="card"><div class="label">↑ VPN send</div><strong id="tx">—</strong><small>Mbit/s · excludes local exit</small></div>
-<div class="card"><div class="label">Active flows</div><strong id="active">—</strong><small id="active-note">TCP · UDP · ICMP</small></div>
-<div class="card"><div class="label">Local exit</div><strong class="compact" id="local">—</strong><small id="local-note">Waiting for state</small></div>
+<section id="overview" aria-label="Client summary">
+<div class="system" aria-label="Process resources">
+<div class="system-head"><span>Process / resource readout</span><span class="clock">Local <b id="clock">--:--:--</b><i class="caret" aria-hidden="true"></i></span></div>
+<div class="proc">
+<div class="proc-cell"><span class="label">MEM / resident</span><strong id="proc-rss">—</strong><small id="proc-rss-kind">No sample</small><div class="meter"><i id="proc-mem-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="mem" id="spark-rss"/></svg></div>
+<div class="proc-cell"><span class="label">CPU / one core</span><strong id="proc-cpu">—</strong><small id="proc-cpu-kind">Waiting for two samples</small><div class="meter"><i id="proc-cpu-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="cpu" id="spark-cpu"/></svg></div>
+<div class="proc-cell"><span class="label">CPU time / cumulative</span><strong id="proc-time">—</strong><small id="proc-time-note">User + system since start</small></div>
+<div class="proc-cell"><span class="label">Session / uptime</span><strong id="uptime">—</strong><small>From started_at · ticks locally</small></div>
+</div>
+<p class="proc-note" id="proc-note">getrusage · current RSS from /proc on Linux · peak RSS is labelled when current RSS is unavailable</p>
+</div>
+<div class="summary">
+<div class="card"><span class="label">Servers ready</span><strong id="ready">—</strong><small>Link readiness, not an internet check</small></div>
+<div class="card card--rx"><span class="label">VPN receive</span><strong id="rx">—</strong><span class="unit">Mbit/s</span><small>Inner IP traffic</small><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="rx" id="spark-rx"/></svg></div>
+<div class="card card--tx"><span class="label">VPN send</span><strong id="tx">—</strong><span class="unit">Mbit/s</span><small>Excludes local exit</small><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="tx" id="spark-tx"/></svg></div>
+<div class="card card--active"><span class="label">Active flows</span><strong id="active">—</strong><small id="active-note">TCP · UDP · ICMP</small></div>
+<div class="card card--local"><span class="label">Local exit</span><strong class="compact" id="local">—</strong><small id="local-note">Waiting for state</small></div>
+</div>
 </section>
-<section class="panel" aria-labelledby="traffic-title">
+<section class="panel" id="traffic" aria-labelledby="traffic-title">
 <div class="heading"><div><h2 id="traffic-title">VPN traffic</h2><p class="muted">Last 5 minutes in this tab · local exit excluded · gaps mean no fresh samples</p></div><label>View <select id="chart-server" aria-label="Traffic graph server" disabled><option value="">All VPN servers</option></select></label></div>
-<div class="chart"><div class="chart-axis"><span id="chart-max">Mbit/s</span></div><svg viewBox="0 20 1000 140" preserveAspectRatio="none" role="img" aria-label="Receive and send rates in Mbit/s"><title>VPN receive and send rates</title>
+<div class="chart">
+<div class="chart-axis"><span id="chart-max">Mbit/s</span><span>peak scale · hover for a value</span></div>
+<div class="chart-plot" id="chart-plot">
+<svg viewBox="0 20 1000 140" preserveAspectRatio="none" role="img" aria-label="Receive and send rates in Mbit/s"><title>VPN receive and send rates</title>
 <line class="grid" x1="0" y1="24" x2="1000" y2="24"/><line class="grid" x1="0" y1="88" x2="1000" y2="88"/><line class="grid" x1="0" y1="152" x2="1000" y2="152"/>
-<path class="rx" id="chart-rx"/><path class="tx" id="chart-tx"/></svg><div class="chart-axis"><span>−5 min</span><span id="chart-end">Latest snapshot</span></div>
-<div class="legend"><span class="rx" id="legend-rx">↓ Receive —</span><span class="tx" id="legend-tx">↑ Send —</span><span id="chart-note">Waiting for connection…</span></div></div>
+<line class="grid v" x1="250" y1="24" x2="250" y2="152"/><line class="grid v" x1="500" y1="24" x2="500" y2="152"/><line class="grid v" x1="750" y1="24" x2="750" y2="152"/>
+<path class="area rx" id="chart-rx-area"/><path class="area tx" id="chart-tx-area"/>
+<path class="rx" id="chart-rx"/><path class="tx" id="chart-tx"/>
+<line class="cursor" id="chart-cursor" x1="0" x2="0" y1="20" y2="152" hidden/>
+</svg>
+<div class="chart-tooltip" id="chart-tooltip" hidden></div>
+</div>
+<div class="chart-axis"><span>−5 min</span><span id="chart-end">Latest snapshot</span></div>
+<div class="legend"><span class="legend-item rx"><i aria-hidden="true"></i><span id="legend-rx">RX —</span></span><span class="legend-item tx"><i aria-hidden="true"></i><span id="legend-tx">TX —</span></span><span id="chart-note">Waiting for connection…</span></div>
+</div>
 </section>
-<section class="panel" aria-labelledby="servers-title"><div class="heading"><div><h2 id="servers-title">Servers</h2><p class="muted" id="recent-errors">Waiting for the next sample to calculate changes</p></div><span class="muted">Totals since client start</span></div>
-<div class="scroll"><table id="servers"><thead><tr><th>Server</th><th>State</th><th class="num">↓ Mbit/s</th><th class="num">↑ Mbit/s</th><th class="num">Flows</th><th class="num">Total RX / TX</th><th>Diagnostics</th></tr></thead><tbody></tbody></table></div></section>
-<section class="panel" aria-labelledby="rules-title"><div class="heading"><div><h2 id="rules-title">Rules &amp; exits</h2><p class="muted">Config order · first match wins · flow attribution stays pinned</p></div><span class="muted">IP bytes since client start</span></div>
-<div class="scroll"><table id="rules"><thead><tr><th>Rule / match</th><th>Current exit</th><th>Allowed exits</th><th class="num">Flows</th><th class="num">↓ Received</th><th class="num">↑ Sent</th><th>Resolver</th></tr></thead><tbody></tbody></table></div>
-<div class="pagination">TX: accepted by the hub queue. RX: delivered to the client TUN. Includes IP headers; excludes VPN framing and VPN-transport retries. Queued TX does not prove remote delivery.</div></section>
-<section class="panel" aria-labelledby="flows-title"><div class="heading"><div><h2 id="flows-title">Flows</h2><p class="muted" id="flow-status">Live ownership table</p></div><button type="button" id="pause" aria-pressed="false" disabled>Pause table</button></div>
-<div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP or port" placeholder="Search IP or port…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label></div>
+<section class="panel" id="servers-panel" aria-labelledby="servers-title"><div class="heading"><div><h2 id="servers-title">Servers</h2><p class="muted" id="recent-errors">Waiting for the next sample to calculate changes</p></div><span class="aside">Totals since client start</span></div>
+<div class="scroll"><table id="servers"><thead><tr><th>Server</th><th>State</th><th class="num">RX Mbit/s</th><th class="num">TX Mbit/s</th><th class="num">Flows</th><th class="num">Total RX / TX</th><th>Diagnostics</th></tr></thead><tbody></tbody></table></div></section>
+<section class="panel" id="rules-panel" aria-labelledby="rules-title"><div class="heading"><div><h2 id="rules-title">Rules &amp; exits</h2><p class="muted">Config order · first match wins · flow attribution stays pinned</p></div><span class="aside">IP bytes since client start</span></div>
+<div class="scroll"><table id="rules"><thead><tr><th>Rule / match</th><th>Current exit</th><th>Allowed exits</th><th class="num">Flows</th><th class="num">RX received</th><th class="num">TX sent</th><th>Resolver</th></tr></thead><tbody></tbody></table></div>
+<div class="pagination"><span class="note">TX: accepted by the hub queue. RX: delivered to the client TUN. Includes IP headers; excludes VPN framing and VPN-transport retries. Queued TX does not prove remote delivery.</span></div></section>
+<section class="panel" id="flows-panel" aria-labelledby="flows-title"><div class="heading"><div><h2 id="flows-title">Flows</h2><p class="muted" id="flow-status">Live ownership table</p></div><button type="button" id="pause" aria-pressed="false" disabled>Pause table</button></div>
+<div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP or port" placeholder="Search IP or port…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label><span class="hint">Press / to search · Esc to clear</span></div>
 <div class="scroll"><table id="flows"><thead><tr><th>Protocol</th><th>Source</th><th>Destination</th><th>Exit</th><th>Rule</th></tr></thead><tbody></tbody></table></div>
 <div class="pagination"><span id="flow-count">No snapshot yet</span><div><button type="button" id="previous" disabled>Previous</button><span id="flow-page">1 / 1</span><button type="button" id="next" disabled>Next</button></div></div></section>
-<section class="panel" aria-labelledby="database-title"><div class="heading"><div><h2 id="database-title">Databases &amp; jobs</h2><p class="muted">Failed updates keep the previous in-memory table · script output is not exposed</p></div></div>
+<section class="panel" id="data-panel" aria-labelledby="database-title"><div class="heading"><div><h2 id="database-title">Databases &amp; jobs</h2><p class="muted">Failed updates keep the previous in-memory table · script output is not exposed</p></div></div>
 <div class="scroll"><table id="databases"><thead><tr><th>Database</th><th>State</th><th class="num">IPv4 ranges</th><th>Loaded into memory</th><th>Last update attempt</th><th>Update / reload status</th></tr></thead><tbody></tbody></table></div>
 <div class="scroll"><table id="jobs"><thead><tr><th>Job</th><th>State</th><th>Last attempt</th><th>Last success</th><th>Next check</th><th>Result</th></tr></thead><tbody></tbody></table></div></section>
-<details class="panel groups"><summary>Pinned groups</summary><div class="scroll"><table id="groups"><thead><tr><th>Group</th><th>Current server</th></tr></thead><tbody></tbody></table></div></details>
-<details class="panel diagnostics"><summary>Diagnostics · Counters</summary><p class="toolbar muted">Cumulative since client start, not current incidents. No configuration or restart controls.</p><div class="counters" id="counters"></div></details>
+<details class="panel groups" id="groups-panel"><summary>Pinned groups</summary><div class="scroll"><table id="groups"><thead><tr><th>Group</th><th>Current server</th></tr></thead><tbody></tbody></table></div></details>
+<details class="panel diagnostics" id="diagnostics-panel"><summary>Diagnostics · Counters</summary><p class="toolbar muted">Cumulative since client start, not current incidents. No configuration or restart controls.</p><div class="counters" id="counters"></div></details>
 <footer id="footer">No external assets · no persistent browser history · loopback only</footer>
+</div>
 </main>
 <script type="module" src="/dashboard.mjs"></script>
 </body>

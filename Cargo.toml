@@ -16,7 +16,7 @@ getrandom = "0.3"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
-nix = { version = "0.31.3", default-features = false, features = ["fs", "signal"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "signal", "resource"] }
 quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio", "futures-io", "log"] }
 rlimit = "0.10"
 russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2", "rsa"] }

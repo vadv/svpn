@@ -419,8 +419,21 @@ What it shows:
 - Sticky rules in first-match order: selectors, allowed exits, current owners,
   connections and RX/TX. Local is explicit; resolved-IP counts apply only to DNS
   rules. Traffic matching no sticky rule appears as Fallback.
-- Flows: address/port search, protocol/exit filters and 50-row pages. Freeze table
-  pauses only the table; the overview stays live.
+- Flows: address/port search, protocol/exit filters and 50-row pages. Pause table
+  freezes only the table; the overview stays live.
+- `svpn` process resources: RSS, CPU as a percentage of one core, cumulative
+  user+system CPU time, logical CPU count and uptime. Current RSS comes from
+  `/proc/self/status` on Linux; when it is unavailable, peak RSS from
+  `getrusage` is shown and explicitly labelled. The browser derives CPU percent
+  from two fresh snapshots of a cumulative counter: after a restart, API gap or
+  stale state it shows an unknown value rather than an invented average. A value
+  above 100% means multithreaded load, not an error.
+- Interface: a dense monospace instrument readout with flat surfaces, sharp
+  corners, a hard grid, one acid accent, a live clock and caret. Side navigation,
+  sparklines, a filled traffic chart with a hover tooltip and a light/dark theme
+  switch. The theme lives only in the open tab and is never persisted; `/`
+  focuses the flow search and `Esc` clears it. No gradients, glassmorphism,
+  decorative icons, external fonts, images or CDNs are used.
 - Job state, last successful attempt, failure reason and next run; ASN/Country
   database loading time in this process, range counts and update outcomes. Failed
   updates retain the previous table. A non-zero `run_if` exit skips the attempt;
@@ -436,8 +449,10 @@ flow opens: DNS refresh does not reclassify a live flow, and close/reconnect doe
 not reset totals. This accounting includes local exit; the VPN chart does not.
 
 An API failure or a snapshot unchanged for over five seconds visibly marks the
-screen stale. Rates become unknown, not zero. Recovery does not invent a rate
-across the missing interval. Cumulative counters are labelled since client start;
+screen stale. Rates and live RSS/CPU values become unknown, not zero. Recovery
+does not invent a rate across the missing interval. Cumulative CPU time and
+uptime are based on the last known start and are not proof that the process is
+answering right now. Cumulative counters are labelled since client start;
 recent error/drop increments are shown separately.
 
 Two addresses:

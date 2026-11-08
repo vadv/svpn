@@ -1,4 +1,4 @@
-import { STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, flowPage, selector, localState } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, selector, localState } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -61,6 +61,40 @@ function options(select, items) {
 
 function isStale() { return apiError || !latest || performance.now() - lastChange > STALE_MS; }
 
+function setMeter(id, percent) {
+  const width = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  $(id).style.width = `${width.toFixed(1)}%`;
+}
+
+function renderClock() {
+  $("clock").textContent = new Date().toLocaleTimeString("en-GB", { hour12: false });
+  if (latest) $("uptime").textContent = duration(uptimeSeconds(latest));
+}
+
+function renderProcess() {
+  const process = latest.process ?? null;
+  const memory = processRss(process);
+  const cpu = Number.isFinite(point?.cpu) ? point.cpu : null;
+  const cpuTime = Number.isFinite(process?.cpu_seconds) ? process.cpu_seconds : null;
+  const cpus = Number.isFinite(process?.cpus) && process.cpus > 0 ? process.cpus : null;
+  $("proc-rss").textContent = memory.bytes == null ? "—" : bytes(memory.bytes);
+  $("proc-rss-kind").textContent = memory.bytes == null ? "No process sample" : memory.peak ? "Peak RSS · live value unavailable" : "Current RSS · resident set";
+  $("proc-cpu").textContent = cpu == null ? "—" : `${cpu.toFixed(1)}%`;
+  $("proc-cpu-kind").textContent = cpu == null ? "Waiting for two fresh samples" : "Of one core · >100% is multithreaded";
+  $("proc-time").textContent = cpuTime == null ? "—" : `${cpuTime.toFixed(2)} s`;
+  $("proc-time-note").textContent = cpus ? `${cpus} logical CPUs · user + system` : "User + system · CPU count unknown";
+  const peak = Number.isFinite(process?.peak_rss_bytes) && process.peak_rss_bytes > 0 ? process.peak_rss_bytes : null;
+  $("proc-note").textContent = [
+    "getrusage: cumulative CPU + peak RSS",
+    "Linux: current RSS from /proc/self/status",
+    memory.peak ? "fallback shown: PEAK RSS, not live RSS" : peak ? "memory meter: current / peak RSS" : "memory meter unavailable: no peak RSS",
+  ].join(" · ");
+  setMeter("proc-mem-bar", peak == null || memory.bytes == null ? null : memory.bytes / peak * 100);
+  setMeter("proc-cpu-bar", cpu);
+  $("spark-rss").setAttribute("d", sparkScaled(history, "rss"));
+  $("spark-cpu").setAttribute("d", spark(history, "cpu"));
+}
+
 function freshness() {
   const stale = isStale();
   document.body.classList.toggle("stale", stale && Boolean(latest));
@@ -80,8 +114,16 @@ function freshness() {
   if (stale) {
     $("chart-note").textContent = latest ? "Last successful snapshot · not live" : "Waiting for connection…";
     $("recent-errors").textContent = latest ? "Recent changes unavailable while stale" : "No snapshot available";
-    $("legend-rx").textContent = "↓ Receive — Mbit/s";
-    $("legend-tx").textContent = "↑ Send — Mbit/s";
+    $("legend-rx").textContent = "RX — Mbit/s";
+    $("legend-tx").textContent = "TX — Mbit/s";
+    $("proc-rss").textContent = "—";
+    $("proc-cpu").textContent = "—";
+    $("proc-cpu-kind").textContent = "No live process sample";
+    $("proc-rss-kind").textContent = latest ? "Live value hidden while stale" : "No process sample";
+    setMeter("proc-mem-bar", null);
+    setMeter("proc-cpu-bar", null);
+    $("spark-rss").setAttribute("d", "");
+    $("spark-cpu").setAttribute("d", "");
   }
 }
 
@@ -101,6 +143,7 @@ function renderServers() {
     }
     // Keep details and keyboard focus stable while values update.
     if (body.children[index] !== row.tr) body.insertBefore(row.tr, body.children[index] ?? null);
+    row.tr.dataset.state = server.state;
     row.identity.replaceChildren(title(name(server.id), server.server));
     const state = badge(server.state);
     row.state.replaceChildren(state);
@@ -143,7 +186,12 @@ function renderFlows() {
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule"]);
   const signature = JSON.stringify({ labels, empty: result.total === 0 });
   if (flowSignature !== signature) {
-    table("flows", labels.map(row => row.map(value => cell(value))), 5, result.total ? "No flows match these filters" : "No active flows");
+    const rows = result.rows.map((flow, index) => [
+      cell(node("span", labels[index][0], `tag tag--${flow.protocol}`)),
+      cell(node("code", labels[index][1])), cell(node("code", labels[index][2])),
+      cell(node("span", labels[index][3], "exit-tag")), cell(node("span", labels[index][4], "rule-tag")),
+    ]);
+    table("flows", rows, 5, result.total ? "No flows match these filters" : "No active flows");
     flowSignature = signature;
   }
   const start = result.count ? page * PAGE_SIZE + 1 : 0;
@@ -184,16 +232,22 @@ function renderCounters() {
 }
 
 function renderChart() {
-  if (!latest) return;
+  if (!latest || !history.length) return;
   options($("chart-server"), [["", "All VPN servers"], ...latest.servers.map(server => [server.id, name(server.id)])]);
-  const result = graph(history, $("chart-server").value);
+  const selected = $("chart-server").value;
+  const result = graph(history, selected);
+  const fill = areas(history, selected);
+  $("chart-rx-area").setAttribute("d", fill.rx);
+  $("chart-tx-area").setAttribute("d", fill.tx);
+  $("spark-rx").setAttribute("d", spark(history, "rx", selected));
+  $("spark-tx").setAttribute("d", spark(history, "tx", selected));
   $("chart-rx").setAttribute("d", result.rx);
   $("chart-tx").setAttribute("d", result.tx);
   $("chart-max").textContent = `${result.max.toFixed(2)} Mbit/s`;
   $("chart-end").textContent = new Date(latest.generated_at_ms).toLocaleTimeString();
   const current = point ? result.latest : null;
-  $("legend-rx").textContent = `↓ Receive ${rate(current?.rx)} Mbit/s`;
-  $("legend-tx").textContent = `↑ Send ${rate(current?.tx)} Mbit/s`;
+  $("legend-rx").textContent = `RX ${rate(current?.rx)} Mbit/s`;
+  $("legend-tx").textContent = `TX ${rate(current?.tx)} Mbit/s`;
   const collected = Math.max(0, Math.floor((history.at(-1).time - history[0].time) / 1000));
   $("chart-note").textContent = current?.rx == null ? "Collecting fresh samples…" : collected < 30 ? `${collected}s collected · 5-minute window` : "Inner IP · VPN links only";
 }
@@ -212,7 +266,9 @@ function render() {
   for (const db of latest.databases) if (db.configured && !db.loaded) warnings.push(`${db.kind === "geo" ? "ASN" : "Country"} database missing`);
   $("warnings").textContent = warnings.join(" · ");
   $("warnings").hidden = !warnings.length;
-  renderServers(); renderRules(); renderFlows(); renderJobs(); renderCounters(); renderChart(); freshness();
+  document.body.dataset.health = warnings.length ? "warn" : "ok";
+  $("rail-health").textContent = warnings.length ? `${warnings.length} warning${warnings.length === 1 ? "" : "s"} to review` : ready === latest.servers.length ? "All links ready" : "Pool recovering";
+  renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderJobs(); renderCounters(); renderChart(); freshness();
   $("footer").textContent = `Client started ${time(latest.started_at / 1000)} · no external assets · history stays in this tab only`;
 }
 
@@ -244,11 +300,71 @@ async function refresh() {
   }
 }
 
+function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidden = true; }
+
 $("chart-server").addEventListener("change", () => { renderChart(); freshness(); });
 for (const id of ["flow-search", "flow-protocol", "flow-exit"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
 $("pause").addEventListener("click", () => { if (latest) { frozen = frozen ? null : latest; page = 0; renderFlows(); } });
 $("previous").addEventListener("click", () => { page--; renderFlows(); });
 $("next").addEventListener("click", () => { page++; renderFlows(); });
+
+function setTheme(light) {
+  document.body.dataset.theme = light ? "light" : "dark";
+  $("theme-toggle").setAttribute("aria-pressed", String(light));
+  $("theme-toggle").textContent = light ? "DARK" : "LIGHT";
+}
+setTheme(document.body.dataset.theme === "light");
+$("theme-toggle").addEventListener("click", () => setTheme(document.body.dataset.theme !== "light"));
+
+$("chart-plot").addEventListener("pointermove", event => {
+  if (!history.length) { hideCursor(); return; }
+  const rect = $("chart-plot").getBoundingClientRect();
+  if (!rect.width) { hideCursor(); return; }
+  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const end = history.at(-1).time;
+  const sample = nearestSample(history, end - WINDOW_MS + ratio * WINDOW_MS, $("chart-server").value);
+  if (!sample || (sample.rx == null && sample.tx == null)) { hideCursor(); return; }
+  $("chart-tooltip").textContent = `${new Date(sample.time).toLocaleTimeString()} · RX ${rate(sample.rx)} / TX ${rate(sample.tx)} Mbit/s`;
+  $("chart-tooltip").style.left = `${(ratio * 100).toFixed(1)}%`;
+  const x = (ratio * 1000).toFixed(2);
+  $("chart-cursor").setAttribute("x1", x);
+  $("chart-cursor").setAttribute("x2", x);
+  $("chart-tooltip").hidden = false;
+  $("chart-cursor").hidden = false;
+});
+$("chart-plot").addEventListener("pointerleave", hideCursor);
+
+document.addEventListener("keydown", event => {
+  const active = document.activeElement;
+  const typing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName);
+  if (event.key === "/" && !typing) { event.preventDefault(); $("flow-search").focus(); }
+  if (event.key === "Escape" && active === $("flow-search")) {
+    $("flow-search").value = "";
+    $("flow-search").dispatchEvent(new Event("input"));
+    $("flow-search").blur();
+  }
+});
+
+const navLinks = [...document.querySelectorAll(".rail-nav a[data-section]")];
+if ("IntersectionObserver" in window) {
+  // Keep the full set currently in the reading band: overlapping sections must not
+  // fight over the highlight, and document order decides which one owns it.
+  const visible = new Set();
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) visible.add(entry.target.id); else visible.delete(entry.target.id);
+    }
+    const active = navLinks.find(link => visible.has(link.dataset.section));
+    if (!active) return;
+    for (const link of navLinks) link.classList.toggle("is-active", link === active);
+  }, { rootMargin: "-12% 0px -72% 0px" });
+  for (const link of navLinks) {
+    const section = document.getElementById(link.dataset.section);
+    if (section) observer.observe(section);
+  }
+}
+
 for (const [id, columns] of [["servers", 7], ["rules", 7], ["flows", 5], ["databases", 6], ["jobs", 6], ["groups", 2]]) table(id, [], columns, "No snapshot yet");
-setInterval(freshness, 1000);
+renderClock();
+setInterval(() => { renderClock(); freshness(); }, 1000);
 refresh();

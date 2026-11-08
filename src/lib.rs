@@ -36,6 +36,7 @@ pub mod perf;
 pub mod pool;
 pub mod portlock;
 pub mod probe;
+pub mod proc_stats;
 pub mod profile;
 pub mod quic;
 #[cfg(test)]

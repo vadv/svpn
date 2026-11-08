@@ -43,8 +43,14 @@ function frame() {
   ];
   const status = { loaded_at: Math.floor(epoch / 1000) - (degraded ? 3900 : 299), attempted_at: Math.floor(epoch / 1000) - 299,
     error: degraded ? "Update failed: exit status: 1; previous table retained" : "" };
+  const process = scenario === "peak" ? {
+    rss_bytes: null, peak_rss_bytes: 48 * 1048576, cpu_seconds: 12 + sequence * 0.18, cpus: 8,
+  } : {
+    rss_bytes: 48 * 1048576 + sequence * 65536, peak_rss_bytes: 64 * 1048576,
+    cpu_seconds: 12 + sequence * 0.18, cpus: 8,
+  };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: false, country_table: true,
-    servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
+    process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0, active_flows: flows.filter(flow => flow.via === "local").length },
     sticky: { lookup_hit: 81, lookup_miss: 2, failover_moves: 0, block_hit: 410, resolve_ok: 8, resolve_fail: 0, resolved_ips: 6, purged_ips: 0 },
     databases: [{ kind: "geo", configured: false, loaded: false, rows: 0, pending: null, status: { loaded_at: null, attempted_at: null, error: "" } },
@@ -72,6 +78,19 @@ try {
   assert($('local').textContent === 'Ready', 'local readiness');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
   assert($('chart-rx').getAttribute('d').includes('l0,0') && getComputedStyle($('chart-rx')).strokeLinecap === 'round', 'isolated first chart sample is visible');
+  await until(() => $('proc-rss').textContent.includes('MiB') && $('proc-cpu').textContent.includes('%'), 'process RSS and CPU readout');
+  assert($('proc-rss-kind').textContent.includes('Current RSS'), 'current RSS is not silently shown as peak');
+  assert(Number.parseFloat($('proc-cpu').textContent) > 0, 'CPU percent is derived from cumulative seconds');
+  assert($('proc-time').textContent.endsWith(' s'), 'cumulative CPU time is shown');
+  assert($('proc-time-note').textContent.includes('8 logical CPUs'), 'logical CPU count is shown');
+  assert(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/.test($('uptime').textContent), 'uptime ticks locally');
+  assert($('spark-rss').getAttribute('d').trim() && $('spark-cpu').getAttribute('d').trim(), 'process trends render');
+  assert(getComputedStyle(document.body).backgroundImage === 'none', 'no decorative gradient background');
+  assert(getComputedStyle($('ready').closest('.card')).borderRadius === '0px', 'sharp instrument-panel cells');
+  $('theme-toggle').click();
+  assert(document.body.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true', 'light theme switch');
+  $('theme-toggle').click();
+  assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false', 'dark theme switch');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
   const details = document.querySelector('#servers details'); details.open = true;
@@ -100,9 +119,11 @@ try {
   const restart = await control('restart');
   await until(() => $('footer').textContent.includes(new Date(restart.started_at).toLocaleString()), 'client restart');
   assert($('rx').textContent === '—' && !$('chart-rx').getAttribute('d').trim(), 'restart clears rates and graph');
+  assert($('proc-cpu').textContent === '—', 'restart clears the derived CPU percentage');
   await until(() => $('rx').textContent !== '—', 'rates resume after restart');
   await control('offline');
   await until(() => $('freshness').textContent === 'Stale data', 'API failure is visible immediately');
+  assert($('proc-rss').textContent === '—' && $('proc-cpu').textContent === '—', 'stale process values are not shown as live');
   assert((await fetch('/api/state')).status === 503, 'HTTP error fixture');
   const beforeApiGap = $('chart-rx').getAttribute('d');
   await control('frozen');
@@ -128,6 +149,9 @@ try {
   assert($('flows').textContent.includes('No flows match'), 'empty filter message updates');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No servers'), 'servers recover without a stale placeholder');
   input('flow-search', '');
+  await control('peak');
+  await until(() => $('proc-rss-kind').textContent.includes('Peak RSS'), 'peak RSS fallback is labelled');
+  assert($('proc-note').textContent.includes('not live RSS'), 'fallback note says the value is not live RSS');
   document.documentElement.dataset.browserCheck = JSON.stringify({ status: 'passed', checks });
 } catch (error) {
   document.documentElement.dataset.browserCheck = JSON.stringify({ status: 'failed', error: String(error), checks });

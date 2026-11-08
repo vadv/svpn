@@ -20,6 +20,7 @@ use tokio::{
 use crate::{
     control::Stats,
     hub::{Hub, JobStats, StickyStats, Target},
+    proc_stats::ProcessView,
 };
 
 /// One server of the pool with its traffic counters.
@@ -122,6 +123,8 @@ pub struct Snapshot {
     pub local: LocalView,
     pub flows: Vec<FlowView>,
     pub jobs: JobStats,
+    /// Resource usage of the svpn process itself. Each field may be null.
+    pub process: ProcessView,
 }
 
 /// Snapshot of the client state for the dashboard.
@@ -275,6 +278,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         local,
         flows,
         jobs: hub.job_stats.clone(),
+        process: crate::proc_stats::sample(),
     }
 }
 
