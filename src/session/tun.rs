@@ -11,18 +11,26 @@ use crate::packet::{self, FlowKey};
 use crate::udp::Incoming;
 
 use super::state::idle_timeout;
-use super::{Flow, PacketIo, Plane, Session, TcpFlow};
+use super::{DRAIN_BATCH, Flow, PacketIo, Plane, Session, TcpFlow};
 
 const FLOW_PENDING: usize = 64;
 
 impl Session {
     pub(crate) async fn notify_closed(&self, id: u64, key: FlowKey) -> Result<()> {
+        self.notify(id, link_io::Event::Closed { id, key }).await
+    }
+
+    pub(crate) async fn notify_closing(&self, id: u64, key: FlowKey) -> Result<()> {
+        self.notify(id, link_io::Event::Closing { id, key }).await
+    }
+
+    async fn notify(&self, id: u64, event: link_io::Event) -> Result<()> {
         if !is_probe_flow(id)
             && let PacketIo::Link(io) = &self.io
         {
             // The event loop's heartbeat deadline also bounds reliable close delivery.
             io.events
-                .send((io.epoch, link_io::Event::Closed { id, key }))
+                .send((io.epoch, event))
                 .await
                 .context("packet event port closed")?;
         }
@@ -75,6 +83,28 @@ impl Session {
         } else {
             crate::error!("{} {reason} ({suppressed} suppressed)", self.drop_prefix);
         }
+    }
+
+    /// Admits one packet plus the burst already queued behind it on the
+    /// hub's packet port: one select pass per burst instead of per packet.
+    /// Queue order and every per-packet check stay those of
+    /// `handle_tun_packet`; the bound keeps one busy link from starving
+    /// the other select arms between rounds.
+    pub async fn handle_tun_packet_burst(&mut self, bytes: &[u8], id: Option<u64>) -> Result<()> {
+        self.handle_tun_packet(bytes, id).await?;
+        for _ in 1..DRAIN_BATCH {
+            let next = match &mut self.io {
+                PacketIo::Link(io) => io.packets.try_recv().ok(),
+                // Device sessions have no packet port: the TUN read arms the loop.
+                PacketIo::Device(_) => return Ok(()),
+            };
+            let Some(packet) = next else {
+                return Ok(());
+            };
+            self.handle_tun_packet(&packet.bytes, Some(packet.id))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn handle_tun_packet(
@@ -289,7 +319,7 @@ impl Session {
                 flow_state.last_seen = now;
                 flow_state.reset_requested |= is_client && packet.is_rst;
                 flow_state.proven |= packet::proves_flow(packet, !is_client);
-                flow_state.tcp_close.observe(packet, is_client, now);
+                let closing_now = flow_state.tcp_close.observe(packet, is_client, now);
                 if !fresh {
                     if let Some(selector) = plane.selector.as_mut() {
                         if selector.enqueue(flow_id, bytes).is_err() {
@@ -314,6 +344,9 @@ impl Session {
                 }
                 self.execute_actions(open_actions).await?;
                 self.flush_flow(flow_id).await?;
+                if closing_now {
+                    self.notify_closing(flow_id, packet.flow).await?;
+                }
             }
             Plane::Tcp(plane) => {
                 let now = tokio::time::Instant::now();
@@ -365,11 +398,12 @@ impl Session {
                         return Ok(());
                     }
                 };
+                let mut closing_now = false;
                 if let Some(flow_state) = plane.flows.get_mut(&id) {
                     flow_state.last_seen = now;
                     flow_state.reset_requested |= is_client && packet.is_rst;
                     flow_state.proven |= packet::proves_flow(packet, !is_client);
-                    flow_state.tcp_close.observe(packet, is_client, now);
+                    closing_now = flow_state.tcp_close.observe(packet, is_client, now);
                 }
                 let Some(flow_state) = plane.flows.get_mut(&id) else {
                     return Ok(());
@@ -387,6 +421,9 @@ impl Session {
                         .count_drop(&self.drop_prefix, "flow pending queue full");
                 }
                 self.flush_flow(id).await?;
+                if closing_now {
+                    self.notify_closing(id, packet.flow).await?;
+                }
             }
         }
         Ok(())
@@ -429,6 +466,20 @@ impl Session {
             }
         }
         Ok(true)
+    }
+
+    /// Delivers one channel packet plus the burst queued behind it in a
+    /// single pass: the loop wakes once per burst, not once per packet.
+    /// Queue order and every per-packet check stay those of `deliver_to_tun`.
+    pub async fn deliver_to_tun_burst(&mut self, incoming: Incoming) -> Result<()> {
+        self.deliver_to_tun(incoming).await?;
+        for _ in 1..DRAIN_BATCH {
+            match self.incoming.1.try_recv() {
+                Ok(incoming) => self.deliver_to_tun(incoming).await?,
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     pub async fn deliver_to_tun(&mut self, incoming: Incoming) -> Result<()> {
@@ -541,17 +592,21 @@ impl Session {
             }
         }
         self.recovery_delivered(incoming.id, "peer_packet");
+        let mut closing_now = false;
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            flow_state.tcp_close.observe(&packet, from_client, now);
+            closing_now = flow_state.tcp_close.observe(&packet, from_client, now);
         }
         if let Plane::Tcp(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            flow_state.tcp_close.observe(&packet, from_client, now);
+            closing_now = flow_state.tcp_close.observe(&packet, from_client, now);
+        }
+        if closing_now {
+            self.notify_closing(incoming.id, packet.flow).await?;
         }
         // The client TCP stack owns reset decisions; a target RST may be out of window.
         if from_client && packet.is_rst {
@@ -574,7 +629,7 @@ impl Session {
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))
                             || (flow.active
-                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                && (flow.tcp_close.deadline().is_some_and(|at| now >= at)
                                     || now.duration_since(flow.last_seen)
                                         >= idle_timeout(flow.key.protocol))))
                 })
@@ -590,7 +645,7 @@ impl Session {
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))
                             || (flow.active
-                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                && (flow.tcp_close.deadline().is_some_and(|at| now >= at)
                                     || now.duration_since(flow.last_seen)
                                         >= idle_timeout(flow.key.protocol))))
                 })

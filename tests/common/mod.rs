@@ -1,5 +1,6 @@
 //! Shared packet fixtures for integration tests.
 
+pub mod csv;
 pub mod hub;
 pub mod selector;
 pub mod session;

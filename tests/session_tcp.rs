@@ -180,6 +180,10 @@ async fn fin_then_eof_keeps_ready_but_reset_or_unexplained_eof_checks() {
                         .handle_tun_packet(&tcp_packet(0x11), Some(41))
                         .await
                         .unwrap();
+                    assert!(matches!(
+                        events.try_recv().unwrap().1,
+                        link_io::Event::Closing { id: 41, .. }
+                    ));
                     let fin_end = packet::parse(&syn, true)
                         .unwrap()
                         .tcp

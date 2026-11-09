@@ -38,6 +38,12 @@ pub enum Event {
     /// stays in Checking and retries after backoff.
     RoundFailed,
     Packet(Packet),
+    /// Both FINs observed: the flow is closing but still retained for
+    /// retransmissions until `Closed` arrives for the same owner.
+    Closing {
+        id: u64,
+        key: FlowKey,
+    },
     Closed {
         id: u64,
         key: FlowKey,

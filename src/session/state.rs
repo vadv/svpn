@@ -18,7 +18,9 @@ use crate::packet::{self, FlowKey};
 use crate::selector::{Action, Candidate, Reason, Selector};
 use crate::webrtc;
 
-use super::{ChannelHandle, FIN_DWELL, FLOW_IDLE, TCP_IDLE, TOMBSTONE_CAP, TOMBSTONE_TTL};
+use super::{
+    ChannelHandle, FIN_DWELL, FLOW_IDLE, RST_DWELL, TCP_IDLE, TOMBSTONE_CAP, TOMBSTONE_TTL,
+};
 
 // ────────────────────────── Tombstones ──────────────────────────
 
@@ -167,56 +169,75 @@ impl Drop for FlowTcp {
     }
 }
 
+/// Close tracking of one TCP flow (conntrack semantics): FINs in both
+/// directions arm the retransmission dwell `FIN_DWELL` — the final ACKs
+/// are not required and an ACK observed before a FIN does not suppress
+/// its recording; a reset in either direction arms a short cancelable
+/// grace `RST_DWELL`.
 #[derive(Default)]
 pub struct TcpClose {
     fin_end: [Option<u32>; 2],
-    acknowledged: [bool; 2],
-    acked_until: [Option<u32>; 2],
-    pub deadline: Option<tokio::time::Instant>,
+    fin_dwell: Option<tokio::time::Instant>,
+    /// Reset grace and the side that sent the reset.
+    reset_dwell: Option<(tokio::time::Instant, bool)>,
 }
 
 impl TcpClose {
+    /// Observe one segment; `true` only on the call that arms the both-FIN
+    /// dwell — the single moment the flow turns closing for its owner.
     pub fn observe(
         &mut self,
         packet: &packet::Packet,
         from_client: bool,
         now: tokio::time::Instant,
-    ) {
-        let Some(tcp) = packet.tcp else { return };
+    ) -> bool {
+        let Some(tcp) = packet.tcp else { return false };
         if from_client && tcp.flags & 0x17 == 0x02 {
             *self = Self::default();
-            return;
+            return false;
         }
-        if self.finished() || tcp.flags & 0x04 != 0 {
-            return;
+        if tcp.flags & 0x04 != 0 {
+            self.reset_dwell = Some((now + RST_DWELL, from_client));
+            return false;
         }
-        let direction = usize::from(from_client);
-        if packet.fin && tcp.flags & 0x02 == 0 {
-            let end = tcp.seq.wrapping_add(tcp.payload_len as u32).wrapping_add(1);
-            // A duplicate ACK of earlier data does not acknowledge this FIN.
-            if self.acked_until[direction].is_none_or(|ack| (end.wrapping_sub(ack) as i32) > 0)
-                && self.fin_end[direction] != Some(end)
-            {
-                self.fin_end[direction] = Some(end);
-                self.acknowledged[direction] = false;
-            }
-        }
-        if tcp.flags & 0x10 != 0 {
-            let peer = 1 - direction;
-            if self.acked_until[peer].is_none_or(|ack| (tcp.ack.wrapping_sub(ack) as i32) >= 0) {
-                self.acked_until[peer] = Some(tcp.ack);
-            }
-            if self.fin_end[peer] == Some(tcp.ack) {
-                self.acknowledged[peer] = true;
-            }
+        // A real reset sender never speaks on this tuple again, so only its
+        // side cancels the grace; the peer's in-flight packets do not.
+        if self
+            .reset_dwell
+            .is_some_and(|(_, sender)| sender == from_client)
+        {
+            self.reset_dwell = None;
         }
         if self.finished() {
-            self.deadline = Some(now + FIN_DWELL);
+            return false;
         }
+        let mut closing = false;
+        if packet.fin && tcp.flags & 0x02 == 0 {
+            let direction = usize::from(from_client);
+            let end = tcp.seq.wrapping_add(tcp.payload_len as u32).wrapping_add(1);
+            if self.fin_end[direction] != Some(end) {
+                self.fin_end[direction] = Some(end);
+                if self.finished() {
+                    self.fin_dwell = Some(now + FIN_DWELL);
+                    closing = true;
+                }
+            }
+        }
+        closing
     }
 
+    /// FINs observed in both directions: the session is closing even when
+    /// the final ACKs are lost.
     pub fn finished(&self) -> bool {
-        self.acknowledged == [true; 2]
+        self.fin_end[0].is_some() && self.fin_end[1].is_some()
+    }
+
+    /// Earliest armed close deadline: the both-FIN dwell or the reset grace.
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        [self.fin_dwell, self.reset_dwell.map(|(at, _)| at)]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 

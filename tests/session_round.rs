@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::time::Instant as StdInstant;
 
 use common::session::{assert_closed, link_session, link_session_cap, test_key};
-use svpn::control::{Control, Message, Stats, Strategy};
+use svpn::control::{Control, Message, RoundOutcome, RoundStage, Stats, Strategy};
 use svpn::link_io::{self, FIRST_PROBE_ID, PREFLIGHT_ID};
 use svpn::packet;
 use svpn::selector::{Action, Allowed, Candidate, Reason, Selector};
@@ -181,6 +181,84 @@ async fn faster_candidate_verified_inside_the_window_wins() {
     };
     assert!(plane.channels.contains_key(&100));
     assert!(!plane.channels.contains_key(&101));
+}
+
+#[tokio::test]
+async fn round_verdict_publishes_the_race_to_the_stats_port() {
+    let (mut session, _keep, probes) = parallel_round().await;
+    // Obfs dies before the verdict, mosh answers, tcp never comes back.
+    let probe = |candidate: Candidate| {
+        probes
+            .iter()
+            .find(|probe| probe.2 == candidate)
+            .unwrap_or_else(|| panic!("no {candidate} probe"))
+    };
+    session
+        .round_attempt_failed(probe(Candidate::Obfs).0, Reason::ChannelFailed)
+        .await
+        .unwrap();
+    let mosh = probe(Candidate::Mosh);
+    session
+        .deliver_to_tun(Incoming {
+            generation: 1,
+            id: mosh.0,
+            channel: Some(mosh.1),
+            packet: echo_reply_for(&mosh.4),
+        })
+        .await
+        .unwrap();
+    let decide_at = session.round.as_ref().unwrap().decide_at.unwrap();
+    session.poll_round(decide_at).await.unwrap();
+    let report = session.stats.last_round.as_ref().expect("race published");
+    assert_eq!(report.winner.as_deref(), Some("mosh"));
+    assert!(report.finished_at_ms > 0);
+    let entry = |name: &str| {
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.candidate == name)
+            .unwrap_or_else(|| panic!("no {name} entry"))
+    };
+    assert!(matches!(
+        &entry("mosh").outcome,
+        RoundOutcome::Verified {
+            penalty: false,
+            rtt_ms: 0..=1000,
+        }
+    ));
+    assert!(matches!(
+        &entry("obfs").outcome,
+        RoundOutcome::Failed {
+            reason: Reason::ChannelFailed,
+        }
+    ));
+    // TCP wrote its probe (tcp_started) but the echo never arrived: probe stage.
+    assert!(matches!(
+        &entry("tcp").outcome,
+        RoundOutcome::Unanswered {
+            stage: RoundStage::Probe,
+        }
+    ));
+    assert_eq!(session.stats.active_candidate.as_deref(), Some("mosh"));
+}
+
+#[tokio::test]
+async fn failed_round_publishes_every_failure_without_a_winner() {
+    let (mut session, _events) = link_session(false);
+    session.begin_preflight().await.unwrap();
+    let now = tokio::time::Instant::now();
+    session.round.as_mut().unwrap().deadline = now;
+    session.poll_round(now).await.unwrap();
+    let report = session.stats.last_round.as_ref().expect("race published");
+    assert_eq!(report.winner, None);
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].candidate, "mosh");
+    assert!(matches!(
+        &report.entries[0].outcome,
+        RoundOutcome::Failed {
+            reason: Reason::PathTimeout,
+        }
+    ));
 }
 
 #[tokio::test]

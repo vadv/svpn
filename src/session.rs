@@ -70,12 +70,23 @@ pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FLOW_IDLE: Duration = Duration::from_secs(60);
 /// TCP idle floor from RFC 5382; silence alone is not a failed connection.
 pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60 + 4 * 60);
-/// Retain both-FIN flows for retransmissions (RFC 5382 transitory timeout).
-pub const FIN_DWELL: Duration = Duration::from_secs(4 * 60);
+/// Retain both-FIN flows for retransmissions, matching conntrack's
+/// TIME_WAIT of 120 s — deliberately below RFC 5382's 4-minute transitory
+/// minimum by user decision: late FIN/ACK retransmits after that fall back
+/// to normal routing (a fresh RST from the peer closes the new attempt).
+pub const FIN_DWELL: Duration = Duration::from_secs(120);
+/// A reset in either direction closes the flow after this grace unless
+/// traffic resumes: a forged or out-of-window reset must not tear down a
+/// live connection (conntrack's UNEXPECTED RST handling, not its window
+/// check — resumption is the cancel signal here).
+pub const RST_DWELL: Duration = Duration::from_secs(10);
 pub const FLOW_CAP: usize = 4096;
 pub const PROBE_FLOW_RESERVE: usize = 16;
 /// Per-channel outgoing IP-packet queue and binding wait.
 pub const CHANNEL_QUEUE: usize = 1024;
+/// Packets one session-loop wake may process from a single port before the
+/// select runs again: a busy channel must not starve the other arms.
+pub const DRAIN_BATCH: usize = 32;
 /// How long a lost link's tuples stay refused before normal admission
 /// resumes: a new-ISN SYN then becomes a new flow.
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(30);
@@ -193,16 +204,22 @@ impl Session {
         let mut ticks: u64 = 0;
         let mut tick = tokio::time::interval(HEARTBEAT);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The heartbeat deadline is a select branch instead of a wrapping
+        // timeout_at: awaiting the select in place keeps the ~43 KB future
+        // from being moved by value every loop iteration.
+        let heartbeat_sleep = tokio::time::sleep_until(started + HEARTBEAT_TIMEOUT);
+        tokio::pin!(heartbeat_sleep);
         loop {
             let accepts_packets = self.accepts_packets();
             let mut deadline = last_heartbeat.unwrap_or(started) + HEARTBEAT_TIMEOUT;
             if !accepts_packets && let Some(sd) = startup_deadline {
                 deadline = deadline.min(sd);
             }
+            heartbeat_sleep.as_mut().reset(deadline);
             let round_wake = self.round.as_ref().and_then(|round| round.decide_at);
             let health_wake = self.health_wake();
             let flush_wake = self.flush_at;
-            let result = with_heartbeat_deadline(deadline, async {
+            let result = async {
                 tokio::select! {
                     message = self.control.recv() => {
                         let message = message?;
@@ -212,7 +229,8 @@ impl Session {
                         self.dispatch_control(message).await?
                     }
                     result = self.io.recv(&mut buffer, self.mtu) => {
-                        self.handle_tun_packet(&buffer, result?).await?;
+                        let id = result?;
+                        self.handle_tun_packet_burst(&buffer, id).await?;
                     }
                     event = self.task_events.1.recv() => {
                         let event = event.context("channel tasks stopped")?;
@@ -220,7 +238,7 @@ impl Session {
                     }
                     incoming = self.incoming.1.recv() => {
                         let incoming = incoming.context("channel pump stopped")?;
-                        self.deliver_to_tun(incoming).await?;
+                        self.deliver_to_tun_burst(incoming).await?;
                     }
                     event = self.tcp_events.1.recv() => {
                         if let Some(event) = event {
@@ -280,6 +298,11 @@ impl Session {
                     _ = tokio::time::sleep_until(flush_wake.unwrap_or(deadline)), if flush_wake.is_some() => {
                         self.flush_pending().await?;
                     }
+                    _ = &mut heartbeat_sleep => {
+                        // Same semantics as the old timeout_at wrapper: the
+                        // error unwinds the loop as link loss.
+                        bail!("control heartbeat timeout")
+                    }
                     _ = tick.tick() => {
                         let now = tokio::time::Instant::now();
                         self.expire_flows(now).await?;
@@ -289,7 +312,9 @@ impl Session {
                         if let PacketIo::Link(io) = &self.io {
                             io.delivery.apply(&mut self.stats);
                         }
-                        self.control.send(Message::Heartbeat { stats: self.stats.clone() }).await?;
+                        // The race report is dashboard-only: keep it off the wire.
+                        let stats = crate::control::Stats { last_round: None, ..self.stats.clone() };
+                        self.control.send(Message::Heartbeat { stats }).await?;
                         if let PacketIo::Link(io) = &self.io {
                             io.stats.send_replace(self.stats.clone());
                         }
@@ -317,8 +342,12 @@ impl Session {
                 {
                     ensure!(tokio::time::Instant::now() < sd, "link readiness timed out");
                 }
-                self.announce_ready(last_heartbeat, startup_deadline).await
-            })
+                let ready = self.announce_ready(last_heartbeat, startup_deadline).await;
+                // Tokio can complete ready work after the deadline without
+                // polling the timer — the old wrapper checked this too.
+                ensure!(tokio::time::Instant::now() < deadline, "control heartbeat timeout");
+                ready
+            }
             .await;
             if !self.accepts_packets()
                 && let Some(sd) = startup_deadline

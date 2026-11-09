@@ -8,6 +8,11 @@ const _: () = {
     compile_error!(
         "hardware AES required on this architecture: build with -C target-feature=+aes (see .cargo/config.toml)"
     );
+    // aes 0.8 / polyval 0.6 ignore `+aes` on aarch64 and need their own cfg.
+    #[cfg(all(target_arch = "aarch64", not(all(aes_armv8, polyval_armv8))))]
+    compile_error!(
+        "ARMv8 AES/GHASH backends required: build with --cfg aes_armv8 --cfg polyval_armv8 (see .cargo/config.toml)"
+    );
 };
 
 pub mod addrpool;
@@ -36,6 +41,7 @@ pub mod perf;
 pub mod pool;
 pub mod portlock;
 pub mod probe;
+pub mod proc_stats;
 pub mod profile;
 pub mod quic;
 #[cfg(test)]

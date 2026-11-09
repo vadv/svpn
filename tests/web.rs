@@ -5,10 +5,13 @@ mod common;
 use std::{net::Ipv4Addr, time::Duration};
 
 use svpn::{
-    control::Stats,
+    MimicArg,
+    control::{RoundEntry, RoundOutcome, RoundReport, RoundStage, Stats},
+    geo::{Geo, pack_country},
     hub::{Hub, Owner, Target},
     link_io::Epoch,
     packet::FlowKey,
+    selector::Reason,
     sticky::{ResolvedVia, RuntimeSticky, Selector, StickyBlock, Via},
     web,
 };
@@ -43,6 +46,50 @@ fn snapshot_reports_server_state_and_node_ids() {
     assert_eq!(snapshot.servers[1].reason, "handshake failed");
     assert!(!snapshot.asn_table);
     assert!(!snapshot.country_table);
+    assert_eq!(snapshot.servers[0].country, None, "no table, no country");
+}
+
+#[test]
+fn server_country_comes_from_its_address_and_unknown_stays_null() {
+    let mut hub = hub();
+    let first = u32::from(Ipv4Addr::new(192, 0, 2, 1));
+    hub.country = Some(Geo::from_ranges(vec![(
+        first,
+        first,
+        pack_country("NL").unwrap(),
+    )]));
+    hub.links[1].params.server = "vps.example".to_owned();
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["servers"][0]["country"], "NL");
+    assert!(
+        json["servers"][1]["country"].is_null(),
+        "a hostname is not resolved inside the snapshot"
+    );
+    hub.links[1].params.server = "192.0.2.2".to_owned();
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(
+        snapshot.servers[1].country, None,
+        "an uncovered address has no country"
+    );
+}
+
+#[test]
+fn snapshot_reports_configured_mimic_without_debug_names() {
+    use MimicArg::*;
+    for (configured, expected) in [
+        (vec![], serde_json::json!([])),
+        (vec![WebRtc], serde_json::json!(["webrtc"])),
+        (
+            vec![Quic, Mosh, Obfs, Ssh],
+            serde_json::json!(["quic", "mosh", "obfs", "ssh"]),
+        ),
+        (vec![Banner, None], serde_json::json!(["banner", "none"])),
+    ] {
+        let mut hub = hub();
+        hub.links[0].params.mimic = configured;
+        let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+        assert_eq!(json["servers"][0]["mimic"], expected);
+    }
 }
 
 #[test]
@@ -105,6 +152,76 @@ fn snapshot_falls_back_to_the_collected_totals_of_a_dead_link() {
     assert_eq!(snapshot.servers[0].stats.active_flows, 3);
 }
 
+// ── selection ──
+
+#[test]
+fn snapshot_exposes_the_live_transport_and_its_race() {
+    let mut hub = hub();
+    let (_sender, latest) = watch::channel(Stats {
+        active_candidate: Some("tcp-ssh".to_owned()),
+        last_round: Some(RoundReport {
+            finished_at_ms: 1_730_000_000_000,
+            winner: Some("tcp".to_owned()),
+            entries: vec![
+                RoundEntry {
+                    candidate: "tcp".to_owned(),
+                    outcome: RoundOutcome::Verified {
+                        rtt_ms: 41,
+                        penalty: true,
+                    },
+                },
+                RoundEntry {
+                    candidate: "quic".to_owned(),
+                    outcome: RoundOutcome::Verified {
+                        rtt_ms: 63,
+                        penalty: false,
+                    },
+                },
+                RoundEntry {
+                    candidate: "webrtc".to_owned(),
+                    outcome: RoundOutcome::Failed {
+                        reason: Reason::PathTimeout,
+                    },
+                },
+                RoundEntry {
+                    candidate: "obfs".to_owned(),
+                    outcome: RoundOutcome::Unanswered {
+                        stage: RoundStage::Handshake,
+                    },
+                },
+            ],
+        }),
+        ..Stats::default()
+    });
+    hub.links[0].latest = Some(latest);
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["servers"][0]["selection"]["active"], "tcp-ssh");
+    assert_eq!(json["servers"][0]["selection"]["round"]["winner"], "tcp");
+    assert_eq!(
+        json["servers"][0]["selection"]["round"]["finished_at_ms"],
+        1_730_000_000_000u64
+    );
+    assert_eq!(
+        json["servers"][0]["selection"]["round"]["entries"],
+        serde_json::json!([
+            { "candidate": "tcp", "status": "verified", "rtt_ms": 41, "penalty": true },
+            { "candidate": "quic", "status": "verified", "rtt_ms": 63, "penalty": false },
+            { "candidate": "webrtc", "status": "failed", "reason": "path_timeout" },
+            { "candidate": "obfs", "status": "unanswered", "stage": "handshake" },
+        ])
+    );
+    // A link without a live session has no verdict yet.
+    assert!(json["servers"][1]["selection"]["active"].is_null());
+    assert!(json["servers"][1]["selection"]["round"].is_null());
+
+    // Session end: the collected totals keep the race for the dead link.
+    let last = hub.links[0].latest.take().expect("live session");
+    hub.links[0].stats.observe(last.borrow().clone());
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.servers[0].selection.active, None);
+    assert!(snapshot.servers[0].selection.round.is_some());
+}
+
 // ── rules and groups ──
 
 #[test]
@@ -149,7 +266,7 @@ fn snapshot_names_asn_groups() {
 #[test]
 fn snapshot_maps_live_flows_to_their_server() {
     let mut hub = hub();
-    hub.routes.by_key.insert(
+    hub.routes.insert(
         flow(6, 40000, 443),
         Target::Remote(Owner {
             epoch: Epoch {
@@ -158,10 +275,10 @@ fn snapshot_maps_live_flows_to_their_server() {
             },
             id: 7,
         }),
+        None,
     );
     hub.routes
-        .by_key
-        .insert(flow(17, 9000, 53), Target::Direct(9));
+        .insert(flow(17, 9000, 53), Target::Direct(9), None);
     let snapshot = web::snapshot(&hub);
     assert_eq!(snapshot.flows.len(), 2);
     // Sorted by protocol: tcp before udp.
@@ -170,6 +287,180 @@ fn snapshot_maps_live_flows_to_their_server() {
     assert_eq!(snapshot.flows[0].destination, "1.2.3.4:443");
     assert_eq!(snapshot.flows[1].protocol, "udp");
     assert_eq!(snapshot.flows[1].via, "local");
+    assert!(
+        snapshot
+            .flows
+            .iter()
+            .all(|flow| flow.country.is_none() && flow.asn.is_none())
+    );
+    // The hub never resolves LAN devices: that happens when the snapshot is
+    // served, from conntrack the hub must not read.
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(json["flows"][0]["client"].is_null());
+    assert!(json["flows"][0]["client_name"].is_null());
+}
+
+#[test]
+fn snapshot_reports_flow_age_and_idle_time() {
+    let mut hub = hub();
+    let key = flow(6, 40000, 443);
+    hub.routes.insert(key, Target::Direct(9), None);
+    let now = std::time::Instant::now();
+    let route = hub.routes.by_key.get_mut(&key).unwrap();
+    route.opened = now - Duration::from_secs(90);
+    route.active = now - Duration::from_secs(30);
+    let flow = &web::snapshot(&hub).flows[0];
+    assert_eq!((flow.age_secs, flow.idle_secs), (90, 30));
+}
+
+#[test]
+fn destination_geo_is_independent_of_exit_policy_and_unknown_ranges_stay_null() {
+    let mut hub = hub();
+    let start = u32::from(Ipv4Addr::new(1, 2, 3, 0));
+    hub.geo = Some(Geo::from_ranges(vec![(start, start + 255, 13335)]));
+    hub.country = Some(Geo::from_ranges(vec![(
+        start,
+        start + 255,
+        pack_country("US").unwrap(),
+    )]));
+    hub.routes
+        .insert(flow(6, 40000, 443), Target::Direct(1), None);
+    let mut unknown = flow(17, 40001, 53);
+    unknown.destination = Ipv4Addr::new(203, 0, 113, 1);
+    hub.routes.insert(unknown, Target::Direct(2), None);
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["policy"], "balance");
+    assert_eq!(json["flows"][0]["country"], "US");
+    assert_eq!(json["flows"][0]["asn"], 13335);
+    assert_eq!(json["flows"][0]["via"], "local");
+    assert!(json["flows"][1]["country"].is_null());
+    assert!(json["flows"][1]["asn"].is_null());
+    hub.country = None;
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.flows[0].asn, Some(13335));
+    assert_eq!(snapshot.flows[0].country, None);
+    hub.geo = None;
+    hub.country = Some(Geo::from_ranges(vec![(
+        start,
+        start + 255,
+        pack_country("DE").unwrap(),
+    )]));
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.flows[0].country.as_deref(), Some("DE"));
+    assert_eq!(snapshot.flows[0].asn, None);
+}
+
+// ── lan sources ──
+
+/// Real-shaped conntrack and lease lines of a masquerading OpenWrt router.
+const CONNTRACK: &str = "\
+ipv4 2 tcp 6 src=192.168.0.30 dst=13.39.241.58 sport=49449 dport=443 packets=2784 bytes=161169 src=13.39.241.58 dst=10.77.0.2 sport=443 dport=49449 packets=32199 bytes=41214720 [OFFLOAD] mark=0 zone=0 use=4\n\
+ipv4 2 udp 17 148 src=192.168.0.186 dst=17.248.214.67 sport=62332 dport=443 packets=0 bytes=0 src=17.248.214.67 dst=10.77.0.2 sport=443 dport=62332 packets=0 bytes=0 [OFFLOAD] mark=0 zone=0 use=3\n\
+ipv4 2 icmp 1 29 src=192.168.0.20 dst=8.8.8.8 type=8 code=0 id=4660 packets=1 bytes=64 src=8.8.8.8 dst=10.77.0.2 type=0 code=0 id=4660 packets=1 bytes=64 mark=0 zone=0 use=2\n\
+ipv4 2 tcp 6 7425 ESTABLISHED src=10.77.0.2 dst=213.180.204.36 sport=58680 dport=443 packets=0 bytes=0 src=213.180.204.36 dst=10.77.0.2 sport=443 dport=58680 packets=0 bytes=0 [ASSURED] mark=0 zone=0 use=2\n";
+
+const LEASES: &str = "\
+1794248488 aa:bb:cc:dd:ee:01 192.168.0.30 Dmitrij-s-S26-Ultra 01:aa:bb:cc:dd:ee:01\n\
+1794254503 aa:bb:cc:dd:ee:02 192.168.0.117 * 01:aa:bb:cc:dd:ee:02\n\
+1794255585 aa:bb:cc:dd:ee:03 fd01:a214:cdb4::fa42 * 00:03:00:01:aa:bb:cc:dd:ee:03\n";
+
+fn view(protocol: &'static str, source: &str, destination: &str) -> web::FlowView {
+    web::FlowView {
+        rule: None,
+        protocol,
+        source: source.to_owned(),
+        destination: destination.to_owned(),
+        country: None,
+        asn: None,
+        via: "local".to_owned(),
+        client: None,
+        client_name: None,
+        rx_bytes: 0,
+        tx_bytes: 0,
+        age_secs: 0,
+        idle_secs: 0,
+        closing: false,
+    }
+}
+
+#[test]
+fn conntrack_maps_masqueraded_flows_by_their_tunnel_tuple() {
+    let map = web::lan::parse_conntrack(CONNTRACK);
+    let tun = Ipv4Addr::new(10, 77, 0, 2);
+    assert_eq!(
+        map.get(&(6, tun, 49449, Ipv4Addr::new(13, 39, 241, 58), 443)),
+        Some(&Ipv4Addr::new(192, 168, 0, 30))
+    );
+    assert_eq!(
+        map.get(&(17, tun, 62332, Ipv4Addr::new(17, 248, 214, 67), 443)),
+        Some(&Ipv4Addr::new(192, 168, 0, 186)),
+        "a NAT port kept by the masquerade still matches"
+    );
+    assert_eq!(
+        map.get(&(1, tun, 4660, Ipv4Addr::new(8, 8, 8, 8), 0)),
+        Some(&Ipv4Addr::new(192, 168, 0, 20)),
+        "icmp keys on the echo id with no destination port, as the hub does"
+    );
+    // The router's own flow leaves the table: its original source is the
+    // TUN address, there is no LAN device behind it.
+    assert!(!map.values().any(|&lan| lan == tun));
+    assert_eq!(map.len(), 3);
+}
+
+#[test]
+fn conntrack_skips_foreign_and_malformed_lines() {
+    let map = web::lan::parse_conntrack(
+        "ipv6 10 udp 17 21 src=::1 dst=::1 sport=52299 dport=53 packets=0 bytes=0 \
+         src=::1 dst=::1 sport=53 dport=52299 packets=0 bytes=0 mark=0 zone=0 use=2\n\
+         ipv4 2 sctp 132 src=192.168.0.5 dst=1.2.3.4 sport=1 dport=2\n\
+         ipv4 2 tcp 6 src=192.168.0.5\n\
+         ipv4 2 tcp 6 src=bogus dst=1.2.3.4 sport=1 dport=2 packets=0 bytes=0 \
+         src=1.2.3.4 dst=10.77.0.2 sport=2 dport=1 packets=0 bytes=0\n\
+         garbage\n",
+    );
+    assert!(map.is_empty(), "{map:?}");
+}
+
+#[test]
+fn leases_keep_named_ipv4_hosts_only() {
+    let names = web::lan::parse_leases(LEASES);
+    assert_eq!(names.len(), 1);
+    assert_eq!(
+        names
+            .get(&Ipv4Addr::new(192, 168, 0, 30))
+            .map(String::as_str),
+        Some("Dmitrij-s-S26-Ultra")
+    );
+    assert!(web::lan::parse_leases("truncated\n").is_empty());
+}
+
+#[test]
+fn lan_sources_apply_to_flow_views_and_stay_null_without_a_mapping() {
+    let sources = web::lan::resolve(CONNTRACK, LEASES);
+    let mut flows = vec![
+        view("tcp", "10.77.0.2:49449", "13.39.241.58:443"),
+        view("udp", "10.77.0.2:62332", "17.248.214.67:443"),
+        view("icmp", "10.77.0.2:4660", "8.8.8.8:0"),
+        view("tcp", "10.77.0.2:58680", "213.180.204.36:443"),
+        view("tcp", "10.77.0.2:1", "1.2.3.4:443"),
+    ];
+    web::lan::apply(&sources, &mut flows);
+    assert_eq!(flows[0].client.as_deref(), Some("192.168.0.30"));
+    assert_eq!(flows[0].client_name.as_deref(), Some("Dmitrij-s-S26-Ultra"));
+    assert_eq!(flows[1].client.as_deref(), Some("192.168.0.186"));
+    assert_eq!(flows[1].client_name, None, "no lease, no name");
+    assert_eq!(
+        flows[2].client.as_deref(),
+        Some("192.168.0.20"),
+        "icmp echo"
+    );
+    assert_eq!(flows[3].client, None, "the router's own flow");
+    assert_eq!(flows[4].client, None, "unknown tuple");
+    let json = serde_json::to_value(&flows).unwrap();
+    assert_eq!(json[0]["client"], "192.168.0.30");
+    assert_eq!(json[0]["client_name"], "Dmitrij-s-S26-Ultra");
+    assert!(json[3]["client"].is_null());
+    assert!(json[4]["client_name"].is_null());
 }
 
 // ── json ──

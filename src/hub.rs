@@ -6,6 +6,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant as StdInstant},
 };
 
@@ -29,9 +30,12 @@ use crate::{
     session, stats,
 };
 
+pub mod jobs;
 mod routes;
 
-pub use routes::{Owner, Routes, Target};
+pub use jobs::{JobContext, JobEvent, JobStats};
+
+pub use routes::{Owner, RoutedFlow, Routes, Target, Traffic};
 
 // Burst absorber for link/hub queues: holds Packet slot structs, payload memory scales
 // with resident packets only. 1024 absorbs CPU/Wi-Fi jitter without unbounded growth.
@@ -43,6 +47,16 @@ pub const SNAPSHOT_INTERVAL: u32 = 1;
 /// Startup grace for restored sticky owners: two connect budgets
 /// (selector::ATTEMPT_BUDGET is 5 s each).
 pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Packets one drain round may flush to the TUN: one busy flow must not
+/// starve the select loop between rounds.
+pub const TUN_BATCH: usize = 32;
+
+/// Deadline one TUN flush batch shares; was a fresh timeout per packet.
+const TUN_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// One TUN flush batch: per-link delivery counters paired with each packet.
+type TunBatch = Vec<(Arc<Delivery>, Packet)>;
 
 pub struct Link {
     pub params: LinkParams,
@@ -100,64 +114,6 @@ pub struct LocalExitState {
     pub ready: bool,
 }
 
-/// One finished job attempt, delivered to the hub loop.
-pub struct JobEvent {
-    pub label: String,
-    pub status: crate::job::JobStatus,
-    pub tail: String,
-    pub reload: Vec<crate::job::Reload>,
-}
-
-/// Everything the scheduler needs: specs, reload paths and the env contract.
-#[derive(Default)]
-pub struct JobContext {
-    pub specs: Vec<crate::job::JobSpec>,
-    pub geo_db: Option<std::path::PathBuf>,
-    pub country_db: Option<std::path::PathBuf>,
-    pub config_dir: Option<std::path::PathBuf>,
-}
-
-impl JobContext {
-    /// Build the context from parsed client arguments (config-driven parts).
-    pub fn from_args(args: &crate::cli::ClientArgs) -> Self {
-        Self {
-            specs: args.jobs.clone(),
-            geo_db: args.geo_db.clone(),
-            country_db: args.country_db.clone(),
-            config_dir: args.config.as_deref().map(|path| {
-                let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-                parent.unwrap_or(std::path::Path::new(".")).to_path_buf()
-            }),
-        }
-    }
-
-    /// The documented environment contract; scripts never hardcode paths.
-    pub fn env(&self) -> Vec<(String, String)> {
-        let mut env = vec![
-            (
-                "SVPN_OS".to_owned(),
-                // The only musl target we ship is OpenWrt; scripts branch on it.
-                if cfg!(all(target_os = "linux", target_env = "musl")) {
-                    "openwrt".to_owned()
-                } else {
-                    std::env::consts::OS.to_owned()
-                },
-            ),
-            ("SVPN_JOB".to_owned(), String::new()),
-        ];
-        if let Some(path) = &self.geo_db {
-            env.push(("SVPN_GEO_DB".to_owned(), path.display().to_string()));
-        }
-        if let Some(path) = &self.country_db {
-            env.push(("SVPN_COUNTRY_DB".to_owned(), path.display().to_string()));
-        }
-        if let Some(dir) = &self.config_dir {
-            env.push(("SVPN_CONFIG_DIR".to_owned(), dir.display().to_string()));
-        }
-        env
-    }
-}
-
 /// Late-bound run inputs: sticky blocks and the job context.
 #[derive(Default)]
 pub struct Extras {
@@ -167,17 +123,9 @@ pub struct Extras {
     pub web_listen: Option<SocketAddr>,
 }
 
-/// Periodic job counters for the stats report.
-#[derive(Default, Clone, Copy, Serialize)]
-pub struct JobStats {
-    pub runs: u64,
-    pub failures: u64,
-    pub timeouts: u64,
-}
-
 /// First-match decision for one destination.
 enum Route {
-    Local,
+    Local(usize),
     Sticky(usize),
     Auto,
 }
@@ -269,7 +217,7 @@ impl Hub {
         if self.tombstones.active(&parsed.flow, now) {
             return Ok(self.tombstones.respond(&parsed.flow, &parsed, now));
         }
-        match self.routes.by_key.get(&parsed.flow) {
+        match self.routes.target(&parsed.flow) {
             Some(Target::Direct(id)) => self.forward_local(*id, bytes),
             Some(Target::Remote(owner)) if self.pool.is_serving(owner.epoch) => {
                 let link = &self.links[owner.epoch.link];
@@ -277,14 +225,16 @@ impl Hub {
                     return Ok(None);
                 };
                 let delivery = link.delivery.clone();
-                self.routes.enqueue(
+                if self.routes.enqueue(
                     bytes,
                     client_ip,
                     owner.epoch,
                     outgoing,
                     &delivery,
                     &self.links,
-                )?;
+                )? {
+                    self.routes.record(parsed.flow, bytes.len(), 0);
+                }
                 Ok(None)
             }
             // A non-serving owner still owns the flow: no reset, no reassign.
@@ -301,7 +251,7 @@ impl Hub {
             if block.matches(destination, self.country.as_ref(), self.geo.as_ref()) {
                 self.sticky.block_hit += 1;
                 return match &self.sticky_via[index] {
-                    crate::sticky::ResolvedVia::Local => Route::Local,
+                    crate::sticky::ResolvedVia::Local => Route::Local(index),
                     crate::sticky::ResolvedVia::Links(_) => Route::Sticky(index),
                 };
             }
@@ -322,10 +272,10 @@ impl Hub {
         if let Some(state) = &mut self.exit_state {
             state.flush_due(StdInstant::now());
         }
-        let epoch = match self.route(key.destination) {
-            Route::Local => return self.open_local(parsed, bytes),
-            Route::Sticky(index) => self.pick_sticky(index),
-            Route::Auto => self.pick(&key),
+        let (rule, epoch) = match self.route(key.destination) {
+            Route::Local(index) => return self.open_local(parsed, bytes, index),
+            Route::Sticky(index) => (Some(index), self.pick_sticky(index)),
+            Route::Auto => (None, self.pick(&key)),
         };
         let Some(epoch) = epoch else {
             return Ok(None);
@@ -335,8 +285,15 @@ impl Hub {
             return Ok(None);
         };
         let delivery = link.delivery.clone();
-        self.routes
-            .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?;
+        if self
+            .routes
+            .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?
+        {
+            if let Some(flow) = self.routes.by_key.get_mut(&key) {
+                flow.rule = rule;
+            }
+            self.routes.record(key, bytes.len(), 0);
+        }
         Ok(None)
     }
 
@@ -356,7 +313,12 @@ impl Hub {
         )
     }
 
-    fn open_local(&mut self, parsed: &packet::Packet, bytes: &[u8]) -> Result<Option<[u8; 40]>> {
+    fn open_local(
+        &mut self,
+        parsed: &packet::Packet,
+        bytes: &[u8],
+        rule: usize,
+    ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
         let Some(local) = &self.local else {
             self.local_stats.failed += 1;
@@ -375,7 +337,8 @@ impl Hub {
         }) {
             Ok(()) => {
                 self.local_stats.opened += 1;
-                self.routes.by_key.insert(key, Target::Direct(id));
+                self.routes.insert(key, Target::Direct(id), Some(rule));
+                self.routes.record(key, bytes.len(), 0);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 delivery.dropped();
@@ -399,7 +362,11 @@ impl Hub {
             id,
             bytes: bytes.to_vec(),
         }) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(key) = key {
+                    self.routes.record(key, bytes.len(), 0);
+                }
+            }
             Err(mpsc::error::TrySendError::Full(_)) => delivery.dropped(),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 if let Some(key) = key {
@@ -412,45 +379,95 @@ impl Hub {
 
     pub async fn handle_local_event(
         &mut self,
-        (_epoch, event): (Epoch, Event),
+        mut event: (Epoch, Event),
         tun: &mut Option<AsyncDevice>,
     ) -> Result<()> {
-        match event {
-            Event::Ready => {
-                if let Some(local) = &mut self.local {
-                    local.ready = true;
-                    crate::info!("local-exit: ready");
+        loop {
+            match event.1 {
+                Event::Ready => {
+                    if let Some(local) = &mut self.local {
+                        local.ready = true;
+                        crate::info!("local-exit: ready");
+                    }
+                }
+                Event::Checking | Event::RoundFailed => {
+                    if let Some(local) = &mut self.local {
+                        local.ready = false;
+                    }
+                }
+                Event::Packet(packet) => {
+                    let Some(delivery) = self.local.as_ref().map(|local| local.delivery.clone())
+                    else {
+                        return Ok(());
+                    };
+                    if !self.local_current(&packet) {
+                        return Ok(());
+                    }
+                    let tun = tun
+                        .as_ref()
+                        .context("local-exit packet without client TUN")?;
+                    // Same one-deadline flush as link packets: the packets
+                    // already queued behind this one share its timer.
+                    let (batch, deferred) = self.local_batch(delivery, packet);
+                    self.flush_tun_batch(tun, &batch).await?;
+                    match deferred {
+                        Some(next) => {
+                            event = next;
+                            continue;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Event::Closing { .. } => {
+                    // The local proxy never reports both-FIN closing (no FIN tracking);
+                    // only the remote flow owner marks a RoutedFlow closing.
+                }
+                Event::Closed { id, key } => {
+                    self.close_local(id, key, false);
                 }
             }
-            Event::Checking | Event::RoundFailed => {
-                if let Some(local) = &mut self.local {
-                    local.ready = false;
+            return Ok(());
+        }
+    }
+
+    /// A local-exit packet is current while its flow still targets the proxy
+    /// session that sent it.
+    fn local_current(&self, packet: &Packet) -> bool {
+        packet::parse(&packet.bytes, false).is_some_and(|parsed| {
+            matches!(self.routes.target(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
+        })
+    }
+
+    /// Gathers the local-exit packets queued behind `first`: at most
+    /// `TUN_BATCH`, only current ones, queue order kept. A queued non-packet
+    /// event stops the batch and is returned for handling after the flush,
+    /// so event order stays strict.
+    pub fn local_batch(
+        &mut self,
+        delivery: Arc<Delivery>,
+        first: Packet,
+    ) -> (TunBatch, Option<(Epoch, Event)>) {
+        let mut batch = Vec::with_capacity(TUN_BATCH);
+        batch.push((delivery, first));
+        while batch.len() < TUN_BATCH {
+            let next = self
+                .local
+                .as_mut()
+                .and_then(|local| local.events.as_mut()?.try_recv().ok());
+            match next {
+                Some((_, Event::Packet(packet))) => {
+                    if self.local_current(&packet)
+                        && let Some(delivery) =
+                            self.local.as_ref().map(|local| local.delivery.clone())
+                    {
+                        batch.push((delivery, packet));
+                    }
                 }
-            }
-            Event::Packet(packet) => {
-                let Some(local) = &self.local else {
-                    return Ok(());
-                };
-                let delivery = local.delivery.clone();
-                let bytes = packet.bytes;
-                let current = packet::parse(&bytes, false).is_some_and(|parsed| {
-                    matches!(self.routes.by_key.get(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
-                });
-                if !current {
-                    return Ok(());
-                }
-                let tun = tun
-                    .as_ref()
-                    .context("local-exit packet without client TUN")?;
-                let result =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&bytes)).await;
-                finish_write(&delivery, bytes.len(), result)?;
-            }
-            Event::Closed { id, key } => {
-                self.close_local(id, key, false);
+                Some(next) => return (batch, Some(next)),
+                None => return (batch, None),
             }
         }
-        Ok(())
+        (batch, None)
     }
 
     fn close_local(&mut self, id: u64, key: FlowKey, failed: bool) {
@@ -489,8 +506,8 @@ impl Hub {
         drop(local.outgoing);
         self.local_cleanup = Some(local.server);
         let mut retired = Vec::new();
-        self.routes.by_key.retain(|key, target| {
-            if matches!(target, Target::Direct(_)) {
+        self.routes.by_key.retain(|key, flow| {
+            if matches!(flow.target, Target::Direct(_)) {
                 retired.push(*key);
                 false
             } else {
@@ -587,103 +604,174 @@ impl Hub {
     /// drain: queued resets of a dying link must pass while owners are live.
     pub async fn handle_event(
         &mut self,
-        epoch: Epoch,
-        event: Event,
+        mut epoch: Epoch,
+        mut event: Event,
         tun: &mut Option<AsyncDevice>,
         params: &LinkParams,
         started: &mut Option<oneshot::Sender<()>>,
         hooks: &mut Hooks,
     ) -> Result<()> {
-        match event {
-            Event::Ready => {
-                let now = Instant::now();
-                if !self.pool.ready(epoch, now) {
-                    return Ok(());
-                }
-                // The first Ready pins the shared tunnel pair (#181); a link
-                // that negotiated another pair is retired — dropping its
-                // channel ends the session, and the retry insists on the pin.
-                let pair = self.links[epoch.link]
-                    .assigned
-                    .get()
-                    .copied()
-                    .unwrap_or((params.tun_addr, params.peer_addr));
-                // Bind the borrow to a temporary first: `match *self.pair.borrow()`
-                // keeps the read guard alive into the match arms, and the None
-                // arm's send_replace self-deadlocks on the write lock.
-                let pinned = *self.pair.borrow();
-                let (tun_addr, peer_addr) = match pinned {
-                    None => {
-                        self.pair.send_replace(Some(pair));
-                        pair
-                    }
-                    Some(pinned) if pinned == pair => pinned,
-                    Some(_) => {
-                        self.links[epoch.link].outgoing = None;
+        loop {
+            match event {
+                Event::Ready => {
+                    let now = Instant::now();
+                    if !self.pool.ready(epoch, now) {
                         return Ok(());
                     }
-                };
-                if tun.is_none() {
-                    *tun = Some(crate::create_tun(
-                        tun_addr,
-                        peer_addr,
-                        params.mtu,
-                        params.tun_name.as_deref(),
-                        true,
-                    )?);
-                    let name = tun
-                        .as_ref()
-                        .context("missing configured client TUN")?
-                        .name()?;
-                    self.start_local(&name, params).await?;
-                    hooks.start(name, tun_addr, peer_addr)?;
-                    if !hooks.starting() {
-                        self.announce_started(params, started);
+                    // The first Ready pins the shared tunnel pair (#181); a link
+                    // that negotiated another pair is retired — dropping its
+                    // channel ends the session, and the retry insists on the pin.
+                    let pair = self.links[epoch.link]
+                        .assigned
+                        .get()
+                        .copied()
+                        .unwrap_or((params.tun_addr, params.peer_addr));
+                    // Bind the borrow to a temporary first: `match *self.pair.borrow()`
+                    // keeps the read guard alive into the match arms, and the None
+                    // arm's send_replace self-deadlocks on the write lock.
+                    let pinned = *self.pair.borrow();
+                    let (tun_addr, peer_addr) = match pinned {
+                        None => {
+                            self.pair.send_replace(Some(pair));
+                            pair
+                        }
+                        Some(pinned) if pinned == pair => pinned,
+                        Some(_) => {
+                            self.links[epoch.link].outgoing = None;
+                            return Ok(());
+                        }
+                    };
+                    if tun.is_none() {
+                        *tun = Some(crate::create_tun(
+                            tun_addr,
+                            peer_addr,
+                            params.mtu,
+                            params.tun_name.as_deref(),
+                            true,
+                        )?);
+                        let name = tun
+                            .as_ref()
+                            .context("missing configured client TUN")?
+                            .name()?;
+                        self.start_local(&name, params).await?;
+                        hooks.start(name, tun_addr, peer_addr)?;
+                        if !hooks.starting() {
+                            self.announce_started(params, started);
+                        }
                     }
-                }
-                self.serving();
-            }
-            Event::Checking => {
-                if self.pool.checking(epoch) {
-                    crate::info!(
-                        "ssh[{}]: data path lost, control alive — checking",
-                        self.links[epoch.link].params.server
-                    );
                     self.serving();
                 }
+                Event::Checking => {
+                    if self.pool.checking(epoch) {
+                        crate::info!(
+                            "ssh[{}]: data path lost, control alive — checking",
+                            self.links[epoch.link].params.server
+                        );
+                        self.serving();
+                    }
+                }
+                Event::RoundFailed => {
+                    if self.pool.round_failed(epoch)? {
+                        crate::info!(
+                            "ssh[{}]: checking round failed, retry after backoff",
+                            self.links[epoch.link].params.server
+                        );
+                    }
+                }
+                Event::Packet(packet) => {
+                    if hooks.starting() {
+                        return Ok(());
+                    }
+                    let delivery = self.links[epoch.link].delivery.clone();
+                    if !self.pool.is_serving(epoch) {
+                        drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
+                        return Ok(());
+                    }
+                    if !self.routes.accepts(epoch, &packet) {
+                        drop_note(
+                            &delivery,
+                            &self.links,
+                            Some(epoch.link),
+                            "no owner for packet from link",
+                        );
+                        return Ok(());
+                    }
+                    let tun = tun.as_ref().context("ready server without client TUN")?;
+                    // Flush the packets already queued behind this one under a
+                    // single deadline: one timer per batch, not one per packet.
+                    let (batch, deferred) = self.tun_batch((delivery, packet));
+                    self.flush_tun_batch(tun, &batch).await?;
+                    match deferred {
+                        Some((next_epoch, next_event)) => {
+                            epoch = next_epoch;
+                            event = next_event;
+                            continue;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Event::Closing { id, key } => self.routes.mark_closing(key, Owner { epoch, id }),
+                Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
             }
-            Event::RoundFailed => {
-                if self.pool.round_failed(epoch)? {
-                    crate::info!(
-                        "ssh[{}]: checking round failed, retry after backoff",
-                        self.links[epoch.link].params.server
-                    );
+            return Ok(());
+        }
+    }
+
+    /// Gathers the packets queued behind `first` for one TUN flush: at most
+    /// `TUN_BATCH`, every one validated exactly like a lone packet, queue
+    /// order kept. A queued non-packet event stops the batch and is returned
+    /// for handling after the flush, so event order stays strict.
+    pub fn tun_batch(
+        &mut self,
+        first: (Arc<Delivery>, Packet),
+    ) -> (TunBatch, Option<(Epoch, Event)>) {
+        let mut batch = Vec::with_capacity(TUN_BATCH);
+        batch.push(first);
+        while batch.len() < TUN_BATCH {
+            match self.incoming.try_recv() {
+                Ok((epoch, Event::Packet(packet))) => {
+                    let delivery = self.links[epoch.link].delivery.clone();
+                    if !self.pool.is_serving(epoch) {
+                        drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
+                        continue;
+                    }
+                    if !self.routes.accepts(epoch, &packet) {
+                        drop_note(
+                            &delivery,
+                            &self.links,
+                            Some(epoch.link),
+                            "no owner for packet from link",
+                        );
+                        continue;
+                    }
+                    batch.push((delivery, packet));
                 }
+                Ok((epoch, event)) => return (batch, Some((epoch, event))),
+                Err(_) => return (batch, None),
             }
-            Event::Packet(packet) => {
-                if hooks.starting() {
-                    return Ok(());
-                }
-                let delivery = self.links[epoch.link].delivery.clone();
-                if !self.pool.is_serving(epoch) {
-                    drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
-                    return Ok(());
-                }
-                if !self.routes.accepts(epoch, &packet) {
-                    drop_note(
-                        &delivery,
-                        &self.links,
-                        Some(epoch.link),
-                        "no owner for packet from link",
-                    );
-                    return Ok(());
-                }
-                let tun = tun.as_ref().context("ready server without client TUN")?;
-                let result =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&packet.bytes)).await;
-                finish_write(&delivery, packet.bytes.len(), result)?;
+        }
+        (batch, None)
+    }
+
+    /// Writes a drained batch to the TUN under one deadline: the TUN is a
+    /// packet device, so every packet keeps its own write, but the whole
+    /// batch shares a single timer instead of one timeout per packet. Once
+    /// the deadline hits, the remaining packets drop exactly like individual
+    /// write timeouts.
+    async fn flush_tun_batch(&mut self, tun: &AsyncDevice, batch: &TunBatch) -> Result<()> {
+        let sleep = tokio::time::sleep_until(Instant::now() + TUN_WRITE_TIMEOUT);
+        tokio::pin!(sleep);
+        for (delivery, packet) in batch {
+            let result = std::future::poll_fn(|cx| match sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(None),
+                Poll::Pending => tun.poll_send(cx, &packet.bytes).map(Some),
+            })
+            .await;
+            if finish_write(delivery, packet.bytes.len(), result)?
+                && let Some(parsed) = packet::parse(&packet.bytes, false)
+            {
+                self.routes.record(parsed.flow, 0, packet.bytes.len());
             }
-            Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
         }
         Ok(())
     }
@@ -814,66 +902,6 @@ impl Hub {
         Some(epoch)
     }
 
-    /// Count one finished job, then reload whatever it asked for. A failed
-    /// reload keeps the previous table: the file on disk is the script's
-    /// responsibility, not ours to fix.
-    #[doc(hidden)]
-    pub fn handle_job_event(&mut self, event: JobEvent) {
-        self.job_stats.runs += 1;
-        match &event.status {
-            crate::job::JobStatus::Ok => {
-                // Only a successful job reloads: a failed script must not
-                // change routing (its file on disk is not ours to trust).
-                for table in &event.reload {
-                    match table {
-                        crate::job::Reload::Geo => self.reload_geo(&event.label),
-                        crate::job::Reload::Country => self.reload_country(&event.label),
-                    }
-                }
-            }
-            crate::job::JobStatus::Failed(_) => self.job_stats.failures += 1,
-            crate::job::JobStatus::Timeout => self.job_stats.timeouts += 1,
-        }
-    }
-
-    /// Re-read the ASN table from the configured path; the previous table
-    /// stays on any error. No policy on top of the loader.
-    pub fn reload_geo(&mut self, label: &str) {
-        let Some(path) = self.geo_path.clone() else {
-            return;
-        };
-        match crate::geo::Geo::load(&path) {
-            Ok(table) => {
-                crate::info!(
-                    "geo database reloaded (job {label}): {} IPv4 ranges",
-                    table.rows()
-                );
-                self.geo = Some(table);
-                self.geo_pending = None;
-            }
-            // Broken file, not ours to fix; keep serving the previous table.
-            Err(error) => crate::error!("job {label}: geo reload failed: {error:#}"),
-        }
-    }
-
-    /// Re-read the country table from the configured path; same contract.
-    pub fn reload_country(&mut self, label: &str) {
-        let Some(path) = self.country_path.clone() else {
-            return;
-        };
-        match crate::geo::Geo::load_country(&path) {
-            Ok(table) => {
-                crate::info!(
-                    "country database reloaded (job {label}): {} IPv4 ranges",
-                    table.rows()
-                );
-                self.country = Some(table);
-                self.country_pending = None;
-            }
-            Err(error) => crate::error!("job {label}: country reload failed: {error:#}"),
-        }
-    }
-
     /// Fold one resolver delivery into the block cache and the counters.
     fn apply_sticky_update(&mut self, update: crate::sticky::Update) {
         if update.ok {
@@ -969,12 +997,9 @@ impl Hub {
                         (*self.pair.borrow()).map_or(params.tun_addr, |(client, _)| client);
                     if let Some(reset) = self.dispatch(&buffer[..length], local)? {
                         let tun = tun.as_ref().context("TCP reset without client TUN")?;
-                        let result = tokio::time::timeout(
-                            Duration::from_millis(100),
-                            tun.send(&reset),
-                        )
-                        .await;
-                        finish_write(&self.links[0].delivery, reset.len(), result)?;
+                        let result =
+                            tokio::time::timeout(TUN_WRITE_TIMEOUT, tun.send(&reset)).await;
+                        finish_write(&self.links[0].delivery, reset.len(), result.ok())?;
                     }
                 }
                 event = self.incoming.recv() => {
@@ -1117,8 +1142,12 @@ impl Hub {
                 && packet::parse(&packet.bytes, false).is_some_and(|p| p.is_rst)
                 && let Some(tun) = tun.as_ref()
             {
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&packet.bytes)).await;
+                let result = tokio::time::timeout(TUN_WRITE_TIMEOUT, tun.send(&packet.bytes)).await;
+                if matches!(result, Ok(Ok(n)) if n == packet.bytes.len())
+                    && let Some(parsed) = packet::parse(&packet.bytes, false)
+                {
+                    self.routes.record(parsed.flow, 0, packet.bytes.len());
+                }
                 continue;
             }
             self.handle_event(queued_epoch, queued, tun, params, started, hooks)
@@ -1195,122 +1224,7 @@ pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
     }
 }
 
-/// Start the episodic name resolver when any sticky block selects by name.
-/// The task resolves every due block in order (first resolve immediately),
-/// purges IPs missing from two refreshes, and stops on shutdown or when the
-/// hub drops the receiving end.
-/// Start the job scheduler when any job is configured. Attempts begin at
-/// startup (each one gated by `run_if`) and repeat every `every`; a still
-/// running job delays its next attempt instead of stacking.
-fn spawn_job_scheduler(
-    context: &JobContext,
-    shutdown: &mut watch::Receiver<bool>,
-) -> (
-    Option<mpsc::Receiver<JobEvent>>,
-    Option<tokio::task::JoinHandle<()>>,
-) {
-    if context.specs.is_empty() {
-        return (None, None);
-    }
-    let (tx, rx) = mpsc::channel(16);
-    let mut shutdown = shutdown.clone();
-    let specs = context.specs.clone();
-    let env = context.env();
-    let task = tokio::spawn(async move {
-        let mut next: Vec<tokio::time::Instant> =
-            specs.iter().map(|_| tokio::time::Instant::now()).collect();
-        // The whole attempt — run_if gate plus the payload — lives inside the
-        // slot's own task: a slow or stuck check delays only its own job and
-        // never the scheduler loop or shutdown. None means run_if skipped.
-        type Attempt = Option<(crate::job::JobStatus, String)>;
-        let mut in_flight: Vec<Option<tokio::task::JoinHandle<Attempt>>> =
-            specs.iter().map(|_| None).collect();
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                () = tokio::time::sleep_until(next.iter().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))) => {
-                    let now = tokio::time::Instant::now();
-                    for slot in 0..specs.len() {
-                        if next[slot] > now {
-                            continue;
-                        }
-                        if let Some(handle) = &mut in_flight[slot] {
-                            if !handle.is_finished() {
-                                next[slot] = now + Duration::from_secs(1);
-                                continue;
-                            }
-                            let outcome = handle.await.unwrap_or(Some((
-                                crate::job::JobStatus::Failed("scheduler join failed".to_owned()),
-                                String::new(),
-                            )));
-                            in_flight[slot] = None;
-                            next[slot] = now + specs[slot].every;
-                            let Some((status, tail)) = outcome else {
-                                continue; // run_if decided there is no work
-                            };
-                            let spec = &specs[slot];
-                            crate::job::log_run(spec, &status, &tail);
-                            if tx
-                                .send(JobEvent {
-                                    label: spec.label.clone(),
-                                    status,
-                                    tail,
-                                    reload: spec.reload.clone(),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return; // hub is gone
-                            }
-                            continue;
-                        }
-                        let spec = specs[slot].clone();
-                        let mut slot_env: Vec<(String, String)> = env.clone();
-                        for (key, value) in &mut slot_env {
-                            if key == "SVPN_JOB" {
-                                value.push_str(&spec.label);
-                            }
-                        }
-                        in_flight[slot] = Some(tokio::spawn(async move {
-                            // The run_if gate: 0 — there is work, anything
-                            // else — a cheap skip; a broken check never
-                            // blind-runs the payload.
-                            if let Some(check) = &spec.run_if {
-                                let check_spec = crate::job::JobSpec {
-                                    label: spec.label.clone(),
-                                    every: spec.every,
-                                    timeout: spec.timeout,
-                                    run_if: None,
-                                    run: check.clone(),
-                                    reload: Vec::new(),
-                                };
-                                match crate::job::run(&check_spec, &slot_env).await.0 {
-                                    crate::job::JobStatus::Ok => {}
-                                    crate::job::JobStatus::Failed(reason) => {
-                                        if reason.contains("spawn failed") {
-                                            crate::error!("job {}: run_if broken: {reason}", spec.label);
-                                        } else {
-                                            crate::info!("job: {} up-to-date, skipped", spec.label);
-                                        }
-                                        return None;
-                                    }
-                                    crate::job::JobStatus::Timeout => {
-                                        crate::error!("job {}: run_if timed out", spec.label);
-                                        return None;
-                                    }
-                                }
-                            }
-                            Some(crate::job::run(&spec, &slot_env).await)
-                        }));
-                        next[slot] = now + Duration::from_millis(100);
-                    }
-                }
-            }
-        }
-    });
-    (Some(rx), Some(task))
-}
-
+/// Start the episodic name resolver for name selectors.
 fn spawn_sticky_resolver(
     stickies: &[crate::sticky::RuntimeSticky],
     shutdown: &mut watch::Receiver<bool>,
@@ -1467,7 +1381,8 @@ pub async fn run(
         geo_pending,
         country_pending,
     } = exits;
-    let (job_events, job_task) = spawn_job_scheduler(&jobs, &mut shutdown);
+    let job_stats = JobStats::new(&jobs.specs, geo.is_some(), country.is_some());
+    let (job_events, job_task) = jobs::spawn_scheduler(&jobs, &mut shutdown);
     ensure!(!servers.is_empty(), "no servers configured");
     let stickies: Vec<crate::sticky::RuntimeSticky> = sticky_blocks
         .into_iter()
@@ -1523,7 +1438,7 @@ pub async fn run(
         policy: exits_policy,
         job_events,
         job_task,
-        job_stats: JobStats::default(),
+        job_stats,
         geo_path: jobs.geo_db,
         country_path: jobs.country_db,
         geo_pending,
@@ -1573,8 +1488,9 @@ pub async fn run(
         Some(addr) => {
             let listener = crate::web::bind(addr).await?;
             let (tx, rx) = watch::channel(crate::web::snapshot(&hub));
+            let geo_path = hub.geo_path.clone();
             let task = tokio::spawn(async move {
-                if let Err(error) = crate::web::serve(listener, rx).await {
+                if let Err(error) = crate::web::serve(listener, rx, geo_path).await {
                     crate::error!("dashboard: {error:#}");
                 }
             });
@@ -1659,18 +1575,22 @@ pub(crate) fn link_state(pool: &Pool, link: &Link, index: usize) -> &'static str
     "failed"
 }
 
+/// Accounting for one TUN write: a fully written packet counts as received,
+/// a missed deadline (`None`) or a failed/short write as dropped. Real write
+/// errors abort the run like the write itself would.
 pub fn finish_write(
     delivery: &Delivery,
     length: usize,
-    result: Result<std::io::Result<usize>, tokio::time::error::Elapsed>,
-) -> Result<()> {
+    result: Option<std::io::Result<usize>>,
+) -> Result<bool> {
+    let written = matches!(&result, Some(Ok(n)) if *n == length);
     match result {
-        Ok(Ok(written)) if written == length => delivery.received(length),
-        Err(_) => {
+        Some(Ok(written)) if written == length => delivery.received(length),
+        None => {
             delivery.dropped();
             crate::error!("vpn: dropped packet — client TUN write timeout");
         }
-        Ok(result) => {
+        Some(result) => {
             delivery.dropped();
             crate::error!("vpn: dropped packet — failed client TUN write");
             ensure!(
@@ -1679,5 +1599,5 @@ pub fn finish_write(
             );
         }
     }
-    Ok(())
+    Ok(written)
 }

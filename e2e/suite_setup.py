@@ -139,12 +139,21 @@ def remote(script, **kwargs):
 
 
 def snapshot():
-    return remote(
+    result = remote(
         "ip -4 -6 route show; cat /etc/resolv.conf; "
         "sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding; "
         "iptables-save | sed -E '/^# (Generated|Completed)/d; s/\\[[0-9]+:[0-9]+\\]/[0:0]/g'; "
         "nft list ruleset | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/g'"
     ).stdout
+    # nft emits this banner on stderr, so its position relative to stdout varies.
+    return "".join(
+        line
+        for line in result.splitlines(keepends=True)
+        if not (
+            line.startswith("# Warning: table ")
+            and line.rstrip().endswith(" is managed by iptables-nft, do not touch!")
+        )
+    )
 
 
 def assert_snapshot(before):

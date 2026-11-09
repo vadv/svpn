@@ -90,6 +90,8 @@ pub struct Decoder {
     /// while the rest of the frame arrives into the buffer.
     pub pending_len: Option<usize>,
     buf: Vec<u8>,
+    /// Reused header buffer: each data frame opens its length block into it.
+    header: Vec<u8>,
 }
 
 impl Decoder {
@@ -99,6 +101,7 @@ impl Decoder {
             ssh: None,
             pending_len: None,
             buf: Vec::new(),
+            header: Vec::new(),
         }
     }
 
@@ -122,6 +125,7 @@ impl Decoder {
             ssh: Some(steps.into()),
             pending_len: None,
             buf: Vec::new(),
+            header: Vec::new(),
         }
     }
 
@@ -239,10 +243,10 @@ impl Decoder {
                 if self.buf.len() < SSH_HEADER {
                     return Ok(None);
                 }
-                let length = cipher
-                    .open(&self.buf[..SSH_HEADER])
+                cipher
+                    .open_into(&self.buf[..SSH_HEADER], &mut self.header)
                     .context("SSH frame header authentication failed")?;
-                let len = u32::from_be_bytes(length.as_slice().try_into()?) as usize;
+                let len = u32::from_be_bytes(self.header.as_slice().try_into()?) as usize;
                 ensure!(len <= MAX_PAYLOAD, "TCP frame too large");
                 self.pending_len = Some(len);
                 len
@@ -286,6 +290,21 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     bytes.extend_from_slice(payload);
     Ok(bytes)
+}
+
+/// Frame with a sealed packet: the same wire shape as `frame`, built in one
+/// buffer without an intermediate sealed copy.
+pub fn frame_sealed(cipher: &mut Cipher, packet: &[u8]) -> Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(4 + 8 + packet.len() + 16);
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    cipher.seal_into(&mut frame, packet)?;
+    ensure!(
+        frame.len() - 4 <= MAX_PAYLOAD,
+        "TCP frame payload too large"
+    );
+    let len = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&len.to_be_bytes());
+    Ok(frame)
 }
 
 /// Binding frame payload: token + first cipher packet.
@@ -396,11 +415,13 @@ pub fn ssh_binding_frame(token: &[u8; TOKEN_BYTES], sealed: &[u8]) -> Result<Vec
 
 /// L2 data frame — AEAD appearance: [seal(u32 block length)][sealed
 /// packet]. Fixed-size header; the receiver opens it with the same flow
-/// cipher; no new crypto primitives.
+/// cipher; no new crypto primitives. One buffer, two seals — the wire shape is
+/// lock-step camouflage and must stay byte-for-byte.
 pub fn ssh_frame(cipher: &mut Cipher, payload: &[u8]) -> Result<Vec<u8>> {
     let sealed_len = (payload.len() + 8 + 16) as u32;
-    let mut frame = cipher.seal(&sealed_len.to_be_bytes())?;
-    frame.extend_from_slice(&cipher.seal(payload)?);
+    let mut frame = Vec::with_capacity(2 * SSH_HEADER + payload.len());
+    cipher.seal_into(&mut frame, &sealed_len.to_be_bytes())?;
+    cipher.seal_into(&mut frame, payload)?;
     Ok(frame)
 }
 

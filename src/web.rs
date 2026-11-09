@@ -4,9 +4,13 @@
 //! shapes it and (in `serve`) hands the latest one over HTTP. Nothing here
 //! changes routing.
 
+pub mod asn;
+pub mod lan;
+
 use std::{
     net::SocketAddr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -18,12 +22,13 @@ use tokio::{
 };
 
 use crate::{
-    control::Stats,
+    control::{RoundReport, Stats},
     hub::{Hub, JobStats, StickyStats, Target},
+    proc_stats::ProcessView,
 };
 
 /// One server of the pool with its traffic counters.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ServerView {
     pub index: usize,
     /// Stable node id (the configured `server` string).
@@ -31,6 +36,12 @@ pub struct ServerView {
     pub label: String,
     pub server: String,
     pub weight: u32,
+    /// Configured camouflage candidates; empty means automatic selection.
+    pub mimic: Vec<crate::mimic::MimicArg>,
+    /// Live selection view: the transport in use and why it won.
+    pub selection: SelectionView,
+    /// Country of the server address from the loaded table; null without one.
+    pub country: Option<String>,
     /// ready, checking, connecting, backoff or failed.
     pub state: &'static str,
     /// Why the link last failed.
@@ -38,10 +49,27 @@ pub struct ServerView {
     pub stats: Stats,
 }
 
+/// Live transport selection of one server: the transport in use and the
+/// race that picked it.
+#[derive(Clone, Serialize)]
+pub struct SelectionView {
+    /// Transport in use right now (`quic`, `mosh`, `tcp-ssh`, …); null
+    /// before the first verified round.
+    pub active: Option<String>,
+    /// The last completed selection round; null before the first verdict.
+    pub round: Option<RoundReport>,
+}
+
 /// One sticky block: what it matches and which server serves it.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RuleView {
+    pub index: usize,
     pub label: String,
+    pub kind: &'static str,
+    pub local: bool,
+    /// Allowed remote node ids, distinct from the group's current owner.
+    pub candidates: Vec<String>,
+    pub traffic: TrafficView,
     pub selector: String,
     pub via: String,
     pub every_secs: u64,
@@ -50,15 +78,35 @@ pub struct RuleView {
     pub owner: Option<String>,
 }
 
+/// Per-rule IP traffic since client start, including retired flows.
+/// `active_flows` counts open flows only; closing ones are separate.
+#[derive(Default, Clone, Serialize)]
+pub struct TrafficView {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub active_flows: usize,
+    pub closing_flows: usize,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DatabaseView {
+    pub kind: &'static str,
+    pub configured: bool,
+    pub loaded: bool,
+    pub pending: Option<String>,
+    pub rows: usize,
+    pub status: crate::hub::jobs::DatabaseStatus,
+}
+
 /// One pinned destination group and the server that serves it.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GroupView {
     pub group: String,
     pub server: String,
 }
 
 /// Local exit: readiness and counters.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct LocalView {
     pub enabled: bool,
     pub ready: bool,
@@ -66,22 +114,44 @@ pub struct LocalView {
     pub failed: u64,
     pub closed: u64,
     pub active_flows: usize,
+    pub closing_flows: usize,
 }
 
 /// One active client flow and where it goes.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FlowView {
+    pub rule: Option<usize>,
     pub protocol: &'static str,
     pub source: String,
     pub destination: String,
+    /// Destination metadata from the loaded tables, independent of routing policy.
+    pub country: Option<String>,
+    pub asn: Option<u32>,
     /// Server node id, or `local`.
     pub via: String,
+    /// Both FINs seen: the flow is closing, not open.
+    pub closing: bool,
+    /// LAN device behind the router's masquerade, from conntrack; null for
+    /// the router's own flows or without conntrack.
+    pub client: Option<String>,
+    /// DHCP hostname of `client`; null without a lease name.
+    pub client_name: Option<String>,
+    /// This flow's bytes since the hub first saw it; the dashboard derives rates.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// Seconds since the hub first saw the flow and since its last packet.
+    pub age_secs: u64,
+    pub idle_secs: u64,
 }
 
 /// Everything the dashboard shows.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Snapshot {
     pub generated_at: u64,
+    pub generated_at_ms: u64,
+    pub started_at: u64,
+    pub fallback: TrafficView,
+    pub databases: Vec<DatabaseView>,
     /// balance or sticky-asn.
     pub policy: &'static str,
     pub asn_table: bool,
@@ -93,6 +163,8 @@ pub struct Snapshot {
     pub local: LocalView,
     pub flows: Vec<FlowView>,
     pub jobs: JobStats,
+    /// Resource usage of the svpn process itself. Each field may be null.
+    pub process: ProcessView,
 }
 
 /// Snapshot of the client state for the dashboard.
@@ -101,22 +173,72 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         .links
         .iter()
         .enumerate()
-        .map(|(index, link)| ServerView {
-            index,
-            id: node_id(hub, index),
-            label: link.params.label.clone(),
-            server: link.params.server.clone(),
-            weight: link.params.weight,
-            state: crate::hub::link_state(&hub.pool, link, index),
-            reason: link.last_reason.clone(),
-            stats: link_counters(link),
+        .map(|(index, link)| {
+            let stats = link_counters(link);
+            ServerView {
+                index,
+                id: node_id(hub, index),
+                label: link.params.label.clone(),
+                server: link.params.server.clone(),
+                weight: link.params.weight,
+                mimic: link.params.mimic.clone(),
+                state: crate::hub::link_state(&hub.pool, link, index),
+                reason: link.last_reason.clone(),
+                selection: SelectionView {
+                    active: stats.active_candidate.clone(),
+                    round: stats.last_round.clone(),
+                },
+                // shortcut: only an IPv4 literal gets a country, a hostname stays null —
+                // keep the startup resolution on the link if hostnames become common.
+                country: hub
+                    .country
+                    .as_ref()
+                    .zip(link.params.server.parse().ok())
+                    .and_then(|(table, ip)| table.lookup(ip))
+                    .map(crate::geo::unpack_country),
+                stats,
+            }
         })
         .collect();
+    let mut active = std::collections::HashMap::<Option<usize>, usize>::new();
+    let mut closing = std::collections::HashMap::<Option<usize>, usize>::new();
+    for flow in hub.routes.by_key.values() {
+        if flow.closing {
+            *closing.entry(flow.rule).or_default() += 1;
+        } else {
+            *active.entry(flow.rule).or_default() += 1;
+        }
+    }
+    let traffic = |rule| {
+        let totals = hub.routes.traffic.get(&rule).copied().unwrap_or_default();
+        TrafficView {
+            rx_bytes: totals.rx_bytes,
+            tx_bytes: totals.tx_bytes,
+            active_flows: active.get(&rule).copied().unwrap_or(0),
+            closing_flows: closing.get(&rule).copied().unwrap_or(0),
+        }
+    };
     let rules = hub
         .stickies
         .iter()
-        .map(|runtime| RuleView {
+        .enumerate()
+        .map(|(index, runtime)| RuleView {
+            index,
             label: runtime.block.label.clone(),
+            kind: match &runtime.block.selector {
+                crate::sticky::Selector::Names(_) => "names",
+                crate::sticky::Selector::Countries(_) => "countries",
+                crate::sticky::Selector::Ips(_) => "ips",
+                crate::sticky::Selector::Asn(_) => "asn",
+            },
+            local: matches!(runtime.block.via, crate::sticky::Via::Local),
+            candidates: match hub.sticky_via.get(index) {
+                Some(crate::sticky::ResolvedVia::Links(links)) => {
+                    links.iter().map(|&link| node_id(hub, link)).collect()
+                }
+                _ => Vec::new(),
+            },
+            traffic: traffic(Some(index)),
             selector: runtime.block.selector.to_string(),
             via: runtime.block.via.to_string(),
             every_secs: runtime.block.every.as_secs(),
@@ -136,18 +258,36 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         })
         .collect();
     groups.sort_by(|a, b| a.group.cmp(&b.group));
+    let now = Instant::now();
     let mut flows: Vec<FlowView> = hub
         .routes
         .by_key
         .iter()
-        .map(|(key, target)| FlowView {
+        .map(|(key, flow)| FlowView {
+            rule: flow.rule,
             protocol: protocol_name(key.protocol),
             source: endpoint(key.source, key.source_port),
             destination: endpoint(key.destination, key.destination_port),
-            via: match target {
+            country: hub
+                .country
+                .as_ref()
+                .and_then(|table| table.lookup(key.destination))
+                .map(crate::geo::unpack_country),
+            asn: hub
+                .geo
+                .as_ref()
+                .and_then(|table| table.lookup(key.destination)),
+            via: match flow.target {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
             },
+            closing: flow.closing,
+            client: None,
+            client_name: None,
+            rx_bytes: flow.traffic.rx_bytes,
+            tx_bytes: flow.traffic.tx_bytes,
+            age_secs: now.saturating_duration_since(flow.opened).as_secs(),
+            idle_secs: now.saturating_duration_since(flow.active).as_secs(),
         })
         .collect();
     flows.sort_by(|a, b| {
@@ -160,21 +300,54 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             opened: hub.local_stats.opened,
             failed: hub.local_stats.failed,
             closed: hub.local_stats.closed,
+            // shortcut: the local proxy tracks no TCP FIN close, so local-exit
+            // flows are never marked closing — track FINs there if needed.
+            closing_flows: 0,
             active_flows: local.latest.borrow().active_flows,
         },
         None => LocalView {
-            enabled: false,
+            enabled: hub
+                .sticky_via
+                .iter()
+                .any(|via| matches!(via, crate::sticky::ResolvedVia::Local)),
             ready: false,
             opened: hub.local_stats.opened,
             failed: hub.local_stats.failed,
             closed: hub.local_stats.closed,
+            closing_flows: 0,
             active_flows: 0,
         },
     };
+    let generated = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     Snapshot {
-        generated_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs()),
+        generated_at: generated.as_secs(),
+        generated_at_ms: generated.as_millis().min(u128::from(u64::MAX)) as u64,
+        started_at: hub.job_stats.started_at,
+        fallback: traffic(None),
+        databases: vec![
+            DatabaseView {
+                kind: "geo",
+                configured: hub.geo_path.is_some()
+                    || hub.geo.is_some()
+                    || hub.geo_pending.is_some(),
+                loaded: hub.geo.is_some(),
+                pending: hub.geo_pending.clone(),
+                rows: hub.geo.as_ref().map_or(0, crate::geo::Geo::rows),
+                status: hub.job_stats.geo.clone(),
+            },
+            DatabaseView {
+                kind: "country",
+                configured: hub.country_path.is_some()
+                    || hub.country.is_some()
+                    || hub.country_pending.is_some(),
+                loaded: hub.country.is_some(),
+                pending: hub.country_pending.clone(),
+                rows: hub.country.as_ref().map_or(0, crate::geo::Geo::rows),
+                status: hub.job_stats.country.clone(),
+            },
+        ],
         policy: match hub.policy {
             crate::cli::ExitPolicy::Balance => "balance",
             crate::cli::ExitPolicy::StickyAsn => "sticky-asn",
@@ -187,7 +360,8 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         groups,
         local,
         flows,
-        jobs: hub.job_stats,
+        jobs: hub.job_stats.clone(),
+        process: crate::proc_stats::sample(),
     }
 }
 
@@ -244,6 +418,8 @@ pub const MAX_HEAD: usize = 8 * 1024;
 
 /// One user, one tab: a stalled peer must not hold the listener or an FD.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound sockets and file buffers even when several browsers download the CSV.
+pub const MAX_CONNECTIONS: usize = 8;
 
 /// Bind the dashboard socket. Only loopback is allowed: the dashboard is
 /// private state and the browser of another host must not reach it.
@@ -257,25 +433,49 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
         .with_context(|| format!("bind dashboard {addr}"))
 }
 
-/// Serve the dashboard until the process ends. Requests are handled in order:
-/// aborting this task on shutdown also drops the in-flight connection.
-pub async fn serve(listener: TcpListener, snapshots: watch::Receiver<Snapshot>) -> Result<()> {
+/// Serve until shutdown. Bounded concurrent requests let CSV downloads run
+/// without holding up snapshots. Dropping the JoinSet closes every connection.
+pub async fn serve(
+    listener: TcpListener,
+    snapshots: watch::Receiver<Snapshot>,
+    geo_path: Option<PathBuf>,
+) -> Result<()> {
+    let mut requests = tokio::task::JoinSet::new();
+    // One shared cache for every request task: the spawned futures are
+    // 'static, so the tables are parsed behind an Arc, once per second.
+    let lan = std::sync::Arc::new(lan::Cache::new());
     loop {
-        let (stream, peer) = listener.accept().await.context("dashboard accept")?;
-        if !peer.ip().is_loopback() {
-            continue;
-        }
-        match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, &snapshots)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => crate::warn!("dashboard: {error:#}"),
-            Err(_) => crate::warn!("dashboard: request timed out"),
+        tokio::select! {
+            finished = requests.join_next(), if !requests.is_empty() => match finished {
+                Some(Ok(Err(error))) => crate::warn!("dashboard: {error:#}"),
+                Some(Err(error)) => crate::warn!("dashboard request task: {error}"),
+                _ => {}
+            },
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted.context("dashboard accept")?;
+                if !peer.ip().is_loopback() || requests.len() >= MAX_CONNECTIONS { continue; }
+                let snapshots = snapshots.clone();
+                let path = geo_path.clone();
+                let lan = std::sync::Arc::clone(&lan);
+                requests.spawn(async move {
+                    handle(stream, &snapshots, path.as_deref(), &lan).await
+                });
+            }
         }
     }
 }
 
-/// Answer one request: `/api/state` as JSON, `/` as HTML, nothing else.
-async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) -> Result<()> {
-    let Some(head) = read_head(&mut stream).await? else {
+/// Answer the read-only snapshot and the embedded page/modules, nothing else.
+async fn handle(
+    mut stream: TcpStream,
+    snapshots: &watch::Receiver<Snapshot>,
+    geo_path: Option<&Path>,
+    lan: &lan::Cache,
+) -> Result<()> {
+    let Some(head) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut stream))
+        .await
+        .context("dashboard read timeout")??
+    else {
         return Ok(());
     };
     let mut lines = head.lines();
@@ -304,8 +504,27 @@ async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) ->
     }
     match path {
         "/api/state" => {
-            let json = serde_json::to_vec(&*snapshots.borrow())?;
+            // Enriched here, not in the hub: conntrack reads belong to this
+            // request task, never to the packet loop that builds snapshots.
+            let mut snapshot = snapshots.borrow().clone();
+            lan.enrich(&mut snapshot.flows).await;
+            let json = serde_json::to_vec(&snapshot)?;
             respond(&mut stream, 200, "application/json", &json).await
+        }
+        "/api/asn.csv" => {
+            let loaded = snapshots.borrow().asn_table;
+            match geo_path {
+                Some(path) if loaded => asn::serve_csv(&mut stream, path).await,
+                _ => {
+                    respond(
+                        &mut stream,
+                        404,
+                        "text/plain; charset=utf-8",
+                        b"ASN database not loaded",
+                    )
+                    .await
+                }
+            }
         }
         "/" => {
             respond(
@@ -313,6 +532,24 @@ async fn handle(mut stream: TcpStream, snapshots: &watch::Receiver<Snapshot>) ->
                 200,
                 "text/html; charset=utf-8",
                 PAGE.as_bytes(),
+            )
+            .await
+        }
+        "/dashboard.mjs" => {
+            respond(
+                &mut stream,
+                200,
+                "text/javascript; charset=utf-8",
+                include_bytes!("web/dashboard.mjs"),
+            )
+            .await
+        }
+        "/state.mjs" => {
+            respond(
+                &mut stream,
+                200,
+                "text/javascript; charset=utf-8",
+                include_bytes!("web/state.mjs"),
             )
             .await
         }
@@ -374,32 +611,42 @@ async fn respond(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        stream
+            .write_all(response_head(status, content_type, body.len() as u64).as_bytes())
+            .await
+            .context("write head")?;
+        stream.write_all(body).await.context("write body")?;
+        stream.flush().await.context("flush body")?;
+        Ok(())
+    })
+    .await
+    .context("dashboard write timeout")?
+}
+
+fn response_head(status: u16, content_type: &str, length: u64) -> String {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let allow = if status == 405 { "allow: GET\r\n" } else { "" };
-    let head = format!(
+    format!(
         "HTTP/1.1 {status} {reason}\r\n\
          {allow}\
          content-type: {content_type}\r\n\
          content-length: {}\r\n\
          cache-control: no-store\r\n\
          x-content-type-options: nosniff\r\n\
+         content-security-policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\
+         referrer-policy: no-referrer\r\n\
          connection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .context("write head")?;
-    stream.write_all(body).await.context("write body")?;
-    stream.flush().await.context("flush body")?;
-    Ok(())
+        length
+    )
 }
 
-/// The dashboard page: a single file with the state tables.
+/// Embedded assets: no runtime files, external hosts or frontend dependencies.
 const PAGE: &str = include_str!("web/index.html");

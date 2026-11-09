@@ -56,6 +56,58 @@ fn tampering_wrong_key_and_wrong_flow_are_rejected() {
     assert!(Cipher::new([7; 16], 43, false).open(&packet).is_err());
 }
 
+// ── seal_into / open_into ──
+
+#[test]
+fn seal_into_appends_without_touching_existing_bytes() {
+    // Captured from the pre-seal_into implementation — the wire bytes are lock-step.
+    const SEALED: [u8; 30] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0x8a, 0xfa, 0x7b, 0xd6, 0xdd, 0xbd, 0xd9, 0xca, 0xf8, 0x13, 0xbe,
+        0xb5, 0x46, 0x11, 0x80, 0x82, 0x70, 0xca, 0x32, 0x4b, 0xff, 0x3c,
+    ];
+    const CONTINUED: [u8; 24] = [
+        0, 0, 0, 0, 0, 0, 0, 1, 0x74, 0xbc, 0xa0, 0x9d, 0x0c, 0x63, 0x6c, 0xa0, 0x51, 0xb5, 0x5d,
+        0xee, 0x8f, 0x88, 0xb9, 0x4f,
+    ];
+    let mut client = Cipher::new([7; 16], 42, true);
+    let mut out = b"prefix".to_vec();
+    client.seal_into(&mut out, b"vector").unwrap();
+    assert_eq!(&out[..6], b"prefix");
+    assert_eq!(out[6..], SEALED);
+    // A fresh `seal` produces the same bytes, and a second append continues the seq.
+    assert_eq!(
+        Cipher::new([7; 16], 42, true).seal(b"vector").unwrap(),
+        SEALED
+    );
+    client.seal_into(&mut out, &[]).unwrap();
+    assert_eq!(out[6 + SEALED.len()..], CONTINUED);
+}
+
+#[test]
+fn open_into_round_trips_seal_into_and_rejects_tampering() {
+    let mut client = Cipher::new([7; 16], 42, true);
+    let mut server = Cipher::new([7; 16], 42, false);
+    let mut wire = Vec::new();
+    client.seal_into(&mut wire, b"first").unwrap();
+    let second = wire.len();
+    client.seal_into(&mut wire, b"second").unwrap();
+    let mut plain = b"stale".to_vec();
+    // Out-of-order open exercises the replay window; contents are replaced, not appended.
+    server.open_into(&wire[second..], &mut plain).unwrap();
+    assert_eq!(plain, b"second");
+    server.open_into(&wire[..second], &mut plain).unwrap();
+    assert_eq!(plain, b"first");
+    for index in 0..wire.len() {
+        let mut bad = wire.clone();
+        bad[index] ^= 1;
+        assert!(
+            Cipher::new([7; 16], 42, false)
+                .open_into(&bad, &mut plain)
+                .is_err()
+        );
+    }
+}
+
 // ── replay window ──
 
 #[test]

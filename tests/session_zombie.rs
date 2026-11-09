@@ -69,9 +69,7 @@ async fn proven_slots_are_never_displaced_and_the_refusal_resets() {
             "the refusal is a reset"
         );
         let mut routes = Routes::default();
-        routes
-            .by_key
-            .insert(key, Target::Remote(Owner { epoch, id }));
+        routes.insert(key, Target::Remote(Owner { epoch, id }), None);
         assert_eq!(reset.id, id, "the reset rides the flow's owner id");
         assert!(
             routes.accepts(epoch, &reset),
@@ -212,13 +210,15 @@ async fn target_reset_does_not_prove_the_flow() {
             session.has_flow(1),
             "a target reset leaves the decision to the client"
         );
-        let budget = svpn::selector::FLOW_BUDGET;
-        advance(budget - Duration::from_secs(1)).await;
+        advance(RST_DWELL - Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
         assert!(session.has_flow(1));
         advance(Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
-        assert!(!session.has_flow(1), "a reset answer proves nothing");
+        assert!(
+            !session.has_flow(1),
+            "a reset answer proves nothing and ends the flow"
+        );
     }
 }
 

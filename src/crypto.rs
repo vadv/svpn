@@ -1,5 +1,5 @@
 use aes_gcm::{AeadInPlace, Aes128Gcm, KeyInit};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use zeroize::Zeroize;
 
 pub const MAX_PLAINTEXT: usize = 1401;
@@ -68,7 +68,15 @@ impl Cipher {
         }
     }
 
+    /// Sealed packet in a fresh buffer; `seal_into` for the allocation-free form.
     pub fn seal(&mut self, plain: &[u8]) -> Result<Vec<u8>> {
+        let mut packet = Vec::with_capacity(8 + plain.len() + TAG_BYTES);
+        self.seal_into(&mut packet, plain)?;
+        Ok(packet)
+    }
+
+    /// Appends `seq || ciphertext || tag` to `out`, leaving its existing bytes untouched.
+    pub fn seal_into(&mut self, out: &mut Vec<u8>, plain: &[u8]) -> Result<()> {
         ensure!(plain.len() <= MAX_PLAINTEXT, "UDP plaintext too large");
         ensure!(self.next < MAX_PACKETS, "UDP key packet budget exhausted");
         let blocks = block_cost(plain.len());
@@ -80,18 +88,31 @@ impl Cipher {
         // The nonce is consumed both on an encryption failure and on a failed UDP send.
         self.next += 1;
         self.sent_blocks += blocks;
-        let mut packet = Vec::with_capacity(8 + plain.len() + TAG_BYTES);
-        packet.extend_from_slice(&sequence.to_be_bytes());
-        packet.extend_from_slice(plain);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(&nonce(sequence).into(), &self.aad, &mut packet[8..])
-            .map_err(|_| anyhow!("UDP encryption failed"))?;
-        packet.extend_from_slice(&tag);
-        Ok(packet)
+        let body = out.len();
+        out.extend_from_slice(&sequence.to_be_bytes());
+        out.extend_from_slice(plain);
+        let Ok(tag) = self.cipher.encrypt_in_place_detached(
+            &nonce(sequence).into(),
+            &self.aad,
+            &mut out[body + 8..],
+        ) else {
+            // Never leave plaintext behind in a buffer that is about to be sent.
+            out.truncate(body);
+            bail!("UDP encryption failed");
+        };
+        out.extend_from_slice(&tag);
+        Ok(())
     }
 
+    /// Opened plaintext in a fresh buffer; `open_into` for the allocation-free form.
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+        let mut plain = Vec::with_capacity(packet.len().saturating_sub(8 + TAG_BYTES));
+        self.open_into(packet, &mut plain)?;
+        Ok(plain)
+    }
+
+    /// Replaces the contents of `out` with the opened plaintext.
+    pub fn open_into(&mut self, packet: &[u8], out: &mut Vec<u8>) -> Result<()> {
         ensure!(
             (8 + TAG_BYTES..=8 + MAX_PLAINTEXT + TAG_BYTES).contains(&packet.len()),
             InvalidPacket("invalid UDP length")
@@ -113,19 +134,20 @@ impl Cipher {
             "UDP key block budget exhausted"
         );
         let (body, tag) = packet.split_at(end);
-        let mut plain = body[8..].to_vec();
+        out.clear();
+        out.extend_from_slice(&body[8..]);
         self.cipher
             .decrypt_in_place_detached(
                 &nonce(sequence).into(),
                 &self.aad,
-                &mut plain,
+                out,
                 // The length of `tag` is guaranteed by the packet.len() check above.
                 tag.into(),
             )
             .map_err(|_| InvalidPacket("invalid UDP authentication"))?;
         self.replay.commit(counter);
         self.received_blocks += blocks;
-        Ok(plain)
+        Ok(())
     }
 }
 

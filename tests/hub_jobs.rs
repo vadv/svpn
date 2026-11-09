@@ -112,6 +112,8 @@ fn reload_geo_loads_the_table_and_clears_pending() {
     assert!(hub.geo.is_none());
     hub.reload_geo("geo-update");
     assert!(hub.geo.is_some(), "the table is live after reload");
+    assert!(hub.job_stats.geo.loaded_at.is_some());
+    assert!(hub.job_stats.geo.error.is_empty());
     assert_eq!(hub.geo_pending, None, "degraded state is over");
     assert_eq!(
         geo::Geo::load(&csv).unwrap().rows(),
@@ -133,6 +135,8 @@ fn reload_geo_failure_keeps_the_previous_table() {
     std::fs::write(&csv, "not,a,table\n").unwrap();
     hub.reload_geo("geo-update");
     assert!(hub.geo.is_some(), "a broken file never unloads the table");
+    assert!(hub.job_stats.geo.loaded_at.is_some());
+    assert!(hub.job_stats.geo.error.contains("previous table retained"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -189,10 +193,10 @@ fn failed_and_timed_out_jobs_never_reload_the_table() {
         || JobStatus::Timeout,
     ] {
         let status = build();
-        hub.handle_job_event(svpn::hub::JobEvent {
+        hub.handle_job_event(svpn::hub::JobEvent::Finished {
             label: "geo-update".to_owned(),
             status: status.clone(),
-            tail: String::new(),
+            next_at: 0,
             reload: vec![Reload::Geo],
         });
         assert_eq!(
@@ -205,10 +209,10 @@ fn failed_and_timed_out_jobs_never_reload_the_table() {
     assert_eq!(hub.job_stats.failures, 1);
     assert_eq!(hub.job_stats.timeouts, 1);
     // Success reloads from the same source — this must swap the table.
-    hub.handle_job_event(svpn::hub::JobEvent {
+    hub.handle_job_event(svpn::hub::JobEvent::Finished {
         label: "geo-update".to_owned(),
         status: JobStatus::Ok,
-        tail: String::new(),
+        next_at: 0,
         reload: vec![Reload::Geo],
     });
     assert_ne!(

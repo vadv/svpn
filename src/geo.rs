@@ -6,7 +6,7 @@
 
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     net::Ipv4Addr,
     path::Path,
 };
@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 /// Sanity floor for a complete DB-IP Lite database; ASN Lite holds ~400k
 /// IPv4 rows, Country Lite is in the same range.
 const MIN_ROWS: usize = 100_000;
+/// Packed `ZZ`, see [`CountryRow::Unassigned`].
+const UNASSIGNED: u32 = (b'Z' as u32) << 8 | b'Z' as u32;
 
 /// Sorted, non-overlapping `(start, end, payload)` ranges; the payload is an
 /// ASN for [`Geo::load`] and a packed country code for [`Geo::load_country`].
@@ -35,10 +37,8 @@ impl Geo {
     /// Reject malformed, inverted or overlapping rows with their row number.
     /// Skip IPv6 rows, which this IPv4-only table cannot use.
     pub fn load_country(path: &Path) -> Result<Self> {
-        let file =
-            File::open(path).with_context(|| format!("country database: {}", path.display()))?;
-        let mut rows: Vec<(u32, u32, u32, usize)> = Vec::with_capacity(410_000);
-        for (index, line) in BufReader::new(file).lines().enumerate() {
+        let mut ranges: Vec<(u32, u32, u32)> = Vec::new();
+        for (index, line) in country_lines(path)?.enumerate() {
             let line = line.context("country database: read")?;
             let number = index + 1;
             match country_row(&line) {
@@ -47,32 +47,28 @@ impl Geo {
                         start <= end,
                         "country database: row {number}: inverted range"
                     );
-                    rows.push((start, end, payload, number));
+                    ranges.push((start, end, payload));
                 }
-                CountryRow::Ipv6 => {}
+                CountryRow::Ipv6 | CountryRow::Unassigned => {}
                 CountryRow::Invalid(category) => {
                     bail!("country database: row {number}: {category}")
                 }
             }
         }
-        rows.sort_unstable();
+        ranges.sort_unstable();
         ensure!(
-            rows.len() >= MIN_ROWS,
+            ranges.len() >= MIN_ROWS,
             "country database: {} IPv4 rows, the file looks truncated",
-            rows.len()
+            ranges.len()
         );
-        for pair in rows.windows(2) {
-            ensure!(
-                pair[0].1 < pair[1].0,
-                "country database: overlapping ranges: rows {} and {}",
-                pair[0].3,
-                pair[1].3
-            );
+        if let Some(pair) = ranges.windows(2).find(|pair| pair[0].1 >= pair[1].0) {
+            // Row numbers stay out of the table: 8 bytes per row over ~400k rows
+            // costs as much as the whole ASN table. They are recovered here,
+            // on the path that rejects the file anyway.
+            let first = country_row_line(path, pair[0].0, pair[0].1)?;
+            let second = country_row_line(path, pair[1].0, pair[1].1)?;
+            bail!("country database: overlapping ranges: rows {first} and {second}");
         }
-        let ranges = rows
-            .into_iter()
-            .map(|(start, end, payload, _)| (start, end, payload))
-            .collect();
         Ok(Self { ranges })
     }
 
@@ -198,6 +194,9 @@ enum CountryRow {
     /// Both address fields contain `:` — a valid IPv6 row, skipped because
     /// the table is IPv4-only.
     Ipv6,
+    /// `ZZ` — DB-IP's reserved/private range marker, not a country: the
+    /// address stays unknown instead of showing a made-up flag.
+    Unassigned,
     /// Corruption category for the row-numbered startup error.
     Invalid(&'static str),
 }
@@ -216,9 +215,28 @@ fn country_row(line: &str) -> CountryRow {
         return CountryRow::Invalid("malformed IPv4 address");
     };
     match pack_country(country) {
+        Some(UNASSIGNED) => CountryRow::Unassigned,
         Some(payload) => CountryRow::Range(start, end, payload),
         None => CountryRow::Invalid("invalid country code"),
     }
+}
+
+fn country_lines(path: &Path) -> Result<impl Iterator<Item = io::Result<String>>> {
+    let file = File::open(path).with_context(|| format!("country database: {}", path.display()))?;
+    Ok(BufReader::new(file).lines())
+}
+
+/// Number of the first row holding exactly this range, for the overlap error.
+fn country_row_line(path: &Path, start: u32, end: u32) -> Result<usize> {
+    for (index, line) in country_lines(path)?.enumerate() {
+        let line = line.context("country database: read")?;
+        if let CountryRow::Range(row_start, row_end, _) = country_row(&line)
+            && (row_start, row_end) == (start, end)
+        {
+            return Ok(index + 1);
+        }
+    }
+    Ok(0)
 }
 
 /// Uppercased two-letter code packed into 16 bits: `"US"` and `"us"` → 0x5553;

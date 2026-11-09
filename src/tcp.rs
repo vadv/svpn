@@ -347,7 +347,7 @@ pub async fn pump(
 pub fn encode_frame(cipher: &mut Cipher, camouflage: Camouflage, packet: &[u8]) -> Result<Vec<u8>> {
     match camouflage {
         Camouflage::Ssh => framing::ssh_frame(cipher, packet),
-        _ => framing::frame(&cipher.seal(packet)?),
+        _ => framing::frame_sealed(cipher, packet),
     }
 }
 

@@ -16,7 +16,7 @@ getrandom = "0.3"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
-nix = { version = "0.31.3", default-features = false, features = ["fs", "signal"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "signal", "resource"] }
 quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio", "futures-io", "log"] }
 rlimit = "0.10"
 russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2", "rsa"] }
@@ -26,7 +26,7 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 sha2 = "0.11.1"
 socket2 = { version = "0.6", features = ["all"] }
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "signal", "sync", "time"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "io-std", "process", "signal", "sync", "time"] }
 mimalloc = "0.1"
 tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
 zeroize = "1"
@@ -45,6 +45,7 @@ netstack-smoltcp = { git = "https://github.com/vadv/netstack-smoltcp", rev = "8a
 
 [lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(aes_armv8)", "cfg(polyval_armv8)"] }
 
 [dev-dependencies]
 # Патч crates-io переписывает на fork; версия здесь только для резолва.

@@ -5,7 +5,8 @@ mod common;
 use std::time::Duration;
 
 use common::session::{
-    activate, assert_closed, fill, link_session_cap, link_session_with, reply, tcp_packet,
+    activate, assert_closed, assert_closing, fill, link_session_cap, link_session_with, reply,
+    tcp_packet,
 };
 use svpn::control::{Control, Message};
 use svpn::link_io::{self, FIRST_PROBE_ID};
@@ -148,37 +149,13 @@ async fn either_half_close_and_repeated_fin_survive_until_both_directions_finish
                     assert!(events.try_recv().is_err());
                 }
             }
-            advance(FIN_DWELL + Duration::from_secs(1)).await;
-            session.expire_flows(Instant::now()).await.unwrap();
-            assert!(session.has_flow(1), "unacknowledged FINs retired the flow");
-            let fin_end = packet::parse(&syn, true)
-                .unwrap()
-                .tcp
-                .unwrap()
-                .seq
-                .wrapping_add(1);
-            let mut ack = tcp_packet(0x10);
-            ack[28..32].copy_from_slice(&fin_end.to_be_bytes());
-            session.handle_tun_packet(&ack, Some(1)).await.unwrap();
-            assert_eq!(outgoing.try_recv().unwrap(), ack);
-            let mut ack = reply(0x10);
-            ack[28..32].copy_from_slice(&fin_end.to_be_bytes());
-            session
-                .deliver_to_tun(Incoming {
-                    generation: 1,
-                    id: 1,
-                    channel: None,
-                    packet: ack,
-                })
-                .await
-                .unwrap();
-            assert!(matches!(
-                events.try_recv().unwrap().1,
-                link_io::Event::Packet(_)
-            ));
+            // Delivered to the second direction, the FIN arms the dwell
+            // even though the final ACKs never arrive: a lost ACK must not
+            // pin the flow until TCP_IDLE.
             advance(FIN_DWELL - Duration::from_secs(1)).await;
             session.expire_flows(Instant::now()).await.unwrap();
             assert!(session.has_flow(1));
+            assert_closing(events.try_recv().unwrap(), 1, key);
             advance(Duration::from_secs(1)).await;
             session.expire_flows(Instant::now()).await.unwrap();
             assert_closed(events.try_recv().unwrap(), 1, key);
@@ -237,7 +214,7 @@ async fn target_reset_leaves_the_close_decision_to_the_client_kernel() {
 }
 
 #[test]
-fn fin_requires_exact_ack_and_handles_payload_wrap_and_retransmission() {
+fn fin_dwell_arms_on_both_fins_and_handles_payload_wrap_and_retransmission() {
     for seq in [100, u32::MAX] {
         let now = Instant::now();
         let mut close = TcpClose::default();
@@ -245,30 +222,24 @@ fn fin_requires_exact_ack_and_handles_payload_wrap_and_retransmission() {
         fin.tcp.as_mut().unwrap().seq = seq;
         fin.tcp.as_mut().unwrap().payload_len = 2;
         close.observe(&fin, true, now);
+        assert!(!close.finished());
+        assert!(close.deadline().is_none());
         close.observe(&fin, false, now);
-        assert!(!close.finished());
-        assert!(close.deadline.is_none());
-        let mut ack = packet::parse(&tcp_packet(0x10), true).unwrap();
-        let end = seq.wrapping_add(3);
-        ack.tcp.as_mut().unwrap().ack = end.wrapping_add(1);
-        close.observe(&ack, true, now);
-        close.observe(&ack, false, now);
-        assert!(!close.finished());
-        ack.tcp.as_mut().unwrap().ack = end;
-        close.observe(&ack, true, now);
-        assert!(!close.finished());
-        close.observe(&ack, false, now);
-        assert!(close.finished());
+        assert!(close.finished(), "FINs in both directions arm the dwell");
+        assert_eq!(close.deadline(), Some(now + FIN_DWELL));
         close.observe(&fin, true, now);
-        assert!(
-            close.finished(),
-            "a repeated FIN erased its acknowledgement"
+        assert_eq!(
+            close.deadline(),
+            Some(now + FIN_DWELL),
+            "a repeated FIN cannot re-arm the dwell"
         );
-        assert_eq!(close.deadline, Some(now + FIN_DWELL));
         fin.tcp.as_mut().unwrap().seq = seq.wrapping_add(20);
         close.observe(&fin, true, now);
-        assert!(close.finished(), "late FIN cannot reopen a completed close");
-        assert_eq!(close.deadline, Some(now + FIN_DWELL));
+        assert_eq!(
+            close.deadline(),
+            Some(now + FIN_DWELL),
+            "a late FIN cannot extend a completed close"
+        );
     }
 }
 

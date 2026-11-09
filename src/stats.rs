@@ -15,6 +15,7 @@ impl Snapshot {
     pub fn observe(&mut self, stats: Stats) {
         add(&mut self.total, &difference(&stats, &self.latest));
         self.total.active_flows = stats.active_flows;
+        self.total.last_round = stats.last_round.clone();
         self.latest = stats;
     }
 
@@ -37,6 +38,7 @@ impl Snapshot {
         add(&mut stats, &difference(live, &self.latest));
         stats.active_flows = live.active_flows;
         stats.active_candidate = live.active_candidate.clone();
+        stats.last_round = live.last_round.clone();
         stats
     }
 
@@ -61,6 +63,7 @@ pub fn difference(now: &Stats, before: &Stats) -> Stats {
         closed_flows: now.closed_flows.saturating_sub(before.closed_flows),
         active_flows: now.active_flows,
         active_candidate: None,
+        last_round: None,
         // Monotonic per-transport counters: keys the newer snapshot still
         // reports, minus what we knew. A restarted peer keeps its own value.
         transport_failures: now

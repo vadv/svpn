@@ -8,6 +8,7 @@
 /plans/
 AGENTS.md
 /.pi/
+/.workbuddy-ai/
 
 __pycache__/
 *.py[cod]

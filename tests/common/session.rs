@@ -38,13 +38,45 @@ pub fn link_session_cap(
     )
 }
 
+/// `link_session` keeping the hub→session packet port, for burst tests on
+/// the upload path; the port capacity allows a full `DRAIN_BATCH` burst.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn link_session_port(
+    tcp: bool,
+) -> (
+    Session,
+    mpsc::Receiver<(link_io::Epoch, link_io::Event)>,
+    mpsc::Sender<link_io::Packet>,
+) {
+    link_session_parts(
+        tcp,
+        Control::new(tokio::io::empty(), tokio::io::sink()),
+        1,
+        svpn::session::CHANNEL_QUEUE,
+    )
+}
+
 fn link_session_cap_with(
     tcp: bool,
     control: Control,
     events_capacity: usize,
 ) -> (Session, mpsc::Receiver<(link_io::Epoch, link_io::Event)>) {
+    let (session, returned, _port) = link_session_parts(tcp, control, events_capacity, 1);
+    (session, returned)
+}
+
+fn link_session_parts(
+    tcp: bool,
+    control: Control,
+    events_capacity: usize,
+    port_capacity: usize,
+) -> (
+    Session,
+    mpsc::Receiver<(link_io::Epoch, link_io::Event)>,
+    mpsc::Sender<link_io::Packet>,
+) {
     let (events, returned) = mpsc::channel(events_capacity);
-    let (_, packets) = mpsc::channel(1);
+    let (packets_tx, packets) = mpsc::channel(port_capacity);
     let server_ip = Some(Ipv4Addr::new(10, 77, 0, 1));
     let plane = if tcp {
         Plane::Tcp(TcpPlane {
@@ -113,6 +145,7 @@ fn link_session_cap_with(
             next_challenge_at: None,
         },
         returned,
+        packets_tx,
     )
 }
 
@@ -133,6 +166,25 @@ pub fn assert_closed(event: (link_io::Epoch, link_io::Event), id: u64, key: Flow
         panic!("expected close event");
     };
     assert_eq!((closed, closed_key), (id, key));
+}
+
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn assert_closing(event: (link_io::Epoch, link_io::Event), id: u64, key: FlowKey) {
+    assert_eq!(
+        event.0,
+        link_io::Epoch {
+            link: 2,
+            generation: 7
+        }
+    );
+    let link_io::Event::Closing {
+        id: closing,
+        key: closing_key,
+    } = event.1
+    else {
+        panic!("expected closing event");
+    };
+    assert_eq!((closing, closing_key), (id, key));
 }
 
 #[allow(dead_code)] // unused by some of the including test targets
@@ -191,7 +243,14 @@ pub fn reply(flags: u8) -> Vec<u8> {
 /// Make flow `id` active with committed transport: flushes are live.
 #[allow(dead_code)] // unused by some of the including test targets
 pub fn activate(session: &mut Session, id: u64) -> mpsc::Receiver<Vec<u8>> {
-    let (send, receive) = mpsc::channel(4);
+    activate_with_cap(session, id, 4)
+}
+
+/// `activate` with a caller-chosen flow-channel capacity, for burst tests
+/// that push more than the default four packets in one pass.
+#[allow(dead_code)] // unused by some of the including test targets
+pub fn activate_with_cap(session: &mut Session, id: u64, cap: usize) -> mpsc::Receiver<Vec<u8>> {
+    let (send, receive) = mpsc::channel(cap);
     match &mut session.plane {
         Plane::Channels(plane) => {
             let flow = plane.flows.get_mut(&id).unwrap();

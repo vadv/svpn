@@ -197,7 +197,7 @@ network is it”. Enabling the modes is covered in ADVANCED.
 
 ## Web dashboard
 
-The client can show its state in a browser: pool servers and their traffic, sticky rules with their owners, active flows and counters. It listens on loopback only:
+The client can show its state in a browser: pool servers and their traffic, sticky rules with their owners, active flows and counters. The read-only panel is a dense monospace instrument readout: flat sections, sharp corners, a hard grid, a live clock, sparklines, a hover tooltip on the traffic chart, flow filters and a light/dark theme switch. A dedicated block reports the `svpn` process itself: RSS, CPU as a percentage of one core, cumulative CPU time and uptime. Linux supplies current RSS from `/proc`; when it is unavailable, peak RSS is shown and explicitly labelled. It listens on loopback only and loads no external assets:
 
 ```bash
 sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080
@@ -241,11 +241,17 @@ uvx ruff@0.14.3 format --check
 python3 e2e/test_artifacts.py
 python3 e2e/test_groups.py
 python3 e2e/test_package.py
+node --test e2e/test_dashboard.mjs
 ```
+
+See [tests/README.md](tests/README.md) for the full check map, network groups
+and artifacts. Run E2E groups one at a time: `e2e/run.sh bootstrap`,
+`e2e/run.sh --matrix udp`.
 
 ## More information
 
 - [ADVANCED.en.md](ADVANCED.en.md) — advanced configuration.
 - [CHANGELOG](CHANGELOG.md) — version history.
 - [Russian README](README.md).
+- [tests/README.md](tests/README.md) — tests, Docker Compose and E2E artifacts.
 - `svpn --help` — command reference.

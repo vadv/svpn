@@ -370,6 +370,8 @@ impl Reassembly {
 pub struct Channel {
     cipher: Cipher,
     reassembly: Reassembly,
+    /// Reused plaintext buffer: every record opens through it allocation-free.
+    scratch: Vec<u8>,
 }
 
 impl Channel {
@@ -377,6 +379,7 @@ impl Channel {
         Self {
             cipher: Cipher::new_channel(key, channel_id, client),
             reassembly: Reassembly::default(),
+            scratch: Vec::new(),
         }
     }
 
@@ -386,13 +389,13 @@ impl Channel {
     }
 
     pub fn open(&mut self, wire: &[u8], now: Instant) -> Result<Option<Record>> {
-        let plain = match self.cipher.open(wire) {
-            Ok(plain) => plain,
+        match self.cipher.open_into(wire, &mut self.scratch) {
+            Ok(()) => {}
             Err(error) if error.is::<crypto::InvalidPacket>() => return Ok(None),
             Err(error) => return Err(error),
-        };
+        }
         self.reassembly.expire(now);
-        Ok(Some(Record::decode(&plain)?))
+        Ok(Some(Record::decode(&self.scratch)?))
     }
 
     /// Runs a DATA record through reassembly; `Some` is a complete inner packet.
