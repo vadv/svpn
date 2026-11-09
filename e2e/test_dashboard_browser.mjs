@@ -22,6 +22,15 @@ function frame() {
   const servers = ["nl.example.test", "de.example.test"].map((id, i) => ({
     index: i, id, server: id, label: scenario === "xss" && i === 0 ? '<img src=x onerror="window.pwned=1">' : i ? "DE" : "NL",
     weight: 1, mimic: i ? ["webrtc", "ssh"] : [], state: degraded && i ? "backoff" : "ready", reason: degraded && i ? "handshake timeout" : "",
+    selection: i
+      ? { active: null, round: { finished_at_ms: now - 4000, winner: null, entries: [
+        { candidate: "webrtc", status: "failed", reason: "path_timeout" },
+        { candidate: "tcp", status: "unanswered", stage: "probe" }] } }
+      : { active: "tcp", round: { finished_at_ms: now - 2000, winner: "tcp", entries: [
+        { candidate: "quic", status: "verified", rtt_ms: 63, penalty: false },
+        { candidate: "tcp", status: "verified", rtt_ms: 41, penalty: true },
+        { candidate: "webrtc", status: "failed", reason: "path_timeout" },
+        { candidate: "obfs", status: "unanswered", stage: "handshake" }] } },
     stats: { inner_rx_bytes: (i ? 460 : 820) * 1048576 + (degraded && i ? 0 : sequence * (i ? 125000 : 250000)),
       inner_tx_bytes: (i ? 91 : 64) * 1048576 + (degraded && i ? 0 : sequence * (i ? 12500 : 25000)), opened_flows: 85,
       open_failed_flows: degraded && i ? 3 : 0, closed_flows: 12, dropped_packets: degraded && i ? 2 : 0 },
@@ -95,7 +104,9 @@ try {
   assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false', 'dark theme switch');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
-  assert($('servers').textContent.includes('webrtc · ssh') && $('servers').textContent.includes('Auto'), 'configured mimic and auto mode are explicit');
+  assert($('servers').textContent.includes('tcp 41 ms (+penalty) · quic 63 ms · webrtc timeout · obfs handshake'), 'race is shown, winner first');
+  assert($('servers').textContent.includes('Selecting…') && $('servers').textContent.includes('limited: webrtc · ssh'), 'pending selection and config restriction are shown');
+  assert(!$('servers').textContent.includes('Auto'), 'configured-only mimic text is gone');
   await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV parsed and cached in browser');
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));

@@ -18,6 +18,7 @@ fn counters(value: u64, active: usize) -> Stats {
         active_flows: active,
         active_candidate: None,
         transport_failures: Default::default(),
+        last_round: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn report_labels_rates_interval_counters_and_totals() {
         active_flows: 3,
         active_candidate: None,
         transport_failures: Default::default(),
+        last_round: None,
     };
     let total = Stats {
         inner_rx_bytes: 64 * 1_048_576,

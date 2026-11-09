@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -163,7 +163,12 @@ function renderServers() {
     row.identity.replaceChildren(title(name(server.id), server.server));
     const state = badge(server.state);
     row.state.replaceChildren(state);
-    row.mimic.textContent = server.mimic?.length ? server.mimic.join(" · ") : "Auto";
+    const lines = mimicCell(server.selection, server.mimic);
+    row.mimic.replaceChildren(
+      node("div", lines.transport),
+      ...(lines.race ? [node("small", lines.race)] : []),
+      ...(lines.limited ? [node("small", lines.limited)] : []),
+    );
     if (server.reason && server.state !== "ready") row.state.append(node("small", server.reason, "reason"));
     row.flows.textContent = latest.flows.filter(flow => flow.via === server.id).length;
     row.total.replaceChildren(node("div", bytes(server.stats.inner_rx_bytes)), node("small", bytes(server.stats.inner_tx_bytes)));

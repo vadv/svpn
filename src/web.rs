@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use crate::{
-    control::Stats,
+    control::{RoundReport, Stats},
     hub::{Hub, JobStats, StickyStats, Target},
     proc_stats::ProcessView,
 };
@@ -37,11 +37,24 @@ pub struct ServerView {
     pub weight: u32,
     /// Configured camouflage candidates; empty means automatic selection.
     pub mimic: Vec<crate::mimic::MimicArg>,
+    /// Live selection view: the transport in use and why it won.
+    pub selection: SelectionView,
     /// ready, checking, connecting, backoff or failed.
     pub state: &'static str,
     /// Why the link last failed.
     pub reason: String,
     pub stats: Stats,
+}
+
+/// Live transport selection of one server: the transport in use and the
+/// race that picked it.
+#[derive(Serialize)]
+pub struct SelectionView {
+    /// Transport in use right now (`quic`, `mosh`, `tcp-ssh`, …); null
+    /// before the first verified round.
+    pub active: Option<String>,
+    /// The last completed selection round; null before the first verdict.
+    pub round: Option<RoundReport>,
 }
 
 /// One sticky block: what it matches and which server serves it.
@@ -141,16 +154,23 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         .links
         .iter()
         .enumerate()
-        .map(|(index, link)| ServerView {
-            index,
-            id: node_id(hub, index),
-            label: link.params.label.clone(),
-            server: link.params.server.clone(),
-            weight: link.params.weight,
-            mimic: link.params.mimic.clone(),
-            state: crate::hub::link_state(&hub.pool, link, index),
-            reason: link.last_reason.clone(),
-            stats: link_counters(link),
+        .map(|(index, link)| {
+            let stats = link_counters(link);
+            ServerView {
+                index,
+                id: node_id(hub, index),
+                label: link.params.label.clone(),
+                server: link.params.server.clone(),
+                weight: link.params.weight,
+                mimic: link.params.mimic.clone(),
+                state: crate::hub::link_state(&hub.pool, link, index),
+                reason: link.last_reason.clone(),
+                selection: SelectionView {
+                    active: stats.active_candidate.clone(),
+                    round: stats.last_round.clone(),
+                },
+                stats,
+            }
         })
         .collect();
     let mut active = std::collections::HashMap::<Option<usize>, usize>::new();

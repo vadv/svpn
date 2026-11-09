@@ -294,7 +294,9 @@ impl Session {
                         if let PacketIo::Link(io) = &self.io {
                             io.delivery.apply(&mut self.stats);
                         }
-                        self.control.send(Message::Heartbeat { stats: self.stats.clone() }).await?;
+                        // The race report is dashboard-only: keep it off the wire.
+                        let stats = crate::control::Stats { last_round: None, ..self.stats.clone() };
+                        self.control.send(Message::Heartbeat { stats }).await?;
                         if let PacketIo::Link(io) = &self.io {
                             io.stats.send_replace(self.stats.clone());
                         }

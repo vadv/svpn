@@ -6,11 +6,12 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use svpn::{
     MimicArg,
-    control::Stats,
+    control::{RoundEntry, RoundOutcome, RoundReport, RoundStage, Stats},
     geo::{Geo, pack_country},
     hub::{Hub, Owner, Target},
     link_io::Epoch,
     packet::FlowKey,
+    selector::Reason,
     sticky::{ResolvedVia, RuntimeSticky, Selector, StickyBlock, Via},
     web,
 };
@@ -124,6 +125,76 @@ fn snapshot_falls_back_to_the_collected_totals_of_a_dead_link() {
     assert_eq!(snapshot.servers[0].stats.inner_tx_bytes, 100);
     assert_eq!(snapshot.servers[0].stats.inner_rx_bytes, 200);
     assert_eq!(snapshot.servers[0].stats.active_flows, 3);
+}
+
+// ── selection ──
+
+#[test]
+fn snapshot_exposes_the_live_transport_and_its_race() {
+    let mut hub = hub();
+    let (_sender, latest) = watch::channel(Stats {
+        active_candidate: Some("tcp-ssh".to_owned()),
+        last_round: Some(RoundReport {
+            finished_at_ms: 1_730_000_000_000,
+            winner: Some("tcp".to_owned()),
+            entries: vec![
+                RoundEntry {
+                    candidate: "tcp".to_owned(),
+                    outcome: RoundOutcome::Verified {
+                        rtt_ms: 41,
+                        penalty: true,
+                    },
+                },
+                RoundEntry {
+                    candidate: "quic".to_owned(),
+                    outcome: RoundOutcome::Verified {
+                        rtt_ms: 63,
+                        penalty: false,
+                    },
+                },
+                RoundEntry {
+                    candidate: "webrtc".to_owned(),
+                    outcome: RoundOutcome::Failed {
+                        reason: Reason::PathTimeout,
+                    },
+                },
+                RoundEntry {
+                    candidate: "obfs".to_owned(),
+                    outcome: RoundOutcome::Unanswered {
+                        stage: RoundStage::Handshake,
+                    },
+                },
+            ],
+        }),
+        ..Stats::default()
+    });
+    hub.links[0].latest = Some(latest);
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["servers"][0]["selection"]["active"], "tcp-ssh");
+    assert_eq!(json["servers"][0]["selection"]["round"]["winner"], "tcp");
+    assert_eq!(
+        json["servers"][0]["selection"]["round"]["finished_at_ms"],
+        1_730_000_000_000u64
+    );
+    assert_eq!(
+        json["servers"][0]["selection"]["round"]["entries"],
+        serde_json::json!([
+            { "candidate": "tcp", "status": "verified", "rtt_ms": 41, "penalty": true },
+            { "candidate": "quic", "status": "verified", "rtt_ms": 63, "penalty": false },
+            { "candidate": "webrtc", "status": "failed", "reason": "path_timeout" },
+            { "candidate": "obfs", "status": "unanswered", "stage": "handshake" },
+        ])
+    );
+    // A link without a live session has no verdict yet.
+    assert!(json["servers"][1]["selection"]["active"].is_null());
+    assert!(json["servers"][1]["selection"]["round"].is_null());
+
+    // Session end: the collected totals keep the race for the dead link.
+    let last = hub.links[0].latest.take().expect("live session");
+    hub.links[0].stats.observe(last.borrow().clone());
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(snapshot.servers[0].selection.active, None);
+    assert!(snapshot.servers[0].selection.round.is_some());
 }
 
 // ── rules and groups ──

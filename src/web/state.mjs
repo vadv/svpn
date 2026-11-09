@@ -326,3 +326,24 @@ export function selector(rule) {
 export function localState(local) {
   return !local.enabled ? "Disabled" : local.ready ? "Ready" : "Unavailable";
 }
+
+// The MIMIC cell: the transport in use, the race that picked it (winner first)
+// and the config restriction as a note — never the configured-only "Auto".
+// A verdict that has not arrived yet is "Selecting…"; `path_timeout` is the
+// one wire reason with a shorter dashboard spelling.
+export function mimicCell(selection, configured = []) {
+  const round = selection?.round ?? null;
+  const text = entry => entry.status === "verified"
+    ? `${entry.candidate} ${entry.rtt_ms} ms${entry.penalty ? " (+penalty)" : ""}`
+    : entry.status === "failed"
+      ? `${entry.candidate} ${entry.reason === "path_timeout" ? "timeout" : entry.reason}`
+      : `${entry.candidate} ${entry.stage ?? ""}`.trimEnd();
+  const entries = round?.winner
+    ? [...round.entries].sort((a, b) => (b.candidate === round.winner) - (a.candidate === round.winner))
+    : round?.entries ?? [];
+  return {
+    transport: selection?.active ?? "Selecting…",
+    race: entries.map(text).join(" · "),
+    limited: configured.length ? `limited: ${configured.join(" · ")}` : "",
+  };
+}

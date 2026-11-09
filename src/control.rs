@@ -27,6 +27,48 @@ pub enum Strategy {
     Obfs,
 }
 
+/// How far a candidate without a verdict got when the round closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundStage {
+    /// The transport handshake had not finished yet.
+    Handshake,
+    /// The channel was up; only the echo answer was missing.
+    Probe,
+}
+
+/// How one candidate ended in a completed liveness round.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RoundOutcome {
+    /// The echo came back: the raw RTT, and whether the TCP penalty counted
+    /// against it in the verdict comparison.
+    Verified { rtt_ms: u64, penalty: bool },
+    /// The candidate died with this reason before the verdict.
+    Failed { reason: Reason },
+    /// No verdict when the round closed; the stage says how far it got.
+    Unanswered { stage: RoundStage },
+}
+
+/// One candidate of a completed liveness round.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundEntry {
+    pub candidate: String,
+    #[serde(flatten)]
+    pub outcome: RoundOutcome,
+}
+
+/// The last completed liveness round, as the dashboard shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundReport {
+    /// Wall-clock completion time, ms since the Unix epoch.
+    pub finished_at_ms: u64,
+    /// The winning candidate; None when every candidate failed.
+    pub winner: Option<String>,
+    /// Every candidate that raced, in verification/failure/pending order.
+    pub entries: Vec<RoundEntry>,
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     pub inner_tx_packets: u64,
@@ -44,6 +86,9 @@ pub struct Stats {
     /// Packet-level failure counters per transport since start.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub transport_failures: std::collections::BTreeMap<String, u64>,
+    /// Last completed liveness round on the client; the server leaves it None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round: Option<RoundReport>,
 }
 
 impl Stats {

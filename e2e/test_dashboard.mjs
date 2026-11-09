@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -356,4 +356,36 @@ test("selectors, local states and byte units are explicit", () => {
   assert.equal(bytes(0), "0 B");
   assert.equal(bytes(1024), "1.0 KiB");
   assert.equal(bytes(1048576), "1.0 MiB");
+});
+
+test("mimic cell shows the live transport and its race, winner first", () => {
+  const selection = {
+    active: "tcp-ssh",
+    round: {
+      finished_at_ms: 1730000000000, winner: "tcp",
+      entries: [
+        { candidate: "quic", status: "verified", rtt_ms: 63, penalty: false },
+        { candidate: "tcp", status: "verified", rtt_ms: 41, penalty: true },
+        { candidate: "webrtc", status: "failed", reason: "path_timeout" },
+        { candidate: "obfs", status: "unanswered", stage: "handshake" },
+        { candidate: "mosh", status: "failed", reason: "channel_failed" },
+      ],
+    },
+  };
+  assert.deepEqual(mimicCell(selection, ["webrtc", "ssh"]), {
+    transport: "tcp-ssh",
+    race: "tcp 41 ms (+penalty) · quic 63 ms · webrtc timeout · obfs handshake · mosh channel_failed",
+    limited: "limited: webrtc · ssh",
+  });
+});
+
+test("mimic cell selects before the first verdict and hides empty notes", () => {
+  assert.deepEqual(mimicCell(null), { transport: "Selecting…", race: "", limited: "" });
+  const allFailed = {
+    active: null,
+    round: { finished_at_ms: 1, winner: null, entries: [{ candidate: "quic", status: "failed", reason: "path_timeout" }] },
+  };
+  assert.deepEqual(mimicCell(allFailed), { transport: "Selecting…", race: "quic timeout", limited: "" });
+  // A live transport without a published round yet still shows the transport.
+  assert.deepEqual(mimicCell({ active: "mosh" }), { transport: "mosh", race: "", limited: "" });
 });

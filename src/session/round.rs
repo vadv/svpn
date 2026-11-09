@@ -4,12 +4,12 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    time::{Duration, Instant as StdInstant},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::control::Message;
+use crate::control::{Message, RoundEntry, RoundOutcome, RoundReport, RoundStage};
 use crate::link_io::{self, PREFLIGHT_ID};
 use crate::packet::{self, FlowKey};
 use crate::selector::{Candidate, Reason};
@@ -491,6 +491,8 @@ impl Session {
             "{} checking round failed ({table}), retry in {delay:?}",
             prefixed(&tag, "ssh")
         );
+        let report = self.round.as_ref().map(|round| round_report(round, None));
+        self.publish_stats(report);
         if let PacketIo::Link(io) = &self.io {
             io.events
                 .send((io.epoch, link_io::Event::RoundFailed))
@@ -625,6 +627,16 @@ impl Session {
         Ok(())
     }
 
+    /// Publish the finished race and the current transport to the stats
+    /// watch port: the dashboard reads both between heartbeats.
+    fn publish_stats(&mut self, last_round: Option<RoundReport>) {
+        self.stats.last_round = last_round;
+        self.stats.active_candidate = self.active_candidate();
+        if let PacketIo::Link(io) = &self.io {
+            io.stats.send_replace(self.stats.clone());
+        }
+    }
+
     /// The grace window closed — the fastest verified candidate wins.
     pub async fn decide_round(&mut self) -> Result<()> {
         // A candidate that reached `established` inside the window gets its
@@ -673,7 +685,13 @@ impl Session {
             candidate.as_str(),
             if silent.is_empty() { "none" } else { &silent },
         );
-        self.round_won(channel, Some(rtt)).await
+        let report = self
+            .round
+            .as_ref()
+            .map(|round| round_report(round, Some(candidate)));
+        self.round_won(channel, Some(rtt)).await?;
+        self.publish_stats(report);
+        Ok(())
     }
 
     /// The first matching echo wins; retire only this round's losers.
@@ -821,6 +839,64 @@ impl Session {
             self.execute_actions(actions).await?;
         }
         Ok(true)
+    }
+}
+
+/// The dashboard report of a finished round: every candidate's outcome and
+/// the winner, as `pick_verified` chose it.
+fn round_report(round: &Round, winner: Option<Candidate>) -> RoundReport {
+    let answered = |attempt: &u64| round.verified.iter().any(|(id, ..)| id == attempt);
+    let stage = |established: bool| {
+        if established {
+            RoundStage::Probe
+        } else {
+            RoundStage::Handshake
+        }
+    };
+    let mut entries: Vec<RoundEntry> = round
+        .verified
+        .iter()
+        .map(|(_, candidate, _, rtt)| RoundEntry {
+            candidate: candidate.as_str().to_owned(),
+            outcome: RoundOutcome::Verified {
+                rtt_ms: rtt.as_millis().min(u128::from(u64::MAX)) as u64,
+                // TCP counts TCP_PENALTY slower in the verdict comparison.
+                penalty: *candidate == Candidate::Tcp,
+            },
+        })
+        .collect();
+    entries.extend(round.failures.iter().map(|(candidate, reason)| RoundEntry {
+        candidate: candidate.as_str().to_owned(),
+        outcome: RoundOutcome::Failed { reason: *reason },
+    }));
+    entries.extend(
+        round
+            .pending
+            .iter()
+            .filter(|(id, _)| !answered(id))
+            .map(|(_, rc)| RoundEntry {
+                candidate: rc.candidate.as_str().to_owned(),
+                outcome: RoundOutcome::Unanswered {
+                    stage: stage(rc.established),
+                },
+            }),
+    );
+    if round.tcp_id.is_some_and(|id| !answered(&id)) {
+        entries.push(RoundEntry {
+            candidate: Candidate::Tcp.as_str().to_owned(),
+            outcome: RoundOutcome::Unanswered {
+                stage: stage(round.tcp_started.is_some()),
+            },
+        });
+    }
+    RoundReport {
+        finished_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        winner: winner.map(|candidate| candidate.as_str().to_owned()),
+        entries,
     }
 }
 
