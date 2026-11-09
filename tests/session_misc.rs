@@ -2,10 +2,12 @@
 
 mod common;
 
-use svpn::control::Strategy;
+use svpn::control::{Control, Strategy};
 use svpn::framing::Camouflage;
+use svpn::link_io::{self, LinkIo};
 use svpn::selector::Candidate;
 use svpn::session::*;
+use tokio::sync::mpsc;
 
 #[test]
 fn prefixed_line_is_unchanged_without_a_tag_and_names_the_server_in_a_pool() {
@@ -104,4 +106,55 @@ async fn active_candidate_reflects_last_good_strategy_and_tcp_camouflage() {
 
     let (session, _) = common::session::link_session(true);
     assert_eq!(session.active_candidate(), Some("tcp-none".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_event_loop_fails_on_the_heartbeat_deadline() {
+    // A link whose peer stays silent: the event loop must unwind with the
+    // heartbeat timeout, not hang, once the deadline branch fires.
+    let (local, peer) = tokio::io::duplex(1 << 16);
+    let (reader, writer) = tokio::io::split(local);
+    let control = Control::new(reader, writer);
+    let (events, _events_rx) = mpsc::channel(1);
+    let (_packets_tx, packets) = mpsc::channel(1);
+    let io = LinkIo {
+        epoch: link_io::Epoch {
+            link: 2,
+            generation: 7,
+        },
+        peer_ip: std::net::Ipv4Addr::new(10, 77, 0, 1),
+        tag: String::new(),
+        packets,
+        events,
+        stats: tokio::sync::watch::channel(svpn::control::Stats::default()).0,
+        delivery: std::sync::Arc::default(),
+    };
+    let config = TransportConfig::Client {
+        strategies: vec![],
+        endpoints: vec![svpn::control::Endpoint {
+            strategy: Strategy::Mosh,
+            port: 9000,
+        }],
+        pin: None,
+        tcp: None,
+        tcp_camouflage: None,
+        remeasure: None,
+    };
+    // The peer half stays alive so the control channel never sees EOF and
+    // only the deadline can end the loop.
+    let _peer = peer;
+    let error = run_link(
+        control,
+        std::net::Ipv4Addr::new(10, 77, 0, 1),
+        std::net::Ipv4Addr::new(10, 77, 0, 2),
+        1400,
+        config,
+        io,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("control heartbeat timeout"),
+        "unexpected error: {error:#}"
+    );
 }

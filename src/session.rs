@@ -198,16 +198,22 @@ impl Session {
         let mut ticks: u64 = 0;
         let mut tick = tokio::time::interval(HEARTBEAT);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The heartbeat deadline is a select branch instead of a wrapping
+        // timeout_at: awaiting the select in place keeps the ~43 KB future
+        // from being moved by value every loop iteration.
+        let heartbeat_sleep = tokio::time::sleep_until(started + HEARTBEAT_TIMEOUT);
+        tokio::pin!(heartbeat_sleep);
         loop {
             let accepts_packets = self.accepts_packets();
             let mut deadline = last_heartbeat.unwrap_or(started) + HEARTBEAT_TIMEOUT;
             if !accepts_packets && let Some(sd) = startup_deadline {
                 deadline = deadline.min(sd);
             }
+            heartbeat_sleep.as_mut().reset(deadline);
             let round_wake = self.round.as_ref().and_then(|round| round.decide_at);
             let health_wake = self.health_wake();
             let flush_wake = self.flush_at;
-            let result = with_heartbeat_deadline(deadline, async {
+            let result = async {
                 tokio::select! {
                     message = self.control.recv() => {
                         let message = message?;
@@ -285,6 +291,11 @@ impl Session {
                     _ = tokio::time::sleep_until(flush_wake.unwrap_or(deadline)), if flush_wake.is_some() => {
                         self.flush_pending().await?;
                     }
+                    _ = &mut heartbeat_sleep => {
+                        // Same semantics as the old timeout_at wrapper: the
+                        // error unwinds the loop as link loss.
+                        bail!("control heartbeat timeout")
+                    }
                     _ = tick.tick() => {
                         let now = tokio::time::Instant::now();
                         self.expire_flows(now).await?;
@@ -324,8 +335,12 @@ impl Session {
                 {
                     ensure!(tokio::time::Instant::now() < sd, "link readiness timed out");
                 }
-                self.announce_ready(last_heartbeat, startup_deadline).await
-            })
+                let ready = self.announce_ready(last_heartbeat, startup_deadline).await;
+                // Tokio can complete ready work after the deadline without
+                // polling the timer — the old wrapper checked this too.
+                ensure!(tokio::time::Instant::now() < deadline, "control heartbeat timeout");
+                ready
+            }
             .await;
             if !self.accepts_packets()
                 && let Some(sd) = startup_deadline
