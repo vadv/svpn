@@ -82,6 +82,7 @@ try {
   await until(() => $('proc-rss').textContent.includes('MiB') && $('proc-cpu').textContent.includes('%'), 'process RSS and CPU readout');
   assert($('proc-rss-kind').textContent.includes('Current RSS'), 'current RSS is not silently shown as peak');
   assert(Number.parseFloat($('proc-cpu').textContent) > 0, 'CPU percent is derived from cumulative seconds');
+  assert(/[0-9]+s average/.test($('proc-cpu-kind').textContent), 'CPU percent states the window it averages over');
   assert($('proc-time').textContent.endsWith(' s'), 'cumulative CPU time is shown');
   assert($('proc-time-note').textContent.includes('8 logical CPUs'), 'logical CPU count is shown');
   assert(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/.test($('uptime').textContent), 'uptime ticks locally');

@@ -33,6 +33,19 @@ export function cpuPercent(previous, current, maxGapMs = STALE_MS) {
   return Number.isFinite(percent) && percent >= 0 ? percent : null;
 }
 
+// A poll-length rate is a spike, not a load: the headline averages the whole chart
+// window and says over how long. A counter reset inside the window is unknown, not 0.
+export function cpuAverage(history) {
+  const first = history.find(item => Number.isFinite(item.cpu_seconds));
+  const last = history.at(-1);
+  if (!first || first === last || !Number.isFinite(last.cpu_seconds)) return null;
+  const seconds = (last.time - first.time) / 1000;
+  const delta = last.cpu_seconds - first.cpu_seconds;
+  if (!(seconds > 0) || !Number.isFinite(delta) || delta < 0) return null;
+  const percent = delta * 100 / seconds; // CPU seconds / wall seconds -> % of one core.
+  return Number.isFinite(percent) ? { percent, seconds } : null;
+}
+
 // Current RSS wins. A peak-only value is explicitly flagged so the UI labels it.
 export function processRss(process = null) {
   const usable = value => Number.isFinite(value) && value >= 0 ? value : null;

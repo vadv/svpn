@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -56,6 +56,22 @@ test("process CPU is derived from cumulative seconds and the real snapshot gap",
   assert.equal(sample.cpu_seconds, 10.25);
   assert.equal(cpuPercent(before, snapshot(3000, [], 1, { cpu_seconds: 10.5 })), 25, "actual elapsed time, not poll interval");
   assert.equal(cpuPercent(before, snapshot(2000, [], 1, { cpu_seconds: 12.5 })), 250, "multithreaded load may exceed 100% of one core");
+});
+
+test("the CPU headline averages the chart window instead of the last poll", () => {
+  // 20% of one core with a 25 CPU-second burst in one poll: that single poll
+  // would read 520%, while the window it happened in used 35 of 50 seconds.
+  const history = Array.from({ length: 11 }, (_, index) => ({
+    time: index * 5000,
+    cpu_seconds: index + (index >= 3 ? 25 : 0),
+  }));
+  const average = cpuAverage(history);
+  assert.equal(average.seconds, 50, "the window the percent is averaged over");
+  assert.equal(average.percent, 70, "35 CPU seconds over 50 wall seconds");
+  assert.equal(cpuAverage([history[0]]), null, "one sample cannot be a rate");
+  assert.equal(cpuAverage([{ time: 0 }, history.at(-1)]), null, "a missing counter is not zero load");
+  assert.equal(cpuAverage([{ time: 0, cpu_seconds: 40 }, { time: 10_000, cpu_seconds: 5 }]), null,
+    "a counter reset inside the window is unknown, not idle");
 });
 
 test("restarts, resets, stale gaps and missing process counters stay unknown", () => {

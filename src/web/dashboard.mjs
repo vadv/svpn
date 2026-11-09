@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -86,12 +86,15 @@ function renderProcess() {
   const process = latest.process ?? null;
   const memory = processRss(process);
   const cpu = Number.isFinite(point?.cpu) ? point.cpu : null;
+  const average = cpuAverage(history);
   const cpuTime = Number.isFinite(process?.cpu_seconds) ? process.cpu_seconds : null;
   const cpus = Number.isFinite(process?.cpus) && process.cpus > 0 ? process.cpus : null;
   $("proc-rss").textContent = memory.bytes == null ? "—" : bytes(memory.bytes);
   $("proc-rss-kind").textContent = memory.bytes == null ? "No process sample" : memory.peak ? "Peak RSS · live value unavailable" : "Current RSS · resident set";
-  $("proc-cpu").textContent = cpu == null ? "—" : `${cpu.toFixed(1)}%`;
-  $("proc-cpu-kind").textContent = cpu == null ? "Waiting for two fresh samples" : "Of one core · >100% is multithreaded";
+  $("proc-cpu").textContent = average ? `${average.percent.toFixed(1)}%` : "—";
+  $("proc-cpu-kind").textContent = average
+    ? `Of one core · ${Math.round(average.seconds)}s average${cpu == null ? "" : ` · now ${cpu.toFixed(0)}%`}`
+    : "Waiting for two fresh samples";
   $("proc-time").textContent = cpuTime == null ? "—" : `${cpuTime.toFixed(2)} s`;
   $("proc-time-note").textContent = cpus ? `${cpus} logical CPUs · user + system` : "User + system · CPU count unknown";
   const peak = Number.isFinite(process?.peak_rss_bytes) && process.peak_rss_bytes > 0 ? process.peak_rss_bytes : null;
@@ -101,7 +104,7 @@ function renderProcess() {
     memory.peak ? "fallback shown: PEAK RSS, not live RSS" : peak ? "memory meter: current / peak RSS" : "memory meter unavailable: no peak RSS",
   ].join(" · ");
   setMeter("proc-mem-bar", peak == null || memory.bytes == null ? null : memory.bytes / peak * 100);
-  setMeter("proc-cpu-bar", cpu);
+  setMeter("proc-cpu-bar", average?.percent ?? null);
   $("spark-rss").setAttribute("d", sparkScaled(history, "rss"));
   $("spark-cpu").setAttribute("d", spark(history, "cpu"));
 }
