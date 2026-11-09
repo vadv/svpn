@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, readAsnNames, selector, localState } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -6,6 +6,16 @@ let latest = null, point = null, history = [], lastChange = 0, apiError = false;
 let frozen = null, page = 0, flowSignature = "";
 const serverRows = new Map();
 let asnNames = Object.create(null), asnCount = 0, asnState = "idle", asnError = "", asnAbort = null, asnIdleTimer = null;
+
+// Regional-indicator pairs have no flag glyph everywhere: Windows renders the two letters
+// again, a Linux without an emoji font renders tofu. A supported pair collapses to one
+// glyph, so measuring it against a single indicator tells us whether to draw it at all.
+const flagsSupported = (() => {
+  const probe = document.createElement("canvas").getContext("2d");
+  probe.font = "16px monospace";
+  const one = probe.measureText("\u{1f1e6}").width;
+  return one > 0 && probe.measureText("\u{1f1e6}\u{1f1e8}").width <= one * 1.6;
+})();
 
 function node(tag, text = "", className = "") {
   const element = document.createElement(tag);
@@ -177,6 +187,9 @@ function renderRules() {
   table("groups", latest.groups.map(group => [cell(group.group), cell(name(group.server))]), 2, "No pinned groups");
 }
 
+// Missing metadata stays an explicit "Unknown", never an empty cell or a lone flag.
+const countryLabel = code => code && flagsSupported ? `${flag(code)} ${code}` : code ?? "Unknown";
+
 function renderFlows() {
   const state = frozen ?? latest;
   if (!state) return;
@@ -191,7 +204,7 @@ function renderFlows() {
     country: $("flow-country").value, asn: $("flow-asn").value, names, page });
   page = result.page;
   const labels = result.rows.map(flow => [flow.protocol.toUpperCase(), flow.source, flow.destination,
-    flow.country ?? "Unknown", asnLabel(flow.asn, names), name(flow.via, state),
+    countryLabel(flow.country), asnLabel(flow.asn, names), name(flow.via, state),
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule"]);
   const signature = JSON.stringify({ labels, empty: result.total === 0 });
   if (flowSignature !== signature) {

@@ -199,6 +199,13 @@ export function asnLabel(asn, names = {}) {
   return asn == null ? "Unknown" : `AS${asn}${names[asn] ? ` · ${names[asn]}` : ""}`;
 }
 
+// Flag for a country code as the regional-indicator pair. The snapshot only ever
+// carries two ASCII letters or null, so anything else stays flagless by design.
+export function flag(code) {
+  return /^[A-Z]{2}$/.test(code ?? "")
+    ? String.fromCodePoint(...[...code].map(letter => 0x1f1e6 + letter.charCodeAt(0) - 65)) : "";
+}
+
 export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0 } = {}) {
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&

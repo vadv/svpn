@@ -100,7 +100,10 @@ try {
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
   input('flow-country', 'US'); input('flow-asn', '13335');
-  assert([...$('flows').tBodies[0].rows].every(row => row.cells[3].textContent === 'US' && row.cells[4].textContent.includes('AS13335 · Cloudflare')), 'country and ASN filters combine');
+  const countryCells = [...$('flows').tBodies[0].rows].map(row => row.cells[3].textContent);
+  // Headless Chrome without an emoji font draws no flag: the code is mandatory, the flag is not.
+  assert(new Set(countryCells).size === 1 && ['US', '\u{1f1fa}\u{1f1f8} US'].includes(countryCells[0]), 'country cell is the code, consistently flagged or not');
+  assert([...$('flows').tBodies[0].rows].every(row => row.cells[4].textContent.includes('AS13335 · Cloudflare')), 'country and ASN filters combine');
   input('flow-search', 'cloudflare');
   assert(!$('flows').textContent.includes('No flows match'), 'organization search works');
   input('flow-search', ''); input('flow-country', 'unknown'); input('flow-asn', 'unknown');

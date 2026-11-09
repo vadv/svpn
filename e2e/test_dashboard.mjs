@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, processRss, uptimeSeconds, duration, flowPage, asnLabel, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -231,6 +231,14 @@ test("destination country/ASN filters combine and search includes organization n
   assert.equal(asnLabel(13335, names), "AS13335 · Cloudflare, Inc.");
   assert.equal(asnLabel(139341), "AS139341");
   assert.equal(asnLabel(null), "Unknown");
+});
+
+test("country flags come from the ISO code alone", () => {
+  assert.equal(flag("US"), "\u{1f1fa}\u{1f1f8}");
+  assert.equal(flag("SE"), "\u{1f1f8}\u{1f1ea}");
+  for (const code of [null, undefined, "", "unknown", "U", "USA", "us", "1A"]) {
+    assert.equal(flag(code), "", `${String(code)} is not a country code`);
+  }
 });
 
 test("browser ASN parser handles DB-IP quoting, boundaries and duplicate ranges", () => {
