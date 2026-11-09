@@ -1,6 +1,6 @@
 //! Flow ownership and first-match traffic attribution across link generations.
 
-use std::{collections::HashMap, net::Ipv4Addr};
+use std::{collections::HashMap, net::Ipv4Addr, time::Instant};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -35,6 +35,9 @@ pub struct RoutedFlow {
     pub closing: bool,
     /// This flow's bytes since the hub first saw it.
     pub traffic: Traffic,
+    /// When the hub first saw the flow, and when it last carried a packet.
+    pub opened: Instant,
+    pub active: Instant,
 }
 
 /// Inner IP bytes: TX accepted by the hub queue, RX delivered to the client TUN.
@@ -67,6 +70,7 @@ impl Routes {
     }
 
     pub fn insert(&mut self, key: FlowKey, target: Target, rule: Option<usize>) {
+        let now = Instant::now();
         self.by_key.insert(
             key,
             RoutedFlow {
@@ -74,6 +78,8 @@ impl Routes {
                 rule,
                 closing: false,
                 traffic: Traffic::default(),
+                opened: now,
+                active: now,
             },
         );
     }
@@ -91,6 +97,7 @@ impl Routes {
     /// Call only after the queue/TUN accepted the full packet.
     pub fn record(&mut self, key: FlowKey, tx: usize, rx: usize) {
         if let Some(flow) = self.by_key.get_mut(&key) {
+            flow.active = Instant::now();
             for traffic in [
                 self.traffic.entry(flow.rule).or_default(),
                 &mut flow.traffic,

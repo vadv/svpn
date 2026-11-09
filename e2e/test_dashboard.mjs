@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -363,6 +363,28 @@ test("source column names the LAN device or the router itself", () => {
     { main: "router", detail: "10.77.0.2:49451" });
   assert.deepEqual(flowSource({ source: "10.77.0.2:49451" }), { main: "router", detail: "10.77.0.2:49451" },
     "a snapshot without the new fields still renders");
+});
+
+test("the service is guessed from the protocol and the destination port", () => {
+  const service = (protocol, destination) => flowService({ protocol, destination });
+  assert.equal(service("tcp", "1.2.3.4:443"), "HTTPS");
+  assert.equal(service("udp", "1.2.3.4:443"), "QUIC", "the same port means another protocol over UDP");
+  assert.equal(service("udp", "8.8.8.8:53"), "DNS");
+  assert.equal(service("tcp", "1.2.3.4:4443"), null, "an unknown port stays unlabeled");
+  assert.equal(service("tcp", "1.2.3.4:44"), null, "the port is matched whole, not by prefix");
+  assert.equal(service("icmp", "8.8.8.8"), null, "ICMP has no port");
+  const flows = [{ protocol: "udp", source: "a", destination: "1.2.3.4:443" }, { protocol: "tcp", source: "b", destination: "1.2.3.4:443" }];
+  assert.equal(flowPage(flows, { query: "quic" }).count, 1, "search matches the guessed service");
+});
+
+test("flow age shows the lifetime and how long the flow has been silent", () => {
+  assert.deepEqual(flowAge({ age_secs: 134, idle_secs: 35 }), { main: "00:02:14", detail: "idle 00:00:35" });
+  assert.deepEqual(flowAge({ age_secs: 5, idle_secs: 1 }), { main: "00:00:05", detail: "active now" }, "a packet within a snapshot is activity");
+  assert.deepEqual(flowAge({}), { main: "—", detail: "" }, "a snapshot without the fields still renders");
+  const flows = [{ source: "a", age_secs: 5, idle_secs: 60 }, { source: "b", age_secs: 90, idle_secs: 0 }, { source: "c" }];
+  const ids = order => flowPage(flows, { order }).rows.map(flow => flow.source).join("");
+  assert.equal(ids("age"), "bac", "longest-lived first, unknown last");
+  assert.equal(ids("idle"), "abc", "most silent first, unknown last");
 });
 
 test("country flags come from the ISO code alone", () => {

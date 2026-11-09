@@ -301,6 +301,19 @@ fn snapshot_maps_live_flows_to_their_server() {
 }
 
 #[test]
+fn snapshot_reports_flow_age_and_idle_time() {
+    let mut hub = hub();
+    let key = flow(6, 40000, 443);
+    hub.routes.insert(key, Target::Direct(9), None);
+    let now = std::time::Instant::now();
+    let route = hub.routes.by_key.get_mut(&key).unwrap();
+    route.opened = now - Duration::from_secs(90);
+    route.active = now - Duration::from_secs(30);
+    let flow = &web::snapshot(&hub).flows[0];
+    assert_eq!((flow.age_secs, flow.idle_secs), (90, 30));
+}
+
+#[test]
 fn destination_geo_is_independent_of_exit_policy_and_unknown_ranges_stay_null() {
     let mut hub = hub();
     let start = u32::from(Ipv4Addr::new(1, 2, 3, 0));
@@ -364,6 +377,8 @@ fn view(protocol: &'static str, source: &str, destination: &str) -> web::FlowVie
         client_name: None,
         rx_bytes: 0,
         tx_bytes: 0,
+        age_secs: 0,
+        idle_secs: 0,
         closing: false,
     }
 }

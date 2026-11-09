@@ -10,7 +10,7 @@ pub mod lan;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -139,6 +139,9 @@ pub struct FlowView {
     /// This flow's bytes since the hub first saw it; the dashboard derives rates.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Seconds since the hub first saw the flow and since its last packet.
+    pub age_secs: u64,
+    pub idle_secs: u64,
 }
 
 /// Everything the dashboard shows.
@@ -255,6 +258,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         })
         .collect();
     groups.sort_by(|a, b| a.group.cmp(&b.group));
+    let now = Instant::now();
     let mut flows: Vec<FlowView> = hub
         .routes
         .by_key
@@ -282,6 +286,8 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             client_name: None,
             rx_bytes: flow.traffic.rx_bytes,
             tx_bytes: flow.traffic.tx_bytes,
+            age_secs: now.saturating_duration_since(flow.opened).as_secs(),
+            idle_secs: now.saturating_duration_since(flow.active).as_secs(),
         })
         .collect();
     flows.sort_by(|a, b| {

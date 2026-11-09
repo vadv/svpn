@@ -278,6 +278,26 @@ export function flowSource(flow) {
     : { main: "router", detail: flow.source };
 }
 
+// A guess from the destination's well-known port: the hub never inspects payloads.
+const SERVICES = {
+  tcp: { 22: "SSH", 25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 465: "SMTPS", 587: "SMTP",
+    853: "DoT", 993: "IMAPS", 995: "POP3S", 1080: "SOCKS", 3389: "RDP", 5222: "XMPP", 5223: "Apple push", 5228: "Google push",
+    8080: "HTTP", 8443: "HTTPS" },
+  udp: { 53: "DNS", 67: "DHCP", 123: "NTP", 443: "QUIC", 500: "IKE", 853: "DoQ", 1900: "SSDP", 3478: "STUN", 4500: "IPsec",
+    5353: "mDNS", 19302: "STUN", 51820: "WireGuard" },
+};
+
+export function flowService(flow) {
+  const port = Number(flow.destination.slice(flow.destination.lastIndexOf(":") + 1));
+  return SERVICES[flow.protocol]?.[port] ?? null;
+}
+
+// The Age column: lifetime since the hub saw the flow, and how long it has been silent.
+export function flowAge(flow) {
+  if (!Number.isFinite(flow.age_secs)) return { main: "—", detail: "" };
+  return { main: duration(flow.age_secs), detail: flow.idle_secs >= 2 ? `idle ${duration(flow.idle_secs)}` : "active now" };
+}
+
 // Each flow's bytes per second since the previous snapshot; null when the flow is new, the
 // clock did not advance or a counter went backwards (a reinserted tuple restarts at zero).
 export function withFlowRates(previous, current) {
@@ -293,13 +313,15 @@ export function withFlowRates(previous, current) {
 const ORDERS = {
   rate: (a, b) => (b.rate ?? -1) - (a.rate ?? -1),
   total: (a, b) => (b.rx_bytes ?? 0) + (b.tx_bytes ?? 0) - (a.rx_bytes ?? 0) - (a.tx_bytes ?? 0),
+  age: (a, b) => (b.age_secs ?? -1) - (a.age_secs ?? -1),
+  idle: (a, b) => (b.idle_secs ?? -1) - (a.idle_secs ?? -1),
 };
 
 export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0, order = "" } = {}) {
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&
     (!country || (flow.country ?? "unknown") === country) && (!asn || String(flow.asn ?? "unknown") === asn) &&
-    (!needle || `${flow.source} ${flow.destination} ${flow.client ?? ""} ${flow.client_name ?? ""} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)}`.toLowerCase().includes(needle)));
+    (!needle || `${flow.source} ${flow.destination} ${flow.client ?? ""} ${flow.client_name ?? ""} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)} ${flowService(flow) ?? ""}`.toLowerCase().includes(needle)));
   // The snapshot already arrives in address order; a stable sort keeps it as the tie-breaker.
   if (ORDERS[order]) filtered.sort(ORDERS[order]);
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));

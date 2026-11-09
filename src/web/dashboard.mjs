@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -222,11 +222,13 @@ function renderFlows() {
   const labels = result.rows.map((flow, index) => [flow.protocol.toUpperCase(), `${sources[index].main} ${sources[index].detail}`, flow.destination,
     countryLabel(flow.country), asnLabel(flow.asn, names), name(flow.via, state),
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule",
-    rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0))]);
+    rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0)),
+    flowService(flow), flowAge(flow).main, flowAge(flow).detail]);
   const signature = JSON.stringify({ labels, closing: result.rows.map(flow => Boolean(flow.closing)), empty: result.total === 0 });
   if (flowSignature !== signature) {
     const rows = result.rows.map((flow, index) => {
       const protocol = cell(node("span", labels[index][0], `tag tag--${flow.protocol}`));
+      if (labels[index][9]) protocol.append(node("span", labels[index][9], "service"));
       if (flow.closing) protocol.append(node("span", "closing", "tag tag--closing"));
       return [
       protocol,
@@ -234,9 +236,10 @@ function renderFlows() {
       cell(labels[index][3]), cell(labels[index][4]),
       cell(node("span", labels[index][5], "exit-tag")), cell(node("span", labels[index][6], "rule-tag")),
       cell(title(labels[index][7], labels[index][8]), true),
+      cell(title(labels[index][10], labels[index][11]), true),
       ];
     });
-    table("flows", rows, 8, result.total ? "No flows match these filters" : "No active flows");
+    table("flows", rows, 9, result.total ? "No flows match these filters" : "No active flows");
     // Closing rows dim in place; the tag alone would vanish in the density.
     result.rows.forEach((flow, index) => {
       if (flow.closing) $("flows").tBodies[0].rows[index].classList.add("closing");

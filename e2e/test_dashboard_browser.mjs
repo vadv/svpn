@@ -46,6 +46,7 @@ function frame() {
     client: i % 3 === 1 ? `192.168.0.${20 + i % 40}` : null,
     client_name: i % 3 === 1 && i % 2 ? "iphone-vadv" : null,
     rx_bytes: i === 7 ? sequence * 2000000 : (count - i) * 1000, tx_bytes: 0,
+    age_secs: 60 + i, idle_secs: i % 4 ? 0 : 45,
   }));
   const traffic = rule => ({
     rx_bytes: rule === 1 ? 2 * 1073741824 : rule === 0 ? servers[0].stats.inner_rx_bytes / (degraded ? 2 : 1) : servers[1].stats.inner_rx_bytes + (degraded ? servers[0].stats.inner_rx_bytes / 2 : 0),
@@ -150,6 +151,9 @@ try {
   assert(isSource(1, 'router', '10.77.0.2:40000'), 'a flow without a LAN client is the router itself');
   input('flow-order', '');
   await until(() => sourceCell(0).note === '10.77.0.2:40000', 'address order keeps the snapshot order');
+  assert(flowRow(0)[0].textContent === 'UDPQUIC' && flowRow(1)[0].textContent.startsWith('TCPHTTPS'), 'the protocol cell guesses the service from the port');
+  assert(flowRow(0)[8].querySelector('strong').textContent === '00:01:00' && flowRow(0)[8].querySelector('small').textContent === 'idle 00:00:45'
+    && flowRow(1)[8].querySelector('small').textContent === 'active now', 'the age column shows lifetime and silence');
   input('flow-search', 'iphone-vadv');
   assert($('flows').tBodies[0].rows.length === 21 && isSource(0, 'iphone-vadv · 192.168.0.21', 'via 10.77.0.2:40001'), 'search finds flows by device name');
   input('flow-search', '192.168.0.27');

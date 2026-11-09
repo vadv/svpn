@@ -110,6 +110,25 @@ fn flow_ids_never_enter_the_reserved_probe_space() {
     assert!(routes.allocate().is_err());
 }
 
+// ── flow activity ──
+
+#[test]
+fn record_refreshes_last_activity_but_not_the_open_time() {
+    let key = packet::parse(&tcp_packet(false), true).unwrap().flow;
+    let mut routes = Routes::default();
+    routes.insert(key, Target::Direct(1), None);
+    let then = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let flow = routes.by_key.get_mut(&key).unwrap();
+    (flow.opened, flow.active) = (then, then);
+    routes.record(key, 40, 0);
+    let flow = &routes.by_key[&key];
+    assert_eq!(flow.opened, then);
+    assert!(
+        flow.active.elapsed().as_secs() < 1,
+        "a packet marks the flow active now"
+    );
+}
+
 // ── closing flows ──
 
 #[test]
