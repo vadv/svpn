@@ -38,6 +38,43 @@ fn frames_round_trip_in_order() {
     assert_eq!(decode_all(Camouflage::None, &stream).unwrap(), payloads);
 }
 
+// ── allocation-free frame builders ──
+
+#[test]
+fn ssh_frame_bytes_match_the_wire_vector() {
+    // Captured from the pre-seal_into implementation — the two-seal shape is
+    // deliberate camouflage and must stay byte-for-byte.
+    const FRAME: [u8; 58] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xfc, 0x9f, 0x18, 0xbc, 0xfd, 0x10, 0x70, 0xb4, 0xd1, 0xf6, 0x35,
+        0xc9, 0x0c, 0x3b, 0xcf, 0x57, 0x01, 0x3b, 0x47, 0xd2, 0, 0, 0, 0, 0, 0, 0, 1, 0x1b, 0xf4,
+        0x13, 0x9e, 0xb1, 0x86, 0x18, 0xc3, 0x65, 0xb9, 0xb5, 0x10, 0xa5, 0x55, 0x3e, 0x72, 0x7d,
+        0x9a, 0xda, 0xbc, 0xc6, 0x75,
+    ];
+    const EMPTY: [u8; 52] = [
+        0, 0, 0, 0, 0, 0, 0, 2, 0x38, 0xb4, 0x0d, 0x21, 0x00, 0xa9, 0x44, 0xfd, 0x99, 0xc2, 0x1e,
+        0x21, 0x59, 0x21, 0xf3, 0xc8, 0xd5, 0xf0, 0x76, 0x40, 0, 0, 0, 0, 0, 0, 0, 3, 0x60, 0x8d,
+        0x95, 0xf6, 0x92, 0xa4, 0x60, 0xc7, 0x58, 0x71, 0x66, 0x91, 0x94, 0x7b, 0x3e, 0xca,
+    ];
+    let mut client = Cipher::new([7; 16], 42, true);
+    assert_eq!(ssh_frame(&mut client, b"vector").unwrap(), FRAME);
+    assert_eq!(ssh_frame(&mut client, &[]).unwrap(), EMPTY);
+}
+
+#[test]
+fn frame_sealed_matches_frame_of_seal_and_decodes_back() {
+    // Captured from the pre-seal_into `frame(&cipher.seal(..))` composition.
+    const PLAIN_FRAME: [u8; 34] = [
+        0, 0, 0, 0x1e, 0, 0, 0, 0, 0, 0, 0, 0, 0x8a, 0xfa, 0x7b, 0xd6, 0xdd, 0xbd, 0xd9, 0xca,
+        0xf8, 0x13, 0xbe, 0xb5, 0x46, 0x11, 0x80, 0x82, 0x70, 0xca, 0x32, 0x4b, 0xff, 0x3c,
+    ];
+    let mut client = Cipher::new([7; 16], 42, true);
+    let wire = frame_sealed(&mut client, b"vector").unwrap();
+    assert_eq!(wire, PLAIN_FRAME);
+    let sealed = decode_all(Camouflage::None, &wire).unwrap();
+    let mut server = Cipher::new([7; 16], 42, false);
+    assert_eq!(server.open(&sealed[0]).unwrap(), b"vector");
+}
+
 #[test]
 fn oversize_payload_and_len_are_rejected() {
     assert!(frame(&[0; MAX_PAYLOAD + 1]).is_err());
