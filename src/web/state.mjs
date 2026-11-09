@@ -2,6 +2,8 @@
 export const WINDOW_MS = 5 * 60 * 1000;
 export const STALE_MS = 5000;
 export const PAGE_SIZE = 50;
+// shortcut: a sample count, not wall time — revisit if snapshot intervals vary by an order of magnitude.
+export const SMOOTH_SAMPLES = 5;
 
 export function bytes(value) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -104,22 +106,42 @@ export function keepHistory(history, point) {
   return [...history.filter(item => item.time > point.time - WINDOW_MS && item.time < point.time), point].slice(-301);
 }
 
+// A rate over one poll is a spike, not a trend: one slow snapshot reads as a traffic burst, so every
+// drawn line averages a short window. A missing sample stays missing — averaging across an API gap
+// would paint traffic that never crossed a tunnel. Values are already in the unit being drawn.
+export function smoothRates(values, window = SMOOTH_SAMPLES) {
+  return values.map((value, index) => {
+    if (value == null) return null;
+    let sum = 0, count = 0;
+    for (let i = Math.max(0, index - window + 1); i <= index; i++) {
+      const item = values[i];
+      if (item != null) { sum += item; count++; }
+    }
+    return count ? sum / count : null;
+  });
+}
+
 // One sample vocabulary for the chart, its filled areas, sparklines and the hover readout.
+// Lines draw the smoothed rates; `latest` stays the newest real sample, so the readouts keep saying
+// "now" while the trend line says "recently".
 function series(history, serverId = "") {
-  const samples = history.map(point => ({
+  const raw = history.map(point => ({
     time: point.time,
     ...(serverId ? point.servers?.[serverId] ?? { rx: null, tx: null } : point),
   }));
+  const rx = smoothRates(raw.map(sample => sample.rx));
+  const tx = smoothRates(raw.map(sample => sample.tx));
+  const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index] }));
   const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
   const end = history.at(-1)?.time ?? 0;
-  return { samples, max, end };
+  return { samples, max, end, latest: raw.at(-1) ?? null };
 }
 
 const chartX = (time, end) => 1000 * (time - end + WINDOW_MS) / WINDOW_MS;
 const chartY = (value, max) => 152 - 128 * value / max;
 
 export function graph(history, serverId = "") {
-  const { samples, max, end } = series(history, serverId);
+  const { samples, max, end, latest } = series(history, serverId);
   const path = field => {
     let connected = false;
     return samples.map(sample => {
@@ -132,7 +154,7 @@ export function graph(history, serverId = "") {
       return segment;
     }).join(" ");
   };
-  return { rx: path("rx"), tx: path("tx"), max, latest: samples.at(-1) };
+  return { rx: path("rx"), tx: path("tx"), max, latest };
 }
 
 // Closed polygons under the lines. A missing interval starts a new polygon

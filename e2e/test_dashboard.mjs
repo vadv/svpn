@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -167,7 +167,7 @@ test("areas and lines use the same scale and can be filtered by server", () => {
   ];
   const line = graph(history, "nl").rx.split(" ").at(-1).slice(1);
   assert.ok(areas(history, "nl").rx.includes(line), "the area ridge follows the line exactly");
-  assert.equal(graph(history, "nl").max, 8.8, "both views scale from the same peak");
+  assert.equal(graph(history, "nl").max, 6 * 1.1, "both views scale from the same smoothed peak");
   assert.ok(areas(history, "nl").rx.includes("1000.00,35.64"));
 });
 
@@ -210,9 +210,33 @@ test("hover readout picks the nearest real sample and never invents a value", ()
   ];
   assert.deepEqual(nearestSample(history, 900), { time: 1000, rx: 1, tx: 2 });
   assert.deepEqual(nearestSample(history, 2600), { time: 3000, rx: null, tx: null });
-  assert.deepEqual(nearestSample(history, 2600, "nl"), { time: 3000, rx: 7, tx: 8 });
+  assert.deepEqual(nearestSample(history, 2600, "nl"), { time: 3000, rx: 6, tx: 7 }, "the readout quotes the smoothed line, not the raw poll");
   assert.deepEqual(nearestSample(history, 1000, "absent"), { time: 1000, rx: null, tx: null });
   assert.equal(nearestSample([], 1000), null);
+});
+
+test("traffic lines average a short window instead of drawing one-poll spikes", () => {
+  const flat = Array.from({ length: 6 }, () => 8);
+  assert.deepEqual(smoothRates(flat), flat, "a steady trend is not moved");
+  const spiky = [8, 8, 8, 40, 8, 8];
+  const smoothed = smoothRates(spiky);
+  assert.equal(smoothed[3], 16, "a one-poll burst is spread over the polls it covers");
+  assert.ok(smoothed[3] < spiky[3] && smoothed[3] > spiky[2], "the burst stays visible, it is only not a needle");
+  assert.deepEqual(smoothRates([2, 4]), [2, 3], "a young series averages what exists");
+  assert.deepEqual(smoothRates([null, 4]), [null, 4], "a gap is not filled from the sample after it");
+  assert.deepEqual(smoothRates([1, null, null]), [1, null, null], "unknown stays unknown");
+  assert.deepEqual(smoothRates([]), []);
+});
+
+test("smoothing never bridges an API gap and never moves the readouts", () => {
+  const history = [
+    { time: 1000, rx: 2, tx: 1, servers: {} }, { time: 2000, rx: 4, tx: 1, servers: {} },
+    { time: 8000, rx: null, tx: null, servers: {} }, { time: 9000, rx: 6, tx: 1, servers: {} },
+  ];
+  assert.equal(graph(history).rx.match(/M/g).length, 2, "the gap still breaks the line");
+  assert.equal(graph([{ time: 1000, rx: null, tx: null, servers: {} }]).rx.trim(), "", "an unknown newest sample draws nothing");
+  assert.equal(graph(history).latest.rx, 6, "the readout keeps the newest real rate, not the average");
+  assert.equal(spark(history, "rx").match(/M/g).length, 2, "the compact trend breaks on the same gap");
 });
 
 test("flow filters combine, pagination is bounded and disappearing pages clamp", () => {
