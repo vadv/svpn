@@ -92,7 +92,8 @@ async function until(condition, label, limit = 7000) {
 async function control(scenario) { return fetch('/fixture?scenario=' + scenario).then(response => response.json()); }
 function input(id, value) { $(id).value = value; $(id).dispatchEvent(new Event(id === 'flow-search' ? 'input' : 'change')); }
 try {
-  await until(() => $('rx').textContent !== '—' && $('active').textContent === '115 active · 8 closing', 'live traffic');
+  await until(() => $('rx').textContent !== '—' && $('active').textContent === '115', 'live traffic');
+  assert($('active-note').textContent.endsWith(' · 8 closing'), 'closing flows are counted in the note, not the headline');
   assert($('rules').tBodies[0].rows[0].cells[3].textContent === '37 active · 4 closing' && $('rules').textContent.includes('41 active'), 'rules split active and closing counts, a rule without closing omits the note');
   assert($('local').textContent === 'Ready', 'local readiness');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
@@ -175,7 +176,7 @@ try {
   await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
   await control('large');
-  await until(() => $('active').textContent === '9336 active · 667 closing', 'large flow snapshot');
+  await until(() => $('active').textContent === '9336', 'large flow snapshot');
   assert($('flows').tBodies[0].rows.length === 50, 'large table bounded to 50 rows');
   assert(document.querySelector('#servers details') === details && details.open, 'details identity and open state preserved');
   input('flow-search', '49999'); input('flow-protocol', 'tcp'); input('flow-exit', 'local');
@@ -187,12 +188,12 @@ try {
   const frozen = $('flows').textContent, frozenExits = $('flow-exit').textContent;
   const frozenCountries = $('flow-country').textContent, frozenAsns = $('flow-asn').textContent;
   await control('empty');
-  await until(() => $('active').textContent === '0 active', 'live servers removed while paused');
+  await until(() => $('active').textContent === '0', 'live servers removed while paused');
   assert($('flow-exit').value === 'de.example.test' && $('flow-exit').textContent === frozenExits, 'paused exit options and selection use the frozen snapshot');
   assert($('flow-country').value === 'US' && $('flow-asn').value === '13335' && $('flow-country').textContent === frozenCountries && $('flow-asn').textContent === frozenAsns, 'pause freezes Geo metadata, names and filter options');
   assert($('flows').textContent === frozen && frozen.includes('DE'), 'paused server and rule labels survive live config changes');
   await control('normal');
-  await until(() => $('active').textContent === '115 active · 8 closing', 'live summary while paused');
+  await until(() => $('active').textContent === '115', 'live summary while paused');
   assert($('flows').textContent === frozen && $('flow-count').textContent.includes('10003') && $('pause').getAttribute('aria-pressed') === 'true', 'flow table stays frozen');
   $('pause').click(); assert($('pause').getAttribute('aria-pressed') === 'false', 'resume live table');
   input('flow-exit', ''); input('flow-country', ''); input('flow-asn', '');
@@ -226,12 +227,12 @@ try {
   await until(() => $('freshness').textContent === 'Stale data', 'unchanged snapshot becomes stale');
   assert(!$('stale-notice').hidden && $('rx').textContent === '—', 'stale screen has warning and unknown rate');
   await control('empty');
-  await until(() => $('active').textContent === '0 active' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
+  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
   assert($('rx').textContent === '—', 'stale recovery starts with an unknown rate');
   assert($('flows').textContent.includes('No active flows'), 'empty flow state');
   assert($('servers').textContent.includes('No servers configured'), 'empty server table is explicit');
   input('flow-search', 'missing'); await control('normal');
-  await until(() => $('active').textContent === '115 active · 8 closing', 'filtered recovery');
+  await until(() => $('active').textContent === '115', 'filtered recovery');
   assert($('flows').textContent.includes('No flows match'), 'empty filter message updates');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No servers'), 'servers recover without a stale placeholder');
   input('flow-search', '');

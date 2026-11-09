@@ -352,9 +352,11 @@ function render() {
   const ready = latest.servers.filter(server => server.state === "ready").length;
   $("ready").textContent = `${ready} / ${latest.servers.length}`;
   const open = latest.flows.filter(flow => !flow.closing).length;
-  $("active").textContent = flowCounts({ active_flows: open, closing_flows: latest.flows.length - open });
+  const closing = latest.flows.length - open;
+  // The headline stays a bare number so the card fits a phone; closing ones go to the note.
+  $("active").textContent = String(open);
   const localFlows = latest.flows.filter(flow => flow.via === "local").length;
-  $("active-note").textContent = `${latest.flows.length - localFlows} VPN · ${localFlows} local`;
+  $("active-note").textContent = `${latest.flows.length - localFlows} VPN · ${localFlows} local${closing ? ` · ${closing} closing` : ""}`;
   $("local").textContent = localState(latest.local);
   $("local-note").textContent = latest.local.enabled ? `${localFlows} owned flows · ${latest.local.ready ? "direct WAN egress" : "no new local flows"}` : "No local-exit rules configured";
   const warnings = latest.servers.filter(server => server.state !== "ready").map(server => `${name(server.id)}: ${server.state}${server.reason ? ` — ${server.reason}` : ""}`);
