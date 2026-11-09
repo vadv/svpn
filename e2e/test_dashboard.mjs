@@ -117,11 +117,11 @@ test("node ids cannot collide with object prototype keys", () => {
   assert.equal(sample.servers.__proto__.tx, 0.008);
 });
 
-test("history is bounded by five minutes and a sample count", () => {
+test("history is bounded by the chart window plus one smoothing window and a sample count", () => {
   let history = [];
   for (let time = 0; time <= 1000000; time += 100) history = keepHistory(history, { time, rx: 1, tx: 2 });
-  assert.ok(history.length <= 301);
-  assert.ok(history.every(item => item.time > 1000000 - WINDOW_MS));
+  assert.ok(history.length <= 316);
+  assert.ok(history.every(item => item.time > 1000000 - WINDOW_MS - SMOOTH_MS));
   history = keepHistory(history, { time: 1, rx: null, tx: null });
   assert.equal(history.length, 1, "future samples are discarded if the clock moves backwards");
 });
@@ -246,6 +246,21 @@ test("traffic lines average a short wall-time window instead of drawing one-poll
   assert.ok(smooth(sixteen)[14] > 0, "a sample inside the window still counts");
   assert.deepEqual(smoothRates([0, 30], [0, 3000]), [0, 15], "slow polls still average by time, not count");
   assert.deepEqual(smoothRates([0, 30], [0, 20000]), [0, 30], "a poll beyond the window does not dilute the rate");
+});
+
+test("the chart's oldest point is as smooth as its newest", () => {
+  // One poll reads 0, the next a burst: the raw rate saw-tooths, the 15 s average sits near 50.
+  let history = [];
+  for (let time = 0; time <= WINDOW_MS + 60000; time += 1000) {
+    history = keepHistory(history, { time, rx: time / 1000 % 2 ? 100 : 0, tx: 0, servers: {} });
+  }
+  const end = history.at(-1).time;
+  for (const at of [end - WINDOW_MS + 1000, end - WINDOW_MS / 2, end]) {
+    const { rx } = nearestSample(history, at);
+    assert.ok(rx > 40 && rx < 60, `smoothed at ${end - at} ms before the end: ${rx}`);
+  }
+  const firstX = Number(graph(history).rx.match(/^M([\d.]+),/)[1]);
+  assert.ok(firstX >= 0, "samples kept only for the average are not drawn left of the axis");
 });
 
 test("traffic average covers the whole history, weighted by measured time", () => {

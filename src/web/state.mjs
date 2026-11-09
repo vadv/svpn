@@ -4,6 +4,8 @@ export const STALE_MS = 5000;
 export const PAGE_SIZE = 50;
 // Wall time, not a sample count: a loaded router answers polls slower than once a second.
 export const SMOOTH_MS = 15000;
+// The chart's oldest point needs a full smoothing window behind it, so history reaches that far back.
+const HISTORY_MS = WINDOW_MS + SMOOTH_MS;
 
 export function bytes(value) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -108,7 +110,8 @@ export function measure(previous, current) {
 
 export function keepHistory(history, point) {
   // Even a faulty future-dated or high-frequency source cannot grow history without a bound.
-  return [...history.filter(item => item.time > point.time - WINDOW_MS && item.time < point.time), point].slice(-301);
+  return [...history.filter(item => item.time > point.time - HISTORY_MS && item.time < point.time), point]
+    .slice(-(HISTORY_MS / 1000 + 1));
 }
 
 // A rate over one poll is a spike, not a trend: one slow snapshot reads as a traffic burst, so every
@@ -152,9 +155,11 @@ function series(history, serverId = "") {
   const rx = smoothRates(raw.map(sample => sample.rx), times);
   const tx = smoothRates(raw.map(sample => sample.tx), times);
   const cpu = smoothRates(raw.map(sample => sample.cpu), times);
-  const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index], cpu: cpu[index] }));
-  const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
   const end = history.at(-1)?.time ?? 0;
+  // Samples older than the window only feed the average: drawn alone they are raw one-poll rates.
+  const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index], cpu: cpu[index] }))
+    .filter(sample => sample.time > end - WINDOW_MS);
+  const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
   return { samples, max, end, latest: samples.at(-1) ?? null };
 }
 
