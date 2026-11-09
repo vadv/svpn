@@ -2,8 +2,6 @@
 
 mod common;
 
-use std::time::Duration;
-
 use common::tcp_packet;
 use svpn::hub::*;
 use svpn::link_io::{Delivery, Epoch, FIRST_PROBE_ID, Packet};
@@ -237,10 +235,9 @@ async fn full_queue_counts_loss_without_installing_a_new_owner() {
 #[tokio::test]
 async fn tun_timeout_is_loss_not_successful_delivery() {
     let delivery = Delivery::default();
-    let timed_out = tokio::time::timeout(Duration::ZERO, std::future::pending()).await;
-    finish_write(&delivery, 100, timed_out).unwrap();
-    finish_write(&delivery, 100, Ok(Ok(100))).unwrap();
-    assert!(finish_write(&delivery, 100, Ok(Ok(99))).is_err());
+    finish_write(&delivery, 100, None).unwrap();
+    finish_write(&delivery, 100, Some(Ok(100))).unwrap();
+    assert!(finish_write(&delivery, 100, Some(Ok(99))).is_err());
     let mut stats = svpn::control::Stats::default();
     delivery.apply(&mut stats);
     assert_eq!(

@@ -6,6 +6,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant as StdInstant},
 };
 
@@ -46,6 +47,16 @@ pub const SNAPSHOT_INTERVAL: u32 = 1;
 /// Startup grace for restored sticky owners: two connect budgets
 /// (selector::ATTEMPT_BUDGET is 5 s each).
 pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Packets one drain round may flush to the TUN: one busy flow must not
+/// starve the select loop between rounds.
+pub const TUN_BATCH: usize = 32;
+
+/// Deadline one TUN flush batch shares; was a fresh timeout per packet.
+const TUN_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// One TUN flush batch: per-link delivery counters paired with each packet.
+type TunBatch = Vec<(Arc<Delivery>, Packet)>;
 
 pub struct Link {
     pub params: LinkParams,
@@ -368,53 +379,95 @@ impl Hub {
 
     pub async fn handle_local_event(
         &mut self,
-        (_epoch, event): (Epoch, Event),
+        mut event: (Epoch, Event),
         tun: &mut Option<AsyncDevice>,
     ) -> Result<()> {
-        match event {
-            Event::Ready => {
-                if let Some(local) = &mut self.local {
-                    local.ready = true;
-                    crate::info!("local-exit: ready");
+        loop {
+            match event.1 {
+                Event::Ready => {
+                    if let Some(local) = &mut self.local {
+                        local.ready = true;
+                        crate::info!("local-exit: ready");
+                    }
+                }
+                Event::Checking | Event::RoundFailed => {
+                    if let Some(local) = &mut self.local {
+                        local.ready = false;
+                    }
+                }
+                Event::Packet(packet) => {
+                    let Some(delivery) = self.local.as_ref().map(|local| local.delivery.clone())
+                    else {
+                        return Ok(());
+                    };
+                    if !self.local_current(&packet) {
+                        return Ok(());
+                    }
+                    let tun = tun
+                        .as_ref()
+                        .context("local-exit packet without client TUN")?;
+                    // Same one-deadline flush as link packets: the packets
+                    // already queued behind this one share its timer.
+                    let (batch, deferred) = self.local_batch(delivery, packet);
+                    self.flush_tun_batch(tun, &batch).await?;
+                    match deferred {
+                        Some(next) => {
+                            event = next;
+                            continue;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Event::Closing { .. } => {
+                    // The local proxy never reports both-FIN closing (no FIN tracking);
+                    // only the remote flow owner marks a RoutedFlow closing.
+                }
+                Event::Closed { id, key } => {
+                    self.close_local(id, key, false);
                 }
             }
-            Event::Checking | Event::RoundFailed => {
-                if let Some(local) = &mut self.local {
-                    local.ready = false;
+            return Ok(());
+        }
+    }
+
+    /// A local-exit packet is current while its flow still targets the proxy
+    /// session that sent it.
+    fn local_current(&self, packet: &Packet) -> bool {
+        packet::parse(&packet.bytes, false).is_some_and(|parsed| {
+            matches!(self.routes.target(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
+        })
+    }
+
+    /// Gathers the local-exit packets queued behind `first`: at most
+    /// `TUN_BATCH`, only current ones, queue order kept. A queued non-packet
+    /// event stops the batch and is returned for handling after the flush,
+    /// so event order stays strict.
+    pub fn local_batch(
+        &mut self,
+        delivery: Arc<Delivery>,
+        first: Packet,
+    ) -> (TunBatch, Option<(Epoch, Event)>) {
+        let mut batch = Vec::with_capacity(TUN_BATCH);
+        batch.push((delivery, first));
+        while batch.len() < TUN_BATCH {
+            let next = self
+                .local
+                .as_mut()
+                .and_then(|local| local.events.as_mut()?.try_recv().ok());
+            match next {
+                Some((_, Event::Packet(packet))) => {
+                    if self.local_current(&packet)
+                        && let Some(delivery) =
+                            self.local.as_ref().map(|local| local.delivery.clone())
+                    {
+                        batch.push((delivery, packet));
+                    }
                 }
-            }
-            Event::Packet(packet) => {
-                let Some(local) = &self.local else {
-                    return Ok(());
-                };
-                let delivery = local.delivery.clone();
-                let bytes = packet.bytes;
-                let current = packet::parse(&bytes, false).is_some_and(|parsed| {
-                    matches!(self.routes.target(&parsed.flow), Some(Target::Direct(id)) if *id == packet.id)
-                });
-                if !current {
-                    return Ok(());
-                }
-                let tun = tun
-                    .as_ref()
-                    .context("local-exit packet without client TUN")?;
-                let result =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&bytes)).await;
-                if finish_write(&delivery, bytes.len(), result)?
-                    && let Some(parsed) = packet::parse(&bytes, false)
-                {
-                    self.routes.record(parsed.flow, 0, bytes.len());
-                }
-            }
-            Event::Closing { .. } => {
-                // The local proxy never reports both-FIN closing (no FIN tracking);
-                // only the remote flow owner marks a RoutedFlow closing.
-            }
-            Event::Closed { id, key } => {
-                self.close_local(id, key, false);
+                Some(next) => return (batch, Some(next)),
+                None => return (batch, None),
             }
         }
-        Ok(())
+        (batch, None)
     }
 
     fn close_local(&mut self, id: u64, key: FlowKey, failed: bool) {
@@ -551,108 +604,174 @@ impl Hub {
     /// drain: queued resets of a dying link must pass while owners are live.
     pub async fn handle_event(
         &mut self,
-        epoch: Epoch,
-        event: Event,
+        mut epoch: Epoch,
+        mut event: Event,
         tun: &mut Option<AsyncDevice>,
         params: &LinkParams,
         started: &mut Option<oneshot::Sender<()>>,
         hooks: &mut Hooks,
     ) -> Result<()> {
-        match event {
-            Event::Ready => {
-                let now = Instant::now();
-                if !self.pool.ready(epoch, now) {
-                    return Ok(());
-                }
-                // The first Ready pins the shared tunnel pair (#181); a link
-                // that negotiated another pair is retired — dropping its
-                // channel ends the session, and the retry insists on the pin.
-                let pair = self.links[epoch.link]
-                    .assigned
-                    .get()
-                    .copied()
-                    .unwrap_or((params.tun_addr, params.peer_addr));
-                // Bind the borrow to a temporary first: `match *self.pair.borrow()`
-                // keeps the read guard alive into the match arms, and the None
-                // arm's send_replace self-deadlocks on the write lock.
-                let pinned = *self.pair.borrow();
-                let (tun_addr, peer_addr) = match pinned {
-                    None => {
-                        self.pair.send_replace(Some(pair));
-                        pair
-                    }
-                    Some(pinned) if pinned == pair => pinned,
-                    Some(_) => {
-                        self.links[epoch.link].outgoing = None;
+        loop {
+            match event {
+                Event::Ready => {
+                    let now = Instant::now();
+                    if !self.pool.ready(epoch, now) {
                         return Ok(());
                     }
-                };
-                if tun.is_none() {
-                    *tun = Some(crate::create_tun(
-                        tun_addr,
-                        peer_addr,
-                        params.mtu,
-                        params.tun_name.as_deref(),
-                        true,
-                    )?);
-                    let name = tun
-                        .as_ref()
-                        .context("missing configured client TUN")?
-                        .name()?;
-                    self.start_local(&name, params).await?;
-                    hooks.start(name, tun_addr, peer_addr)?;
-                    if !hooks.starting() {
-                        self.announce_started(params, started);
+                    // The first Ready pins the shared tunnel pair (#181); a link
+                    // that negotiated another pair is retired — dropping its
+                    // channel ends the session, and the retry insists on the pin.
+                    let pair = self.links[epoch.link]
+                        .assigned
+                        .get()
+                        .copied()
+                        .unwrap_or((params.tun_addr, params.peer_addr));
+                    // Bind the borrow to a temporary first: `match *self.pair.borrow()`
+                    // keeps the read guard alive into the match arms, and the None
+                    // arm's send_replace self-deadlocks on the write lock.
+                    let pinned = *self.pair.borrow();
+                    let (tun_addr, peer_addr) = match pinned {
+                        None => {
+                            self.pair.send_replace(Some(pair));
+                            pair
+                        }
+                        Some(pinned) if pinned == pair => pinned,
+                        Some(_) => {
+                            self.links[epoch.link].outgoing = None;
+                            return Ok(());
+                        }
+                    };
+                    if tun.is_none() {
+                        *tun = Some(crate::create_tun(
+                            tun_addr,
+                            peer_addr,
+                            params.mtu,
+                            params.tun_name.as_deref(),
+                            true,
+                        )?);
+                        let name = tun
+                            .as_ref()
+                            .context("missing configured client TUN")?
+                            .name()?;
+                        self.start_local(&name, params).await?;
+                        hooks.start(name, tun_addr, peer_addr)?;
+                        if !hooks.starting() {
+                            self.announce_started(params, started);
+                        }
                     }
-                }
-                self.serving();
-            }
-            Event::Checking => {
-                if self.pool.checking(epoch) {
-                    crate::info!(
-                        "ssh[{}]: data path lost, control alive — checking",
-                        self.links[epoch.link].params.server
-                    );
                     self.serving();
                 }
+                Event::Checking => {
+                    if self.pool.checking(epoch) {
+                        crate::info!(
+                            "ssh[{}]: data path lost, control alive — checking",
+                            self.links[epoch.link].params.server
+                        );
+                        self.serving();
+                    }
+                }
+                Event::RoundFailed => {
+                    if self.pool.round_failed(epoch)? {
+                        crate::info!(
+                            "ssh[{}]: checking round failed, retry after backoff",
+                            self.links[epoch.link].params.server
+                        );
+                    }
+                }
+                Event::Packet(packet) => {
+                    if hooks.starting() {
+                        return Ok(());
+                    }
+                    let delivery = self.links[epoch.link].delivery.clone();
+                    if !self.pool.is_serving(epoch) {
+                        drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
+                        return Ok(());
+                    }
+                    if !self.routes.accepts(epoch, &packet) {
+                        drop_note(
+                            &delivery,
+                            &self.links,
+                            Some(epoch.link),
+                            "no owner for packet from link",
+                        );
+                        return Ok(());
+                    }
+                    let tun = tun.as_ref().context("ready server without client TUN")?;
+                    // Flush the packets already queued behind this one under a
+                    // single deadline: one timer per batch, not one per packet.
+                    let (batch, deferred) = self.tun_batch((delivery, packet));
+                    self.flush_tun_batch(tun, &batch).await?;
+                    match deferred {
+                        Some((next_epoch, next_event)) => {
+                            epoch = next_epoch;
+                            event = next_event;
+                            continue;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                Event::Closing { id, key } => self.routes.mark_closing(key, Owner { epoch, id }),
+                Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
             }
-            Event::RoundFailed => {
-                if self.pool.round_failed(epoch)? {
-                    crate::info!(
-                        "ssh[{}]: checking round failed, retry after backoff",
-                        self.links[epoch.link].params.server
-                    );
+            return Ok(());
+        }
+    }
+
+    /// Gathers the packets queued behind `first` for one TUN flush: at most
+    /// `TUN_BATCH`, every one validated exactly like a lone packet, queue
+    /// order kept. A queued non-packet event stops the batch and is returned
+    /// for handling after the flush, so event order stays strict.
+    pub fn tun_batch(
+        &mut self,
+        first: (Arc<Delivery>, Packet),
+    ) -> (TunBatch, Option<(Epoch, Event)>) {
+        let mut batch = Vec::with_capacity(TUN_BATCH);
+        batch.push(first);
+        while batch.len() < TUN_BATCH {
+            match self.incoming.try_recv() {
+                Ok((epoch, Event::Packet(packet))) => {
+                    let delivery = self.links[epoch.link].delivery.clone();
+                    if !self.pool.is_serving(epoch) {
+                        drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
+                        continue;
+                    }
+                    if !self.routes.accepts(epoch, &packet) {
+                        drop_note(
+                            &delivery,
+                            &self.links,
+                            Some(epoch.link),
+                            "no owner for packet from link",
+                        );
+                        continue;
+                    }
+                    batch.push((delivery, packet));
                 }
+                Ok((epoch, event)) => return (batch, Some((epoch, event))),
+                Err(_) => return (batch, None),
             }
-            Event::Packet(packet) => {
-                if hooks.starting() {
-                    return Ok(());
-                }
-                let delivery = self.links[epoch.link].delivery.clone();
-                if !self.pool.is_serving(epoch) {
-                    drop_note(&delivery, &self.links, Some(epoch.link), "link not serving");
-                    return Ok(());
-                }
-                if !self.routes.accepts(epoch, &packet) {
-                    drop_note(
-                        &delivery,
-                        &self.links,
-                        Some(epoch.link),
-                        "no owner for packet from link",
-                    );
-                    return Ok(());
-                }
-                let tun = tun.as_ref().context("ready server without client TUN")?;
-                let result =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&packet.bytes)).await;
-                if finish_write(&delivery, packet.bytes.len(), result)?
-                    && let Some(parsed) = packet::parse(&packet.bytes, false)
-                {
-                    self.routes.record(parsed.flow, 0, packet.bytes.len());
-                }
+        }
+        (batch, None)
+    }
+
+    /// Writes a drained batch to the TUN under one deadline: the TUN is a
+    /// packet device, so every packet keeps its own write, but the whole
+    /// batch shares a single timer instead of one timeout per packet. Once
+    /// the deadline hits, the remaining packets drop exactly like individual
+    /// write timeouts.
+    async fn flush_tun_batch(&mut self, tun: &AsyncDevice, batch: &TunBatch) -> Result<()> {
+        let sleep = tokio::time::sleep_until(Instant::now() + TUN_WRITE_TIMEOUT);
+        tokio::pin!(sleep);
+        for (delivery, packet) in batch {
+            let result = std::future::poll_fn(|cx| match sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(None),
+                Poll::Pending => tun.poll_send(cx, &packet.bytes).map(Some),
+            })
+            .await;
+            if finish_write(delivery, packet.bytes.len(), result)?
+                && let Some(parsed) = packet::parse(&packet.bytes, false)
+            {
+                self.routes.record(parsed.flow, 0, packet.bytes.len());
             }
-            Event::Closing { id, key } => self.routes.mark_closing(key, Owner { epoch, id }),
-            Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
         }
         Ok(())
     }
@@ -878,12 +997,9 @@ impl Hub {
                         (*self.pair.borrow()).map_or(params.tun_addr, |(client, _)| client);
                     if let Some(reset) = self.dispatch(&buffer[..length], local)? {
                         let tun = tun.as_ref().context("TCP reset without client TUN")?;
-                        let result = tokio::time::timeout(
-                            Duration::from_millis(100),
-                            tun.send(&reset),
-                        )
-                        .await;
-                        finish_write(&self.links[0].delivery, reset.len(), result)?;
+                        let result =
+                            tokio::time::timeout(TUN_WRITE_TIMEOUT, tun.send(&reset)).await;
+                        finish_write(&self.links[0].delivery, reset.len(), result.ok())?;
                     }
                 }
                 event = self.incoming.recv() => {
@@ -1026,8 +1142,7 @@ impl Hub {
                 && packet::parse(&packet.bytes, false).is_some_and(|p| p.is_rst)
                 && let Some(tun) = tun.as_ref()
             {
-                let result =
-                    tokio::time::timeout(Duration::from_millis(100), tun.send(&packet.bytes)).await;
+                let result = tokio::time::timeout(TUN_WRITE_TIMEOUT, tun.send(&packet.bytes)).await;
                 if matches!(result, Ok(Ok(n)) if n == packet.bytes.len())
                     && let Some(parsed) = packet::parse(&packet.bytes, false)
                 {
@@ -1460,19 +1575,22 @@ pub(crate) fn link_state(pool: &Pool, link: &Link, index: usize) -> &'static str
     "failed"
 }
 
+/// Accounting for one TUN write: a fully written packet counts as received,
+/// a missed deadline (`None`) or a failed/short write as dropped. Real write
+/// errors abort the run like the write itself would.
 pub fn finish_write(
     delivery: &Delivery,
     length: usize,
-    result: Result<std::io::Result<usize>, tokio::time::error::Elapsed>,
+    result: Option<std::io::Result<usize>>,
 ) -> Result<bool> {
-    let written = matches!(&result, Ok(Ok(n)) if *n == length);
+    let written = matches!(&result, Some(Ok(n)) if *n == length);
     match result {
-        Ok(Ok(written)) if written == length => delivery.received(length),
-        Err(_) => {
+        Some(Ok(written)) if written == length => delivery.received(length),
+        None => {
             delivery.dropped();
             crate::error!("vpn: dropped packet — client TUN write timeout");
         }
-        Ok(result) => {
+        Some(result) => {
             delivery.dropped();
             crate::error!("vpn: dropped packet — failed client TUN write");
             ensure!(

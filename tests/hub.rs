@@ -10,7 +10,7 @@ use common::tcp_packet;
 use svpn::control::Stats;
 use svpn::hooks::Hooks;
 use svpn::hub::*;
-use svpn::link_io::{Epoch, Event};
+use svpn::link_io::{Epoch, Event, Packet};
 use svpn::pool::Pool;
 use svpn::server_spec::LinkParams;
 use svpn::{packet, session, stats};
@@ -391,6 +391,168 @@ async fn snapshot_timer_tick_survives_a_wakeup_just_before_the_period() {
             .await
             .is_err()
     );
+}
+
+// ── TUN write batching ──
+
+/// A UDP packet whose source port (bytes 20..22) marks its place in a queue.
+fn batch_packet(port: u16, id: u64) -> Packet {
+    let mut bytes = common::udp_packet(false);
+    bytes[20..22].copy_from_slice(&port.to_be_bytes());
+    Packet { id, bytes }
+}
+
+fn port_of(packet: &Packet) -> u16 {
+    u16::from_be_bytes([packet.bytes[20], packet.bytes[21]])
+}
+
+fn owned_hub() -> (Hub, Epoch) {
+    let mut hub = test_hub([Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]);
+    let epoch = Epoch {
+        link: 0,
+        generation: 1,
+    };
+    hub.pool.ready(epoch, Instant::now());
+    (hub, epoch)
+}
+
+/// Registers `packet`'s flow as owned by `epoch` so `Routes::accepts` passes.
+fn owned(hub: &mut Hub, epoch: Epoch, packet: &Packet) {
+    let key = packet::parse(&packet.bytes, false).unwrap().flow;
+    hub.routes.insert(
+        key,
+        Target::Remote(Owner {
+            epoch,
+            id: packet.id,
+        }),
+        None,
+    );
+}
+
+#[test]
+fn tun_batch_collects_queued_packets_in_order_and_stops_at_the_bound() {
+    let (mut hub, epoch) = owned_hub();
+    for port in 0..=40u16 {
+        let packet = batch_packet(port, u64::from(port));
+        owned(&mut hub, epoch, &packet);
+        hub.events.try_send((epoch, Event::Packet(packet))).unwrap();
+    }
+    let first = batch_packet(100, 100);
+    owned(&mut hub, epoch, &first);
+    let (batch, deferred) = hub.tun_batch((Arc::clone(&hub.links[0].delivery), first));
+    assert_eq!(batch.len(), TUN_BATCH, "one round is bounded");
+    assert!(deferred.is_none());
+    let ports: Vec<u16> = batch.iter().map(|(_, packet)| port_of(packet)).collect();
+    let mut expected = vec![100u16];
+    expected.extend(0..31);
+    assert_eq!(ports, expected, "queue order is kept");
+    // The overflow stays queued for the next round.
+    match hub.incoming.try_recv() {
+        Ok((_, Event::Packet(left))) => assert_eq!(port_of(&left), 31),
+        other => panic!("overflow packet still queued, got {other:?}"),
+    }
+}
+
+#[test]
+fn tun_batch_stops_at_a_queued_control_event_and_defers_it() {
+    let (mut hub, epoch) = owned_hub();
+    let first = batch_packet(1, 1);
+    owned(&mut hub, epoch, &first);
+    let second = batch_packet(2, 2);
+    owned(&mut hub, epoch, &second);
+    let third = batch_packet(3, 3);
+    owned(&mut hub, epoch, &third);
+    hub.events.try_send((epoch, Event::Packet(second))).unwrap();
+    hub.events
+        .try_send((
+            epoch,
+            Event::Closed {
+                id: 2,
+                key: packet::parse(&batch_packet(2, 2).bytes, false)
+                    .unwrap()
+                    .flow,
+            },
+        ))
+        .unwrap();
+    hub.events.try_send((epoch, Event::Packet(third))).unwrap();
+    let (batch, deferred) = hub.tun_batch((Arc::clone(&hub.links[0].delivery), first));
+    assert_eq!(batch.len(), 2);
+    assert!(matches!(deferred, Some((_, Event::Closed { id: 2, .. }))));
+    // The packet behind the control event stays queued for its own round.
+    assert!(matches!(hub.incoming.try_recv(), Ok((_, Event::Packet(_)))));
+}
+
+#[test]
+fn tun_batch_counts_unowned_queued_packets_as_drops_without_writing() {
+    let (mut hub, epoch) = owned_hub();
+    let first = batch_packet(1, 1);
+    owned(&mut hub, epoch, &first);
+    let orphan = batch_packet(2, 2); // never registered as an owned flow
+    hub.events.try_send((epoch, Event::Packet(orphan))).unwrap();
+    let (batch, deferred) = hub.tun_batch((Arc::clone(&hub.links[0].delivery), first));
+    assert_eq!(batch.len(), 1, "only owned packets reach the TUN");
+    assert!(deferred.is_none());
+    let mut stats = Stats::default();
+    hub.links[0].delivery.apply(&mut stats);
+    assert_eq!(stats.dropped_packets, 1);
+}
+
+#[tokio::test]
+async fn local_batch_collects_current_packets_and_stops_at_a_control_event() {
+    let (mut hub, _epoch) = owned_hub();
+    let (events, local_events) = mpsc::channel(8);
+    hub.local = Some(LocalExitState {
+        outgoing: mpsc::channel(1).0,
+        events: Some(local_events),
+        latest: watch::channel(Default::default()).1,
+        delivery: Arc::default(),
+        server: svpn::local_proxy::LocalServer::new(tokio::spawn(std::future::pending())),
+        ready: true,
+    });
+    let epoch = Epoch {
+        link: 0,
+        generation: 1,
+    };
+    let first = batch_packet(1, 7);
+    let second = batch_packet(2, 7);
+    let stale = batch_packet(3, 8); // targets another proxy session: not current
+    let third = batch_packet(4, 7);
+    for packet in [&first, &second, &third] {
+        let key = packet::parse(&packet.bytes, false).unwrap().flow;
+        hub.routes.insert(key, Target::Direct(packet.id), None);
+    }
+    // The stale packet's flow no longer targets its session id.
+    let key = packet::parse(&stale.bytes, false).unwrap().flow;
+    hub.routes.insert(key, Target::Direct(999), None);
+    events.send((epoch, Event::Packet(second))).await.unwrap();
+    events.send((epoch, Event::Ready)).await.unwrap();
+    events.send((epoch, Event::Packet(third))).await.unwrap();
+    events.send((epoch, Event::Packet(stale))).await.unwrap();
+    let (batch, deferred) = hub.local_batch(Arc::default(), first);
+    let ports: Vec<u16> = batch.iter().map(|(_, packet)| port_of(packet)).collect();
+    assert_eq!(ports, vec![1, 2], "current packets in order, stale skipped");
+    assert!(matches!(deferred, Some((_, Event::Ready))));
+    // The packets behind the control event stay queued.
+    assert!(matches!(
+        hub.local
+            .as_mut()
+            .unwrap()
+            .events
+            .as_mut()
+            .unwrap()
+            .try_recv(),
+        Ok((_, Event::Packet(_)))
+    ));
+    assert!(matches!(
+        hub.local
+            .as_mut()
+            .unwrap()
+            .events
+            .as_mut()
+            .unwrap()
+            .try_recv(),
+        Ok((_, Event::Packet(_)))
+    ));
 }
 
 // ── bootstrap ──
