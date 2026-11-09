@@ -40,12 +40,15 @@ function frame() {
     country: i % 5 === 0 ? null : i % 2 ? "US" : "DE", asn: i % 5 === 0 ? null : i % 2 ? 13335 : 15169,
     via: degraded ? servers[0].id : i % 3 === 0 ? "local" : i % 3 === 1 ? servers[0].id : servers[1].id,
     rule: degraded ? i % 2 ? 0 : null : i % 3 === 0 ? 1 : i % 3 === 1 ? 0 : null,
+    // Remote TCP flows closed by FINs: 8 of 123 in `normal`, never local-exit ones.
+    closing: i % 2 === 1 && i % 3 !== 0 && i % 10 === 5,
     rx_bytes: i === 7 ? sequence * 2000000 : (count - i) * 1000, tx_bytes: 0,
   }));
   const traffic = rule => ({
     rx_bytes: rule === 1 ? 2 * 1073741824 : rule === 0 ? servers[0].stats.inner_rx_bytes / (degraded ? 2 : 1) : servers[1].stats.inner_rx_bytes + (degraded ? servers[0].stats.inner_rx_bytes / 2 : 0),
     tx_bytes: rule === 1 ? 310 * 1048576 : rule === 0 ? servers[0].stats.inner_tx_bytes / (degraded ? 2 : 1) : servers[1].stats.inner_tx_bytes + (degraded ? servers[0].stats.inner_tx_bytes / 2 : 0),
-    active_flows: flows.filter(flow => flow.rule === rule).length,
+    active_flows: flows.filter(flow => flow.rule === rule && !flow.closing).length,
+    closing_flows: flows.filter(flow => flow.rule === rule && flow.closing).length,
   });
   const rules = scenario === "empty" ? [] : [
     { index: 0, label: "claude", kind: "names", selector: "names: claude.ai, anthropic.com", via: "servers: nl", local: false, candidates: [servers[0].id],
@@ -62,7 +65,8 @@ function frame() {
   };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
     process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
-    local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0, active_flows: flows.filter(flow => flow.via === "local").length },
+    local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0,
+      active_flows: flows.filter(flow => flow.via === "local").length, closing_flows: 0 },
     sticky: { lookup_hit: 81, lookup_miss: 2, failover_moves: 0, block_hit: 410, resolve_ok: 8, resolve_fail: 0, resolved_ips: 6, purged_ips: 0 },
     databases: [{ kind: "geo", configured: true, loaded: true, rows: 402389, pending: null, status: { loaded_at: null, attempted_at: null, error: "" } },
       { kind: "country", configured: true, loaded: true, rows: 65123, pending: null, status }],
@@ -85,7 +89,8 @@ async function until(condition, label, limit = 7000) {
 async function control(scenario) { return fetch('/fixture?scenario=' + scenario).then(response => response.json()); }
 function input(id, value) { $(id).value = value; $(id).dispatchEvent(new Event(id === 'flow-search' ? 'input' : 'change')); }
 try {
-  await until(() => $('rx').textContent !== '—' && $('active').textContent === '123', 'live traffic');
+  await until(() => $('rx').textContent !== '—' && $('active').textContent === '115 active · 8 closing', 'live traffic');
+  assert($('rules').tBodies[0].rows[0].cells[3].textContent === '37 active · 4 closing' && $('rules').textContent.includes('41 active'), 'rules split active and closing counts, a rule without closing omits the note');
   assert($('local').textContent === 'Ready', 'local readiness');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
   assert($('chart-rx').getAttribute('d').includes('l0,0') && getComputedStyle($('chart-rx')).strokeLinecap === 'round', 'isolated first chart sample is visible');
@@ -136,6 +141,7 @@ try {
   assert(flowRow(0)[1].textContent === '10.77.0.2:40007' && flowRow(1)[1].textContent === '10.77.0.2:40000', 'total order ranks by bytes so far');
   input('flow-order', '');
   assert(flowRow(0)[1].textContent === '10.77.0.2:40000', 'address order is the default');
+  assert([...$('flows').tBodies[0].rows].some(row => row.classList.contains('closing')) && $('flows').textContent.includes('closing'), 'closing flows are dimmed and tagged');
   $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('Downloading and parsing'), 'explicit browser CSV reload');
   await until(() => $('asn-status').textContent.includes('2 names in this browser') && !$('asn-load').disabled, 'browser names reload completes');
@@ -156,7 +162,7 @@ try {
   await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
   await control('large');
-  await until(() => $('active').textContent === '10003', 'large flow snapshot');
+  await until(() => $('active').textContent === '9336 active · 667 closing', 'large flow snapshot');
   assert($('flows').tBodies[0].rows.length === 50, 'large table bounded to 50 rows');
   assert(document.querySelector('#servers details') === details && details.open, 'details identity and open state preserved');
   input('flow-search', '49999'); input('flow-protocol', 'tcp'); input('flow-exit', 'local');
@@ -168,12 +174,12 @@ try {
   const frozen = $('flows').textContent, frozenExits = $('flow-exit').textContent;
   const frozenCountries = $('flow-country').textContent, frozenAsns = $('flow-asn').textContent;
   await control('empty');
-  await until(() => $('active').textContent === '0', 'live servers removed while paused');
+  await until(() => $('active').textContent === '0 active', 'live servers removed while paused');
   assert($('flow-exit').value === 'de.example.test' && $('flow-exit').textContent === frozenExits, 'paused exit options and selection use the frozen snapshot');
   assert($('flow-country').value === 'US' && $('flow-asn').value === '13335' && $('flow-country').textContent === frozenCountries && $('flow-asn').textContent === frozenAsns, 'pause freezes Geo metadata, names and filter options');
   assert($('flows').textContent === frozen && frozen.includes('DE'), 'paused server and rule labels survive live config changes');
   await control('normal');
-  await until(() => $('active').textContent === '123', 'live summary while paused');
+  await until(() => $('active').textContent === '115 active · 8 closing', 'live summary while paused');
   assert($('flows').textContent === frozen && $('flow-count').textContent.includes('10003') && $('pause').getAttribute('aria-pressed') === 'true', 'flow table stays frozen');
   $('pause').click(); assert($('pause').getAttribute('aria-pressed') === 'false', 'resume live table');
   input('flow-exit', ''); input('flow-country', ''); input('flow-asn', '');
@@ -207,12 +213,12 @@ try {
   await until(() => $('freshness').textContent === 'Stale data', 'unchanged snapshot becomes stale');
   assert(!$('stale-notice').hidden && $('rx').textContent === '—', 'stale screen has warning and unknown rate');
   await control('empty');
-  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
+  await until(() => $('active').textContent === '0 active' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
   assert($('rx').textContent === '—', 'stale recovery starts with an unknown rate');
   assert($('flows').textContent.includes('No active flows'), 'empty flow state');
   assert($('servers').textContent.includes('No servers configured'), 'empty server table is explicit');
   input('flow-search', 'missing'); await control('normal');
-  await until(() => $('active').textContent === '123', 'filtered recovery');
+  await until(() => $('active').textContent === '115 active · 8 closing', 'filtered recovery');
   assert($('flows').textContent.includes('No flows match'), 'empty filter message updates');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No servers'), 'servers recover without a stale placeholder');
   input('flow-search', '');

@@ -136,6 +136,25 @@ pub fn assert_closed(event: (link_io::Epoch, link_io::Event), id: u64, key: Flow
 }
 
 #[allow(dead_code)] // unused by some of the including test targets
+pub fn assert_closing(event: (link_io::Epoch, link_io::Event), id: u64, key: FlowKey) {
+    assert_eq!(
+        event.0,
+        link_io::Epoch {
+            link: 2,
+            generation: 7
+        }
+    );
+    let link_io::Event::Closing {
+        id: closing,
+        key: closing_key,
+    } = event.1
+    else {
+        panic!("expected closing event");
+    };
+    assert_eq!((closing, closing_key), (id, key));
+}
+
+#[allow(dead_code)] // unused by some of the including test targets
 pub fn tcp_packet(flags: u8) -> Vec<u8> {
     let mut bytes = super::udp_packet(false);
     bytes.resize(40, 0);

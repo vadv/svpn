@@ -78,11 +78,13 @@ pub struct RuleView {
 }
 
 /// Per-rule IP traffic since client start, including retired flows.
+/// `active_flows` counts open flows only; closing ones are separate.
 #[derive(Default, Serialize)]
 pub struct TrafficView {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub active_flows: usize,
+    pub closing_flows: usize,
 }
 
 #[derive(Serialize)]
@@ -111,6 +113,7 @@ pub struct LocalView {
     pub failed: u64,
     pub closed: u64,
     pub active_flows: usize,
+    pub closing_flows: usize,
 }
 
 /// One active client flow and where it goes.
@@ -125,6 +128,8 @@ pub struct FlowView {
     pub asn: Option<u32>,
     /// Server node id, or `local`.
     pub via: String,
+    /// Both FINs seen: the flow is closing, not open.
+    pub closing: bool,
     /// This flow's bytes since the hub first saw it; the dashboard derives rates.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -187,8 +192,13 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         })
         .collect();
     let mut active = std::collections::HashMap::<Option<usize>, usize>::new();
+    let mut closing = std::collections::HashMap::<Option<usize>, usize>::new();
     for flow in hub.routes.by_key.values() {
-        *active.entry(flow.rule).or_default() += 1;
+        if flow.closing {
+            *closing.entry(flow.rule).or_default() += 1;
+        } else {
+            *active.entry(flow.rule).or_default() += 1;
+        }
     }
     let traffic = |rule| {
         let totals = hub.routes.traffic.get(&rule).copied().unwrap_or_default();
@@ -196,6 +206,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             rx_bytes: totals.rx_bytes,
             tx_bytes: totals.tx_bytes,
             active_flows: active.get(&rule).copied().unwrap_or(0),
+            closing_flows: closing.get(&rule).copied().unwrap_or(0),
         }
     };
     let rules = hub
@@ -260,6 +271,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
             },
+            closing: flow.closing,
             rx_bytes: flow.traffic.rx_bytes,
             tx_bytes: flow.traffic.tx_bytes,
         })
@@ -274,6 +286,9 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             opened: hub.local_stats.opened,
             failed: hub.local_stats.failed,
             closed: hub.local_stats.closed,
+            // shortcut: the local proxy tracks no TCP FIN close, so local-exit
+            // flows are never marked closing — track FINs there if needed.
+            closing_flows: 0,
             active_flows: local.latest.borrow().active_flows,
         },
         None => LocalView {
@@ -285,6 +300,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             opened: hub.local_stats.opened,
             failed: hub.local_stats.failed,
             closed: hub.local_stats.closed,
+            closing_flows: 0,
             active_flows: 0,
         },
     };

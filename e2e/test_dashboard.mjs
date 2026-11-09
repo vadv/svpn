@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -396,6 +396,12 @@ test("selectors, local states and byte units are explicit", () => {
   assert.equal(bytes(0), "0 B");
   assert.equal(bytes(1024), "1.0 KiB");
   assert.equal(bytes(1048576), "1.0 MiB");
+});
+
+test("flow counts state closing flows instead of folding them into active", () => {
+  assert.equal(flowCounts({ active_flows: 3, closing_flows: 2 }), "3 active · 2 closing");
+  assert.equal(flowCounts({ active_flows: 3, closing_flows: 0 }), "3 active", "nothing closing omits the note");
+  assert.equal(flowCounts(), "0 active", "a missing snapshot is not a zero-flow claim");
 });
 
 test("mimic cell shows the live transport and its race, winner first", () => {

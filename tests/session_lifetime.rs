@@ -5,7 +5,8 @@ mod common;
 use std::time::Duration;
 
 use common::session::{
-    activate, assert_closed, fill, link_session_cap, link_session_with, reply, tcp_packet,
+    activate, assert_closed, assert_closing, fill, link_session_cap, link_session_with, reply,
+    tcp_packet,
 };
 use svpn::control::{Control, Message};
 use svpn::link_io::{self, FIRST_PROBE_ID};
@@ -154,6 +155,7 @@ async fn either_half_close_and_repeated_fin_survive_until_both_directions_finish
             advance(FIN_DWELL - Duration::from_secs(1)).await;
             session.expire_flows(Instant::now()).await.unwrap();
             assert!(session.has_flow(1));
+            assert_closing(events.try_recv().unwrap(), 1, key);
             advance(Duration::from_secs(1)).await;
             session.expire_flows(Instant::now()).await.unwrap();
             assert_closed(events.try_recv().unwrap(), 1, key);

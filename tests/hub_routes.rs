@@ -112,6 +112,44 @@ fn flow_ids_never_enter_the_reserved_probe_space() {
     assert!(routes.allocate().is_err());
 }
 
+// ── closing flows ──
+
+#[test]
+fn closing_marks_only_the_current_owner_and_a_new_syn_reopens_the_tuple() {
+    let syn = tcp_packet(false);
+    let key = packet::parse(&syn, true).unwrap().flow;
+    let mut data = syn.clone();
+    data[33] = 0x18;
+    let mut routes = Routes::default();
+    let owner = Owner {
+        epoch: epoch(1),
+        id: routes.allocate().unwrap(),
+    };
+    routes.insert(key, Target::Remote(owner), None);
+    let stale = Owner {
+        epoch: epoch(2),
+        id: routes.allocate().unwrap(),
+    };
+    routes.mark_closing(key, stale);
+    assert!(
+        !routes.by_key[&key].closing,
+        "a stale owner cannot mark closing"
+    );
+    routes.mark_closing(key, owner);
+    assert!(routes.by_key[&key].closing);
+    let (outgoing, _incoming) = mpsc::channel(2);
+    let delivery = Delivery::default();
+    // Ordinary traffic keeps the mark; a new SYN on the tuple clears it.
+    routes
+        .enqueue(&data, key.source, epoch(1), &outgoing, &delivery, &[])
+        .unwrap();
+    assert!(routes.by_key[&key].closing);
+    routes
+        .enqueue(&syn, key.source, epoch(1), &outgoing, &delivery, &[])
+        .unwrap();
+    assert!(!routes.by_key[&key].closing, "a re-SYN reopens the tuple");
+}
+
 // ── direct ownership (spec §5.5) ──
 
 #[test]

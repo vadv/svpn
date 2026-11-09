@@ -5,6 +5,7 @@ mod common;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use svpn::{
+    hooks::Hooks,
     hub::{Hub, LocalExitState, Owner, Target, Traffic},
     link_io::{Epoch, Event, Packet},
     packet,
@@ -187,6 +188,93 @@ fn counters_saturate_instead_of_wrapping() {
     hub.routes.record(key, 28, 28);
     assert_eq!(hub.routes.traffic[&Some(0)].tx_bytes, u64::MAX);
     assert_eq!(hub.routes.traffic[&Some(0)].rx_bytes, u64::MAX);
+}
+
+// ── closing flows ──
+
+#[tokio::test]
+async fn a_closing_flow_leaves_the_active_counts_and_a_new_syn_reopens_it() {
+    let mut hub = common::hub::dashboard_hub();
+    let (tx, mut rx) = mpsc::channel(4);
+    hub.links[0].outgoing = Some(tx);
+    let epoch = Epoch {
+        link: 0,
+        generation: 1,
+    };
+    let syn = common::tcp_packet(false);
+    let key = packet::parse(&syn, true).unwrap().flow;
+    hub.dispatch(&syn, CLIENT).unwrap();
+    let id = rx.recv().await.unwrap().id;
+    let mut tun = None;
+    let mut started = None;
+    let mut hooks = Hooks::default();
+    let params = hub.links[0].params.clone();
+    // A stale generation cannot mark a tuple it no longer owns.
+    hub.handle_event(
+        Epoch {
+            generation: 2,
+            ..epoch
+        },
+        Event::Closing { id, key },
+        &mut tun,
+        &params,
+        &mut started,
+        &mut hooks,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (web::snapshot(&hub).fallback.active_flows, 0),
+        (1, 0),
+        "a stale owner leaves the flow active"
+    );
+    hub.handle_event(
+        epoch,
+        Event::Closing { id, key },
+        &mut tun,
+        &params,
+        &mut started,
+        &mut hooks,
+    )
+    .await
+    .unwrap();
+    let state = web::snapshot(&hub);
+    assert_eq!(
+        (state.fallback.active_flows, state.fallback.closing_flows),
+        (0, 1),
+        "a closing flow is not counted active"
+    );
+    assert!(state.flows[0].closing);
+    // The dwell has not retired the flow: a new SYN on the tuple reopens it.
+    hub.dispatch(&syn, CLIENT).unwrap();
+    rx.recv().await.unwrap();
+    let state = web::snapshot(&hub);
+    assert_eq!(
+        (state.fallback.active_flows, state.fallback.closing_flows),
+        (1, 0)
+    );
+    assert!(!state.flows[0].closing);
+    hub.handle_event(
+        epoch,
+        Event::Closing { id, key },
+        &mut tun,
+        &params,
+        &mut started,
+        &mut hooks,
+    )
+    .await
+    .unwrap();
+    hub.handle_event(
+        epoch,
+        Event::Closed { id, key },
+        &mut tun,
+        &params,
+        &mut started,
+        &mut hooks,
+    )
+    .await
+    .unwrap();
+    assert!(hub.routes.by_key.is_empty(), "the dwell ends with Closed");
 }
 
 // ── helpers ──

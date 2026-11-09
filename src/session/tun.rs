@@ -17,12 +17,20 @@ const FLOW_PENDING: usize = 64;
 
 impl Session {
     pub(crate) async fn notify_closed(&self, id: u64, key: FlowKey) -> Result<()> {
+        self.notify(id, link_io::Event::Closed { id, key }).await
+    }
+
+    pub(crate) async fn notify_closing(&self, id: u64, key: FlowKey) -> Result<()> {
+        self.notify(id, link_io::Event::Closing { id, key }).await
+    }
+
+    async fn notify(&self, id: u64, event: link_io::Event) -> Result<()> {
         if !is_probe_flow(id)
             && let PacketIo::Link(io) = &self.io
         {
             // The event loop's heartbeat deadline also bounds reliable close delivery.
             io.events
-                .send((io.epoch, link_io::Event::Closed { id, key }))
+                .send((io.epoch, event))
                 .await
                 .context("packet event port closed")?;
         }
@@ -289,7 +297,7 @@ impl Session {
                 flow_state.last_seen = now;
                 flow_state.reset_requested |= is_client && packet.is_rst;
                 flow_state.proven |= packet::proves_flow(packet, !is_client);
-                flow_state.tcp_close.observe(packet, is_client, now);
+                let closing_now = flow_state.tcp_close.observe(packet, is_client, now);
                 if !fresh {
                     if let Some(selector) = plane.selector.as_mut() {
                         if selector.enqueue(flow_id, bytes).is_err() {
@@ -314,6 +322,9 @@ impl Session {
                 }
                 self.execute_actions(open_actions).await?;
                 self.flush_flow(flow_id).await?;
+                if closing_now {
+                    self.notify_closing(flow_id, packet.flow).await?;
+                }
             }
             Plane::Tcp(plane) => {
                 let now = tokio::time::Instant::now();
@@ -365,11 +376,12 @@ impl Session {
                         return Ok(());
                     }
                 };
+                let mut closing_now = false;
                 if let Some(flow_state) = plane.flows.get_mut(&id) {
                     flow_state.last_seen = now;
                     flow_state.reset_requested |= is_client && packet.is_rst;
                     flow_state.proven |= packet::proves_flow(packet, !is_client);
-                    flow_state.tcp_close.observe(packet, is_client, now);
+                    closing_now = flow_state.tcp_close.observe(packet, is_client, now);
                 }
                 let Some(flow_state) = plane.flows.get_mut(&id) else {
                     return Ok(());
@@ -387,6 +399,9 @@ impl Session {
                         .count_drop(&self.drop_prefix, "flow pending queue full");
                 }
                 self.flush_flow(id).await?;
+                if closing_now {
+                    self.notify_closing(id, packet.flow).await?;
+                }
             }
         }
         Ok(())
@@ -541,17 +556,21 @@ impl Session {
             }
         }
         self.recovery_delivered(incoming.id, "peer_packet");
+        let mut closing_now = false;
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            flow_state.tcp_close.observe(&packet, from_client, now);
+            closing_now = flow_state.tcp_close.observe(&packet, from_client, now);
         }
         if let Plane::Tcp(plane) = &mut self.plane
             && let Some(flow_state) = plane.flows.get_mut(&incoming.id)
         {
             flow_state.last_seen = now;
-            flow_state.tcp_close.observe(&packet, from_client, now);
+            closing_now = flow_state.tcp_close.observe(&packet, from_client, now);
+        }
+        if closing_now {
+            self.notify_closing(incoming.id, packet.flow).await?;
         }
         // The client TCP stack owns reset decisions; a target RST may be out of window.
         if from_client && packet.is_rst {

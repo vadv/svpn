@@ -14,6 +14,11 @@ export function bytes(value) {
 
 export const rate = value => value == null ? "—" : value.toFixed(2);
 
+// Closing flows are stated, never folded into the active count; the note is
+// omitted entirely when nothing is closing, and a missing field is not a zero.
+export const flowCounts = ({ active_flows = 0, closing_flows = 0 } = {}) =>
+  closing_flows > 0 ? `${active_flows} active · ${closing_flows} closing` : `${active_flows} active`;
+
 export function change(before, after) {
   if (!Number.isFinite(before) || !Number.isFinite(after) || after < before) return null;
   return after - before;

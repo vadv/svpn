@@ -197,7 +197,11 @@ where
             }
             Some((
                 _,
-                Event::Closed { .. } | Event::Ready | Event::Checking | Event::RoundFailed,
+                Event::Closed { .. }
+                | Event::Ready
+                | Event::Checking
+                | Event::RoundFailed
+                | Event::Closing { .. },
             )) => {}
             None => panic!("канал событий proxy закрылся"),
         }
@@ -213,7 +217,10 @@ async fn expect_closed(proxy: &mut LocalProxy) -> (u64, FlowKey) {
         match event {
             Some((_, Event::Closed { id, key })) => return (id, key),
             Some((_, Event::Packet(_))) => {}
-            Some((_, Event::Ready | Event::Checking | Event::RoundFailed)) => {}
+            Some((
+                _,
+                Event::Ready | Event::Checking | Event::RoundFailed | Event::Closing { .. },
+            )) => {}
             None => panic!("канал событий proxy закрылся"),
         }
     }

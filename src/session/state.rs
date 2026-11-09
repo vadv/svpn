@@ -183,20 +183,22 @@ pub struct TcpClose {
 }
 
 impl TcpClose {
+    /// Observe one segment; `true` only on the call that arms the both-FIN
+    /// dwell — the single moment the flow turns closing for its owner.
     pub fn observe(
         &mut self,
         packet: &packet::Packet,
         from_client: bool,
         now: tokio::time::Instant,
-    ) {
-        let Some(tcp) = packet.tcp else { return };
+    ) -> bool {
+        let Some(tcp) = packet.tcp else { return false };
         if from_client && tcp.flags & 0x17 == 0x02 {
             *self = Self::default();
-            return;
+            return false;
         }
         if tcp.flags & 0x04 != 0 {
             self.reset_dwell = Some((now + RST_DWELL, from_client));
-            return;
+            return false;
         }
         // A real reset sender never speaks on this tuple again, so only its
         // side cancels the grace; the peer's in-flight packets do not.
@@ -207,8 +209,9 @@ impl TcpClose {
             self.reset_dwell = None;
         }
         if self.finished() {
-            return;
+            return false;
         }
+        let mut closing = false;
         if packet.fin && tcp.flags & 0x02 == 0 {
             let direction = usize::from(from_client);
             let end = tcp.seq.wrapping_add(tcp.payload_len as u32).wrapping_add(1);
@@ -216,9 +219,11 @@ impl TcpClose {
                 self.fin_end[direction] = Some(end);
                 if self.finished() {
                     self.fin_dwell = Some(now + FIN_DWELL);
+                    closing = true;
                 }
             }
         }
+        closing
     }
 
     /// FINs observed in both directions: the session is closing even when

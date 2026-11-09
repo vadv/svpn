@@ -5,7 +5,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::session::{activate, assert_closed, link_session, link_session_cap, reply, tcp_packet};
+use common::session::{
+    activate, assert_closed, assert_closing, link_session, link_session_cap, reply, tcp_packet,
+};
 use svpn::link_io::{self, FIRST_PROBE_ID};
 use svpn::packet::{self, FlowKey, Packet};
 use svpn::session::{
@@ -16,6 +18,28 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, advance};
 
 // ── close tracking ──
+
+#[test]
+fn observe_reports_the_dwell_arming_once_and_again_after_a_reopen() {
+    let now = Instant::now();
+    let mut close = TcpClose::default();
+    assert!(
+        !close.observe(&segment(0x11, 100, 200), true, now),
+        "one FIN is a half-close"
+    );
+    assert!(close.observe(&segment(0x11, 200, 101), false, now));
+    assert!(
+        !close.observe(&segment(0x11, 200, 101), false, now),
+        "a retransmitted FIN does not re-arm the dwell"
+    );
+    close.observe(&segment(0x02, 500, 0), true, now);
+    assert!(!close.finished(), "a new SYN resets the close state");
+    assert!(!close.observe(&segment(0x11, 600, 501), true, now));
+    assert!(
+        close.observe(&segment(0x11, 700, 601), false, now),
+        "the reopened tuple reports closing again"
+    );
+}
 
 #[test]
 fn new_syn_clears_the_previous_connections_close_state() {
@@ -137,6 +161,10 @@ async fn target_reset_then_silence_closes_the_flow_after_the_grace() {
             events.try_recv().unwrap().1,
             link_io::Event::Packet(_)
         ));
+        assert!(
+            events.try_recv().is_err(),
+            "a reset never reports the flow closing"
+        );
         advance(RST_DWELL - Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
         assert!(session.has_flow(1), "the reset grace has not passed");
@@ -216,6 +244,59 @@ async fn traffic_after_a_reset_cancels_the_grace() {
 // ── fin dwell ──
 
 #[tokio::test(start_paused = true)]
+async fn both_fins_report_the_flow_closing_once_before_the_dwell_ends() {
+    for legacy in [false, true] {
+        let (mut session, mut events) = link_session_cap(legacy, 4);
+        let (mut outgoing, key) = committed(&mut session).await;
+        // A half-close is not closing: nothing is reported yet.
+        session
+            .handle_tun_packet(&tcp_packet(0x11), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(outgoing.try_recv().unwrap(), tcp_packet(0x11));
+        assert!(
+            events.try_recv().is_err(),
+            "a single FIN never reports closing"
+        );
+        session
+            .deliver_to_tun(Incoming {
+                generation: 1,
+                id: 1,
+                channel: None,
+                packet: reply(0x11),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().1,
+            link_io::Event::Packet(_)
+        ));
+        assert_closing(events.try_recv().unwrap(), 1, key);
+        // A retransmitted segment on the finished tuple does not report twice.
+        session
+            .deliver_to_tun(Incoming {
+                generation: 1,
+                id: 1,
+                channel: None,
+                packet: reply(0x11),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().1,
+            link_io::Event::Packet(_)
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "closing is reported exactly once"
+        );
+        advance(FIN_DWELL + Duration::from_secs(1)).await;
+        session.expire_flows(Instant::now()).await.unwrap();
+        assert_closed(events.try_recv().unwrap(), 1, key);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn both_fins_close_the_flow_after_the_dwell_even_without_the_final_acks() {
     for legacy in [false, true] {
         let (mut session, mut events) = link_session_cap(legacy, 4);
@@ -238,6 +319,7 @@ async fn both_fins_close_the_flow_after_the_dwell_even_without_the_final_acks() 
             events.try_recv().unwrap().1,
             link_io::Event::Packet(_)
         ));
+        assert_closing(events.try_recv().unwrap(), 1, key);
         advance(FIN_DWELL - Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
         assert!(session.has_flow(1), "the dwell has not passed");

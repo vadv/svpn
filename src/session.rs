@@ -70,8 +70,11 @@ pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FLOW_IDLE: Duration = Duration::from_secs(60);
 /// TCP idle floor from RFC 5382; silence alone is not a failed connection.
 pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60 + 4 * 60);
-/// Retain both-FIN flows for retransmissions (RFC 5382 transitory timeout).
-pub const FIN_DWELL: Duration = Duration::from_secs(4 * 60);
+/// Retain both-FIN flows for retransmissions, matching conntrack's
+/// TIME_WAIT of 120 s — deliberately below RFC 5382's 4-minute transitory
+/// minimum by user decision: late FIN/ACK retransmits after that fall back
+/// to normal routing (a fresh RST from the peer closes the new attempt).
+pub const FIN_DWELL: Duration = Duration::from_secs(120);
 /// A reset in either direction closes the flow after this grace unless
 /// traffic resumes: a forged or out-of-window reset must not tear down a
 /// live connection (conntrack's UNEXPECTED RST handling, not its window

@@ -31,6 +31,8 @@ pub struct RoutedFlow {
     pub target: Target,
     /// Config-order sticky index; None is the automatic fallback.
     pub rule: Option<usize>,
+    /// The owner reported both FINs: retained for retransmissions, not open.
+    pub closing: bool,
     /// This flow's bytes since the hub first saw it.
     pub traffic: Traffic,
 }
@@ -70,9 +72,20 @@ impl Routes {
             RoutedFlow {
                 target,
                 rule,
+                closing: false,
                 traffic: Traffic::default(),
             },
         );
+    }
+
+    /// Both FINs reported by the current owner; a stale owner cannot mark
+    /// a reused tuple closing.
+    pub fn mark_closing(&mut self, key: FlowKey, owner: Owner) {
+        if let Some(flow) = self.by_key.get_mut(&key)
+            && flow.target == Target::Remote(owner)
+        {
+            flow.closing = true;
+        }
     }
 
     /// Call only after the queue/TUN accepted the full packet.
@@ -155,6 +168,11 @@ impl Routes {
             Ok(()) => {
                 if fresh {
                     self.insert(parsed.flow, Target::Remote(owner), None);
+                } else if parsed.tcp.is_some_and(|tcp| tcp.flags & 0x17 == 0x02)
+                    && let Some(flow) = self.by_key.get_mut(&parsed.flow)
+                {
+                    // A new SYN reopens the tuple: its dwell was cancelled.
+                    flow.closing = false;
                 }
                 Ok(true)
             }

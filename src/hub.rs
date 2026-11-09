@@ -406,6 +406,10 @@ impl Hub {
                     self.routes.record(parsed.flow, 0, bytes.len());
                 }
             }
+            Event::Closing { .. } => {
+                // The local proxy never reports both-FIN closing (no FIN tracking);
+                // only the remote flow owner marks a RoutedFlow closing.
+            }
             Event::Closed { id, key } => {
                 self.close_local(id, key, false);
             }
@@ -647,6 +651,7 @@ impl Hub {
                     self.routes.record(parsed.flow, 0, packet.bytes.len());
                 }
             }
+            Event::Closing { id, key } => self.routes.mark_closing(key, Owner { epoch, id }),
             Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
         }
         Ok(())

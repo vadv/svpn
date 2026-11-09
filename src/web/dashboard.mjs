@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -190,12 +190,12 @@ function renderRules() {
     cell(title(`${rule.index + 1}. ${rule.label}`, selector(rule))),
     cell(rule.local ? badge(latest.local.ready ? "ready" : "missing", latest.local.ready ? "Local" : "Local unavailable") : rule.owner ? name(rule.owner) : "Not assigned yet"),
     cell(rule.local ? "Local only" : rule.candidates.map(id => name(id)).join(", ")),
-    cell(rule.traffic.active_flows, true), cell(bytes(rule.traffic.rx_bytes), true), cell(bytes(rule.traffic.tx_bytes), true),
+    cell(flowCounts(rule.traffic), true), cell(bytes(rule.traffic.rx_bytes), true), cell(bytes(rule.traffic.tx_bytes), true),
     cell(rule.kind === "names" ? `${rule.resolved_ips} IPs · every ${rule.every_secs}s` : "Not a DNS rule"),
   ]);
   rows.push([
     cell(title("Fallback", latest.policy === "sticky-asn" ? "Unmatched traffic → ASN grouping" : "Unmatched traffic → weighted balance")),
-    cell("Per flow / group"), cell("VPN pool"), cell(latest.fallback.active_flows, true),
+    cell("Per flow / group"), cell("VPN pool"), cell(flowCounts(latest.fallback), true),
     cell(bytes(latest.fallback.rx_bytes), true), cell(bytes(latest.fallback.tx_bytes), true), cell("—"),
   ]);
   table("rules", rows, 7);
@@ -222,16 +222,24 @@ function renderFlows() {
     countryLabel(flow.country), asnLabel(flow.asn, names), name(flow.via, state),
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule",
     rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0))]);
-  const signature = JSON.stringify({ labels, empty: result.total === 0 });
+  const signature = JSON.stringify({ labels, closing: result.rows.map(flow => Boolean(flow.closing)), empty: result.total === 0 });
   if (flowSignature !== signature) {
-    const rows = result.rows.map((flow, index) => [
-      cell(node("span", labels[index][0], `tag tag--${flow.protocol}`)),
+    const rows = result.rows.map((flow, index) => {
+      const protocol = cell(node("span", labels[index][0], `tag tag--${flow.protocol}`));
+      if (flow.closing) protocol.append(node("span", "closing", "tag tag--closing"));
+      return [
+      protocol,
       cell(node("code", labels[index][1])), cell(node("code", labels[index][2])),
       cell(labels[index][3]), cell(labels[index][4]),
       cell(node("span", labels[index][5], "exit-tag")), cell(node("span", labels[index][6], "rule-tag")),
       cell(title(labels[index][7], labels[index][8]), true),
-    ]);
+      ];
+    });
     table("flows", rows, 8, result.total ? "No flows match these filters" : "No active flows");
+    // Closing rows dim in place; the tag alone would vanish in the density.
+    result.rows.forEach((flow, index) => {
+      if (flow.closing) $("flows").tBodies[0].rows[index].classList.add("closing");
+    });
     flowSignature = signature;
   }
   const start = result.count ? page * PAGE_SIZE + 1 : 0;
@@ -342,7 +350,8 @@ function render() {
   for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn", "flow-order"])  $(id).disabled = false;
   const ready = latest.servers.filter(server => server.state === "ready").length;
   $("ready").textContent = `${ready} / ${latest.servers.length}`;
-  $("active").textContent = latest.flows.length;
+  const open = latest.flows.filter(flow => !flow.closing).length;
+  $("active").textContent = flowCounts({ active_flows: open, closing_flows: latest.flows.length - open });
   const localFlows = latest.flows.filter(flow => flow.via === "local").length;
   $("active-note").textContent = `${latest.flows.length - localFlows} VPN · ${localFlows} local`;
   $("local").textContent = localState(latest.local);
