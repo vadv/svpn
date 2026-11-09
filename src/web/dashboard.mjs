@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -218,7 +218,8 @@ function renderFlows() {
   const result = flowPage(state.flows, { query: $("flow-search").value, protocol: $("flow-protocol").value, via: $("flow-exit").value,
     country: $("flow-country").value, asn: $("flow-asn").value, names, page, order: $("flow-order").value });
   page = result.page;
-  const labels = result.rows.map(flow => [flow.protocol.toUpperCase(), flow.source, flow.destination,
+  const sources = result.rows.map(flowSource);
+  const labels = result.rows.map((flow, index) => [flow.protocol.toUpperCase(), `${sources[index].main} ${sources[index].detail}`, flow.destination,
     countryLabel(flow.country), asnLabel(flow.asn, names), name(flow.via, state),
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule",
     rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0))]);
@@ -229,7 +230,7 @@ function renderFlows() {
       if (flow.closing) protocol.append(node("span", "closing", "tag tag--closing"));
       return [
       protocol,
-      cell(node("code", labels[index][1])), cell(node("code", labels[index][2])),
+      cell(title(sources[index].main, sources[index].detail)), cell(node("code", labels[index][2])),
       cell(labels[index][3]), cell(labels[index][4]),
       cell(node("span", labels[index][5], "exit-tag")), cell(node("span", labels[index][6], "rule-tag")),
       cell(title(labels[index][7], labels[index][8]), true),

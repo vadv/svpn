@@ -42,6 +42,9 @@ function frame() {
     rule: degraded ? i % 2 ? 0 : null : i % 3 === 0 ? 1 : i % 3 === 1 ? 0 : null,
     // Remote TCP flows closed by FINs: 8 of 123 in `normal`, never local-exit ones.
     closing: i % 2 === 1 && i % 3 !== 0 && i % 10 === 5,
+    // LAN devices behind the router's masquerade: every third flow, named on the odd ones.
+    client: i % 3 === 1 ? `192.168.0.${20 + i % 40}` : null,
+    client_name: i % 3 === 1 && i % 2 ? "iphone-vadv" : null,
     rx_bytes: i === 7 ? sequence * 2000000 : (count - i) * 1000, tx_bytes: 0,
   }));
   const traffic = rule => ({
@@ -134,13 +137,23 @@ try {
   assert([...$('flows').tBodies[0].rows].every(row => row.cells[3].textContent === 'Unknown' && row.cells[4].textContent === 'Unknown'), 'unknown Geo metadata has explicit filters');
   input('flow-country', ''); input('flow-asn', '');
   const flowRow = index => $('flows').tBodies[0].rows[index].cells;
+  const sourceCell = index => { const cell = flowRow(index)[1]; return { main: cell.querySelector('strong')?.textContent ?? '', note: cell.querySelector('small')?.textContent ?? '' }; };
+  const isSource = (index, main, note) => sourceCell(index).main === main && sourceCell(index).note === note;
+  assert(isSource(0, 'router', '10.77.0.2:40000'), 'a flow without a LAN client is the router itself');
   input('flow-order', 'rate');
-  await until(() => flowRow(0)[1].textContent === '10.77.0.2:40007' && flowRow(0)[7].querySelector('strong')?.textContent === '16.00', 'rate order puts the busiest flow first with its Mbit/s');
+  await until(() => sourceCell(0).note === 'via 10.77.0.2:40007' && flowRow(0)[7].querySelector('strong')?.textContent === '16.00', 'rate order puts the busiest flow first with its Mbit/s');
+  assert(isSource(0, 'iphone-vadv · 192.168.0.27', 'via 10.77.0.2:40007'), 'a LAN device shows as the source with the tunnel address as the note');
   assert(flowRow(1)[7].querySelector('strong').textContent === '0.00' && flowRow(0)[7].querySelector('small').textContent.endsWith('MiB'), 'idle flows read 0, the total sits under the rate');
   input('flow-order', 'total');
-  assert(flowRow(0)[1].textContent === '10.77.0.2:40007' && flowRow(1)[1].textContent === '10.77.0.2:40000', 'total order ranks by bytes so far');
+  await until(() => sourceCell(0).note === 'via 10.77.0.2:40007', 'total order ranks by bytes so far');
+  assert(isSource(1, 'router', '10.77.0.2:40000'));
   input('flow-order', '');
-  assert(flowRow(0)[1].textContent === '10.77.0.2:40000', 'address order is the default');
+  await until(() => sourceCell(0).note === '10.77.0.2:40000', 'address order is the default');
+  input('flow-search', 'iphone-vadv');
+  assert($('flows').tBodies[0].rows.length === 21 && isSource(0, 'iphone-vadv · 192.168.0.21', 'via 10.77.0.2:40001'), 'search finds flows by device name');
+  input('flow-search', '192.168.0.27');
+  assert($('flows').tBodies[0].rows.length === 1 && isSource(0, 'iphone-vadv · 192.168.0.27', 'via 10.77.0.2:40007'), 'search finds flows by LAN address');
+  input('flow-search', '');
   assert([...$('flows').tBodies[0].rows].some(row => row.classList.contains('closing')) && $('flows').textContent.includes('closing'), 'closing flows are dimmed and tagged');
   $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('Downloading and parsing'), 'explicit browser CSV reload');

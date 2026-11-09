@@ -293,6 +293,11 @@ fn snapshot_maps_live_flows_to_their_server() {
             .iter()
             .all(|flow| flow.country.is_none() && flow.asn.is_none())
     );
+    // The hub never resolves LAN devices: that happens when the snapshot is
+    // served, from conntrack the hub must not read.
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(json["flows"][0]["client"].is_null());
+    assert!(json["flows"][0]["client_name"].is_null());
 }
 
 #[test]
@@ -330,6 +335,117 @@ fn destination_geo_is_independent_of_exit_policy_and_unknown_ranges_stay_null() 
     let snapshot = web::snapshot(&hub);
     assert_eq!(snapshot.flows[0].country.as_deref(), Some("DE"));
     assert_eq!(snapshot.flows[0].asn, None);
+}
+
+// ── lan sources ──
+
+/// Real-shaped conntrack and lease lines of a masquerading OpenWrt router.
+const CONNTRACK: &str = "\
+ipv4 2 tcp 6 src=192.168.0.30 dst=13.39.241.58 sport=49449 dport=443 packets=2784 bytes=161169 src=13.39.241.58 dst=10.77.0.2 sport=443 dport=49449 packets=32199 bytes=41214720 [OFFLOAD] mark=0 zone=0 use=4\n\
+ipv4 2 udp 17 148 src=192.168.0.186 dst=17.248.214.67 sport=62332 dport=443 packets=0 bytes=0 src=17.248.214.67 dst=10.77.0.2 sport=443 dport=62332 packets=0 bytes=0 [OFFLOAD] mark=0 zone=0 use=3\n\
+ipv4 2 icmp 1 29 src=192.168.0.20 dst=8.8.8.8 type=8 code=0 id=4660 packets=1 bytes=64 src=8.8.8.8 dst=10.77.0.2 type=0 code=0 id=4660 packets=1 bytes=64 mark=0 zone=0 use=2\n\
+ipv4 2 tcp 6 7425 ESTABLISHED src=10.77.0.2 dst=213.180.204.36 sport=58680 dport=443 packets=0 bytes=0 src=213.180.204.36 dst=10.77.0.2 sport=443 dport=58680 packets=0 bytes=0 [ASSURED] mark=0 zone=0 use=2\n";
+
+const LEASES: &str = "\
+1794248488 aa:bb:cc:dd:ee:01 192.168.0.30 Dmitrij-s-S26-Ultra 01:aa:bb:cc:dd:ee:01\n\
+1794254503 aa:bb:cc:dd:ee:02 192.168.0.117 * 01:aa:bb:cc:dd:ee:02\n\
+1794255585 aa:bb:cc:dd:ee:03 fd01:a214:cdb4::fa42 * 00:03:00:01:aa:bb:cc:dd:ee:03\n";
+
+fn view(protocol: &'static str, source: &str, destination: &str) -> web::FlowView {
+    web::FlowView {
+        rule: None,
+        protocol,
+        source: source.to_owned(),
+        destination: destination.to_owned(),
+        country: None,
+        asn: None,
+        via: "local".to_owned(),
+        client: None,
+        client_name: None,
+        rx_bytes: 0,
+        tx_bytes: 0,
+        closing: false,
+    }
+}
+
+#[test]
+fn conntrack_maps_masqueraded_flows_by_their_tunnel_tuple() {
+    let map = web::lan::parse_conntrack(CONNTRACK);
+    let tun = Ipv4Addr::new(10, 77, 0, 2);
+    assert_eq!(
+        map.get(&(6, tun, 49449, Ipv4Addr::new(13, 39, 241, 58), 443)),
+        Some(&Ipv4Addr::new(192, 168, 0, 30))
+    );
+    assert_eq!(
+        map.get(&(17, tun, 62332, Ipv4Addr::new(17, 248, 214, 67), 443)),
+        Some(&Ipv4Addr::new(192, 168, 0, 186)),
+        "a NAT port kept by the masquerade still matches"
+    );
+    assert_eq!(
+        map.get(&(1, tun, 4660, Ipv4Addr::new(8, 8, 8, 8), 0)),
+        Some(&Ipv4Addr::new(192, 168, 0, 20)),
+        "icmp keys on the echo id with no destination port, as the hub does"
+    );
+    // The router's own flow leaves the table: its original source is the
+    // TUN address, there is no LAN device behind it.
+    assert!(!map.values().any(|&lan| lan == tun));
+    assert_eq!(map.len(), 3);
+}
+
+#[test]
+fn conntrack_skips_foreign_and_malformed_lines() {
+    let map = web::lan::parse_conntrack(
+        "ipv6 10 udp 17 21 src=::1 dst=::1 sport=52299 dport=53 packets=0 bytes=0 \
+         src=::1 dst=::1 sport=53 dport=52299 packets=0 bytes=0 mark=0 zone=0 use=2\n\
+         ipv4 2 sctp 132 src=192.168.0.5 dst=1.2.3.4 sport=1 dport=2\n\
+         ipv4 2 tcp 6 src=192.168.0.5\n\
+         ipv4 2 tcp 6 src=bogus dst=1.2.3.4 sport=1 dport=2 packets=0 bytes=0 \
+         src=1.2.3.4 dst=10.77.0.2 sport=2 dport=1 packets=0 bytes=0\n\
+         garbage\n",
+    );
+    assert!(map.is_empty(), "{map:?}");
+}
+
+#[test]
+fn leases_keep_named_ipv4_hosts_only() {
+    let names = web::lan::parse_leases(LEASES);
+    assert_eq!(names.len(), 1);
+    assert_eq!(
+        names
+            .get(&Ipv4Addr::new(192, 168, 0, 30))
+            .map(String::as_str),
+        Some("Dmitrij-s-S26-Ultra")
+    );
+    assert!(web::lan::parse_leases("truncated\n").is_empty());
+}
+
+#[test]
+fn lan_sources_apply_to_flow_views_and_stay_null_without_a_mapping() {
+    let sources = web::lan::resolve(CONNTRACK, LEASES);
+    let mut flows = vec![
+        view("tcp", "10.77.0.2:49449", "13.39.241.58:443"),
+        view("udp", "10.77.0.2:62332", "17.248.214.67:443"),
+        view("icmp", "10.77.0.2:4660", "8.8.8.8:0"),
+        view("tcp", "10.77.0.2:58680", "213.180.204.36:443"),
+        view("tcp", "10.77.0.2:1", "1.2.3.4:443"),
+    ];
+    web::lan::apply(&sources, &mut flows);
+    assert_eq!(flows[0].client.as_deref(), Some("192.168.0.30"));
+    assert_eq!(flows[0].client_name.as_deref(), Some("Dmitrij-s-S26-Ultra"));
+    assert_eq!(flows[1].client.as_deref(), Some("192.168.0.186"));
+    assert_eq!(flows[1].client_name, None, "no lease, no name");
+    assert_eq!(
+        flows[2].client.as_deref(),
+        Some("192.168.0.20"),
+        "icmp echo"
+    );
+    assert_eq!(flows[3].client, None, "the router's own flow");
+    assert_eq!(flows[4].client, None, "unknown tuple");
+    let json = serde_json::to_value(&flows).unwrap();
+    assert_eq!(json[0]["client"], "192.168.0.30");
+    assert_eq!(json[0]["client_name"], "Dmitrij-s-S26-Ultra");
+    assert!(json[3]["client"].is_null());
+    assert!(json[4]["client_name"].is_null());
 }
 
 // ── json ──

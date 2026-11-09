@@ -5,6 +5,7 @@
 //! changes routing.
 
 pub mod asn;
+pub mod lan;
 
 use std::{
     net::SocketAddr,
@@ -27,7 +28,7 @@ use crate::{
 };
 
 /// One server of the pool with its traffic counters.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ServerView {
     pub index: usize,
     /// Stable node id (the configured `server` string).
@@ -50,7 +51,7 @@ pub struct ServerView {
 
 /// Live transport selection of one server: the transport in use and the
 /// race that picked it.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SelectionView {
     /// Transport in use right now (`quic`, `mosh`, `tcp-ssh`, …); null
     /// before the first verified round.
@@ -60,7 +61,7 @@ pub struct SelectionView {
 }
 
 /// One sticky block: what it matches and which server serves it.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RuleView {
     pub index: usize,
     pub label: String,
@@ -79,7 +80,7 @@ pub struct RuleView {
 
 /// Per-rule IP traffic since client start, including retired flows.
 /// `active_flows` counts open flows only; closing ones are separate.
-#[derive(Default, Serialize)]
+#[derive(Default, Clone, Serialize)]
 pub struct TrafficView {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -87,7 +88,7 @@ pub struct TrafficView {
     pub closing_flows: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct DatabaseView {
     pub kind: &'static str,
     pub configured: bool,
@@ -98,14 +99,14 @@ pub struct DatabaseView {
 }
 
 /// One pinned destination group and the server that serves it.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GroupView {
     pub group: String,
     pub server: String,
 }
 
 /// Local exit: readiness and counters.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct LocalView {
     pub enabled: bool,
     pub ready: bool,
@@ -117,7 +118,7 @@ pub struct LocalView {
 }
 
 /// One active client flow and where it goes.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FlowView {
     pub rule: Option<usize>,
     pub protocol: &'static str,
@@ -130,13 +131,18 @@ pub struct FlowView {
     pub via: String,
     /// Both FINs seen: the flow is closing, not open.
     pub closing: bool,
+    /// LAN device behind the router's masquerade, from conntrack; null for
+    /// the router's own flows or without conntrack.
+    pub client: Option<String>,
+    /// DHCP hostname of `client`; null without a lease name.
+    pub client_name: Option<String>,
     /// This flow's bytes since the hub first saw it; the dashboard derives rates.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }
 
 /// Everything the dashboard shows.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Snapshot {
     pub generated_at: u64,
     pub generated_at_ms: u64,
@@ -272,6 +278,8 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
             },
             closing: flow.closing,
+            client: None,
+            client_name: None,
             rx_bytes: flow.traffic.rx_bytes,
             tx_bytes: flow.traffic.tx_bytes,
         })
@@ -427,6 +435,9 @@ pub async fn serve(
     geo_path: Option<PathBuf>,
 ) -> Result<()> {
     let mut requests = tokio::task::JoinSet::new();
+    // One shared cache for every request task: the spawned futures are
+    // 'static, so the tables are parsed behind an Arc, once per second.
+    let lan = std::sync::Arc::new(lan::Cache::new());
     loop {
         tokio::select! {
             finished = requests.join_next(), if !requests.is_empty() => match finished {
@@ -439,7 +450,10 @@ pub async fn serve(
                 if !peer.ip().is_loopback() || requests.len() >= MAX_CONNECTIONS { continue; }
                 let snapshots = snapshots.clone();
                 let path = geo_path.clone();
-                requests.spawn(async move { handle(stream, &snapshots, path.as_deref()).await });
+                let lan = std::sync::Arc::clone(&lan);
+                requests.spawn(async move {
+                    handle(stream, &snapshots, path.as_deref(), &lan).await
+                });
             }
         }
     }
@@ -450,6 +464,7 @@ async fn handle(
     mut stream: TcpStream,
     snapshots: &watch::Receiver<Snapshot>,
     geo_path: Option<&Path>,
+    lan: &lan::Cache,
 ) -> Result<()> {
     let Some(head) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut stream))
         .await
@@ -483,7 +498,11 @@ async fn handle(
     }
     match path {
         "/api/state" => {
-            let json = serde_json::to_vec(&*snapshots.borrow())?;
+            // Enriched here, not in the hub: conntrack reads belong to this
+            // request task, never to the packet loop that builds snapshots.
+            let mut snapshot = snapshots.borrow().clone();
+            lan.enrich(&mut snapshot.flows).await;
+            let json = serde_json::to_vec(&snapshot)?;
             respond(&mut stream, 200, "application/json", &json).await
         }
         "/api/asn.csv" => {

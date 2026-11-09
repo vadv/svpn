@@ -264,6 +264,15 @@ export function flag(code) {
 
 const flowKey = flow => `${flow.protocol} ${flow.source} ${flow.destination}`;
 
+// The Source column: the LAN device behind the router's masquerade when the
+// snapshot names one, otherwise the router itself; the tunnel address stays
+// visible as the note under it.
+export function flowSource(flow) {
+  return flow.client
+    ? { main: flow.client_name ? `${flow.client_name} · ${flow.client}` : flow.client, detail: `via ${flow.source}` }
+    : { main: "router", detail: flow.source };
+}
+
 // Each flow's bytes per second since the previous snapshot; null when the flow is new, the
 // clock did not advance or a counter went backwards (a reinserted tuple restarts at zero).
 export function withFlowRates(previous, current) {
@@ -285,7 +294,7 @@ export function flowPage(flows, { query = "", protocol = "", via = "", country =
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&
     (!country || (flow.country ?? "unknown") === country) && (!asn || String(flow.asn ?? "unknown") === asn) &&
-    (!needle || `${flow.source} ${flow.destination} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)}`.toLowerCase().includes(needle)));
+    (!needle || `${flow.source} ${flow.destination} ${flow.client ?? ""} ${flow.client_name ?? ""} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)}`.toLowerCase().includes(needle)));
   // The snapshot already arrives in address order; a stable sort keeps it as the tie-breaker.
   if (ORDERS[order]) filtered.sort(ORDERS[order]);
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));

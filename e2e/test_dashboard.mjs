@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -323,6 +323,31 @@ test("destination country/ASN filters combine and search includes organization n
   assert.equal(asnLabel(13335, names), "AS13335 · Cloudflare, Inc.");
   assert.equal(asnLabel(139341), "AS139341");
   assert.equal(asnLabel(null), "Unknown");
+});
+
+test("flow search includes the LAN device behind the masquerade", () => {
+  const base = { destination: "1.2.3.4:443", protocol: "tcp", via: "nl" };
+  const flows = [
+    { ...base, source: "10.77.0.2:49449", client: "192.168.0.23", client_name: "iphone-vadv" },
+    { ...base, source: "10.77.0.2:49450", client: "192.168.0.24", client_name: null },
+    { ...base, source: "10.77.0.2:49451" },
+  ];
+  assert.equal(flowPage(flows, { query: "iphone-vadv" }).count, 1, "device name");
+  assert.equal(flowPage(flows, { query: "IPHONE" }).count, 1, "search is case-insensitive");
+  assert.equal(flowPage(flows, { query: "192.168.0.24" }).count, 1, "LAN address");
+  assert.equal(flowPage(flows, { query: "49451" }).count, 1, "the NAT port still matches");
+  assert.equal(flowPage(flows, { query: "192.168.0.99" }).count, 0);
+});
+
+test("source column names the LAN device or the router itself", () => {
+  assert.deepEqual(flowSource({ source: "10.77.0.2:49449", client: "192.168.0.23", client_name: "iphone-vadv" }),
+    { main: "iphone-vadv · 192.168.0.23", detail: "via 10.77.0.2:49449" });
+  assert.deepEqual(flowSource({ source: "10.77.0.2:49450", client: "192.168.0.24", client_name: null }),
+    { main: "192.168.0.24", detail: "via 10.77.0.2:49450" }, "a device without a lease shows its address alone");
+  assert.deepEqual(flowSource({ source: "10.77.0.2:49451", client: null, client_name: null }),
+    { main: "router", detail: "10.77.0.2:49451" });
+  assert.deepEqual(flowSource({ source: "10.77.0.2:49451" }), { main: "router", detail: "10.77.0.2:49451" },
+    "a snapshot without the new fields still renders");
 });
 
 test("country flags come from the ISO code alone", () => {
