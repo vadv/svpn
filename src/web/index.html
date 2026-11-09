@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>svpn · state readout</title>
 <style>
-:root { color-scheme:dark; --bg:#0a0b0b; --surface:#101213; --surface-2:#151819; --surface-3:#1b1f20; --line:#394042; --line-soft:#252b2c; --grid:#242a2b; --text:#e8ede9; --muted:#9da6a1; --faint:#6f7873; --accent:#c9f227; --accent-ink:#11140a; --rx:#59c9ff; --tx:#ff7b45; --rx-fill:rgba(89,201,255,.13); --tx-fill:rgba(255,123,69,.11); --good:#c9f227; --warn:#ffd166; --bad:#ff6b6b; --good-bg:rgba(201,242,39,.08); --warn-bg:rgba(255,209,102,.09); --bad-bg:rgba(255,107,107,.10); --neutral-bg:rgba(157,166,161,.08); }
-body[data-theme="light"] { color-scheme:light; --bg:#eceee9; --surface:#fafbf7; --surface-2:#f1f3ec; --surface-3:#e4e8dd; --line:#858e86; --line-soft:#c9cfc4; --grid:#d3d8cd; --text:#151a16; --muted:#4f5951; --faint:#69736b; --accent:#5f7100; --accent-ink:#fafbf7; --rx:#005b91; --tx:#a13d00; --rx-fill:rgba(0,91,145,.09); --tx-fill:rgba(161,61,0,.08); --good:#4b5d00; --warn:#7a5b00; --bad:#9c2020; --good-bg:rgba(75,93,0,.08); --warn-bg:rgba(122,91,0,.08); --bad-bg:rgba(156,32,32,.08); --neutral-bg:rgba(80,90,82,.08); }
+:root { color-scheme:dark; --bg:#0a0b0b; --surface:#101213; --surface-2:#151819; --surface-3:#1b1f20; --line:#394042; --line-soft:#252b2c; --grid:#242a2b; --text:#e8ede9; --muted:#9da6a1; --faint:#6f7873; --accent:#c9f227; --accent-ink:#11140a; --rx:#59c9ff; --tx:#ff7b45; --rx-fill:rgba(89,201,255,.13); --tx-fill:rgba(255,123,69,.11); --good:#c9f227; --warn:#ffd166; --bad:#ff6b6b; --warn-bg:rgba(255,209,102,.09); --bad-bg:rgba(255,107,107,.10); }
+body[data-theme="light"] { color-scheme:light; --bg:#eceee9; --surface:#fafbf7; --surface-2:#f1f3ec; --surface-3:#e4e8dd; --line:#858e86; --line-soft:#c9cfc4; --grid:#d3d8cd; --text:#151a16; --muted:#4f5951; --faint:#69736b; --accent:#5f7100; --accent-ink:#fafbf7; --rx:#005b91; --tx:#a13d00; --rx-fill:rgba(0,91,145,.09); --tx-fill:rgba(161,61,0,.08); --good:#4b5d00; --warn:#7a5b00; --bad:#9c2020; --warn-bg:rgba(122,91,0,.08); --bad-bg:rgba(156,32,32,.08); }
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; }
 body { margin:0; background:var(--bg); color:var(--text); font:12px/1.5 ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; font-variant-numeric:tabular-nums; -webkit-font-smoothing:antialiased; }
@@ -95,6 +95,8 @@ button.help { width:18px; height:18px; min-height:0; padding:0; border:1px solid
 button.help:hover:not(:disabled),button.help:focus-visible { background:var(--surface-3); color:var(--text); border-color:var(--accent); }
 .help-pop { display:none; position:absolute; z-index:10; top:calc(100% + 6px); left:0; width:max-content; max-width:min(320px,78vw); padding:8px 10px; border:1px solid var(--line); background:var(--surface-3); color:var(--text); font-size:11px; font-weight:400; line-height:1.55; letter-spacing:0; text-transform:none; white-space:normal; }
 .help-wrap:hover .help-pop,.help-wrap:focus-within .help-pop { display:block; }
+.help-pop::before { content:""; position:absolute; top:-6px; left:0; width:100%; height:6px; }
+.help-wrap.dismissed .help-pop { display:none; }
 .scroll { overflow-x:auto; }
 table { width:100%; border-collapse:collapse; font-size:11.5px; }
 th,td { padding:8px 13px; text-align:left; border-top:1px solid var(--line-soft); vertical-align:top; }
@@ -111,7 +113,7 @@ code { font:inherit; overflow-wrap:anywhere; }
 .tag--tcp { color:var(--rx); }
 .tag--udp { color:var(--accent); }
 .tag--icmp { color:var(--tx); }
-.tag--closing { opacity:.6; }
+.tag--closing { margin-left:6px; opacity:.6; }
 .service { margin-left:6px; color:var(--muted); font-size:11px; white-space:nowrap; }
 #flows tr.closing td { opacity:.55; }
 .exit-tag { color:var(--text); }

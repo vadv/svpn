@@ -189,7 +189,7 @@ function renderRules() {
   ]);
   rows.push([
     cell(title("Fallback", "Unmatched traffic")),
-    cell("Per flow"), cell("VPN pool"), cell(flowCounts(latest.fallback), true),
+    cell("Per flow / group"), cell("VPN pool"), cell(flowCounts(latest.fallback), true),
     cell(bytes(latest.fallback.rx_bytes), true), cell(bytes(latest.fallback.tx_bytes), true), cell("—"),
   ]);
   table("rules", rows, 7);
@@ -308,7 +308,7 @@ function renderJobs() {
   table("jobs", latest.jobs.details.map(job => [
     cell(title(job.label, `Every ${job.every_secs}s · timeout ${job.timeout_secs}s${job.reload.length ? ` · reload ${job.reload.join(", ")}` : ""}`)),
     cell(badge(job.state)), cell(time(job.started_at)), cell(time(job.success_at)),
-    cell(job.state === "running" ? "Running" : time(job.next_at)), cell(job.reason || (job.state === "ok" ? "OK" : "—")),
+    cell(job.state === "running" ? "Running" : time(job.next_at)), cell(job.reason ? `${job.state === "running" ? "Previous attempt: " : ""}${job.reason}` : job.state === "ok" ? "OK" : "—"),
   ]), 6, "No scheduled jobs");
 }
 
@@ -441,10 +441,30 @@ $("chart-plot").addEventListener("pointermove", event => {
 });
 $("chart-plot").addEventListener("pointerleave", hideCursor);
 
+// The absolute-positioned popup can grow a phone document past the viewport, so it is
+// nudged back inside on open; the same hooks un-dismiss a popup closed by Escape.
+// CSP forbids inline handlers, hence this listener instead of markup attributes.
+for (const wrap of document.querySelectorAll(".help-wrap")) {
+  const open = () => {
+    wrap.classList.remove("dismissed");
+    const pop = wrap.querySelector(".help-pop");
+    pop.style.left = "";
+    const rect = pop.getBoundingClientRect(), edge = document.documentElement.clientWidth - 8;
+    const shift = Math.max(0, rect.right - edge, 8 - rect.left);
+    if (shift > 0) pop.style.left = `${-shift}px`;
+  };
+  wrap.addEventListener("focusin", open);
+  wrap.addEventListener("pointerenter", open);
+}
+
 document.addEventListener("keydown", event => {
   const active = document.activeElement;
   const typing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName);
   if (event.key === "/" && !typing) { event.preventDefault(); $("flow-search").focus(); }
+  if (event.key === "Escape") {
+    // WCAG 1.4.13: Esc must also close the open tooltip, hover-opened included.
+    document.querySelector(".help-wrap:focus-within, .help-wrap:hover")?.classList.add("dismissed");
+  }
   if (event.key === "Escape" && active === $("flow-search")) {
     $("flow-search").value = "";
     $("flow-search").dispatchEvent(new Event("input"));

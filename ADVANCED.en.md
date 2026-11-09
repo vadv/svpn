@@ -419,7 +419,7 @@ What it shows:
 - Sticky rules in first-match order: selectors, allowed exits, current owners,
   connections and RX/TX. Local is explicit; resolved-IP counts apply only to DNS
   rules. Traffic matching no sticky rule appears as Fallback.
-- Flows: address/port search, protocol/exit filters and 50-row pages. Pause table
+- Flows: address/port search, protocol/exit filters and 50-row pages. Pause
   freezes only the table; the overview stays live.
 - `svpn` process resources: RSS, CPU as a percentage of one core, cumulative
   user+system CPU time, logical CPU count and uptime. Current RSS comes from
