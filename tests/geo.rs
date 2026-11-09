@@ -179,6 +179,29 @@ fn country_skips_ipv6_rows() {
 }
 
 #[test]
+fn country_skips_unassigned_zz_rows() {
+    let extra = vec![
+        "192.168.0.0,192.168.255.255,ZZ".to_string(),
+        "1.0.0.0,1.0.0.255,zz".to_string(),
+        "8.8.8.0,8.8.8.255,US".to_string(),
+    ];
+    let csv = Csv::of(&full_country_rows(&extra));
+    let geo = Geo::load_country(csv.0.as_path()).unwrap();
+    assert_eq!(
+        geo.rows(),
+        100_001,
+        "ZZ is a reserved-range marker, not a country"
+    );
+    assert_eq!(geo.lookup(Ipv4Addr::new(192, 168, 0, 1)), None);
+    assert_eq!(
+        geo.lookup(Ipv4Addr::new(1, 0, 0, 5)),
+        None,
+        "lowercase zz too"
+    );
+    assert!(geo.lookup(Ipv4Addr::new(8, 8, 8, 8)).is_some());
+}
+
+#[test]
 fn country_lookup_hits_ipv4_boundaries() {
     let extra = vec![
         "0.0.0.0,0.0.0.0,DE".to_string(),

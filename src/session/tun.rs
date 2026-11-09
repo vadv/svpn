@@ -574,7 +574,7 @@ impl Session {
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))
                             || (flow.active
-                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                && (flow.tcp_close.deadline().is_some_and(|at| now >= at)
                                     || now.duration_since(flow.last_seen)
                                         >= idle_timeout(flow.key.protocol))))
                 })
@@ -590,7 +590,7 @@ impl Session {
                             || (flow.data_started
                                 && super::recovery::recovery_expired(&flow.recovery, now))
                             || (flow.active
-                                && (flow.tcp_close.deadline.is_some_and(|at| now >= at)
+                                && (flow.tcp_close.deadline().is_some_and(|at| now >= at)
                                     || now.duration_since(flow.last_seen)
                                         >= idle_timeout(flow.key.protocol))))
                 })

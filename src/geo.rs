@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 /// Sanity floor for a complete DB-IP Lite database; ASN Lite holds ~400k
 /// IPv4 rows, Country Lite is in the same range.
 const MIN_ROWS: usize = 100_000;
+/// Packed `ZZ`, see [`CountryRow::Unassigned`].
+const UNASSIGNED: u32 = (b'Z' as u32) << 8 | b'Z' as u32;
 
 /// Sorted, non-overlapping `(start, end, payload)` ranges; the payload is an
 /// ASN for [`Geo::load`] and a packed country code for [`Geo::load_country`].
@@ -47,7 +49,7 @@ impl Geo {
                     );
                     ranges.push((start, end, payload));
                 }
-                CountryRow::Ipv6 => {}
+                CountryRow::Ipv6 | CountryRow::Unassigned => {}
                 CountryRow::Invalid(category) => {
                     bail!("country database: row {number}: {category}")
                 }
@@ -192,6 +194,9 @@ enum CountryRow {
     /// Both address fields contain `:` — a valid IPv6 row, skipped because
     /// the table is IPv4-only.
     Ipv6,
+    /// `ZZ` — DB-IP's reserved/private range marker, not a country: the
+    /// address stays unknown instead of showing a made-up flag.
+    Unassigned,
     /// Corruption category for the row-numbered startup error.
     Invalid(&'static str),
 }
@@ -210,6 +215,7 @@ fn country_row(line: &str) -> CountryRow {
         return CountryRow::Invalid("malformed IPv4 address");
     };
     match pack_country(country) {
+        Some(UNASSIGNED) => CountryRow::Unassigned,
         Some(payload) => CountryRow::Range(start, end, payload),
         None => CountryRow::Invalid("invalid country code"),
     }

@@ -145,6 +145,18 @@ test("graph can select a server and handles the empty first screen", () => {
   assert.equal(graph([]).rx, "");
 });
 
+test("headline numbers quote the smoothed rate, never a lone poll", () => {
+  const history = [10, 10, 10, 10, 0].map((rx, index) => ({
+    time: 1000 * (index + 1), rx, tx: rx / 2, cpu: rx * 10, servers: { nl: { rx, tx: 0 } },
+  }));
+  assert.equal(graph(history).latest.rx, 8, "a zero-delta poll after steady traffic is not 0 Mbit/s");
+  assert.equal(graph(history).latest.tx, 4);
+  assert.equal(graph(history, "nl").latest.rx, 8, "server rows use the same average");
+  assert.equal(graph(history).latest.cpu, 80, "the CPU sparkline is averaged too");
+  assert.equal(graph([...history, { time: 6000, rx: null, tx: null, cpu: null, servers: {} }]).latest.rx, null,
+    "a gap is still unknown, not the average before it");
+});
+
 test("filled areas close at the baseline and break around unknown intervals", () => {
   const history = [
     { time: 1000, rx: 1, tx: 0, servers: {} }, { time: 2000, rx: 2, tx: 1, servers: {} },
@@ -228,14 +240,14 @@ test("traffic lines average a short window instead of drawing one-poll spikes", 
   assert.deepEqual(smoothRates([]), []);
 });
 
-test("smoothing never bridges an API gap and never moves the readouts", () => {
+test("smoothing never bridges an API gap and the readout quotes the drawn line", () => {
   const history = [
     { time: 1000, rx: 2, tx: 1, servers: {} }, { time: 2000, rx: 4, tx: 1, servers: {} },
     { time: 8000, rx: null, tx: null, servers: {} }, { time: 9000, rx: 6, tx: 1, servers: {} },
   ];
   assert.equal(graph(history).rx.match(/M/g).length, 2, "the gap still breaks the line");
   assert.equal(graph([{ time: 1000, rx: null, tx: null, servers: {} }]).rx.trim(), "", "an unknown newest sample draws nothing");
-  assert.equal(graph(history).latest.rx, 6, "the readout keeps the newest real rate, not the average");
+  assert.equal(graph(history).latest.rx, 4, "the readout is the averaged value the line ends on (2, 4, 6)");
   assert.equal(spark(history, "rx").match(/M/g).length, 2, "the compact trend breaks on the same gap");
 });
 

@@ -121,9 +121,9 @@ export function smoothRates(values, window = SMOOTH_SAMPLES) {
   });
 }
 
-// One sample vocabulary for the chart, its filled areas, sparklines and the hover readout.
-// Lines draw the smoothed rates; `latest` stays the newest real sample, so the readouts keep saying
-// "now" while the trend line says "recently".
+// One sample vocabulary for the chart, its filled areas, sparklines, the hover readout and the
+// headline numbers. Everything shows the smoothed rate: a single poll-length rate reads 0 or a spike
+// while the line says otherwise, and two numbers for one quantity is one too many.
 function series(history, serverId = "") {
   const raw = history.map(point => ({
     time: point.time,
@@ -131,10 +131,11 @@ function series(history, serverId = "") {
   }));
   const rx = smoothRates(raw.map(sample => sample.rx));
   const tx = smoothRates(raw.map(sample => sample.tx));
-  const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index] }));
+  const cpu = smoothRates(raw.map(sample => sample.cpu));
+  const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index], cpu: cpu[index] }));
   const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
   const end = history.at(-1)?.time ?? 0;
-  return { samples, max, end, latest: raw.at(-1) ?? null };
+  return { samples, max, end, latest: samples.at(-1) ?? null };
 }
 
 const chartX = (time, end) => 1000 * (time - end + WINDOW_MS) / WINDOW_MS;

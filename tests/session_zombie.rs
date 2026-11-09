@@ -210,13 +210,15 @@ async fn target_reset_does_not_prove_the_flow() {
             session.has_flow(1),
             "a target reset leaves the decision to the client"
         );
-        let budget = svpn::selector::FLOW_BUDGET;
-        advance(budget - Duration::from_secs(1)).await;
+        advance(RST_DWELL - Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
         assert!(session.has_flow(1));
         advance(Duration::from_secs(1)).await;
         session.expire_flows(Instant::now()).await.unwrap();
-        assert!(!session.has_flow(1), "a reset answer proves nothing");
+        assert!(
+            !session.has_flow(1),
+            "a reset answer proves nothing and ends the flow"
+        );
     }
 }
 

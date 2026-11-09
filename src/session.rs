@@ -72,6 +72,11 @@ pub const FLOW_IDLE: Duration = Duration::from_secs(60);
 pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60 + 4 * 60);
 /// Retain both-FIN flows for retransmissions (RFC 5382 transitory timeout).
 pub const FIN_DWELL: Duration = Duration::from_secs(4 * 60);
+/// A reset in either direction closes the flow after this grace unless
+/// traffic resumes: a forged or out-of-window reset must not tear down a
+/// live connection (conntrack's UNEXPECTED RST handling, not its window
+/// check — resumption is the cancel signal here).
+pub const RST_DWELL: Duration = Duration::from_secs(10);
 pub const FLOW_CAP: usize = 4096;
 pub const PROBE_FLOW_RESERVE: usize = 16;
 /// Per-channel outgoing IP-packet queue and binding wait.

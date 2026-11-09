@@ -85,7 +85,6 @@ function renderClock() {
 function renderProcess() {
   const process = latest.process ?? null;
   const memory = processRss(process);
-  const cpu = Number.isFinite(point?.cpu) ? point.cpu : null;
   const average = cpuAverage(history);
   const cpuTime = Number.isFinite(process?.cpu_seconds) ? process.cpu_seconds : null;
   const cpus = Number.isFinite(process?.cpus) && process.cpus > 0 ? process.cpus : null;
@@ -93,7 +92,7 @@ function renderProcess() {
   $("proc-rss-kind").textContent = memory.bytes == null ? "No process sample" : memory.peak ? "Peak RSS · live value unavailable" : "Current RSS · resident set";
   $("proc-cpu").textContent = average ? `${average.percent.toFixed(1)}%` : "—";
   $("proc-cpu-kind").textContent = average
-    ? `Of one core · ${Math.round(average.seconds)}s average${cpu == null ? "" : ` · now ${cpu.toFixed(0)}%`}`
+    ? `Of one core · ${Math.round(average.seconds)}s average`
     : "Waiting for two fresh samples";
   $("proc-time").textContent = cpuTime == null ? "—" : `${cpuTime.toFixed(2)} s`;
   $("proc-time-note").textContent = cpus ? `${cpus} logical CPUs · user + system` : "User + system · CPU count unknown";
@@ -119,11 +118,14 @@ function freshness() {
     const age = Math.max(0, Math.floor((performance.now() - lastChange) / 1000));
     $("meta").textContent = `${latest.policy} · snapshot ${new Date(latest.generated_at_ms).toLocaleTimeString()} · ${age}s since change`;
   } else if (apiError) $("meta").textContent = "Cannot load /api/state. Retrying automatically.";
-  $("rx").textContent = stale ? "—" : rate(point?.rx);
-  $("tx").textContent = stale ? "—" : rate(point?.tx);
+  // Same smoothed value the chart draws; `point` gates it so a duplicate or failed poll shows —.
+  const total = point ? graph(history).latest : null;
+  $("rx").textContent = stale ? "—" : rate(total?.rx);
+  $("tx").textContent = stale ? "—" : rate(total?.tx);
   for (const row of serverRows.values()) {
-    row.rx.textContent = stale ? "—" : rate(point?.servers[row.id]?.rx);
-    row.tx.textContent = stale ? "—" : rate(point?.servers[row.id]?.tx);
+    const server = point ? graph(history, row.id).latest : null;
+    row.rx.textContent = stale ? "—" : rate(server?.rx);
+    row.tx.textContent = stale ? "—" : rate(server?.tx);
   }
   if (stale) {
     $("chart-note").textContent = latest ? "Last successful snapshot · not live" : "Waiting for connection…";
