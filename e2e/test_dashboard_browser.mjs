@@ -115,6 +115,17 @@ try {
   assert($('spark-rss').getAttribute('d').trim() && $('spark-cpu').getAttribute('d').trim(), 'process trends render');
   assert(getComputedStyle(document.body).backgroundImage === 'none', 'no decorative gradient background');
   assert(getComputedStyle($('ready').closest('.card')).borderRadius === '0px', 'sharp instrument-panel cells');
+  assert(document.querySelector('header').getBoundingClientRect().height <= 64, 'header stays a single row');
+  assert([...document.querySelectorAll('.heading')].every(h => h.getBoundingClientRect().height <= 48), 'panel headings stay on one line');
+  const helps = [...document.querySelectorAll('button.help')];
+  assert(helps.length >= 5 && helps.every(b => b.getAttribute('aria-describedby') && document.getElementById(b.getAttribute('aria-describedby'))), 'each help trigger has a described tooltip');
+  assert(getComputedStyle(document.getElementById(helps[0].getAttribute('aria-describedby'))).display === 'none', 'help is hidden until hover or focus');
+  helps[0].focus();
+  assert(getComputedStyle(document.getElementById(helps[0].getAttribute('aria-describedby'))).display !== 'none', 'help opens on keyboard focus');
+  helps[0].blur();
+  const statusTag = document.querySelector('#rules .pill');
+  assert(statusTag && getComputedStyle(statusTag).borderTopWidth === '0px', 'status labels are plain text, not button-like boxes');
+  assert(!document.querySelector('#rules-panel').textContent.includes('IP bytes since client start'), 'long prose is removed from the rules panel');
   $('theme-toggle').click();
   assert(document.body.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true', 'light theme switch');
   $('theme-toggle').click();
@@ -124,7 +135,7 @@ try {
   assert($('servers').textContent.includes('tcp 41 ms (+penalty) · quic 63 ms · webrtc timeout · obfs handshake'), 'race is shown, winner first');
   assert($('servers').textContent.includes('Selecting…') && $('servers').textContent.includes('limited: webrtc · ssh'), 'pending selection and config restriction are shown');
   assert(!$('servers').textContent.includes('Auto'), 'configured-only mimic text is gone');
-  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV parsed and cached in browser');
+  await until(() => $('asn-status').textContent.includes('2 names'), 'CSV parsed and cached in browser');
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
@@ -161,23 +172,23 @@ try {
   input('flow-search', '');
   assert([...$('flows').tBodies[0].rows].some(row => row.classList.contains('closing')) && $('flows').textContent.includes('closing'), 'closing flows are dimmed and tagged');
   $('asn-load').click();
-  await until(() => $('asn-status').textContent.includes('Downloading and parsing'), 'explicit browser CSV reload');
-  await until(() => $('asn-status').textContent.includes('2 names in this browser') && !$('asn-load').disabled, 'browser names reload completes');
+  await until(() => $('asn-status').textContent.includes('Loading'), 'explicit browser CSV reload');
+  await until(() => $('asn-status').textContent.includes('2 names') && !$('asn-load').disabled, 'browser names reload completes');
   const realTimeout = window.setTimeout;
   window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 300000 ? 30 : ms, ...args);
   Object.defineProperty(document, 'hidden', { configurable: true, value: true });
   document.dispatchEvent(new Event('visibilitychange'));
-  await until(() => $('asn-status').textContent.startsWith('ASN names freed after 5 min hidden'), 'hidden-tab idle eviction');
+  await until(() => $('asn-status').textContent.startsWith('Freed after 5 min hidden'), 'hidden-tab idle eviction');
   assert(!$('flows').textContent.includes('Cloudflare') && !$('asn-load').disabled, 'eviction releases dictionary and leaves numbers and reload available');
   window.setTimeout = realTimeout; delete document.hidden;
   document.dispatchEvent(new Event('visibilitychange'));
   $('asn-load').click();
-  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'explicit load after eviction');
+  await until(() => $('asn-status').textContent.includes('2 names'), 'explicit load after eviction');
   await control('names-error'); $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('HTTP 503'), 'CSV fetch error is explicit');
   assert($('freshness').textContent === 'Live snapshots', 'CSV errors do not break live state polling');
   await control('normal'); $('asn-load').click();
-  await until(() => $('asn-status').textContent.includes('2 names in this browser'), 'CSV retry recovers');
+  await until(() => $('asn-status').textContent.includes('2 names'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
   await control('large');
   await until(() => $('active').textContent === '9336', 'large flow snapshot');
@@ -204,7 +215,7 @@ try {
   await control('xss');
   await until(() => $('servers').textContent.includes('<img'), 'untrusted label rendered');
   $('asn-load').click();
-  await until(() => $('asn-status').textContent.includes('2 names in this browser') && $('flows').textContent.includes('<img'), 'untrusted CSV names loaded in browser');
+  await until(() => $('asn-status').textContent.includes('2 names') && $('flows').textContent.includes('<img'), 'untrusted CSV names loaded in browser');
   assert($('flows').textContent.includes('<img'), 'organization names render as text');
   assert(!document.querySelector('main img') && !window.pwned, 'snapshot text cannot inject HTML');
   const restart = await control('restart');
@@ -354,13 +365,25 @@ async function browser(query = "", screenshot, mobile = false) {
     const layout = await evaluate(`({ width: innerWidth, scroll: document.documentElement.scrollWidth,
       fontHeight: document.getElementById('chart-max').getBoundingClientRect().height,
       cardsFit: [...document.querySelectorAll('.summary .card, header, .scroll')].every(node => node.getBoundingClientRect().right <= innerWidth),
+      navFit: (() => { const nav = document.querySelector('.rail-nav');
+        return nav.scrollWidth <= nav.clientWidth + 1 && [...nav.querySelectorAll('a')].every(a =>
+          a.getBoundingClientRect().right <= innerWidth && a.scrollWidth <= a.clientWidth + 1); })(),
+      cardGaps: [...document.querySelectorAll('.summary .card')].map(card => {
+        const visible = [...card.children].filter(ch => ch.getBoundingClientRect().height > 0);
+        return Math.round(card.getBoundingClientRect().bottom - Math.max(...visible.map(ch => ch.getBoundingClientRect().bottom))); }),
       jobsTop: document.getElementById('database-title').closest('section').getBoundingClientRect().top + scrollY,
       jobsHeight: document.getElementById('database-title').closest('section').getBoundingClientRect().height })`);
     assert.equal(layout.width, width, "real browser viewport size");
     assert.ok(layout.scroll <= width, `page overflows: ${JSON.stringify(layout)}`);
     assert.ok(layout.cardsFit, `cards and scroll containers fit viewport: ${JSON.stringify(layout)}`);
+    assert.ok(layout.navFit, `all navigation items visible, no hidden horizontal scrolling: ${JSON.stringify(layout)}`);
+    // A card may stretch to a neighbour's two-line note; a hidden sparkline used to add ~38px of dead space.
+    if (mobile) assert.ok(layout.cardGaps.every(gap => gap <= 28), `KPI cards keep compact bottoms on mobile: ${JSON.stringify(layout)}`);
     assert.ok(layout.fontHeight >= 10, "chart axis labels are legible without SVG scaling");
-    if (query.includes("cold")) assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
+    if (query.includes("cold")) {
+      assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
+      assert.ok(await evaluate("!document.getElementById('chart-empty').hidden"), "cold chart shows a collecting placeholder");
+    }
     if (screenshot) {
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y: 0, width, height, scale: 1 } });
