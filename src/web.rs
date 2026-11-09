@@ -39,6 +39,8 @@ pub struct ServerView {
     pub mimic: Vec<crate::mimic::MimicArg>,
     /// Live selection view: the transport in use and why it won.
     pub selection: SelectionView,
+    /// Country of the server address from the loaded table; null without one.
+    pub country: Option<String>,
     /// ready, checking, connecting, backoff or failed.
     pub state: &'static str,
     /// Why the link last failed.
@@ -169,6 +171,14 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
                     active: stats.active_candidate.clone(),
                     round: stats.last_round.clone(),
                 },
+                // shortcut: only an IPv4 literal gets a country, a hostname stays null —
+                // keep the startup resolution on the link if hostnames become common.
+                country: hub
+                    .country
+                    .as_ref()
+                    .zip(link.params.server.parse().ok())
+                    .and_then(|(table, ip)| table.lookup(ip))
+                    .map(crate::geo::unpack_country),
                 stats,
             }
         })

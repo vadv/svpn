@@ -21,7 +21,7 @@ function frame() {
   const started = epoch - 7200000 + generation * 1000;
   const servers = ["nl.example.test", "de.example.test"].map((id, i) => ({
     index: i, id, server: id, label: scenario === "xss" && i === 0 ? '<img src=x onerror="window.pwned=1">' : i ? "DE" : "NL",
-    weight: 1, mimic: i ? ["webrtc", "ssh"] : [], state: degraded && i ? "backoff" : "ready", reason: degraded && i ? "handshake timeout" : "",
+    weight: 1, country: i ? null : "NL", mimic: i ? ["webrtc", "ssh"] : [], state: degraded && i ? "backoff" : "ready", reason: degraded && i ? "handshake timeout" : "",
     selection: i
       ? { active: null, round: { finished_at_ms: now - 4000, winner: null, entries: [
         { candidate: "webrtc", status: "failed", reason: "path_timeout" },
@@ -92,6 +92,9 @@ try {
   assert($('proc-rss-kind').textContent.includes('Current RSS'), 'current RSS is not silently shown as peak');
   assert(Number.parseFloat($('proc-cpu').textContent) > 0, 'CPU percent is derived from cumulative seconds');
   assert(/[0-9]+s average/.test($('proc-cpu-kind').textContent), 'CPU percent states the window it averages over');
+  const identity = row => $('servers').tBodies[0].rows[row].cells[0];
+  assert(identity(0).querySelector('small').textContent.endsWith(' · NL') && ['nl', '🇳🇱 nl'].some(text => identity(0).querySelector('strong').textContent.toLowerCase().includes(text)), 'server shows its country code, flag only as decoration');
+  assert(!identity(1).querySelector('small').textContent.includes(' · ') && !/[\u{1f1e6}-\u{1f1ff}]/u.test(identity(1).textContent), 'server without a country gets no code and no flag');
   const rxCell = $('servers').tBodies[0].rows[0].cells[3];
   await until(() => /^avg [0-9]+s [0-9.]+$/.test(rxCell.querySelector('small')?.textContent ?? ''), 'server RX shows its whole-history average');
   assert(rxCell.querySelector('div').textContent !== '' && rxCell.querySelector('small').textContent.startsWith('avg '), 'current rate stays the headline, average is the note');

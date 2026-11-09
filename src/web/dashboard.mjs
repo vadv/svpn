@@ -163,7 +163,9 @@ function renderServers() {
     // Keep details and keyboard focus stable while values update.
     if (body.children[index] !== row.tr) body.insertBefore(row.tr, body.children[index] ?? null);
     row.tr.dataset.state = server.state;
-    row.identity.replaceChildren(title(name(server.id), server.server));
+    // The code is always text; the flag only decorates the name where the font draws it.
+    const mark = server.country && flagsSupported ? `${flag(server.country)} ` : "";
+    row.identity.replaceChildren(title(`${mark}${name(server.id)}`, server.country ? `${server.server} · ${server.country}` : server.server));
     const state = badge(server.state);
     row.state.replaceChildren(state);
     const lines = mimicCell(server.selection, server.mimic);

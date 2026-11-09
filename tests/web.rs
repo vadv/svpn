@@ -46,6 +46,31 @@ fn snapshot_reports_server_state_and_node_ids() {
     assert_eq!(snapshot.servers[1].reason, "handshake failed");
     assert!(!snapshot.asn_table);
     assert!(!snapshot.country_table);
+    assert_eq!(snapshot.servers[0].country, None, "no table, no country");
+}
+
+#[test]
+fn server_country_comes_from_its_address_and_unknown_stays_null() {
+    let mut hub = hub();
+    let first = u32::from(Ipv4Addr::new(192, 0, 2, 1));
+    hub.country = Some(Geo::from_ranges(vec![(
+        first,
+        first,
+        pack_country("NL").unwrap(),
+    )]));
+    hub.links[1].params.server = "vps.example".to_owned();
+    let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
+    assert_eq!(json["servers"][0]["country"], "NL");
+    assert!(
+        json["servers"][1]["country"].is_null(),
+        "a hostname is not resolved inside the snapshot"
+    );
+    hub.links[1].params.server = "192.0.2.2".to_owned();
+    let snapshot = web::snapshot(&hub);
+    assert_eq!(
+        snapshot.servers[1].country, None,
+        "an uncovered address has no country"
+    );
 }
 
 #[test]
