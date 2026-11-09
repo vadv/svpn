@@ -89,19 +89,13 @@ function renderProcess() {
   const cpuTime = Number.isFinite(process?.cpu_seconds) ? process.cpu_seconds : null;
   const cpus = Number.isFinite(process?.cpus) && process.cpus > 0 ? process.cpus : null;
   $("proc-rss").textContent = memory.bytes == null ? "—" : bytes(memory.bytes);
-  $("proc-rss-kind").textContent = memory.bytes == null ? "No process sample" : memory.peak ? "Peak RSS · live value unavailable" : "Current RSS · resident set";
+  $("proc-rss-kind").textContent = memory.bytes == null ? "No sample" : memory.peak ? "Peak RSS · not live" : "Current RSS";
   $("proc-cpu").textContent = average ? `${average.percent.toFixed(1)}%` : "—";
-  $("proc-cpu-kind").textContent = average
-    ? `Of one core · ${Math.round(average.seconds)}s average`
-    : "Waiting for two fresh samples";
+  $("proc-cpu-kind").textContent = average ? `1 core · ${Math.round(average.seconds)}s average` : "Waiting for samples";
   $("proc-time").textContent = cpuTime == null ? "—" : `${cpuTime.toFixed(2)} s`;
-  $("proc-time-note").textContent = cpus ? `${cpus} logical CPUs · user + system` : "User + system · CPU count unknown";
+  $("proc-time-note").textContent = cpus ? `${cpus} logical CPUs` : "User + system";
   const peak = Number.isFinite(process?.peak_rss_bytes) && process.peak_rss_bytes > 0 ? process.peak_rss_bytes : null;
-  $("proc-note").textContent = [
-    "getrusage: cumulative CPU + peak RSS",
-    "Linux: current RSS from /proc/self/status",
-    memory.peak ? "fallback shown: PEAK RSS, not live RSS" : peak ? "memory meter: current / peak RSS" : "memory meter unavailable: no peak RSS",
-  ].join(" · ");
+  $("proc-note").textContent = memory.peak ? "Peak RSS · not live RSS" : peak ? "Meter against peak RSS" : "No peak RSS";
   setMeter("proc-mem-bar", peak == null || memory.bytes == null ? null : memory.bytes / peak * 100);
   setMeter("proc-cpu-bar", average?.percent ?? null);
   $("spark-rss").setAttribute("d", sparkScaled(history, "rss"));
@@ -116,8 +110,8 @@ function freshness() {
   $("freshness").textContent = !latest ? (apiError ? "API unavailable" : "Connecting…") : stale ? "Stale data" : "Live snapshots";
   if (latest) {
     const age = Math.max(0, Math.floor((performance.now() - lastChange) / 1000));
-    $("meta").textContent = `${latest.policy} · snapshot ${new Date(latest.generated_at_ms).toLocaleTimeString()} · ${age}s since change`;
-  } else if (apiError) $("meta").textContent = "Cannot load /api/state. Retrying automatically.";
+    $("meta").textContent = `${latest.policy} · ${new Date(latest.generated_at_ms).toLocaleTimeString()} · ${age}s`;
+  } else if (apiError) $("meta").textContent = "Retrying /api/state";
   // Same smoothed value the chart draws; `point` gates it so a duplicate or failed poll shows —.
   const total = point ? graph(history).latest : null;
   $("rx").textContent = stale ? "—" : rate(total?.rx);
@@ -131,14 +125,14 @@ function freshness() {
     row.tx.replaceChildren(node("div", stale ? "—" : rate(server?.tx)), node("small", average ? `${note} ${rate(average.tx)}` : note));
   }
   if (stale) {
-    $("chart-note").textContent = latest ? "Last successful snapshot · not live" : "Waiting for connection…";
-    $("recent-errors").textContent = latest ? "Recent changes unavailable while stale" : "No snapshot available";
+    $("chart-note").textContent = latest ? "Last snapshot" : "Waiting…";
+    $("recent-errors").textContent = latest ? "—" : "No snapshot";
     $("legend-rx").textContent = "RX — Mbit/s";
     $("legend-tx").textContent = "TX — Mbit/s";
     $("proc-rss").textContent = "—";
     $("proc-cpu").textContent = "—";
-    $("proc-cpu-kind").textContent = "No live process sample";
-    $("proc-rss-kind").textContent = latest ? "Live value hidden while stale" : "No process sample";
+    $("proc-cpu-kind").textContent = "No sample";
+    $("proc-rss-kind").textContent = latest ? "Hidden while stale" : "No sample";
     setMeter("proc-mem-bar", null);
     setMeter("proc-cpu-bar", null);
     $("spark-rss").setAttribute("d", "");
@@ -178,11 +172,11 @@ function renderServers() {
     row.flows.textContent = latest.flows.filter(flow => flow.via === server.id).length;
     row.total.replaceChildren(node("div", bytes(server.stats.inner_rx_bytes)), node("small", bytes(server.stats.inner_tx_bytes)));
     const stats = server.stats;
-    row.result.textContent = `Weight ${server.weight} · ${stats.opened_flows} opened / ${stats.open_failed_flows} failed / ${stats.closed_flows} closed · ${stats.dropped_packets} drops since start. ${server.reason ? `Last failure: ${server.reason}` : "No recorded failure."}`;
+    row.result.textContent = `Weight ${server.weight} · ${stats.opened_flows} opened / ${stats.open_failed_flows} failed / ${stats.closed_flows} closed · ${stats.dropped_packets} drops. ${server.reason ? `Last failure: ${server.reason}` : "No failure recorded."}`;
   });
   if (!latest.servers.length) table("servers", [], 8, "No servers configured");
-  if (point?.drops != null) $("recent-errors").textContent = `Since previous sample: ${point.drops} drops · ${point.failed} failed opens (VPN links)`;
-  else $("recent-errors").textContent = "Waiting for two fresh samples to calculate changes";
+  if (point?.drops != null) $("recent-errors").textContent = `${point.drops} drops · ${point.failed} failed`;
+  else $("recent-errors").textContent = "—";
 }
 
 function renderRules() {
@@ -191,10 +185,10 @@ function renderRules() {
     cell(rule.local ? badge(latest.local.ready ? "ready" : "missing", latest.local.ready ? "Local" : "Local unavailable") : rule.owner ? name(rule.owner) : "Not assigned yet"),
     cell(rule.local ? "Local only" : rule.candidates.map(id => name(id)).join(", ")),
     cell(flowCounts(rule.traffic), true), cell(bytes(rule.traffic.rx_bytes), true), cell(bytes(rule.traffic.tx_bytes), true),
-    cell(rule.kind === "names" ? `${rule.resolved_ips} IPs · every ${rule.every_secs}s` : "Not a DNS rule"),
+    cell(rule.kind === "names" ? `${rule.resolved_ips} IPs / ${rule.every_secs}s` : "—"),
   ]);
   rows.push([
-    cell(title("Fallback", latest.policy === "sticky-asn" ? "Unmatched traffic → ASN grouping" : "Unmatched traffic → weighted balance")),
+    cell(title("Fallback", "Unmatched traffic")),
     cell("Per flow / group"), cell("VPN pool"), cell(flowCounts(latest.fallback), true),
     cell(bytes(latest.fallback.rx_bytes), true), cell(bytes(latest.fallback.tx_bytes), true), cell("—"),
   ]);
@@ -247,26 +241,26 @@ function renderFlows() {
     flowSignature = signature;
   }
   const start = result.count ? page * PAGE_SIZE + 1 : 0;
-  $("flow-count").textContent = `Showing ${start}–${result.count ? start + result.rows.length - 1 : 0} of ${result.count} matching · ${result.total} total`;
+  $("flow-count").textContent = `${start}–${result.count ? start + result.rows.length - 1 : 0} / ${result.count} · ${result.total} total`;
   $("flow-page").textContent = `${page + 1} / ${result.pages}`;
   $("previous").disabled = page === 0;
   $("next").disabled = page + 1 >= result.pages;
   $("pause").disabled = false;
-  $("pause").textContent = frozen ? "Resume live table" : "Pause table";
+  $("pause").textContent = frozen ? "Resume" : "Pause";
   $("pause").setAttribute("aria-pressed", String(Boolean(frozen)));
-  $("flow-status").textContent = frozen ? `Paused at ${new Date(frozen.generated_at_ms).toLocaleTimeString()} · filters still work · summary remains live` : "Live ownership table · 50 rows per page";
+  $("flow-status").textContent = frozen ? `Paused ${new Date(frozen.generated_at_ms).toLocaleTimeString()}` : "Live";
 }
 
 function renderAsnNames() {
   const state = latest?.asn_table ? asnState : "unavailable";
   $("asn-load").disabled = state === "loading" || state === "unavailable";
-  $("asn-load").textContent = state === "ready" ? "Reload ASN names" : "Load ASN names";
-  $("asn-status").textContent = state === "ready" ? `${asnCount.toLocaleString()} names in this browser · freed after 5 min in a hidden tab`
-    : state === "loading" ? "Downloading and parsing ASN CSV in this browser… · numbers remain available"
-    : state === "error" ? `ASN names unavailable: ${asnError} · retry with Load ASN names`
-    : state === "unavailable" ? "ASN names require a loaded geo-db CSV"
-    : state === "evicted" ? "ASN names freed after 5 min hidden · use Load ASN names"
-    : "ASN names not loaded";
+  $("asn-load").textContent = state === "ready" ? "Reload" : "ASN names";
+  $("asn-status").textContent = state === "ready" ? `${asnCount.toLocaleString()} names`
+    : state === "loading" ? "Loading…"
+    : state === "error" ? `ASN names unavailable: ${asnError}`
+    : state === "unavailable" ? "No geo-db CSV"
+    : state === "evicted" ? "Freed after 5 min hidden"
+    : "Not loaded";
 }
 
 function clearAsnNames(state) {
@@ -309,12 +303,12 @@ function renderJobs() {
     cell(badge(db.loaded ? db.status.error ? "previous" : "ready" : db.configured ? "missing" : "disabled",
       db.loaded ? db.status.error ? "Using previous table" : "Loaded" : db.configured ? "Missing" : "Not configured")),
     cell(db.rows, true), cell(time(db.status.loaded_at)), cell(time(db.status.attempted_at)),
-    cell(db.status.error || (db.pending ? `Waiting for job ${db.pending}` : "No update error recorded")),
+    cell(db.status.error || (db.pending ? `Waiting for job ${db.pending}` : "—")),
   ]), 6);
   table("jobs", latest.jobs.details.map(job => [
     cell(title(job.label, `Every ${job.every_secs}s · timeout ${job.timeout_secs}s${job.reload.length ? ` · reload ${job.reload.join(", ")}` : ""}`)),
     cell(badge(job.state)), cell(time(job.started_at)), cell(time(job.success_at)),
-    cell(job.state === "running" ? "Running now" : time(job.next_at)), cell(job.reason ? `${job.state === "running" ? "Previous attempt: " : ""}${job.reason}` : job.state === "ok" ? "Completed successfully" : "—"),
+    cell(job.state === "running" ? "Running" : time(job.next_at)), cell(job.reason ? `${job.state === "running" ? "Previous attempt: " : ""}${job.reason}` : job.state === "ok" ? "OK" : "—"),
   ]), 6, "No scheduled jobs");
 }
 
@@ -330,7 +324,7 @@ function renderCounters() {
 }
 
 function renderChart() {
-  if (!latest || !history.length) return;
+  if (!latest || !history.length) { $("chart-empty").hidden = false; return; }
   options($("chart-server"), [["", "All VPN servers"], ...latest.servers.map(server => [server.id, name(server.id)])]);
   const selected = $("chart-server").value;
   const result = graph(history, selected);
@@ -347,7 +341,8 @@ function renderChart() {
   $("legend-rx").textContent = `RX ${rate(current?.rx)} Mbit/s`;
   $("legend-tx").textContent = `TX ${rate(current?.tx)} Mbit/s`;
   const collected = Math.max(0, Math.floor((history.at(-1).time - history[0].time) / 1000));
-  $("chart-note").textContent = current?.rx == null ? "Collecting fresh samples…" : collected < 30 ? `${collected}s collected · 5-minute window` : "Inner IP · VPN links only";
+  $("chart-empty").hidden = collected >= 30 && current?.rx != null;
+  $("chart-note").textContent = current?.rx == null ? "collecting samples…" : collected < 30 ? `${collected}s collected` : "VPN links";
 }
 
 function render() {
@@ -361,7 +356,7 @@ function render() {
   const localFlows = latest.flows.filter(flow => flow.via === "local").length;
   $("active-note").textContent = `${latest.flows.length - localFlows} VPN · ${localFlows} local${closing ? ` · ${closing} closing` : ""}`;
   $("local").textContent = localState(latest.local);
-  $("local-note").textContent = latest.local.enabled ? `${localFlows} owned flows · ${latest.local.ready ? "direct WAN egress" : "no new local flows"}` : "No local-exit rules configured";
+  $("local-note").textContent = latest.local.enabled ? `${localFlows} flows · ${latest.local.ready ? "ready" : "unavailable"}` : "Disabled";
   const warnings = latest.servers.filter(server => server.state !== "ready").map(server => `${name(server.id)}: ${server.state}${server.reason ? ` — ${server.reason}` : ""}`);
   if (latest.local.enabled && !latest.local.ready) warnings.push("Local exit unavailable; local rules do not fall back to VPN");
   for (const db of latest.databases) if (db.configured && !db.loaded) warnings.push(`${db.kind === "geo" ? "ASN" : "Country"} database missing`);
@@ -370,7 +365,7 @@ function render() {
   document.body.dataset.health = warnings.length ? "warn" : "ok";
   $("rail-health").textContent = warnings.length ? `${warnings.length} warning${warnings.length === 1 ? "" : "s"} to review` : ready === latest.servers.length ? "All links ready" : "Pool recovering";
   renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderAsnNames(); renderJobs(); renderCounters(); renderChart(); freshness();
-  $("footer").textContent = `Client started ${time(latest.started_at / 1000)} · no external assets · history stays in this tab only`;
+  $("footer").textContent = `Client started ${time(latest.started_at / 1000)}`;
   if (latest.asn_table && asnState === "idle" && !document.hidden) void loadAsnNames();
 }
 
@@ -436,7 +431,7 @@ $("chart-plot").addEventListener("pointermove", event => {
   const end = history.at(-1).time;
   const sample = nearestSample(history, end - WINDOW_MS + ratio * WINDOW_MS, $("chart-server").value);
   if (!sample || (sample.rx == null && sample.tx == null)) { hideCursor(); return; }
-  $("chart-tooltip").textContent = `${new Date(sample.time).toLocaleTimeString()} · RX ${rate(sample.rx)} / TX ${rate(sample.tx)} Mbit/s`;
+  $("chart-tooltip").textContent = `${new Date(sample.time).toLocaleTimeString()} · RX ${rate(sample.rx)} / TX ${rate(sample.tx)}`;
   $("chart-tooltip").style.left = `${(ratio * 100).toFixed(1)}%`;
   const x = (ratio * 1000).toFixed(2);
   $("chart-cursor").setAttribute("x1", x);
@@ -446,10 +441,30 @@ $("chart-plot").addEventListener("pointermove", event => {
 });
 $("chart-plot").addEventListener("pointerleave", hideCursor);
 
+// The absolute-positioned popup can grow a phone document past the viewport, so it is
+// nudged back inside on open; the same hooks un-dismiss a popup closed by Escape.
+// CSP forbids inline handlers, hence this listener instead of markup attributes.
+for (const wrap of document.querySelectorAll(".help-wrap")) {
+  const open = () => {
+    wrap.classList.remove("dismissed");
+    const pop = wrap.querySelector(".help-pop");
+    pop.style.left = "";
+    const rect = pop.getBoundingClientRect(), edge = document.documentElement.clientWidth - 8;
+    const shift = Math.max(0, rect.right - edge, 8 - rect.left);
+    if (shift > 0) pop.style.left = `${-shift}px`;
+  };
+  wrap.addEventListener("focusin", open);
+  wrap.addEventListener("pointerenter", open);
+}
+
 document.addEventListener("keydown", event => {
   const active = document.activeElement;
   const typing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName);
   if (event.key === "/" && !typing) { event.preventDefault(); $("flow-search").focus(); }
+  if (event.key === "Escape") {
+    // WCAG 1.4.13: Esc must also close the open tooltip, hover-opened included.
+    document.querySelector(".help-wrap:focus-within, .help-wrap:hover")?.classList.add("dismissed");
+  }
   if (event.key === "Escape" && active === $("flow-search")) {
     $("flow-search").value = "";
     $("flow-search").dispatchEvent(new Event("input"));
@@ -476,7 +491,7 @@ if ("IntersectionObserver" in window) {
   }
 }
 
-for (const [id, columns] of [["servers", 7], ["rules", 7], ["flows", 5], ["databases", 6], ["jobs", 6], ["groups", 2]]) table(id, [], columns, "No snapshot yet");
+for (const [id, columns] of [["servers", 8], ["rules", 7], ["flows", 9], ["databases", 6], ["jobs", 6], ["groups", 2]]) table(id, [], columns, "No snapshot yet");
 renderClock();
 setInterval(() => { renderClock(); freshness(); }, 1000);
 refresh();
