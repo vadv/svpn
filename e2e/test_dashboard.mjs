@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -227,17 +227,42 @@ test("hover readout picks the nearest real sample and never invents a value", ()
   assert.equal(nearestSample([], 1000), null);
 });
 
-test("traffic lines average a short window instead of drawing one-poll spikes", () => {
+test("traffic lines average a short wall-time window instead of drawing one-poll spikes", () => {
+  const ticks = values => values.map((_, index) => index * 1000);
+  const smooth = values => smoothRates(values, ticks(values));
   const flat = Array.from({ length: 6 }, () => 8);
-  assert.deepEqual(smoothRates(flat), flat, "a steady trend is not moved");
+  assert.deepEqual(smooth(flat), flat, "a steady trend is not moved");
   const spiky = [8, 8, 8, 40, 8, 8];
-  const smoothed = smoothRates(spiky);
+  const smoothed = smooth(spiky);
   assert.equal(smoothed[3], 16, "a one-poll burst is spread over the polls it covers");
   assert.ok(smoothed[3] < spiky[3] && smoothed[3] > spiky[2], "the burst stays visible, it is only not a needle");
-  assert.deepEqual(smoothRates([2, 4]), [2, 3], "a young series averages what exists");
-  assert.deepEqual(smoothRates([null, 4]), [null, 4], "a gap is not filled from the sample after it");
-  assert.deepEqual(smoothRates([1, null, null]), [1, null, null], "unknown stays unknown");
-  assert.deepEqual(smoothRates([]), []);
+  assert.deepEqual(smooth([2, 4]), [2, 3], "a young series averages what exists");
+  assert.deepEqual(smooth([null, 4]), [null, 4], "a gap is not filled from the sample after it");
+  assert.deepEqual(smooth([1, null, null]), [1, null, null], "unknown stays unknown");
+  assert.deepEqual(smoothRates([], []), []);
+  assert.equal(SMOOTH_MS, 15000);
+  const sixteen = Array.from({ length: 17 }, (_, index) => index === 0 ? 100 : 0);
+  assert.equal(smooth(sixteen)[15], 0, "a sample older than the window no longer counts");
+  assert.ok(smooth(sixteen)[14] > 0, "a sample inside the window still counts");
+  assert.deepEqual(smoothRates([0, 30], [0, 3000]), [0, 15], "slow polls still average by time, not count");
+  assert.deepEqual(smoothRates([0, 30], [0, 20000]), [0, 30], "a poll beyond the window does not dilute the rate");
+});
+
+test("traffic average covers the whole history, weighted by measured time", () => {
+  const point = (time, rx, tx, servers) => ({ time, rx, tx, servers });
+  const history = [
+    point(0, null, null, {}),
+    point(1000, 10, 1, { a: { rx: 10, tx: 1 } }),
+    point(4000, 2, 1, { a: { rx: 2, tx: 1 } }),
+    point(5000, null, null, { a: { rx: null, tx: null } }),
+    point(6000, 6, 3, {}),
+  ];
+  assert.deepEqual(trafficAverage(history), { rx: 4.4, tx: 1.4, seconds: 5 }, "intervals are weighted, gaps are skipped");
+  assert.deepEqual(trafficAverage(history, "a"), { rx: 4, tx: 1, seconds: 4 }, "a server without a sample is not zero");
+  assert.equal(trafficAverage(history, "absent"), null);
+  assert.equal(trafficAverage([point(0, 5, 5, {})]), null, "one sample has no interval yet");
+  assert.equal(trafficAverage([]), null);
+  assert.equal(trafficAverage([point(1000, null, null, {}), point(1000, 9, 9, {})]), null, "a duplicate snapshot is no interval");
 });
 
 test("smoothing never bridges an API gap and the readout quotes the drawn line", () => {

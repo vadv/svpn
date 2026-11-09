@@ -2,8 +2,8 @@
 export const WINDOW_MS = 5 * 60 * 1000;
 export const STALE_MS = 5000;
 export const PAGE_SIZE = 50;
-// shortcut: a sample count, not wall time — revisit if snapshot intervals vary by an order of magnitude.
-export const SMOOTH_SAMPLES = 5;
+// Wall time, not a sample count: a loaded router answers polls slower than once a second.
+export const SMOOTH_MS = 15000;
 
 export function bytes(value) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -109,16 +109,30 @@ export function keepHistory(history, point) {
 // A rate over one poll is a spike, not a trend: one slow snapshot reads as a traffic burst, so every
 // drawn line averages a short window. A missing sample stays missing — averaging across an API gap
 // would paint traffic that never crossed a tunnel. Values are already in the unit being drawn.
-export function smoothRates(values, window = SMOOTH_SAMPLES) {
+export function smoothRates(values, times, windowMs = SMOOTH_MS) {
   return values.map((value, index) => {
     if (value == null) return null;
     let sum = 0, count = 0;
-    for (let i = Math.max(0, index - window + 1); i <= index; i++) {
+    for (let i = index; i >= 0 && times[i] > times[index] - windowMs; i--) {
       const item = values[i];
       if (item != null) { sum += item; count++; }
     }
     return count ? sum / count : null;
   });
+}
+
+// The whole-history average of one server (or all of them): every measured interval weighted by its
+// length, so the result is bytes over time actually seen. Unmeasured intervals (gaps, restarts) are
+// left out rather than read as zero; null until one interval exists.
+export function trafficAverage(history, serverId = "") {
+  let rx = 0, tx = 0, ms = 0;
+  for (let i = 1; i < history.length; i++) {
+    const sample = serverId ? history[i].servers?.[serverId] : history[i];
+    const elapsed = history[i].time - history[i - 1].time;
+    if (sample?.rx == null || sample?.tx == null || !(elapsed > 0)) continue;
+    rx += sample.rx * elapsed; tx += sample.tx * elapsed; ms += elapsed;
+  }
+  return ms ? { rx: rx / ms, tx: tx / ms, seconds: ms / 1000 } : null;
 }
 
 // One sample vocabulary for the chart, its filled areas, sparklines, the hover readout and the
@@ -129,9 +143,10 @@ function series(history, serverId = "") {
     time: point.time,
     ...(serverId ? point.servers?.[serverId] ?? { rx: null, tx: null } : point),
   }));
-  const rx = smoothRates(raw.map(sample => sample.rx));
-  const tx = smoothRates(raw.map(sample => sample.tx));
-  const cpu = smoothRates(raw.map(sample => sample.cpu));
+  const times = raw.map(sample => sample.time);
+  const rx = smoothRates(raw.map(sample => sample.rx), times);
+  const tx = smoothRates(raw.map(sample => sample.tx), times);
+  const cpu = smoothRates(raw.map(sample => sample.cpu), times);
   const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index], cpu: cpu[index] }));
   const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
   const end = history.at(-1)?.time ?? 0;

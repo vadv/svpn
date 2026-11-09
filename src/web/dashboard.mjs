@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -124,8 +124,11 @@ function freshness() {
   $("tx").textContent = stale ? "—" : rate(total?.tx);
   for (const row of serverRows.values()) {
     const server = point ? graph(history, row.id).latest : null;
-    row.rx.textContent = stale ? "—" : rate(server?.rx);
-    row.tx.textContent = stale ? "—" : rate(server?.tx);
+    // Second line: the whole-history average, so a burst or a lull reads against the norm.
+    const average = trafficAverage(history, row.id);
+    const note = average ? `avg ${Math.round(average.seconds)}s` : "avg —";
+    row.rx.replaceChildren(node("div", stale ? "—" : rate(server?.rx)), node("small", average ? `${note} ${rate(average.rx)}` : note));
+    row.tx.replaceChildren(node("div", stale ? "—" : rate(server?.tx)), node("small", average ? `${note} ${rate(average.tx)}` : note));
   }
   if (stale) {
     $("chart-note").textContent = latest ? "Last successful snapshot · not live" : "Waiting for connection…";
