@@ -162,6 +162,12 @@ fn totals_survive_retirement_and_new_generation_without_double_charging() {
     let totals = hub.routes.traffic[&Some(0)];
     assert_eq!((totals.tx_bytes, totals.rx_bytes), (56, 300));
     assert_eq!(hub.routes.by_key.len(), 1);
+    // The reinserted flow starts its own count; the rule keeps the history.
+    let flow = hub.routes.by_key[&key].traffic;
+    assert_eq!((flow.tx_bytes, flow.rx_bytes), (28, 200));
+    let json = serde_json::to_value(svpn::web::snapshot(&hub)).unwrap();
+    assert_eq!(json["flows"][0]["rx_bytes"], 200);
+    assert_eq!(json["flows"][0]["tx_bytes"], 28);
 }
 
 #[test]

@@ -257,11 +257,32 @@ export function flag(code) {
     ? String.fromCodePoint(...[...code].map(letter => 0x1f1e6 + letter.charCodeAt(0) - 65)) : "";
 }
 
-export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0 } = {}) {
+const flowKey = flow => `${flow.protocol} ${flow.source} ${flow.destination}`;
+
+// Each flow's bytes per second since the previous snapshot; null when the flow is new, the
+// clock did not advance or a counter went backwards (a reinserted tuple restarts at zero).
+export function withFlowRates(previous, current) {
+  const elapsed = previous ? (current.generated_at_ms - previous.generated_at_ms) / 1000 : 0;
+  const before = new Map(elapsed > 0 ? previous.flows.map(flow => [flowKey(flow), flow]) : []);
+  return current.flows.map(flow => {
+    const old = before.get(flowKey(flow));
+    const rx = old && change(old.rx_bytes, flow.rx_bytes), tx = old && change(old.tx_bytes, flow.tx_bytes);
+    return { ...flow, rate: rx == null || tx == null ? null : (rx + tx) / elapsed };
+  });
+}
+
+const ORDERS = {
+  rate: (a, b) => (b.rate ?? -1) - (a.rate ?? -1),
+  total: (a, b) => (b.rx_bytes ?? 0) + (b.tx_bytes ?? 0) - (a.rx_bytes ?? 0) - (a.tx_bytes ?? 0),
+};
+
+export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0, order = "" } = {}) {
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&
     (!country || (flow.country ?? "unknown") === country) && (!asn || String(flow.asn ?? "unknown") === asn) &&
     (!needle || `${flow.source} ${flow.destination} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)}`.toLowerCase().includes(needle)));
+  // The snapshot already arrives in address order; a stable sort keeps it as the tie-breaker.
+  if (ORDERS[order]) filtered.sort(ORDERS[order]);
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   page = Math.max(0, Math.min(page, pages - 1));
   return { rows: filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), count: filtered.length, total: flows.length, page, pages };

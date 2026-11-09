@@ -125,6 +125,9 @@ pub struct FlowView {
     pub asn: Option<u32>,
     /// Server node id, or `local`.
     pub via: String,
+    /// This flow's bytes since the hub first saw it; the dashboard derives rates.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 /// Everything the dashboard shows.
@@ -257,6 +260,8 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
             },
+            rx_bytes: flow.traffic.rx_bytes,
+            tx_bytes: flow.traffic.tx_bytes,
         })
         .collect();
     flows.sort_by(|a, b| {

@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -216,11 +216,12 @@ function renderFlows() {
   options($("flow-country"), [["", "All countries"], ...countries.map(country => [country, country === "unknown" ? "Unknown" : country])]);
   options($("flow-asn"), [["", "All ASNs"], ...asns.map(asn => [asn, asn === "unknown" ? "Unknown" : asnLabel(asn, names)])]);
   const result = flowPage(state.flows, { query: $("flow-search").value, protocol: $("flow-protocol").value, via: $("flow-exit").value,
-    country: $("flow-country").value, asn: $("flow-asn").value, names, page });
+    country: $("flow-country").value, asn: $("flow-asn").value, names, page, order: $("flow-order").value });
   page = result.page;
   const labels = result.rows.map(flow => [flow.protocol.toUpperCase(), flow.source, flow.destination,
     countryLabel(flow.country), asnLabel(flow.asn, names), name(flow.via, state),
-    flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule"]);
+    flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule",
+    rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0))]);
   const signature = JSON.stringify({ labels, empty: result.total === 0 });
   if (flowSignature !== signature) {
     const rows = result.rows.map((flow, index) => [
@@ -228,8 +229,9 @@ function renderFlows() {
       cell(node("code", labels[index][1])), cell(node("code", labels[index][2])),
       cell(labels[index][3]), cell(labels[index][4]),
       cell(node("span", labels[index][5], "exit-tag")), cell(node("span", labels[index][6], "rule-tag")),
+      cell(title(labels[index][7], labels[index][8]), true),
     ]);
-    table("flows", rows, 7, result.total ? "No flows match these filters" : "No active flows");
+    table("flows", rows, 8, result.total ? "No flows match these filters" : "No active flows");
     flowSignature = signature;
   }
   const start = result.count ? page * PAGE_SIZE + 1 : 0;
@@ -337,7 +339,7 @@ function renderChart() {
 }
 
 function render() {
-  for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"])  $(id).disabled = false;
+  for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn", "flow-order"])  $(id).disabled = false;
   const ready = latest.servers.filter(server => server.state === "ready").length;
   $("ready").textContent = `${ready} / ${latest.servers.length}`;
   $("active").textContent = latest.flows.length;
@@ -369,7 +371,7 @@ async function refresh() {
       point = measure(resumed || !point ? null : latest, state);
       apiError = false;
       history = keepHistory(history, point);
-      latest = { ...state, asn_names: asnNames };
+      latest = { ...state, flows: withFlowRates(resumed ? null : latest, state), asn_names: asnNames };
       lastChange = performance.now();
       render();
     } else {
@@ -390,7 +392,7 @@ async function refresh() {
 function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidden = true; }
 
 $("chart-server").addEventListener("change", () => { renderChart(); freshness(); });
-for (const id of ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
+for (const id of ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn", "flow-order"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
 $("asn-load").addEventListener("click", () => void loadAsnNames());
 document.addEventListener("visibilitychange", asnVisibility);
 asnVisibility();

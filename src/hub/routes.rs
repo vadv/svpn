@@ -31,6 +31,8 @@ pub struct RoutedFlow {
     pub target: Target,
     /// Config-order sticky index; None is the automatic fallback.
     pub rule: Option<usize>,
+    /// This flow's bytes since the hub first saw it.
+    pub traffic: Traffic,
 }
 
 /// Inner IP bytes: TX accepted by the hub queue, RX delivered to the client TUN.
@@ -63,15 +65,26 @@ impl Routes {
     }
 
     pub fn insert(&mut self, key: FlowKey, target: Target, rule: Option<usize>) {
-        self.by_key.insert(key, RoutedFlow { target, rule });
+        self.by_key.insert(
+            key,
+            RoutedFlow {
+                target,
+                rule,
+                traffic: Traffic::default(),
+            },
+        );
     }
 
     /// Call only after the queue/TUN accepted the full packet.
     pub fn record(&mut self, key: FlowKey, tx: usize, rx: usize) {
-        if let Some(flow) = self.by_key.get(&key) {
-            let traffic = self.traffic.entry(flow.rule).or_default();
-            traffic.tx_bytes = traffic.tx_bytes.saturating_add(tx as u64);
-            traffic.rx_bytes = traffic.rx_bytes.saturating_add(rx as u64);
+        if let Some(flow) = self.by_key.get_mut(&key) {
+            for traffic in [
+                self.traffic.entry(flow.rule).or_default(),
+                &mut flow.traffic,
+            ] {
+                traffic.tx_bytes = traffic.tx_bytes.saturating_add(tx as u64);
+                traffic.rx_bytes = traffic.rx_bytes.saturating_add(rx as u64);
+            }
         }
     }
 

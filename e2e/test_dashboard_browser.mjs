@@ -40,6 +40,7 @@ function frame() {
     country: i % 5 === 0 ? null : i % 2 ? "US" : "DE", asn: i % 5 === 0 ? null : i % 2 ? 13335 : 15169,
     via: degraded ? servers[0].id : i % 3 === 0 ? "local" : i % 3 === 1 ? servers[0].id : servers[1].id,
     rule: degraded ? i % 2 ? 0 : null : i % 3 === 0 ? 1 : i % 3 === 1 ? 0 : null,
+    rx_bytes: i === 7 ? sequence * 2000000 : (count - i) * 1000, tx_bytes: 0,
   }));
   const traffic = rule => ({
     rx_bytes: rule === 1 ? 2 * 1073741824 : rule === 0 ? servers[0].stats.inner_rx_bytes / (degraded ? 2 : 1) : servers[1].stats.inner_rx_bytes + (degraded ? servers[0].stats.inner_rx_bytes / 2 : 0),
@@ -127,6 +128,14 @@ try {
   input('flow-search', ''); input('flow-country', 'unknown'); input('flow-asn', 'unknown');
   assert([...$('flows').tBodies[0].rows].every(row => row.cells[3].textContent === 'Unknown' && row.cells[4].textContent === 'Unknown'), 'unknown Geo metadata has explicit filters');
   input('flow-country', ''); input('flow-asn', '');
+  const flowRow = index => $('flows').tBodies[0].rows[index].cells;
+  input('flow-order', 'rate');
+  await until(() => flowRow(0)[1].textContent === '10.77.0.2:40007' && flowRow(0)[7].querySelector('strong')?.textContent === '16.00', 'rate order puts the busiest flow first with its Mbit/s');
+  assert(flowRow(1)[7].querySelector('strong').textContent === '0.00' && flowRow(0)[7].querySelector('small').textContent.endsWith('MiB'), 'idle flows read 0, the total sits under the rate');
+  input('flow-order', 'total');
+  assert(flowRow(0)[1].textContent === '10.77.0.2:40007' && flowRow(1)[1].textContent === '10.77.0.2:40000', 'total order ranks by bytes so far');
+  input('flow-order', '');
+  assert(flowRow(0)[1].textContent === '10.77.0.2:40000', 'address order is the default');
   $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('Downloading and parsing'), 'explicit browser CSV reload');
   await until(() => $('asn-status').textContent.includes('2 names in this browser') && !$('asn-load').disabled, 'browser names reload completes');

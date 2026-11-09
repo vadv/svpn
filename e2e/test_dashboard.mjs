@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };
@@ -274,6 +274,21 @@ test("smoothing never bridges an API gap and the readout quotes the drawn line",
   assert.equal(graph([{ time: 1000, rx: null, tx: null, servers: {} }]).rx.trim(), "", "an unknown newest sample draws nothing");
   assert.equal(graph(history).latest.rx, 4, "the readout is the averaged value the line ends on (2, 4, 6)");
   assert.equal(spark(history, "rx").match(/M/g).length, 2, "the compact trend breaks on the same gap");
+});
+
+test("flow rates come from consecutive snapshots and order is stable", () => {
+  const flow = (source, rx, tx) => ({ protocol: "tcp", source, destination: "1.2.3.4:443", rx_bytes: rx, tx_bytes: tx });
+  const previous = { generated_at_ms: 1000, flows: [flow("a", 100, 0), flow("b", 0, 0), flow("c", 5000, 0)] };
+  const current = { generated_at_ms: 3000, flows: [flow("a", 2100, 0), flow("b", 0, 0), flow("c", 10, 0), flow("d", 900, 0)] };
+  const rated = withFlowRates(previous, current);
+  assert.deepEqual(rated.map(f => f.rate), [1000, 0, null, null], "delta over 2 s; restarted counter and new flow have no rate");
+  assert.deepEqual(withFlowRates(null, current).map(f => f.rate), [null, null, null, null], "first snapshot has no rates");
+  assert.deepEqual(withFlowRates({ ...previous, generated_at_ms: 3000 }, current).map(f => f.rate), [null, null, null, null], "no elapsed time, no rate");
+  const ids = order => flowPage(rated, { order }).rows.map(f => f.source).join("");
+  assert.equal(ids(""), "abcd", "address order is the snapshot order");
+  assert.equal(ids("rate"), "abcd", "unknown rates sink, ties keep address order");
+  assert.equal(ids("total"), "adcb", "largest total first");
+  assert.equal(flowPage(rated, { order: "bogus" }).rows.length, 4, "unknown order falls back to address");
 });
 
 test("flow filters combine, pagination is bounded and disappearing pages clamp", () => {
