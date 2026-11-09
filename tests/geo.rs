@@ -157,6 +157,15 @@ fn country_rejects_overlapping_country_ranges() {
 }
 
 #[test]
+fn country_overlap_error_names_the_real_rows() {
+    // The table holds no row numbers, so the error re-reads the file: it must
+    // report the colliding lines, not the ends of the file.
+    let rows = full_country_rows(&["10.0.1.64,10.0.1.128,DE".to_string()]);
+    let message = country_error(&rows);
+    assert!(message.contains("rows 2 and 100001"), "{message}");
+}
+
+#[test]
 fn country_skips_ipv6_rows() {
     let extra = vec![
         "2001:db8::,2001:db8::ffff:ffff:ffff:ffff:ffff:ffff,JP".to_string(),
