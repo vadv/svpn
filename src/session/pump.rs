@@ -2,6 +2,7 @@
 //! DATA/keepalive loop until a transport error or shutdown.
 
 use anyhow::{Result, bail};
+use std::time::Instant as StdInstant;
 use tokio::{
     sync::{mpsc, oneshot},
     time::MissedTickBehavior,
@@ -191,13 +192,16 @@ pub async fn pump(
             },
             event = io.events.recv() => match event {
                 Some(drivers::Event::Wire(bytes)) => {
-                    let Some(record) = chan.open(&bytes, std::time::Instant::now())? else {
+                    // One clock read per record: open/assemble only stamp TTLs
+                    // and last_seen only checks CONSENT_TIMEOUT freshness.
+                    let now = StdInstant::now();
+                    let Some(record) = chan.open(&bytes, now)? else {
                         continue;
                     };
-                    last_seen = tokio::time::Instant::now();
+                    last_seen = tokio::time::Instant::from_std(now);
                     match record {
                         channel::Record::Data { flow_id, generation, .. } => {
-                            if let Some(packet) = chan.assemble(&record, std::time::Instant::now())? {
+                            if let Some(packet) = chan.assemble(&record, now)? {
                                 ctx.incoming.send(Incoming { id: flow_id, generation, channel: Some(ctx.channel_id), packet }).await.ok();
                             }
                         }

@@ -11,7 +11,7 @@ use crate::packet::{self, FlowKey};
 use crate::udp::Incoming;
 
 use super::state::idle_timeout;
-use super::{Flow, PacketIo, Plane, Session, TcpFlow};
+use super::{DRAIN_BATCH, Flow, PacketIo, Plane, Session, TcpFlow};
 
 const FLOW_PENDING: usize = 64;
 
@@ -83,6 +83,28 @@ impl Session {
         } else {
             crate::error!("{} {reason} ({suppressed} suppressed)", self.drop_prefix);
         }
+    }
+
+    /// Admits one packet plus the burst already queued behind it on the
+    /// hub's packet port: one select pass per burst instead of per packet.
+    /// Queue order and every per-packet check stay those of
+    /// `handle_tun_packet`; the bound keeps one busy link from starving
+    /// the other select arms between rounds.
+    pub async fn handle_tun_packet_burst(&mut self, bytes: &[u8], id: Option<u64>) -> Result<()> {
+        self.handle_tun_packet(bytes, id).await?;
+        for _ in 1..DRAIN_BATCH {
+            let next = match &mut self.io {
+                PacketIo::Link(io) => io.packets.try_recv().ok(),
+                // Device sessions have no packet port: the TUN read arms the loop.
+                PacketIo::Device(_) => return Ok(()),
+            };
+            let Some(packet) = next else {
+                return Ok(());
+            };
+            self.handle_tun_packet(&packet.bytes, Some(packet.id))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn handle_tun_packet(
@@ -444,6 +466,20 @@ impl Session {
             }
         }
         Ok(true)
+    }
+
+    /// Delivers one channel packet plus the burst queued behind it in a
+    /// single pass: the loop wakes once per burst, not once per packet.
+    /// Queue order and every per-packet check stay those of `deliver_to_tun`.
+    pub async fn deliver_to_tun_burst(&mut self, incoming: Incoming) -> Result<()> {
+        self.deliver_to_tun(incoming).await?;
+        for _ in 1..DRAIN_BATCH {
+            match self.incoming.1.try_recv() {
+                Ok(incoming) => self.deliver_to_tun(incoming).await?,
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     pub async fn deliver_to_tun(&mut self, incoming: Incoming) -> Result<()> {

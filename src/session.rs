@@ -84,6 +84,9 @@ pub const FLOW_CAP: usize = 4096;
 pub const PROBE_FLOW_RESERVE: usize = 16;
 /// Per-channel outgoing IP-packet queue and binding wait.
 pub const CHANNEL_QUEUE: usize = 1024;
+/// Packets one session-loop wake may process from a single port before the
+/// select runs again: a busy channel must not starve the other arms.
+pub const DRAIN_BATCH: usize = 32;
 /// How long a lost link's tuples stay refused before normal admission
 /// resumes: a new-ISN SYN then becomes a new flow.
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(30);
@@ -226,7 +229,8 @@ impl Session {
                         self.dispatch_control(message).await?
                     }
                     result = self.io.recv(&mut buffer, self.mtu) => {
-                        self.handle_tun_packet(&buffer, result?).await?;
+                        let id = result?;
+                        self.handle_tun_packet_burst(&buffer, id).await?;
                     }
                     event = self.task_events.1.recv() => {
                         let event = event.context("channel tasks stopped")?;
@@ -234,7 +238,7 @@ impl Session {
                     }
                     incoming = self.incoming.1.recv() => {
                         let incoming = incoming.context("channel pump stopped")?;
-                        self.deliver_to_tun(incoming).await?;
+                        self.deliver_to_tun_burst(incoming).await?;
                     }
                     event = self.tcp_events.1.recv() => {
                         if let Some(event) = event {
