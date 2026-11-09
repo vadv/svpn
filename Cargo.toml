@@ -45,6 +45,7 @@ netstack-smoltcp = { git = "https://github.com/vadv/netstack-smoltcp", rev = "8a
 
 [lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(aes_armv8)", "cfg(polyval_armv8)"] }
 
 [dev-dependencies]
 # Патч crates-io переписывает на fork; версия здесь только для резолва.

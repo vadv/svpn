@@ -1,6 +1,10 @@
 # Software AES+GHASH dominates CPU on router-class ARM; always build with
-# hardware AES. Enforced at compile time in src/main.rs on aarch64/x86_64.
-# Note: an RUSTFLAGS environment variable overrides this file and must also
-# include the feature.
+# hardware AES. Enforced at compile time in src/lib.rs on aarch64/x86_64.
+# `+aes` covers x86_64; on aarch64 aes 0.8 and polyval 0.6 pick the ARMv8
+# backend only behind their own cfg flags (otherwise they silently fall back to
+# the 16x slower fixslice code). Note: an RUSTFLAGS environment variable
+# overrides this file and must also include all of these.
 [build]
-rustflags = ["-C", "target-feature=+aes"]
+rustflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+# rustdoc does not read `rustflags`; doctests compile src/lib.rs and hit the guard.
+rustdocflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
