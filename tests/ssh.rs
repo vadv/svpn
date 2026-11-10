@@ -180,6 +180,277 @@ async fn hung_key_exchange_is_closed_after_the_timeout() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn handshake_error_closes_the_socket() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        // A valid banner, then a binary packet whose declared length breaks
+        // the SSH framing: russh must fail the handshake instead of idling.
+        sock.write_all(b"SSH-2.0-SVPNTest\r\n").await.unwrap();
+        sock.write_all(&[0xFF, 0xFF, 0xFF, 0x00]).await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            if sock.read(&mut buf).await.unwrap() == 0 {
+                return;
+            }
+        }
+    });
+    let target = SshTarget {
+        user: "nobody".into(),
+        identity: None,
+        host_key: None,
+        host_label: "garbage-banner".into(),
+    };
+    let err = match connect(&target, addr, "true", "").await {
+        Ok(_) => panic!("a non-SSH peer must not complete the connection"),
+        Err(e) => e,
+    };
+    assert!(
+        !err.to_string().contains("timeout"),
+        "garbage banner must fail the handshake, not stall: {err:#}"
+    );
+    // The failed handshake must tear the socket down, not park it in
+    // russh's session task until the inactivity bound.
+    tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect("peer socket leaked after a handshake error")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rejected_authentication_closes_the_socket() {
+    use russh::server::{self, Auth};
+
+    struct RejectingServer;
+    impl server::Handler for RejectingServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &russh::keys::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
+    let server_key = {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
+        PrivateKey::new(pair.into(), "test").unwrap()
+    };
+    let config = Arc::new(server::Config {
+        keys: vec![server_key],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The server stays up after a rejection, waiting for the next auth
+    // attempt: only the client closing the socket ends this task.
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        server::run_stream(config, stream, RejectingServer)
+            .await
+            .unwrap()
+            .await
+    });
+    let target = SshTarget {
+        user: "test".into(),
+        identity: None,
+        host_key: None,
+        host_label: "rejecting-auth".into(),
+    };
+    // AgentAny offers no key, so authentication fails without an agent.
+    let err = match connect(&target, addr, "true", "").await {
+        Ok(_) => panic!("a rejecting server must not complete the connection"),
+        Err(e) => e,
+    };
+    assert!(
+        !err.to_string().contains("timeout"),
+        "rejection must fail fast, not stall: {err:#}"
+    );
+    match tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("peer socket leaked after an authentication failure")
+        .unwrap()
+    {
+        Ok(()) => {}
+        Err(russh::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        result => panic!("unexpected SSH server result: {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn authentication_timeout_closes_the_socket() {
+    use russh::server::{self, Auth};
+
+    struct StalledAuth;
+    impl server::Handler for StalledAuth {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &russh::keys::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            // The reply never arrives: the client's authenticate() must hit
+            // its deadline while the session transport is healthy.
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            Ok(Auth::Accept)
+        }
+    }
+
+    let [client_key, server_key] = [(); 2].map(|()| {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
+        PrivateKey::new(pair.into(), "test").unwrap()
+    });
+    let pinned = server_key.public_key().fingerprint(HashAlg::Sha256);
+    let config = Arc::new(server::Config {
+        keys: vec![server_key],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = server::run_stream(config, stream, StalledAuth).await;
+    });
+    // The key must load through the real path: connect() owns the socket
+    // and its teardown, so the test has to exercise connect(), not a bare
+    // authenticate() call.
+    let key_path = std::env::temp_dir().join(format!("svpn-ssh-test-{}.key", std::process::id()));
+    fs::write(
+        &key_path,
+        client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap(),
+    )
+    .unwrap();
+    let target = SshTarget {
+        user: "test".into(),
+        identity: Some(key_path.clone()),
+        host_key: Some(pinned),
+        host_label: "stalled-auth".into(),
+    };
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").unwrap().count()
+    }
+
+    let before = open_fds();
+    let err = match connect(&target, addr, "true", "").await {
+        Ok(_) => panic!("stalled peer must not complete the connection"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("authentication timeout"),
+        "{err:#}"
+    );
+    let _ = fs::remove_file(&key_path);
+    // The deadline-dropped authenticate() must not leave the session task
+    // holding its socket fd. Bounded well under russh's inactivity timeout.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while open_fds() > before {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("authentication timeout leaked the session socket fd");
+    server.abort();
+}
+
+#[tokio::test]
+async fn channel_open_timeout_closes_the_socket() {
+    use russh::server::{self, Auth};
+
+    struct StalledChannel;
+    impl server::Handler for StalledChannel {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &russh::keys::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<server::Msg>,
+            _: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            // The reply never arrives while the transport keeps answering
+            // keepalives: the worst case for a dropped bootstrap.
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            Ok(())
+        }
+    }
+
+    let [client_key, server_key] = [(); 2].map(|()| {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let pair = russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
+        PrivateKey::new(pair.into(), "test").unwrap()
+    });
+    let pinned = server_key.public_key().fingerprint(HashAlg::Sha256);
+    let config = Arc::new(server::Config {
+        keys: vec![server_key],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = server::run_stream(config, stream, StalledChannel).await;
+    });
+    let key_path = std::env::temp_dir().join(format!("svpn-ssh-chan-{}.key", std::process::id()));
+    fs::write(
+        &key_path,
+        client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap(),
+    )
+    .unwrap();
+    let target = SshTarget {
+        user: "test".into(),
+        identity: Some(key_path.clone()),
+        host_key: Some(pinned),
+        host_label: "stalled-channel".into(),
+    };
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").unwrap().count()
+    }
+
+    let before = open_fds();
+    let err = match connect(&target, addr, "true", "").await {
+        Ok(_) => panic!("stalled peer must not complete the connection"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("channel open timeout"), "{err:#}");
+    let _ = fs::remove_file(&key_path);
+    // Answered keepalives reset russh's inactivity timer, so only the
+    // explicit teardown must free the session socket fd.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while open_fds() > before {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("channel open timeout leaked the session socket fd");
+    server.abort();
+}
+
 // ── host-key checks ──
 
 #[tokio::test]

@@ -257,19 +257,26 @@ pub async fn connect_handle<A: ToSocketAddrs>(
     let _ = stream.set_nodelay(true);
     let std_stream = stream.into_std()?;
     let killer = std_stream.try_clone().ok();
+    // Every bail below must tear the socket down: russh's session task
+    // outlives dropped futures and its pre-auth keepalives reset the
+    // inactivity timer, so an unkilled socket (and its fd) is held forever.
+    let kill_socket = || {
+        if let Some(sock) = &killer {
+            // Bare syscall on an idle socket: cheap enough for async code.
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    };
     std_stream.set_nonblocking(true)?;
     let stream = tokio::net::TcpStream::from_std(std_stream)?;
     let connect = russh::client::connect_stream(config, stream, handler);
     tokio::pin!(connect);
     let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, &mut connect).await {
         Err(_) => {
-            if let Some(sock) = &killer {
-                // Bare syscall on an idle socket: cheap enough for async code.
-                let _ = sock.shutdown(std::net::Shutdown::Both);
-            }
+            kill_socket();
             anyhow::bail!("SSH connection timeout");
         }
         Ok(Err(e)) => {
+            kill_socket();
             anyhow::bail!("SSH connection failed (host key rejected or malformed handshake): {e}")
         }
         Ok(Ok(handle)) => handle,
@@ -284,7 +291,11 @@ pub async fn connect_handle<A: ToSocketAddrs>(
         authenticate(&mut handle, &target.user, &identity, tag),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("authentication timeout"))??;
+    .map_err(|_| {
+        kill_socket();
+        anyhow::anyhow!("authentication timeout")
+    })?
+    .inspect_err(|_| kill_socket())?;
 
     let fingerprint = seen
         .lock()
@@ -314,14 +325,24 @@ pub async fn connect<A: ToSocketAddrs>(
     tag: &str,
 ) -> Result<SshSession> {
     let handle = connect_handle(target, addr, tag).await?;
-    let channel = tokio::time::timeout(CONNECT_TIMEOUT, handle.channel_open_session())
-        .await
-        .map_err(|_| anyhow::anyhow!("channel open timeout"))?
-        .context("opening the channel")?;
-    channel
-        .exec(true, command)
-        .await
-        .context("starting the command on the server")?;
+    // Post-auth failures must not leave the session task alive: answered
+    // keepalives reset russh's inactivity timer, so an abandoned but healthy
+    // transport is never reaped and holds its socket fd forever.
+    let channel = match tokio::time::timeout(CONNECT_TIMEOUT, handle.channel_open_session()).await {
+        Err(_) => {
+            drop_session(&handle).await;
+            anyhow::bail!("channel open timeout");
+        }
+        Ok(Err(e)) => {
+            drop_session(&handle).await;
+            return Err(e).context("opening the channel");
+        }
+        Ok(Ok(channel)) => channel,
+    };
+    if let Err(e) = channel.exec(true, command).await {
+        drop_session(&handle).await;
+        return Err(e).context("starting the command on the server");
+    }
     let (stdin_writer, stdin_reader) = duplex(STDIN_BUF);
     let (stdout_writer, stdout_reader) = duplex(STDOUT_BUF);
     let pump = tokio::spawn(pump_channel(
@@ -335,6 +356,17 @@ pub async fn connect<A: ToSocketAddrs>(
         stdout: stdout_reader,
         tail: SshTail { pump, handle },
     })
+}
+
+/// Best-effort teardown of an authenticated session whose bootstrap failed;
+/// bounded because the caller is already on an error path. Without it the
+/// session task outlives the dropped handle and keeps its socket fd.
+async fn drop_session(handle: &Handle<HostKeyCheck>) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        handle.disconnect(Disconnect::ByApplication, "bootstrap failed", "en"),
+    )
+    .await;
 }
 
 /// Run one bounded command on an authenticated connection. Stdin is sent
