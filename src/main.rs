@@ -1,8 +1,7 @@
-// musl's allocator is slow under multithreaded load; the router client is
-// exactly that workload.
-#[cfg(target_env = "musl")]
+// Match pg_doorman's jemalloc defaults on every Linux build; see .cargo/config.toml.
+#[cfg(target_os = "linux")]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> std::process::ExitCode {
     svpn::main_entry()

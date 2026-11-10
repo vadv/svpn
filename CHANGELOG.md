@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.0
+
+Jemalloc с настройками возврата памяти из pg_doorman на всех Linux-сборках:
+на OpenWrt/musl он заменяет mimalloc, на GNU/Linux (x86_64, aarch64) —
+системный аллокатор. Настройки встроены при сборке; macOS остаётся на
+системном аллокаторе.
+
+- OpenWrt/musl: jemalloc с настройками из pg_doorman
+  `dirty_decay_ms:30000,muzzy_decay_ms:30000,background_thread:true,metadata_thp:auto`.
+- GNU/Linux x86_64 и aarch64 (VPS): тот же jemalloc с теми же настройками;
+  docker-рецепты прогоняют allocator-тест, проверяющий встроенные настройки
+  на готовом бинарнике.
+
 ## v1.3.0
 
 Меньше CPU на пакет (аппаратный AES/GHASH, пакетная обработка и запись в TUN,

@@ -5,15 +5,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools perl
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add aarch64-unknown-linux-musl \
     && rustup component add clippy
+# Keep atomics inline: Debian's outline-atomic helpers are built for glibc.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    CC_aarch64_unknown_linux_musl=musl-gcc
+    CC_aarch64_unknown_linux_musl=musl-gcc \
+    CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY README.md README.en.md ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY scripts ./scripts
-COPY tests/stderr.rs ./tests/stderr.rs
+COPY tests/stderr.rs tests/allocator.rs ./tests/
 RUN --mount=type=cache,id=svpn-router-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=svpn-router-target,target=/src/target \
     cargo test --locked --target aarch64-unknown-linux-musl --all-targets \

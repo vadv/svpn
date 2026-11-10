@@ -10,6 +10,7 @@
 !src/
 !src/**
 !tests/stderr.rs
+!tests/allocator.rs
 !e2e/
 !e2e/**
 e2e/.work/
