@@ -7,9 +7,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY scripts ./scripts
+COPY tests/allocator.rs ./tests/
 RUN --mount=type=cache,id=svpn-x86-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=svpn-x86-target,target=/src/target \
-    cargo build --locked --release \
+    cargo test --locked --all-targets \
+    && cargo build --locked --release \
     && install -D target/release/svpn /out/svpn-x86_64-gnu \
     && readelf -h /out/svpn-x86_64-gnu | grep -q 'Machine:.*Advanced Micro Devices X86-64' \
     && readelf -l /out/svpn-x86_64-gnu | grep -q '/lib64/ld-linux-x86-64.so.2' \

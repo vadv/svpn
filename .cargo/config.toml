@@ -8,3 +8,7 @@
 rustflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
 # rustdoc does not read `rustflags`; doctests compile src/lib.rs and hit the guard.
 rustdocflags = ["-C", "target-feature=+aes", "--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[env]
+# Compile in pg_doorman's reclamation defaults; no router environment setup needed.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "dirty_decay_ms:30000,muzzy_decay_ms:30000,background_thread:true,metadata_thp:auto"

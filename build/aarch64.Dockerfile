@@ -7,9 +7,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
 COPY scripts ./scripts
+COPY tests/allocator.rs ./tests/
 RUN --mount=type=cache,id=svpn-aarch64-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=svpn-aarch64-target,target=/src/target \
-    cargo build --locked --release \
+    cargo test --locked --all-targets \
+    && cargo build --locked --release \
     && install -D target/release/svpn /out/svpn-aarch64-gnu \
     && readelf -h /out/svpn-aarch64-gnu | grep -q 'Machine:.*AArch64' \
     && readelf -l /out/svpn-aarch64-gnu | grep -q '/lib/ld-linux-aarch64.so.1' \
