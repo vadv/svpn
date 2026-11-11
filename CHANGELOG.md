@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.6.0
 
 Для автоматического sticky-ASN добавлены режимы `balanced` и `hashed`:
 `fallback_sticky.mode` / `--sticky-asn-mode`, по умолчанию `hashed`.
