@@ -94,6 +94,7 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
             })
             .collect(),
         policy: svpn::cli::ExitPolicy::StickyAsn,
+        sticky_asn_mode: Default::default(),
         pool,
         geo,
         country,
@@ -115,11 +116,9 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
             .enumerate()
             .map(|(i, s)| (s.to_string(), weights[i]))
             .collect(),
-        exit_owners: std::collections::HashMap::new(),
-        exit_state: None,
+        exit_owners: svpn::exit_state::StickyOwners::default(),
         sticky: StickyStats::default(),
         local_stats: Default::default(),
-        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,
@@ -151,13 +150,7 @@ fn flow(destination: Ipv4Addr, source_port: u16) -> packet::FlowKey {
 }
 
 fn pick_link(hub: &mut Hub, key: packet::FlowKey) -> Epoch {
-    hub.pick(&key).expect("a Ready link exists")
-}
-
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("svpn-hub-exit-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    hub.pick(&key).0.expect("a Ready link exists")
 }
 
 // ── sticky pick ──
@@ -256,11 +249,7 @@ fn checking_owner_gets_no_new_flows() {
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let primary = pick_link(&mut hub, key);
     assert!(hub.pool.checking(primary));
-    assert_ne!(
-        pick_link(&mut hub, key),
-        primary,
-        "Checking is excluded from new picks"
-    );
+    assert_eq!(hub.pick(&key).0, None, "Checking cannot split an ASN");
 }
 
 #[test]
@@ -286,44 +275,9 @@ fn sticky_counters_track_lookup_and_failover() {
 }
 
 #[test]
-fn connecting_owner_keeps_group_in_grace() {
-    let mut hub = connecting_hub(&[1, 1]);
-    hub.grace_until = Some(std::time::Instant::now() + svpn::hub::STARTUP_GRACE);
-    let group = svpn::geo::asn_key(100);
-    hub.exit_owners.insert(group, 0);
-    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
-
-    assert!(
-        hub.pick(&key).is_none(),
-        "a saved owner still connecting holds the group: no flows yet"
-    );
-    assert_eq!(
-        hub.exit_owners.get(&group),
-        Some(&0),
-        "grace must not reassign the group"
-    );
-
-    let now = Instant::now();
-    assert!(hub.pool.ready(
-        Epoch {
-            link: 0,
-            generation: 1
-        },
-        now
-    ));
-    assert_eq!(
-        hub.pick(&key),
-        Some(Epoch {
-            link: 0,
-            generation: 1
-        }),
-        "once Ready, the saved owner serves its group"
-    );
-}
-
-#[test]
-fn grace_deadline_expired_fails_over() {
-    // Owner 0 restored from state but still Connecting; link 1 is Ready.
+fn connecting_owner_with_ready_reserve_fails_over() {
+    // No grace window any more: a restored owner still Connecting hands the
+    // group to the first Ready link immediately (counted as a failover).
     let mut hub = sticky_hub(&[1, 1]);
     let now = Instant::now();
     hub.pool
@@ -336,7 +290,6 @@ fn grace_deadline_expired_fails_over() {
             "startup connect failed",
         )
         .unwrap();
-    // A failed startup round leaves the slot Connecting again after retry.
     let retries = hub
         .pool
         .retry_due(now + std::time::Duration::from_secs(2))
@@ -345,30 +298,64 @@ fn grace_deadline_expired_fails_over() {
     assert!(hub.pool.is_connecting(0));
 
     let group = svpn::geo::asn_key(100);
-    hub.exit_owners.insert(group, 0);
-    // The grace deadline has passed: the group must not starve behind a
-    // connecting owner while a healthy reserve exists.
-    hub.grace_until = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    hub.exit_owners.assign(group, 0);
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let moved = pick_link(&mut hub, key);
-    assert_eq!(moved.link, 1, "expired grace must fail over to the reserve");
-    assert_eq!(hub.exit_owners.get(&group), Some(&1));
+    assert_eq!(
+        moved.link, 1,
+        "a Connecting owner fails over to the reserve"
+    );
+    assert_eq!(hub.exit_owners.link_of(group), Some(1));
     assert_eq!(hub.sticky.failover_moves, 1);
 }
 
 #[test]
-fn checking_owner_falls_back_without_migration() {
+fn connecting_owner_without_ready_reserve_returns_none() {
+    // All links Connecting: no pick, binding untouched.
+    let mut hub = connecting_hub(&[1, 1]);
+    let group = svpn::geo::asn_key(100);
+    hub.exit_owners.assign(group, 0);
+    let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
+
+    assert!(
+        hub.pick(&key).0.is_none(),
+        "a connecting owner without any Ready link yields no flow"
+    );
+    assert_eq!(
+        hub.exit_owners.link_of(group),
+        Some(0),
+        "the binding must survive a pick that found no Ready link"
+    );
+
+    assert!(hub.pool.ready(
+        Epoch {
+            link: 0,
+            generation: 1
+        },
+        Instant::now()
+    ));
+    assert_eq!(
+        hub.pick(&key).0,
+        Some(Epoch {
+            link: 0,
+            generation: 1
+        }),
+        "once Ready, the owner serves its group"
+    );
+}
+
+#[test]
+fn checking_owner_waits_without_migration() {
     let mut hub = sticky_hub(&[1, 1]);
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let primary = pick_link(&mut hub, key);
     assert!(hub.pool.checking(primary));
 
-    let reserve = pick_link(&mut hub, key);
-    assert_ne!(reserve, primary, "Checking is excluded from new picks");
+    assert_eq!(hub.pick(&key).0, None);
     let group = svpn::geo::asn_key(100);
     assert_eq!(
-        hub.exit_owners.get(&group),
-        Some(&primary.link),
+        hub.exit_owners.link_of(group),
+        Some(primary.link),
         "a Checking owner keeps the group — no migration"
     );
     assert_eq!(hub.sticky.failover_moves, 0, "Checking is not a failover");
@@ -383,50 +370,32 @@ fn checking_owner_falls_back_without_migration() {
 }
 
 #[test]
-fn normal_assignment_is_not_persisted() {
+fn baseline_assignment_is_recorded_in_ram_only() {
     let mut hub = sticky_hub(&[1, 1]);
-    let dir = temp_dir("normal-assign");
-    let path = dir.join("exit-state.json");
-    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     let primary = pick_link(&mut hub, key);
+    let group = svpn::geo::asn_key(100);
+    let baseline = svpn::geo::rendezvous(group, &hub.nodes)[0];
     assert_eq!(
-        hub.exit_state
-            .as_ref()
-            .unwrap()
-            .owner(&svpn::exit_state::ExitKey::Asn(100)),
-        None,
-        "a baseline rendezvous assignment reproduces itself — nothing to persist"
+        primary.link, baseline,
+        "a baseline rendezvous assignment lands on the primary"
     );
-    assert!(
-        !path.exists(),
-        "no state file may be written before a failover"
-    );
-
-    hub.pool.failed(primary, Instant::now(), "test").unwrap();
-    let reserve = pick_link(&mut hub, key);
-    let id = hub.nodes[reserve.link].0.clone();
     assert_eq!(
-        hub.exit_state
-            .as_ref()
-            .unwrap()
-            .owner(&svpn::exit_state::ExitKey::Asn(100)),
-        Some(&id),
-        "a failover transition is recorded"
+        hub.exit_owners.link_of(group),
+        Some(baseline),
+        "the binding lives in RAM"
     );
-    // Pick marks state dirty; flush_due or clean stop writes it.
-    assert!(!path.exists(), "batched: no sync write inside pick");
-    hub.exit_state.as_mut().unwrap().flush();
-    assert!(path.exists(), "flush persists the failover transition");
-    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(
+        hub.sticky.failover_moves, 0,
+        "a baseline assignment is not a failover"
+    );
 }
 
 #[test]
-fn first_assignment_skipping_unavailable_primary_is_persisted() {
+fn first_assignment_skipping_unavailable_primary_is_kept() {
     // The first rendezvous node stays unavailable; with only the reserve
-    // Ready the first assignment deviates from the baseline and must be
-    // persisted, otherwise a restart with the primary back would snap the
-    // group back (review P0).
+    // Ready the first assignment deviates from the baseline and is recorded
+    // in RAM without counting as a failover.
     let mut hub = connecting_hub(&[1, 1]);
     let group = svpn::geo::asn_key(100);
     let order = svpn::geo::rendezvous(group, &hub.nodes);
@@ -438,9 +407,6 @@ fn first_assignment_skipping_unavailable_primary_is_persisted() {
         },
         Instant::now()
     ));
-    let dir = temp_dir("deviation");
-    let path = dir.join("exit-state.json");
-    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
 
     let key = flow(Ipv4Addr::new(1, 0, 0, 5), 1000);
     assert_eq!(pick_link(&mut hub, key).link, reserve);
@@ -449,36 +415,25 @@ fn first_assignment_skipping_unavailable_primary_is_persisted() {
         "a first assignment is not a failover"
     );
     assert_eq!(
-        hub.exit_state
-            .as_ref()
-            .unwrap()
-            .owner(&svpn::exit_state::ExitKey::Asn(100)),
-        Some(&hub.nodes[reserve].0),
-        "a first assignment that skipped the unavailable primary is recorded"
+        hub.exit_owners.link_of(group),
+        Some(reserve),
+        "a first assignment that skipped the unavailable primary is kept"
     );
-    hub.exit_state.as_mut().unwrap().flush();
-    assert!(path.exists());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn uncovered_ip_is_stateless() {
     let mut hub = sticky_hub(&[1, 1]);
-    let dir = temp_dir("uncovered");
-    let path = dir.join("exit-state.json");
-    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
     let first = pick_link(&mut hub, flow(Ipv4Addr::new(9, 9, 9, 9), 1000));
     assert!(
         hub.exit_owners.is_empty(),
         "an uncovered /32 is never recorded in exit_owners"
     );
-    assert!(!path.exists(), "an uncovered /32 is never persisted");
     // Deterministic rendezvous: the same address maps to the same exit.
     assert_eq!(
         pick_link(&mut hub, flow(Ipv4Addr::new(9, 9, 9, 9), 1001)),
         first
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -510,4 +465,4 @@ fn balance_mode_unchanged_without_geo() {
 
 // ── country constraint (spec §3) ──
 
-// ── restore (spec §4) ──
+// ── owner registry (RAM-only, no restore) ──

@@ -1,6 +1,6 @@
 //! Shared hub fixture for dashboard tests.
 
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use std::{net::Ipv4Addr, sync::Arc};
 
 use svpn::{
     cli::ExitPolicy,
@@ -72,11 +72,10 @@ pub fn dashboard_hub() -> Hub {
             .map(|server| (server.to_string(), 1))
             .collect(),
         policy: ExitPolicy::Balance,
-        exit_owners: HashMap::new(),
-        exit_state: None,
+        sticky_asn_mode: Default::default(),
+        exit_owners: svpn::exit_state::StickyOwners::default(),
         sticky: StickyStats::default(),
         local_stats: Default::default(),
-        grace_until: None,
         tasks: tokio::task::JoinSet::new(),
         events,
         incoming,

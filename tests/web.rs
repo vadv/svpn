@@ -234,7 +234,7 @@ fn snapshot_shows_sticky_rule_with_its_owner() {
         every: Duration::from_secs(60),
     };
     let group = svpn::sticky::group_key(&block.canonical_key());
-    hub.exit_owners.insert(group, 1);
+    hub.exit_owners.assign(group, 1);
     hub.stickies.push(RuntimeSticky::new(block));
     hub.sticky_via.push(ResolvedVia::Links(vec![1]));
 
@@ -254,7 +254,7 @@ fn snapshot_shows_sticky_rule_with_its_owner() {
 #[test]
 fn snapshot_names_asn_groups() {
     let mut hub = hub();
-    hub.exit_owners.insert(64500, 0);
+    hub.exit_owners.assign(64500, 0);
     let snapshot = web::snapshot(&hub);
     assert_eq!(snapshot.groups.len(), 1);
     assert_eq!(snapshot.groups[0].group, "asn 64500");
@@ -276,9 +276,10 @@ fn snapshot_maps_live_flows_to_their_server() {
             id: 7,
         }),
         None,
+        None,
     );
     hub.routes
-        .insert(flow(17, 9000, 53), Target::Direct(9), None);
+        .insert(flow(17, 9000, 53), Target::Direct(9), None, None);
     let snapshot = web::snapshot(&hub);
     assert_eq!(snapshot.flows.len(), 2);
     // Sorted by protocol: tcp before udp.
@@ -304,7 +305,7 @@ fn snapshot_maps_live_flows_to_their_server() {
 fn snapshot_reports_flow_age_and_idle_time() {
     let mut hub = hub();
     let key = flow(6, 40000, 443);
-    hub.routes.insert(key, Target::Direct(9), None);
+    hub.routes.insert(key, Target::Direct(9), None, None);
     let now = std::time::Instant::now();
     let route = hub.routes.by_key.get_mut(&key).unwrap();
     route.opened = now - Duration::from_secs(90);
@@ -324,10 +325,10 @@ fn destination_geo_is_independent_of_exit_policy_and_unknown_ranges_stay_null() 
         pack_country("US").unwrap(),
     )]));
     hub.routes
-        .insert(flow(6, 40000, 443), Target::Direct(1), None);
+        .insert(flow(6, 40000, 443), Target::Direct(1), None, None);
     let mut unknown = flow(17, 40001, 53);
     unknown.destination = Ipv4Addr::new(203, 0, 113, 1);
-    hub.routes.insert(unknown, Target::Direct(2), None);
+    hub.routes.insert(unknown, Target::Direct(2), None, None);
     let json = serde_json::to_value(web::snapshot(&hub)).unwrap();
     assert_eq!(json["policy"], "balance");
     assert_eq!(json["flows"][0]["country"], "US");

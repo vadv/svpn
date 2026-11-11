@@ -2,7 +2,6 @@
 
 import contextlib
 import ipaddress
-import json
 import pathlib
 import re
 import socket
@@ -35,7 +34,7 @@ def set_records(*lines):
     RECORDS.write_text("\n".join(lines) + "\n")
 
 
-def sticky_config(*sticky_blocks, with_state=True):
+def sticky_config(*sticky_blocks, with_state=False):
     state = f'  state = "{STATE}"\n' if with_state else ""
     CONFIG.write_text(
         'ssh {\n  user = "root"\n  identity = "/keys/client"\n}\n'
@@ -210,7 +209,7 @@ def test_ip_change_purges_stale_pins():
     print("PASS sticky purge: a re-resolved name moves its pins, stale IPs wash out")
 
 
-def test_restart_restores_pinned_owner():
+def test_restart_forgets_pinned_owner():
     fresh_state()
     enable_target_masquerade()
     set_records(f"pin.example {TARGET_A}")
@@ -229,12 +228,7 @@ def test_restart_restores_pinned_owner():
                 kill_server(owner, path)
                 assert {target_tcp_echo(i, "pin.example") for i in range(4, 8)} == {spare}
             cleanup_verified(process, server_hosts=HOSTS)
-            persisted = json.loads(STATE.read_text())
-            assert persisted == {
-                "version": 1,
-                "asn": {},
-                "sticky": {"name:pin.example": f"{spare}:22"},
-            }, persisted
+            assert not STATE.exists(), "no state file may be written: owners are RAM-only"
             with session(
                 "sticky-name-restart-2",
                 args=sticky_config(name_block('["s1", "s2"]')),
@@ -243,13 +237,15 @@ def test_restart_restores_pinned_owner():
             ) as (process, path):
                 until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=45)
                 route_targets_into_tun(TARGET_A)
-                assert {target_tcp_echo(i, "pin.example") for i in range(8, 14)} == {spare}
+                assert {target_tcp_echo(i, "pin.example") for i in range(8, 14)} == {owner}, (
+                    "without persistence the pin returns to its rendezvous primary"
+                )
             cleanup_verified(process, server_hosts=HOSTS)
     finally:
         command(
             ["ssh", "-i", "/keys/client", f"root@{SERVER}", "nft delete table inet svpn_masq"], check=False
         )
-    print("PASS sticky restart: the persisted name pin restores, no snap-back")
+    print("PASS sticky restart: RAM-only owners, the pin deviation is forgotten, group returns to primary")
 
 
 TESTS = [
@@ -257,5 +253,5 @@ TESTS = [
     ("test_first_match_over_later_blocks", test_first_match_over_later_blocks),
     ("test_failover_without_snapback", test_failover_without_snapback),
     ("test_ip_change_purges_stale_pins", test_ip_change_purges_stale_pins),
-    ("test_restart_restores_pinned_owner", test_restart_restores_pinned_owner),
+    ("test_restart_forgets_pinned_owner", test_restart_forgets_pinned_owner),
 ]

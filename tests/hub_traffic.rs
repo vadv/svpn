@@ -146,6 +146,7 @@ fn totals_survive_retirement_and_new_generation_without_double_charging() {
             id: 1,
         }),
         Some(0),
+        None,
     );
     hub.routes.record(key, 28, 100);
     assert_eq!(hub.routes.remove_epoch(epoch(1)), vec![key]);
@@ -158,6 +159,7 @@ fn totals_survive_retirement_and_new_generation_without_double_charging() {
             id: 2,
         }),
         Some(0),
+        None,
     );
     hub.routes.record(key, 28, 200);
     let totals = hub.routes.traffic[&Some(0)];
@@ -177,7 +179,7 @@ fn counters_saturate_instead_of_wrapping() {
     let key = packet::parse(&common::udp_packet(false), true)
         .unwrap()
         .flow;
-    hub.routes.insert(key, Target::Direct(1), Some(0));
+    hub.routes.insert(key, Target::Direct(1), Some(0), None);
     hub.routes.traffic.insert(
         Some(0),
         Traffic {

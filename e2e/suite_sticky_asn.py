@@ -6,6 +6,7 @@ import pathlib
 import re
 import signal
 import socket
+from contextlib import ExitStack
 
 from _lib import (
     CLIENT_POOL,
@@ -152,7 +153,7 @@ def country_args(local_exit=False, shared=False, slow_down=False):
         'log_level = "debug"\n'
         'tunnel {\n  peer_name = "svpn0"\n  name = "svpn0"\n}\n'
         'transport {\n  stats = "1s"\n}\n'
-        + f'fallback_sticky {{\n  strategy = "sticky-asn"\n  state = "{STATE}"\n}}\n'
+        + 'fallback_sticky {\n  strategy = "sticky-asn"\n}\n'
         + f'geo {{\n  db = "{CSV}"\n}}\n'
         + f'country {{\n  db = "{COUNTRY_CSV}"\n}}\n'
         + hooks
@@ -179,8 +180,6 @@ def sticky_args():
         "sticky-asn",
         "--geo-db",
         str(CSV),
-        "--exit-state",
-        str(STATE),
         "--stats-interval",
         "1",
     ]
@@ -233,9 +232,8 @@ def kill_and_degrade(process, path, owner):
     degraded = path.read_text().count("serving (1/2 servers ready,")
     command(ssh_to(owner) + ["pkill", "-x", "svpn"])
     until(lambda: path.read_text().count("serving (1/2 servers ready,") > degraded, seconds=15)
-    # A checking owner intentionally lends new flows to a reserve without
-    # migrating the sticky group. Wait for the actual failed/backoff state
-    # before testing failover persistence.
+    # Checking doesn't lend new flows to a reserve. Wait for confirmed
+    # failure and retirement of the owner's flows before testing failover.
     until(lambda: f"vpn[{owner}]: link failed" in path.read_text(), seconds=15)
     return steady
 
@@ -261,6 +259,24 @@ def test_sticky_dst():
         assert (hit, miss, moves) == (9, 1, 0), (hit, miss, moves)
     cleanup_verified(process, server_hosts=HOSTS)
     print("PASS sticky destination: 10 flows to one dst:port exit via one server (9 hits / 1 miss)")
+
+    # The same registered case also exercises balanced through the real CLI/data plane.
+    args = sticky_args() + ["--sticky-asn-mode", "balanced"]
+    with session("sticky-balanced-live", args=args, server_hosts=HOSTS, ready_timeout=20) as (
+        process,
+        path,
+    ):
+        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        baseline = opened(path)
+        with ExitStack() as streams:
+            for _ in range(10):
+                stream = streams.enter_context(socket.create_connection((PEER, 9000), timeout=15))
+                stream.sendall(b"x")
+                assert stream.recv(1) == b"x"
+            until(lambda: pinned_owner(path, baseline, 10), seconds=15)
+            until(lambda: sticky_counters_now(path, (9, 1, 0)), seconds=15)
+    cleanup_verified(process, server_hosts=HOSTS)
+    print("PASS balanced destination: 10 simultaneous flows share one live ASN owner")
 
 
 def test_balance_diff():
@@ -315,7 +331,8 @@ def test_failover_move():
 
 
 def test_restart_restore():
-    asn = write_geo()
+    # RAM-only owners: a restart forgets failover deviations, so the group
+    # returns to its rendezvous primary once that server is back.
     fresh_state()
     with session("sticky-restart-1", args=sticky_args(), server_hosts=HOSTS, ready_timeout=20) as (
         process,
@@ -333,25 +350,24 @@ def test_restart_restore():
         for index in range(4, 8):
             tcp_echo(index)
         until(lambda: opened(path)[spare] - baseline[spare] == 4 and opened(path)[owner] == 0, seconds=30)
-    # Clean stop: the client flushes the failover transition to /var/lib/svpn.
+    # Clean stop: RAM-only means nothing is written to /var/lib/svpn.
     cleanup_verified(process, server_hosts=HOSTS)
-    persisted = json.loads(STATE.read_text())
-    # Persisted identity is host:port (spec); the default ssh port is 22.
-    assert persisted == {"version": 1, "asn": {str(asn): f"{spare}:22"}, "sticky": {}}, persisted
+    assert not STATE.exists(), "no state file may be written: owners are RAM-only"
     with session("sticky-restart-2", args=sticky_args(), server_hosts=HOSTS, ready_timeout=20) as (
         process,
         path,
     ):
-        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=15)
+        # The killed server restarts in its container: wait for 2/2 before pinning.
+        until(lambda: "serving (2/2 servers ready," in path.read_text(), seconds=45)
         baseline = opened(path)
         for index in range(6):
             tcp_echo(index)
-        until(
-            lambda: pinned_owner(path, baseline, 6) and pinned_owner(path, baseline, 6)[spare] == 6,
-            seconds=15,
+        until(lambda: pinned_owner(path, baseline, 6), seconds=15)
+        assert delta(path, baseline)[owner] == 6, (
+            "without persistence the group returns to its rendezvous primary"
         )
     cleanup_verified(process, server_hosts=HOSTS)
-    print("PASS sticky restart: persisted exit state restores the failed-over owner, no snap-back")
+    print("PASS sticky restart: RAM-only owners, failover deviation forgotten, group returns to primary")
 
 
 def local_opened(path):

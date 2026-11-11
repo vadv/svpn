@@ -48,6 +48,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
         policy: svpn::cli::ExitPolicy::Balance,
+        sticky_asn_mode: Default::default(),
         links: servers
             .into_iter()
             .enumerate()
@@ -82,11 +83,9 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         local: None,
         local_cleanup: None,
         nodes: Vec::new(),
-        exit_owners: std::collections::HashMap::new(),
-        exit_state: None,
+        exit_owners: svpn::exit_state::StickyOwners::default(),
         sticky: StickyStats::default(),
         local_stats: Default::default(),
-        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,
@@ -134,8 +133,12 @@ async fn closed_tcp_without_owner_gets_reset_but_live_owner_is_preserved() {
     hub.pool.ready(epoch, Instant::now());
     let (outgoing, mut incoming) = mpsc::channel(2);
     hub.links[0].outgoing = Some(outgoing);
-    hub.routes
-        .insert(parsed.flow, Target::Remote(Owner { epoch, id: 41 }), None);
+    hub.routes.insert(
+        parsed.flow,
+        Target::Remote(Owner { epoch, id: 41 }),
+        None,
+        None,
+    );
     assert!(hub.dispatch(&bytes, client_ip).unwrap().is_none());
     let forwarded = incoming.try_recv().unwrap();
     assert_eq!(forwarded.id, 41);
@@ -426,6 +429,7 @@ fn owned(hub: &mut Hub, epoch: Epoch, packet: &Packet) {
             id: packet.id,
         }),
         None,
+        None,
     );
 }
 
@@ -519,11 +523,12 @@ async fn local_batch_collects_current_packets_and_stops_at_a_control_event() {
     let third = batch_packet(4, 7);
     for packet in [&first, &second, &third] {
         let key = packet::parse(&packet.bytes, false).unwrap().flow;
-        hub.routes.insert(key, Target::Direct(packet.id), None);
+        hub.routes
+            .insert(key, Target::Direct(packet.id), None, None);
     }
     // The stale packet's flow no longer targets its session id.
     let key = packet::parse(&stale.bytes, false).unwrap().flow;
-    hub.routes.insert(key, Target::Direct(999), None);
+    hub.routes.insert(key, Target::Direct(999), None, None);
     events.send((epoch, Event::Packet(second))).await.unwrap();
     events.send((epoch, Event::Ready)).await.unwrap();
     events.send((epoch, Event::Packet(third))).await.unwrap();

@@ -294,28 +294,12 @@ fn load_geo(args: &cli::ClientArgs) -> Result<hub::GeoExits> {
         (None, false) => None,
         (None, true) => unreachable!("validate_geo requires country db"),
     };
-    // Owners persist while sticky-asn or any explicit sticky group exists.
-    let owners_needed = args.exit_policy == cli::ExitPolicy::StickyAsn || !args.stickies.is_empty();
     // Prefer the explicit state path, then a file beside either database.
-    let state_path = args
-        .exit_state
-        .clone()
-        .or_else(|| {
-            args.geo_db
-                .as_ref()
-                .map(|path| path.with_extension("state.json"))
-        })
-        .or_else(|| {
-            args.country_db
-                .as_ref()
-                .map(|path| path.with_extension("state.json"))
-        });
-    let exit_state = owners_needed.then(|| exit_state::ExitState::load(state_path));
     Ok(hub::GeoExits {
         geo: asn,
         country,
         policy: args.exit_policy,
-        exit_state,
+        sticky_asn_mode: args.sticky_asn_mode,
         geo_pending,
         country_pending,
     })

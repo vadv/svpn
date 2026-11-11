@@ -17,6 +17,15 @@ pub enum ExitPolicy {
     StickyAsn,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum StickyAsnMode {
+    /// Choose by the number of live ASN groups per server weight.
+    Balanced,
+    /// Keep a rendezvous-selected owner in RAM until it fails or svpn exits.
+    #[default]
+    Hashed,
+}
+
 #[derive(clap::Args)]
 pub struct ClientArgs {
     /// Read all client settings from one HCL file instead of CLI options.
@@ -36,15 +45,15 @@ pub struct ClientArgs {
     /// Exit selection: balance (default) or sticky-asn (stable exit per destination ASN).
     #[arg(long, value_enum, default_value_t = ExitPolicy::Balance)]
     pub exit_policy: ExitPolicy,
+    /// Automatic sticky-asn placement: hashed (default) or balanced by live ASN groups.
+    #[arg(long, value_enum, default_value_t = StickyAsnMode::Hashed)]
+    pub sticky_asn_mode: StickyAsnMode,
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
     /// DB-IP Country Lite CSV database for country selectors.
     #[arg(long, value_name = "FILE")]
     pub country_db: Option<PathBuf>,
-    /// Sticky owner persistence; default: GEO_DB with a .state.json suffix.
-    #[arg(long, value_name = "FILE")]
-    pub exit_state: Option<PathBuf>,
     /// Explicit sticky groups (config-file only).
     #[arg(skip)]
     pub stickies: Vec<crate::sticky::StickyBlock>,
@@ -173,6 +182,11 @@ impl ClientArgs {
     /// selectors and via = local need neither. An unused database is ignored
     /// at runtime, not here.
     pub(crate) fn validate_geo(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.sticky_asn_mode != StickyAsnMode::Balanced
+                || self.exit_policy == ExitPolicy::StickyAsn,
+            "sticky-asn-mode balanced requires exit-policy sticky-asn"
+        );
         let needs_geo = self.exit_policy == ExitPolicy::StickyAsn
             || self
                 .stickies

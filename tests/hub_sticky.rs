@@ -110,6 +110,7 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
             })
             .collect(),
         policy: svpn::cli::ExitPolicy::Balance,
+        sticky_asn_mode: Default::default(),
         pool,
         geo: None,
         country: None,
@@ -131,10 +132,8 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
         local_cleanup: None,
         nodes: vec![("a.example".to_owned(), 1), ("b.example".to_owned(), 1)],
         exit_owners: Default::default(),
-        exit_state: None,
         sticky: StickyStats::default(),
         local_stats: LocalStats::default(),
-        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,
@@ -211,6 +210,10 @@ fn via_owner_is_stable_and_fails_over_without_snapback() {
             "test",
         )
         .unwrap();
+    hub.routes.remove_epoch(Epoch {
+        link: owner,
+        generation: 1,
+    });
     let reserve = dispatch_link(&mut hub, dest, 1002).unwrap().unwrap();
     assert_ne!(reserve, owner, "failover moves off the dead owner");
     let retries = hub
@@ -304,8 +307,8 @@ fn names_selector_uses_the_resolved_set() {
 }
 
 #[test]
-fn restored_owner_removed_from_via_relinquishes_the_group() {
-    // The persisted owner is restored, then the config drops it from via.
+fn removed_candidate_cannot_split_a_live_sticky_group() {
+    // A changed candidate list cannot create a second exit while old flows live.
     let mut hub = sticky_hub(vec![block(
         "cf",
         Selector::Ips(vec![svpn::sticky::IpNet::parse("1.2.3.4").unwrap()]),
@@ -313,23 +316,45 @@ fn restored_owner_removed_from_via_relinquishes_the_group() {
     )]);
     let dest = Ipv4Addr::new(1, 2, 3, 4);
     let owner = dispatch_link(&mut hub, dest, 1000).unwrap().unwrap();
-    // Simulate a restored owner that no longer serves the changed via list.
     hub.sticky_via = vec![svpn::sticky::ResolvedVia::Links(vec![1 - owner])];
+    assert!(dispatch_link(&mut hub, dest, 1001).is_none());
+    hub.routes.remove_epoch(Epoch {
+        link: owner,
+        generation: 1,
+    });
     let after = dispatch_link(&mut hub, dest, 1001).unwrap().unwrap();
     assert_ne!(after, owner, "a removed owner cannot keep the group");
 }
 
 #[test]
-fn sticky_failover_persists_under_the_canonical_key() {
-    let dir = std::env::temp_dir().join(format!("svpn-sticky-state-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("state.json");
+fn balanced_fallback_keeps_explicit_rules_hashed_and_out_of_asn_counts() {
+    let mut hub = sticky_hub(vec![block(
+        "cf",
+        Selector::Ips(vec![svpn::sticky::IpNet::parse("1.2.3.4").unwrap()]),
+        Via::Servers(vec!["s1".into()]),
+    )]);
+    hub.policy = svpn::cli::ExitPolicy::StickyAsn;
+    hub.sticky_asn_mode = svpn::cli::StickyAsnMode::Balanced;
+    let dest = Ipv4Addr::new(1, 2, 3, 4);
+    assert_eq!(dispatch_link(&mut hub, dest, 1000), Some(Some(1)));
+    assert!(hub.routes.asn_owners().is_empty());
+    assert_eq!(hub.exit_owners.len(), 1);
+    hub.routes.remove_epoch(Epoch {
+        link: 1,
+        generation: 1,
+    });
+    assert_eq!(dispatch_link(&mut hub, dest, 1001), Some(Some(1)));
+    assert_eq!(hub.exit_owners.len(), 1, "explicit owner survives idle");
+}
+
+#[test]
+fn sticky_failover_lives_only_in_ram() {
+    // RAM-only owners: a failover updates the registry, nothing touches disk.
     let mut hub = sticky_hub(vec![block(
         "cf",
         Selector::Ips(vec![svpn::sticky::IpNet::parse("1.2.3.4").unwrap()]),
         Via::Servers(vec!["s0".into(), "s1".into()]),
     )]);
-    hub.exit_state = Some(svpn::exit_state::ExitState::load(Some(path.clone())));
     let dest = Ipv4Addr::new(1, 2, 3, 4);
     let owner = dispatch_link(&mut hub, dest, 1000).unwrap().unwrap();
     hub.pool
@@ -342,15 +367,16 @@ fn sticky_failover_persists_under_the_canonical_key() {
             "test",
         )
         .unwrap();
+    // The run loop retires failed-session flows before another assignment.
+    hub.routes.remove_epoch(Epoch {
+        link: owner,
+        generation: 1,
+    });
     let reserve = dispatch_link(&mut hub, dest, 1001).unwrap().unwrap();
-    hub.exit_state.as_mut().unwrap().flush();
-    let reloaded = svpn::exit_state::ExitState::load(Some(path.clone()));
+    let group = svpn::sticky::group_key("ip:1.2.3.4");
     assert_eq!(
-        reloaded
-            .owner(&svpn::exit_state::ExitKey::Sticky("ip:1.2.3.4".to_owned()))
-            .map(String::as_str),
-        Some(hub.nodes[reserve].0.as_str()),
-        "the failover deviation persists under the canonical key"
+        hub.exit_owners.link_of(group),
+        Some(reserve),
+        "the failover deviation is kept in RAM under the canonical key"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }

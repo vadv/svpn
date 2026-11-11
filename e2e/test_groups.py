@@ -62,7 +62,7 @@ test_failed_job_keeps_serving_degraded
 """.split()
 STICKY_DNS_BASELINE = """
 test_name_pin test_first_match_over_later_blocks test_failover_without_snapback
-test_ip_change_purges_stale_pins test_restart_restores_pinned_owner
+test_ip_change_purges_stale_pins test_restart_forgets_pinned_owner
 """.split()
 ZOMBIE_BASELINE = """
 test_zombie_storm_keeps_flows_moving test_zombie_silent_storm_reclaims_flow_slots

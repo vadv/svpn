@@ -48,6 +48,7 @@ fn local_hub() -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
         policy: svpn::cli::ExitPolicy::Balance,
+        sticky_asn_mode: Default::default(),
         links: vec![Link {
             params: params(),
             outgoing: None,
@@ -97,10 +98,8 @@ fn local_hub() -> Hub {
         local_cleanup: None,
         nodes: Vec::new(),
         exit_owners: Default::default(),
-        exit_state: None,
         sticky: StickyStats::default(),
         local_stats: LocalStats::default(),
-        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,

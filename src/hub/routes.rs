@@ -31,6 +31,9 @@ pub struct RoutedFlow {
     pub target: Target,
     /// Config-order sticky index; None is the automatic fallback.
     pub rule: Option<usize>,
+    /// Sticky owner group (ASN affinity or explicit block); None for local
+    /// exits and stateless rendezvous. Holds the group's binding alive.
+    pub group: Option<u64>,
     /// The owner reported both FINs: retained for retransmissions, not open.
     pub closing: bool,
     /// This flow's bytes since the hub first saw it.
@@ -69,13 +72,20 @@ impl Routes {
         self.by_key.get(key).map(|flow| &flow.target)
     }
 
-    pub fn insert(&mut self, key: FlowKey, target: Target, rule: Option<usize>) {
+    pub fn insert(
+        &mut self,
+        key: FlowKey,
+        target: Target,
+        rule: Option<usize>,
+        group: Option<u64>,
+    ) {
         let now = Instant::now();
         self.by_key.insert(
             key,
             RoutedFlow {
                 target,
                 rule,
+                group,
                 closing: false,
                 traffic: Traffic::default(),
                 opened: now,
@@ -108,12 +118,45 @@ impl Routes {
         }
     }
 
+    /// Retained/closing flows still own their group until actual removal.
+    pub fn group_owner(&self, group: u64) -> Option<Epoch> {
+        self.by_key.values().find_map(|flow| match flow.target {
+            Target::Remote(owner) if flow.group == Some(group) => Some(owner.epoch),
+            _ => None,
+        })
+    }
+
+    /// Find a live automatic ASN without collecting the full distribution.
+    pub fn asn_owner(&self, group: u64) -> Option<Epoch> {
+        self.by_key.values().find_map(|flow| match flow.target {
+            Target::Remote(owner) if flow.rule.is_none() && flow.group == Some(group) => {
+                Some(owner.epoch)
+            }
+            _ => None,
+        })
+    }
+
+    /// Automatic ASN ownership comes only from registered flows, never explicit rules.
+    pub fn asn_owners(&self) -> HashMap<u64, Epoch> {
+        let mut owners = HashMap::new();
+        for flow in self.by_key.values().filter(|flow| flow.rule.is_none()) {
+            if let (Some(group), Target::Remote(owner)) = (flow.group, flow.target) {
+                owners.insert(group, owner.epoch);
+            }
+        }
+        owners
+    }
+
     /// True only when the packet was accepted by the link queue.
+    // `group` rides along with `epoch` as flat packet-routing context; a
+    // struct for one Option would not make the call sites clearer.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &mut self,
         bytes: &[u8],
         client_ip: Ipv4Addr,
         epoch: Epoch,
+        group: Option<u64>,
         outgoing: &mpsc::Sender<Packet>,
         delivery: &Delivery,
         links: &[Link],
@@ -174,7 +217,7 @@ impl Routes {
         }) {
             Ok(()) => {
                 if fresh {
-                    self.insert(parsed.flow, Target::Remote(owner), None);
+                    self.insert(parsed.flow, Target::Remote(owner), None, group);
                 } else if parsed.tcp.is_some_and(|tcp| tcp.flags & 0x17 == 0x02)
                     && let Some(flow) = self.by_key.get_mut(&parsed.flow)
                 {

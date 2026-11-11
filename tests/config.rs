@@ -13,6 +13,44 @@ const SINGLE: &str =
 const MULTI: &str =
     "tunnel {\n  peer_name = \"svpn0\"\n}\nserver \"a\" {\n  address = \"vpn.example\"\n}\n";
 
+// ── automatic ASN modes ──
+
+#[test]
+fn fallback_mode_defaults_parses_and_rejects_invalid_values() {
+    let config = |extra: &str| {
+        format!(
+            "{MULTI}\ngeo {{\n db = \"asn.csv\"\n}}\nfallback_sticky {{\n strategy = \"sticky-asn\"\n {extra}\n}}"
+        )
+    };
+    let base = Path::new("/config");
+    assert_eq!(
+        parse(&config(""), base, true).unwrap().sticky_asn_mode,
+        svpn::cli::StickyAsnMode::Hashed
+    );
+    for (value, mode) in [
+        ("balanced", svpn::cli::StickyAsnMode::Balanced),
+        ("hashed", svpn::cli::StickyAsnMode::Hashed),
+    ] {
+        assert_eq!(
+            parse(&config(&format!("mode = \"{value}\"")), base, true)
+                .unwrap()
+                .sticky_asn_mode,
+            mode
+        );
+    }
+    for value in ["\"typo\"", "15", "true"] {
+        assert!(parse(&config(&format!("mode = {value}")), base, true).is_err());
+    }
+    assert!(
+        parse(
+            &format!("{MULTI}\nfallback_sticky {{\n mode = \"balanced\"\n}}"),
+            base,
+            true
+        )
+        .is_err()
+    );
+}
+
 // ── defaults and inheritance ──
 
 #[test]
@@ -274,10 +312,7 @@ fn sticky_blocks_parse_with_all_selectors() {
     )
     .unwrap();
     assert_eq!(args.exit_policy, svpn::cli::ExitPolicy::StickyAsn);
-    assert_eq!(
-        args.exit_state,
-        Some(std::path::PathBuf::from("/configs/exits.json"))
-    );
+    // The deprecated state key still parses (value ignored, RAM-only owners).
     assert_eq!(args.geo_db.as_deref(), Some(Path::new("/configs/asn.csv")));
     assert_eq!(
         args.country_db.as_deref(),
