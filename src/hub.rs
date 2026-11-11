@@ -44,10 +44,6 @@ pub const QUEUE: usize = 1024;
 /// How often the dashboard snapshot is refreshed, in seconds.
 pub const SNAPSHOT_INTERVAL: u32 = 1;
 
-/// Startup grace for restored sticky owners: two connect budgets
-/// (selector::ATTEMPT_BUDGET is 5 s each).
-pub const STARTUP_GRACE: Duration = Duration::from_secs(10);
-
 /// Packets one drain round may flush to the TUN: one busy flow must not
 /// starve the select loop between rounds.
 pub const TUN_BATCH: usize = 32;
@@ -165,16 +161,12 @@ pub struct Hub {
     pub nodes: Vec<(String, u32)>,
     /// Fallback strategy for traffic matched by no sticky block.
     pub policy: crate::cli::ExitPolicy,
-    /// Sticky owners: group key → link index. An alive owner keeps its group
-    /// (no snap-back); reassigned only when the owner cannot serve new flows.
-    pub exit_owners: std::collections::HashMap<u64, usize>,
-    /// Failover persistence; None in balance mode.
-    pub exit_state: Option<crate::exit_state::ExitState>,
+    pub sticky_asn_mode: crate::cli::StickyAsnMode,
+    /// Hashed ASN and explicit block owners, retained until restart, without snap-back.
+    pub exit_owners: crate::exit_state::StickyOwners,
     /// Sticky exit counters, surfaced in the periodic stats report.
     pub sticky: StickyStats,
     pub local_stats: LocalStats,
-    /// Restored owners keep their groups while connecting until this instant.
-    pub grace_until: Option<StdInstant>,
     pub tasks: JoinSet<(Epoch, Result<()>)>,
     pub events: mpsc::Sender<(Epoch, Event)>,
     pub incoming: mpsc::Receiver<(Epoch, Event)>,
@@ -229,6 +221,8 @@ impl Hub {
                     bytes,
                     client_ip,
                     owner.epoch,
+                    // Existing flow: the fresh-insert path is unreachable here.
+                    None,
                     outgoing,
                     &delivery,
                     &self.links,
@@ -268,16 +262,18 @@ impl Hub {
         client_ip: Ipv4Addr,
     ) -> Result<Option<[u8; 40]>> {
         let key = parsed.flow;
-        // Retry throttled persistence on every new flow, whatever routes it.
-        if let Some(state) = &mut self.exit_state {
-            state.flush_due(StdInstant::now());
-        }
-        let (rule, epoch) = match self.route(key.destination) {
+        let (rule, picked, group) = match self.route(key.destination) {
             Route::Local(index) => return self.open_local(parsed, bytes, index),
-            Route::Sticky(index) => (Some(index), self.pick_sticky(index)),
-            Route::Auto => (None, self.pick(&key)),
+            Route::Sticky(index) => {
+                let (epoch, group) = self.pick_sticky(index);
+                (Some(index), epoch, group)
+            }
+            Route::Auto => {
+                let (epoch, group) = self.pick(&key);
+                (None, epoch, group)
+            }
         };
-        let Some(epoch) = epoch else {
+        let Some(epoch) = picked else {
             return Ok(None);
         };
         let link = &self.links[epoch.link];
@@ -285,10 +281,15 @@ impl Hub {
             return Ok(None);
         };
         let delivery = link.delivery.clone();
-        if self
-            .routes
-            .enqueue(bytes, client_ip, epoch, outgoing, &delivery, &self.links)?
-        {
+        if self.routes.enqueue(
+            bytes,
+            client_ip,
+            epoch,
+            group,
+            outgoing,
+            &delivery,
+            &self.links,
+        )? {
             if let Some(flow) = self.routes.by_key.get_mut(&key) {
                 flow.rule = rule;
             }
@@ -298,19 +299,15 @@ impl Hub {
     }
 
     /// Owner of one sticky group: rendezvous inside `via`, no snap-back,
-    /// failover persisted under the canonical selector key.
-    fn pick_sticky(&mut self, index: usize) -> Option<Epoch> {
+    /// RAM-only binding until restart under the canonical selector key.
+    fn pick_sticky(&mut self, index: usize) -> (Option<Epoch>, Option<u64>) {
         let canonical = self.stickies[index].block.canonical_key();
         let group = crate::sticky::group_key(&canonical);
         let links: Vec<usize> = match &self.sticky_via[index] {
             crate::sticky::ResolvedVia::Links(links) => links.clone(),
             crate::sticky::ResolvedVia::Local => unreachable!("route() separated local blocks"),
         };
-        self.sticky_epoch(
-            group,
-            Some(&links),
-            crate::exit_state::ExitKey::Sticky(canonical),
-        )
+        (self.sticky_epoch(group, Some(&links)), Some(group))
     }
 
     fn open_local(
@@ -337,7 +334,8 @@ impl Hub {
         }) {
             Ok(()) => {
                 self.local_stats.opened += 1;
-                self.routes.insert(key, Target::Direct(id), Some(rule));
+                self.routes
+                    .insert(key, Target::Direct(id), Some(rule), None);
                 self.routes.record(key, bytes.len(), 0);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -822,60 +820,82 @@ impl Hub {
         });
     }
 
-    pub fn pick(&mut self, key: &FlowKey) -> Option<Epoch> {
+    pub fn pick(&mut self, key: &FlowKey) -> (Option<Epoch>, Option<u64>) {
         if self.policy != crate::cli::ExitPolicy::StickyAsn {
-            return self.pool.pick();
+            return (self.pool.pick(), None);
         }
         let Some(geo) = &self.geo else {
-            return self.pool.pick();
+            return (self.pool.pick(), None);
         };
         let Some(asn) = geo.lookup(key.destination) else {
-            // Uncovered /32 uses stateless rendezvous without persisted ownership.
+            // Uncovered /32 uses stateless rendezvous without ownership.
             self.sticky.lookup(false);
-            return crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
-                .into_iter()
-                .find_map(|link| self.pool.ready_epoch(link));
+            return (
+                crate::geo::rendezvous(crate::geo::ip_key(key.destination), &self.nodes)
+                    .into_iter()
+                    .find_map(|link| self.pool.ready_epoch(link)),
+                None,
+            );
         };
         let group = crate::geo::asn_key(asn);
-        self.sticky_epoch(group, None, crate::exit_state::ExitKey::Asn(asn))
+        let epoch = match self.sticky_asn_mode {
+            crate::cli::StickyAsnMode::Balanced => self.balanced_epoch(group),
+            crate::cli::StickyAsnMode::Hashed => self.sticky_epoch(group, None),
+        };
+        (epoch, Some(group))
     }
 
-    /// Select a sticky owner without snap-back.
-    /// Checking/restored owners retain their grace period; failover stays
-    /// within candidates and persists the deviation. None means all links.
-    fn sticky_epoch(
-        &mut self,
-        group: u64,
-        candidates: Option<&[usize]>,
-        key: crate::exit_state::ExitKey,
-    ) -> Option<Epoch> {
+    /// Derive placement from live flows only, once per new flow (not per packet).
+    fn balanced_epoch(&mut self, group: u64) -> Option<Epoch> {
+        if let Some(epoch) = self.routes.asn_owner(group) {
+            self.sticky.lookup(true);
+            return self
+                .pool
+                .ready_epoch(epoch.link)
+                .filter(|&ready| ready == epoch);
+        }
+        self.sticky.lookup(false);
+        let mut counts = vec![0_u128; self.nodes.len()];
+        for epoch in self.routes.asn_owners().values() {
+            counts[epoch.link] += 1;
+        }
+        // Rendezvous order breaks equal scores; integer cross-products avoid rounding.
+        crate::geo::rendezvous(group, &self.nodes)
+            .into_iter()
+            .filter_map(|link| self.pool.ready_epoch(link))
+            .min_by(|a, b| {
+                (counts[a.link] * u128::from(self.nodes[b.link].1))
+                    .cmp(&(counts[b.link] * u128::from(self.nodes[a.link].1)))
+            })
+    }
+
+    /// Select a hashed sticky owner without snap-back. None means all links.
+    fn sticky_epoch(&mut self, group: u64, candidates: Option<&[usize]>) -> Option<Epoch> {
         let serves = |link: usize| candidates.is_none_or(|set| set.contains(&link));
-        if let Some(&owner) = self.exit_owners.get(&group).filter(|&&owner| serves(owner)) {
+        // Do not split a live group, even between failure notification and flow retirement.
+        if let Some(epoch) = self.routes.group_owner(group) {
+            self.sticky.lookup(true);
+            return self
+                .pool
+                .ready_epoch(epoch.link)
+                .filter(|&ready| ready == epoch && serves(epoch.link));
+        }
+        if let Some(owner) = self
+            .exit_owners
+            .link_of(group)
+            .filter(|&owner| serves(owner))
+        {
             if let Some(epoch) = self.pool.ready_epoch(owner) {
                 self.sticky.lookup(true);
                 return Some(epoch);
             }
-            // Checking owner keeps its group: serve new flows from a reserve
-            // without migrating (spec: no migration on Checking).
             if self.pool.link_checking(owner) {
                 self.sticky.lookup(true);
-                return crate::geo::rendezvous(group, &self.nodes)
-                    .into_iter()
-                    .filter(|&link| link != owner && serves(link))
-                    .find_map(|link| self.pool.ready_epoch(link));
-            }
-            // Startup grace: a restored owner still connecting keeps its
-            // groups until the deadline; afterwards it fails over.
-            if self.pool.is_connecting(owner)
-                && self
-                    .grace_until
-                    .is_some_and(|until| StdInstant::now() < until)
-            {
                 return None;
             }
         }
         self.sticky.lookup(false);
-        let previous = self.exit_owners.get(&group).copied();
+        let previous = self.exit_owners.link_of(group);
         let order: Vec<usize> = crate::geo::rendezvous(group, &self.nodes)
             .into_iter()
             .filter(|&link| serves(link))
@@ -885,19 +905,10 @@ impl Hub {
             .find_map(|&link| self.pool.ready_epoch(link).map(|epoch| (link, epoch)));
         let (link, epoch) = next?;
         if previous != Some(link) {
-            self.exit_owners.insert(group, link);
-            // The rendezvous baseline needs no state; failover or an unavailable
-            // primary creates a persisted deviation to prevent restart snap-back.
-            let deviation = order.first() != Some(&link);
             if previous.is_some() {
                 self.sticky.failover_moves += 1;
             }
-            if (previous.is_some() || deviation)
-                && let Some(state) = &mut self.exit_state
-            {
-                // Batched: dirty here, flushed by flush_due / clean stop.
-                state.assign(key, &self.nodes[link].0);
-            }
+            self.exit_owners.assign(group, link);
         }
         Some(epoch)
     }
@@ -1198,8 +1209,7 @@ impl Hub {
 }
 
 /// Geo-driven exit inputs of one client run: the ASN affinity table, the
-/// country table, the fallback strategy, the explicit sticky blocks and the
-/// shared owner state.
+/// country table, the fallback strategy and the explicit sticky blocks.
 #[derive(Default)]
 pub struct GeoExits {
     /// ASN database; None — sticky-asn degraded to weighted balance.
@@ -1208,20 +1218,10 @@ pub struct GeoExits {
     pub country: Option<crate::geo::Geo>,
     /// Fallback strategy for traffic matched by no sticky block.
     pub policy: crate::cli::ExitPolicy,
-    /// Sticky owner persistence; None — nothing sticky is active.
-    pub exit_state: Option<crate::exit_state::ExitState>,
+    pub sticky_asn_mode: crate::cli::StickyAsnMode,
     /// The table is missing but a provider job is fetching it (degraded start).
     pub geo_pending: Option<String>,
     pub country_pending: Option<String>,
-}
-
-/// Map a persisted typed owner key to its numeric rendezvous group.
-#[doc(hidden)]
-pub fn restored_group(key: crate::exit_state::ExitKey) -> Option<u64> {
-    match key {
-        crate::exit_state::ExitKey::Asn(asn) => Some(crate::geo::asn_key(asn)),
-        crate::exit_state::ExitKey::Sticky(canonical) => Some(crate::sticky::group_key(&canonical)),
-    }
 }
 
 /// Start the episodic name resolver for name selectors.
@@ -1377,7 +1377,7 @@ pub async fn run(
         geo,
         country,
         policy: exits_policy,
-        exit_state,
+        sticky_asn_mode,
         geo_pending,
         country_pending,
     } = exits;
@@ -1415,27 +1415,13 @@ pub async fn run(
         .iter()
         .map(|s| (format!("{}:{}", s.server, s.ssh_port), s.weight))
         .collect();
-    let mut exit_state = exit_state;
-    let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
-    let exit_owners = match &mut exit_state {
-        Some(state) => {
-            state.retain_nodes(&ids);
-            state
-                .owner_indices(&ids)
-                .into_iter()
-                .filter_map(|(key, link)| restored_group(key).map(|group| (group, link)))
-                .collect()
-        }
-        None => std::collections::HashMap::new(),
-    };
-    // Startup grace covers exactly the restored owners: two connect budgets.
-    let grace_until = (!exit_owners.is_empty()).then(|| StdInstant::now() + STARTUP_GRACE);
     let (events, incoming) = mpsc::channel(QUEUE);
     let (sticky_updates, sticky_task) = spawn_sticky_resolver(&stickies, &mut shutdown);
     let mut hub = Hub {
         geo,
         country,
         policy: exits_policy,
+        sticky_asn_mode,
         job_events,
         job_task,
         job_stats,
@@ -1450,11 +1436,9 @@ pub async fn run(
         local: None,
         local_cleanup: None,
         nodes,
-        exit_owners,
-        exit_state,
+        exit_owners: crate::exit_state::StickyOwners::default(),
         sticky: StickyStats::default(),
         local_stats: LocalStats::default(),
-        grace_until,
         links: servers
             .into_iter()
             .map(|params| Link {
@@ -1511,9 +1495,6 @@ pub async fn run(
         .await;
     if let Some((_, task)) = dashboard {
         task.abort();
-    }
-    if let Some(state) = &mut hub.exit_state {
-        state.flush();
     }
     let canceled = hooks.cancel_up().await;
     hub.tasks.shutdown().await;

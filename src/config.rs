@@ -55,18 +55,9 @@ pub fn load(path: &Path, multi: bool) -> Result<ClientArgs> {
         Ok(args)
     })
     .map(|mut args| {
-        // Keep the supplied path: the job env contract and the state default
-        // below both derive from it (parse rebuilds ClientArgs with None).
+        // Keep the supplied path: the job env contract derives from it
+        // (parse rebuilds ClientArgs with None).
         args.config = Some(path.to_path_buf());
-        // Sticky owners persist even without any database: default the state
-        // file next to the config itself.
-        if args.exit_state.is_none()
-            && !args.stickies.is_empty()
-            && args.geo_db.is_none()
-            && args.country_db.is_none()
-        {
-            args.exit_state = Some(path.with_extension("state.json"));
-        }
         args
     })
     .with_context(|| path.display().to_string())
@@ -176,6 +167,10 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
     }
     crate::job::JobSpec::validate_all(&jobs)?;
 
+    // Deprecated: sticky owners are RAM-only; the key is accepted so old
+    // configs keep parsing and the value is ignored.
+    let _ = top.take_path("fallback_sticky", "state", base)?;
+
     let args = ClientArgs {
         config: None,
         server: server_specs,
@@ -186,9 +181,13 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         exit_policy: top
             .take_exit_policy("fallback_sticky", "strategy")?
             .unwrap_or_default(),
+        sticky_asn_mode: match top.take_string("fallback_sticky", "mode")? {
+            Some(text) => crate::cli::StickyAsnMode::from_str(&text, true)
+                .map_err(|_| anyhow::anyhow!("fallback_sticky: mode must be balanced or hashed"))?,
+            None => crate::cli::StickyAsnMode::default(),
+        },
         geo_db,
         country_db,
-        exit_state: top.take_path("fallback_sticky", "state", base)?,
         web_listen: match top.take_string("dashboard", "listen")? {
             Some(text) => Some(
                 text.parse::<std::net::SocketAddr>()

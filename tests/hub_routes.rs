@@ -24,7 +24,7 @@ fn stale_close_cannot_forget_a_reused_tuple() {
         epoch: epoch(2),
         id: routes.allocate().unwrap(),
     };
-    routes.insert(key, Target::Remote(second), None);
+    routes.insert(key, Target::Remote(second), None, None);
     routes.forget(key, first);
     let retired = routes.remove_epoch(first.epoch);
     assert!(retired.is_empty(), "first owner was already forgotten");
@@ -45,6 +45,7 @@ fn remove_epoch_returns_tcp_and_udp_keys_for_tombstoning() {
             id: 1,
         }),
         None,
+        None,
     );
     routes.insert(
         packet::parse(&tcp, true).unwrap().flow,
@@ -53,6 +54,7 @@ fn remove_epoch_returns_tcp_and_udp_keys_for_tombstoning() {
             id: 2,
         }),
         None,
+        None,
     );
     routes.insert(
         packet::parse(&common::udp_packet(true), true).unwrap().flow,
@@ -60,6 +62,7 @@ fn remove_epoch_returns_tcp_and_udp_keys_for_tombstoning() {
             epoch: epoch(2),
             id: 3,
         }),
+        None,
         None,
     );
     let mut retired = routes.remove_epoch(epoch(1));
@@ -81,6 +84,7 @@ fn old_epoch_and_flow_id_cannot_deliver_after_tuple_reuse() {
             epoch: epoch(2),
             id: 9,
         }),
+        None,
         None,
     );
     assert!(!routes.accepts(
@@ -116,7 +120,7 @@ fn flow_ids_never_enter_the_reserved_probe_space() {
 fn record_refreshes_last_activity_but_not_the_open_time() {
     let key = packet::parse(&tcp_packet(false), true).unwrap().flow;
     let mut routes = Routes::default();
-    routes.insert(key, Target::Direct(1), None);
+    routes.insert(key, Target::Direct(1), None, None);
     let then = std::time::Instant::now() - std::time::Duration::from_secs(60);
     let flow = routes.by_key.get_mut(&key).unwrap();
     (flow.opened, flow.active) = (then, then);
@@ -142,7 +146,7 @@ fn closing_marks_only_the_current_owner_and_a_new_syn_reopens_the_tuple() {
         epoch: epoch(1),
         id: routes.allocate().unwrap(),
     };
-    routes.insert(key, Target::Remote(owner), None);
+    routes.insert(key, Target::Remote(owner), None, None);
     let stale = Owner {
         epoch: epoch(2),
         id: routes.allocate().unwrap(),
@@ -158,11 +162,11 @@ fn closing_marks_only_the_current_owner_and_a_new_syn_reopens_the_tuple() {
     let delivery = Delivery::default();
     // Ordinary traffic keeps the mark; a new SYN on the tuple clears it.
     routes
-        .enqueue(&data, key.source, epoch(1), &outgoing, &delivery, &[])
+        .enqueue(&data, key.source, epoch(1), None, &outgoing, &delivery, &[])
         .unwrap();
     assert!(routes.by_key[&key].closing);
     routes
-        .enqueue(&syn, key.source, epoch(1), &outgoing, &delivery, &[])
+        .enqueue(&syn, key.source, epoch(1), None, &outgoing, &delivery, &[])
         .unwrap();
     assert!(!routes.by_key[&key].closing, "a re-SYN reopens the tuple");
 }
@@ -175,7 +179,7 @@ fn forget_direct_removes_only_the_current_generation() {
         .unwrap()
         .flow;
     let mut routes = Routes::default();
-    routes.insert(key, Target::Direct(2), None);
+    routes.insert(key, Target::Direct(2), None, None);
     // A late close of the previous generation leaves the new owner.
     assert!(!routes.forget_direct(key, 1));
     assert_eq!(routes.target(&key), Some(&Target::Direct(2)));
@@ -184,11 +188,11 @@ fn forget_direct_removes_only_the_current_generation() {
         epoch: epoch(1),
         id: routes.allocate().unwrap(),
     };
-    routes.insert(key, Target::Remote(owner), None);
+    routes.insert(key, Target::Remote(owner), None, None);
     assert!(!routes.forget_direct(key, owner.id));
     assert_eq!(routes.target(&key), Some(&Target::Remote(owner)));
     // Only the current direct generation removes and reports success.
-    routes.insert(key, Target::Direct(5), None);
+    routes.insert(key, Target::Direct(5), None, None);
     assert!(routes.forget_direct(key, 5));
     assert!(routes.by_key.is_empty());
 }
@@ -198,7 +202,7 @@ fn direct_owner_survives_epoch_removal_and_never_accepts_link_packets() {
     let bytes = common::udp_packet(false);
     let key = packet::parse(&bytes, false).unwrap().flow;
     let mut routes = Routes::default();
-    routes.insert(key, Target::Direct(7), None);
+    routes.insert(key, Target::Direct(7), None, None);
     // A dying link retires only its own owners: direct survives (spec §5.5).
     assert!(routes.remove_epoch(epoch(1)).is_empty());
     assert_eq!(routes.target(&key), Some(&Target::Direct(7)));
@@ -229,7 +233,7 @@ async fn full_queue_counts_loss_without_installing_a_new_owner() {
     let bytes = common::udp_packet(false);
     let ip = packet::parse(&bytes, true).unwrap().flow.source;
     routes
-        .enqueue(&bytes, ip, epoch(1), &outgoing, &delivery, &[])
+        .enqueue(&bytes, ip, epoch(1), None, &outgoing, &delivery, &[])
         .unwrap();
     assert!(routes.by_key.is_empty());
     let mut stats = svpn::control::Stats::default();
@@ -237,7 +241,7 @@ async fn full_queue_counts_loss_without_installing_a_new_owner() {
     assert_eq!(stats.dropped_packets, 1);
     incoming.recv().await.unwrap();
     routes
-        .enqueue(&bytes, ip, epoch(1), &outgoing, &delivery, &[])
+        .enqueue(&bytes, ip, epoch(1), None, &outgoing, &delivery, &[])
         .unwrap();
     assert_eq!(routes.by_key.len(), 1);
     let id = incoming.recv().await.unwrap().id;
@@ -247,7 +251,7 @@ async fn full_queue_counts_loss_without_installing_a_new_owner() {
     ));
     drop(incoming);
     routes
-        .enqueue(&bytes, ip, epoch(1), &outgoing, &delivery, &[])
+        .enqueue(&bytes, ip, epoch(1), None, &outgoing, &delivery, &[])
         .unwrap();
 }
 

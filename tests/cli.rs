@@ -14,6 +14,56 @@ fn client(args: &[&str]) -> ClientArgs {
     }
 }
 
+// ── automatic ASN modes ──
+
+#[test]
+fn sticky_asn_mode_defaults_and_validation() {
+    let base = [
+        "multi",
+        "--server",
+        "vpn.example",
+        "--exit-policy",
+        "sticky-asn",
+        "--geo-db",
+        "asn.csv",
+    ];
+    assert_eq!(client(&base).sticky_asn_mode, StickyAsnMode::Hashed);
+    for (value, mode) in [
+        ("balanced", StickyAsnMode::Balanced),
+        ("hashed", StickyAsnMode::Hashed),
+    ] {
+        let args: Vec<_> = base
+            .into_iter()
+            .chain(["--sticky-asn-mode", value])
+            .collect();
+        assert_eq!(client(&args).sticky_asn_mode, mode);
+    }
+    assert!(
+        Cli::try_parse_from(
+            ["svpn"]
+                .into_iter()
+                .chain(base)
+                .chain(["--sticky-asn-mode", "typo"])
+        )
+        .is_err()
+    );
+    let error = Cli::try_parse_from([
+        "svpn",
+        "multi",
+        "--server",
+        "vpn.example",
+        "--sticky-asn-mode",
+        "balanced",
+    ])
+    .err()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("requires exit-policy sticky-asn")
+    );
+}
+
 // ── dashboard address ──
 
 #[test]
@@ -197,6 +247,7 @@ fn every_explicit_client_setting_conflicts_with_config_even_at_default() {
         ("--mimic", "mosh"),
         ("--tcp-port", "0"),
         ("--stats-interval", "30"),
+        ("--sticky-asn-mode", "hashed"),
         ("--web-listen", "127.0.0.1:8080"),
         ("--up-script", "up"),
         ("--down-script", "down"),

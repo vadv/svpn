@@ -245,14 +245,22 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
             resolved_ips: runtime.resolved.len(),
             owner: hub
                 .exit_owners
-                .get(&crate::sticky::group_key(&runtime.block.canonical_key()))
-                .map(|&link| node_id(hub, link)),
+                .link_of(crate::sticky::group_key(&runtime.block.canonical_key()))
+                .map(|link| node_id(hub, link)),
         })
         .collect();
-    let mut groups: Vec<GroupView> = hub
-        .exit_owners
-        .iter()
-        .map(|(&group, &link)| GroupView {
+    let mut owners = hub.exit_owners.iter();
+    if hub.sticky_asn_mode == crate::cli::StickyAsnMode::Balanced {
+        owners.extend(
+            hub.routes
+                .asn_owners()
+                .into_iter()
+                .map(|(group, epoch)| (group, epoch.link)),
+        );
+    }
+    let mut groups: Vec<GroupView> = owners
+        .into_iter()
+        .map(|(group, link)| GroupView {
             group: group_name(hub, group),
             server: node_id(hub, link),
         })

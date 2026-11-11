@@ -36,6 +36,7 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
     let (events, incoming) = mpsc::channel(QUEUE);
     Hub {
         policy: svpn::cli::ExitPolicy::StickyAsn,
+        sticky_asn_mode: Default::default(),
         links: vec![Link {
             params: LinkParams {
                 label: "s0".to_owned(),
@@ -89,10 +90,8 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
         local_cleanup: None,
         nodes: vec![("a.example".to_owned(), 1)],
         exit_owners: Default::default(),
-        exit_state: None,
         sticky: StickyStats::default(),
         local_stats: LocalStats::default(),
-        grace_until: None,
         tasks: JoinSet::new(),
         events,
         incoming,

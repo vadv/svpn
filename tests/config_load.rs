@@ -257,7 +257,6 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
         "--mtu", "1300", "--log-level", "debug", "--udp-port-range", "60000-60009",
         "--mimic", "mosh", "--tcp-port", "0", "--stats-interval", "7",
         "--exit-policy", "sticky-asn", "--geo-db", base.join("geo db.csv").to_str().unwrap(),
-        "--exit-state", base.join("geo state.json").to_str().unwrap(),
         "--up-command", "printf up", "--down-script", base.join("hooks/down script").to_str().unwrap(),
     ]).unwrap().command else { panic!("expected client") };
     fn resolved(args: &ClientArgs) -> Vec<(String, String)> {
@@ -295,7 +294,6 @@ fn multi_cli_and_both_config_positions_produce_the_same_server_commands() {
         assert_eq!(file.stats_interval, cli.stats_interval);
         assert_eq!(file.exit_policy, cli.exit_policy);
         assert_eq!(file.geo_db, cli.geo_db);
-        assert_eq!(file.exit_state, cli.exit_state);
         assert_eq!(file.hooks.up_command, cli.hooks.up_command);
         assert_eq!(file.hooks.down_script, cli.hooks.down_script);
     }
