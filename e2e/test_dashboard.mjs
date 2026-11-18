@@ -1,7 +1,20 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking } from "../src/web/state.mjs";
+
+test("usage ranks raw bytes, not formatted strings, and includes the pooled share", () => {
+  const entries = [["a", "Small", { rx_bytes: 99, tx_bytes: 0 }], ["b", "Big", { rx_bytes: 1024, tx_bytes: 4 }], [null, "Other", { rx_bytes: 0, tx_bytes: 7 }]];
+  assert.deepEqual(usageRanking(entries, "total").rows.map(r => r.key), ["b", "a", null]);
+  assert.deepEqual(usageRanking(entries, "tx").rows.map(r => r.key), [null, "b"]);
+  assert.equal(usageRanking(entries, "total").total, 1134);
+  assert.deepEqual(usageRanking([], "rx"), { rows: [], total: 0 });
+});
+
+test("destination drill-down matches an IP exactly, not a prefix or a source", () => {
+  const flows = ["1.1.1.10:443", "1.1.1.1:53"].map(destination => ({ source: "1.1.1.1:123", destination }));
+  assert.deepEqual(flowPage(flows, { drill: { axis: "destinations", key: "1.1.1.1" } }).rows, [flows[1]]);
+});
 
 function snapshot(time, servers = [server("nl", 0, 0)], started = 1, process = null) {
   return { generated_at_ms: time, started_at: started, servers, ...(process ? { process } : {}) };

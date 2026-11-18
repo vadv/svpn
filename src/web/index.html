@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>svpn · state readout</title>
+<title>SVPN · Traffic explorer</title>
 <style>
 :root { color-scheme:dark; --bg:#0a0b0b; --surface:#101213; --surface-2:#151819; --surface-3:#1b1f20; --line:#394042; --line-soft:#252b2c; --grid:#242a2b; --text:#e8ede9; --muted:#9da6a1; --faint:#6f7873; --accent:#c9f227; --accent-ink:#11140a; --rx:#59c9ff; --tx:#ff7b45; --rx-fill:rgba(89,201,255,.13); --tx-fill:rgba(255,123,69,.11); --good:#c9f227; --warn:#ffd166; --bad:#ff6b6b; --warn-bg:rgba(255,209,102,.09); --bad-bg:rgba(255,107,107,.10); }
 body[data-theme="light"] { color-scheme:light; --bg:#eceee9; --surface:#fafbf7; --surface-2:#f1f3ec; --surface-3:#e4e8dd; --line:#858e86; --line-soft:#c9cfc4; --grid:#d3d8cd; --text:#151a16; --muted:#4f5951; --faint:#69736b; --accent:#5f7100; --accent-ink:#fafbf7; --rx:#005b91; --tx:#a13d00; --rx-fill:rgba(0,91,145,.09); --tx-fill:rgba(161,61,0,.08); --good:#4b5d00; --warn:#7a5b00; --bad:#9c2020; --warn-bg:rgba(122,91,0,.08); --bad-bg:rgba(156,32,32,.08); }
@@ -192,13 +192,46 @@ body.stale .rail-health { color:var(--warn); }
   .heading,.toolbar,.pagination,.chart { padding-left:10px; padding-right:10px; }
   th,td { padding:7px 8px; }
 }
+.explorer { margin-top:16px; border:1px solid var(--line); border-top:3px solid var(--accent); background:var(--surface); }
+.usage-head,.usage-controls,.usage-readout { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+.usage-head { justify-content:space-between; padding:18px clamp(12px,2vw,24px) 0; }
+.usage-head h2,.ranks h3 { font-family:system-ui,sans-serif; text-transform:none; letter-spacing:-.035em; }
+.usage-head h2 { margin-top:3px; font-size:clamp(22px,3vw,36px); line-height:1.15; }
+.segmented { display:inline-flex; }
+.segmented button { min-height:36px; letter-spacing:.02em; }
+.segmented button+button { border-left:0; }
+.segmented button[aria-pressed=true] { background:var(--accent); color:var(--accent-ink); }
+.usage-readout { padding:16px clamp(12px,2vw,24px); }
+.usage-readout strong { font-size:clamp(30px,3.3vw,48px); line-height:1.1; letter-spacing:-.07em; }
+.usage-readout small { display:block; }
+.ranks { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); border-block:1px solid var(--line-soft); }
+.ranks article { --ink:var(--accent); min-width:0; padding:14px clamp(12px,1.5vw,20px); }
+.ranks article+article { border-left:1px solid var(--line-soft); --ink:var(--rx); }
+.ranks article:last-child { --ink:var(--tx); }
+.ranks h3 { margin:0; font-size:17px; }
+.ranks p,.usage-note { color:var(--muted); font-size:11px; }
+.ranks p { margin:1px 0 9px; }
+.ranks ol { margin:0; padding:0; list-style:none; max-height:330px; overflow:auto; }
+.ranks li { padding:4px 2px 6px; }
+.rank-line { display:flex; align-items:baseline; justify-content:space-between; gap:5px; }
+.rank-line :first-child { min-width:0; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; }
+.rank-line button { padding:0; min-height:24px; background:none; border:0; color:var(--text); text-transform:none; font:inherit; text-align:left; letter-spacing:0; }
+.rank-line button:hover:not(:disabled) { background:transparent; color:var(--ink); text-decoration:underline; }
+.rank-line button:focus-visible { outline-offset:-2px; }
+.rank-line small { white-space:nowrap; }
+.rank-meter { height:3px; background:var(--line-soft); }
+.rank-meter i { display:block; height:100%; background:var(--ink); }
+.usage-note,#drill-note { padding:8px 12px; margin:0; }
+.more { margin-top:6px; }
+.mobile-axis { display:none; }
+@media(max-width:720px) { .mobile-axis { display:flex; justify-content:space-between; padding:8px 12px; background:var(--surface-2); } .ranks[data-axis=exits] article:not(:first-child),.ranks[data-axis=networks] article:not(:nth-child(2)),.ranks[data-axis=destinations] article:not(:last-child) { display:none; } .ranks { grid-template-columns:1fr; } .ranks article+article { border-left:0; border-top:1px solid var(--line-soft); } .usage-head,.usage-controls { gap:8px; } }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .caret { animation:none; } }
 </style>
 </head>
 <body>
 <main class="app" data-endpoint="/api/state">
 <aside class="rail" aria-label="Dashboard navigation">
-<div class="brand"><h1>svpn</h1><span class="brand-sub">state readout</span></div>
+<div class="brand"><h1>svpn</h1><span class="brand-sub">traffic console</span></div>
 <div class="rail-live"><span>read-only</span><span class="rail-live-tag">1 Hz</span></div>
 <nav class="rail-nav">
 <a href="#overview" data-section="overview" class="is-active"><span>01</span>Overview</a>
@@ -213,7 +246,7 @@ body.stale .rail-health { color:var(--warn); }
 </aside>
 <div class="content">
 <header>
-<div><div class="stamp">SVPN / CLIENT STATE / 01</div><div class="subtitle">Read-only snapshot · 1 Hz</div></div>
+<div><div class="stamp">SVPN / CLIENT TELEMETRY</div><div class="subtitle">Read-only snapshot · 1 Hz</div></div>
 <div class="status">
 <div class="status-text"><span class="pill" id="freshness" aria-live="polite">Connecting…</span><p class="muted" id="meta">Waiting for the first snapshot</p></div>
 <button type="button" id="theme-toggle" aria-pressed="false" aria-label="Switch colour theme">LIGHT</button>
@@ -223,17 +256,18 @@ body.stale .rail-health { color:var(--warn); }
 <div id="stale-notice" class="notice bad" role="status" hidden>Stale data — showing the last snapshot.</div>
 <div id="warnings" class="notice" role="status" hidden></div>
 <section id="overview" aria-label="Client summary">
-<div class="system" aria-label="Process resources">
-<div class="system-head">
-<span class="heading-title">Process<span class="help-wrap"><button type="button" class="help" aria-label="About process values" aria-describedby="proc-help">?</button><span class="help-pop" id="proc-help" role="tooltip">CPU and RSS come from the client process. <span id="proc-note">Values since start.</span></span></span></span>
-<span class="clock">Local <b id="clock">--:--:--</b><i class="caret" aria-hidden="true"></i></span>
+<div class="explorer" aria-labelledby="usage-title">
+<div class="usage-head"><div><div class="stamp">Traffic explorer</div><h2 id="usage-title">Where traffic goes</h2></div>
+<div class="usage-controls"><div class="segmented" role="group" aria-label="Measurement period"><button type="button" id="usage-session" aria-pressed="true" disabled>Since start</button><button type="button" id="usage-now" aria-pressed="false" disabled>Right now</button></div>
+<label>Rank by <select id="usage-direction" disabled><option value="total">RX + TX</option><option value="rx">Received</option><option value="tx">Sent</option></select></label></div></div>
+<div class="usage-readout"><strong id="usage-total">—</strong><div><b id="usage-period">Since client start</b><small id="usage-split">Waiting for the first snapshot</small></div></div>
+<label class="mobile-axis">Break down by <select id="usage-axis"><option value="exits">Exit route</option><option value="networks">Destination network</option><option value="destinations">Destination IP</option></select></label>
+<div class="ranks" id="usage-ranks" data-axis="exits">
+<article><h3>Exit routes</h3><p>Which VPN server or local exit carried it?</p><ol id="rank-exits"></ol><button class="more" type="button" hidden>Show all</button></article>
+<article><h3>Destination networks</h3><p>Which provider owns the destination IP?</p><ol id="rank-networks"></ol><button class="more" type="button" hidden>Show all</button></article>
+<article><h3>Destination IPs</h3><p>Which addresses used the most traffic?</p><ol id="rank-destinations"></ol><button class="more" type="button" hidden>Show all</button></article>
 </div>
-<div class="proc">
-<div class="proc-cell"><span class="label">MEM / resident</span><strong id="proc-rss">—</strong><small id="proc-rss-kind">No sample</small><div class="meter"><i id="proc-mem-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="mem" id="spark-rss"/></svg></div>
-<div class="proc-cell"><span class="label">CPU / one core</span><strong id="proc-cpu">—</strong><small id="proc-cpu-kind">Waiting for samples</small><div class="meter"><i id="proc-cpu-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="cpu" id="spark-cpu"/></svg></div>
-<div class="proc-cell"><span class="label">CPU time / cumulative</span><strong id="proc-time">—</strong><small id="proc-time-note">User + system</small></div>
-<div class="proc-cell"><span class="label">Session / uptime</span><strong id="uptime">—</strong><small>Since start</small></div>
-</div>
+<p class="usage-note">Three views of the same traffic. Select a name for current flows; completed flows still count. Small IP and ASN entries can be pooled into Other.</p>
 </div>
 <div class="summary">
 <div class="card"><span class="label">Servers ready</span><strong id="ready">—</strong><small>Links ready</small></div>
@@ -275,6 +309,7 @@ body.stale .rail-health { color:var(--warn); }
 </section>
 <section class="panel" id="flows-panel" aria-labelledby="flows-title">
 <div class="heading"><div class="heading-title"><h2 id="flows-title">Flows</h2><span class="muted" id="flow-status">Live</span><span class="help-wrap"><button type="button" class="help" aria-label="About flows" aria-describedby="flows-help">?</button><span class="help-pop" id="flows-help" role="tooltip">Press / to search and Esc to clear. The table holds 50 rows per page; pausing freezes it while the summary stays live.</span></span></div><span class="aside" id="flow-count">No snapshot yet</span></div>
+<div id="drill-note" hidden><span id="drill-label"></span> <button id="clear-drill" type="button">Clear filter</button></div>
 <div class="toolbar"><input id="flow-search" type="search" disabled aria-label="Search flows by IP, device, country, ASN organization or service" placeholder="Search IP, device, country, ASN, organization or service…"><label>Protocol <select id="flow-protocol" disabled><option value="">All</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label><label>Exit <select id="flow-exit" disabled><option value="">All exits</option></select></label><label>Country <select id="flow-country" disabled><option value="">All countries</option></select></label><label>ASN <select id="flow-asn" disabled><option value="">All ASNs</option></select></label><label>Order <select id="flow-order" disabled><option value="">Address</option><option value="rate">Rate</option><option value="total" selected>Total</option><option value="age">Age</option><option value="idle">Idle</option></select></label><div class="toolbar-actions"><button type="button" id="asn-load" disabled>ASN names</button><button type="button" id="pause" aria-pressed="false" disabled>Pause</button></div></div>
 <div class="toolbar"><span class="note" id="asn-status" role="status">Not loaded</span></div>
 <div class="scroll"><table id="flows"><thead><tr><th>Protocol</th><th>Source</th><th>Destination</th><th>Country</th><th>ASN / organization</th><th>Exit</th><th>Rule</th><th class="num" title="RX+TX since the previous snapshot; total since the hub saw the flow">Mbit/s · total</th><th class="num" title="Time since the hub saw the flow; silence since its last packet">Age · idle</th></tr></thead><tbody></tbody></table></div>
@@ -285,6 +320,18 @@ body.stale .rail-health { color:var(--warn); }
 <div class="scroll"><table id="databases"><thead><tr><th>Database</th><th>State</th><th class="num">IPv4 ranges</th><th>Loaded into memory</th><th>Last update attempt</th><th>Update / reload status</th></tr></thead><tbody></tbody></table></div>
 <div class="scroll"><table id="jobs"><thead><tr><th>Job</th><th>State</th><th>Last attempt</th><th>Last success</th><th>Next check</th><th>Result</th></tr></thead><tbody></tbody></table></div>
 </section>
+<div class="system" aria-label="Process resources">
+<div class="system-head">
+<span class="heading-title">Process<span class="help-wrap"><button type="button" class="help" aria-label="About process values" aria-describedby="proc-help">?</button><span class="help-pop" id="proc-help" role="tooltip">CPU and RSS come from the client process. <span id="proc-note">Values since start.</span></span></span></span>
+<span class="clock">Local <b id="clock">--:--:--</b><i class="caret" aria-hidden="true"></i></span>
+</div>
+<div class="proc">
+<div class="proc-cell"><span class="label">MEM / resident</span><strong id="proc-rss">—</strong><small id="proc-rss-kind">No sample</small><div class="meter"><i id="proc-mem-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="mem" id="spark-rss"/></svg></div>
+<div class="proc-cell"><span class="label">CPU / one core</span><strong id="proc-cpu">—</strong><small id="proc-cpu-kind">Waiting for samples</small><div class="meter"><i id="proc-cpu-bar"></i></div><svg class="spark" viewBox="0 0 120 30" preserveAspectRatio="none" aria-hidden="true"><path class="cpu" id="spark-cpu"/></svg></div>
+<div class="proc-cell"><span class="label">CPU time / cumulative</span><strong id="proc-time">—</strong><small id="proc-time-note">User + system</small></div>
+<div class="proc-cell"><span class="label">Session / uptime</span><strong id="uptime">—</strong><small>Since start</small></div>
+</div>
+</div>
 <details class="panel groups" id="groups-panel"><summary>Pinned groups</summary><div class="scroll"><table id="groups"><thead><tr><th>Group</th><th>Current server</th></tr></thead><tbody></tbody></table></div></details>
 <details class="panel diagnostics" id="diagnostics-panel"><summary>Diagnostics · Counters</summary><div class="counters" id="counters"></div></details>
 <footer id="footer">—</footer>
