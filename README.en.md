@@ -197,7 +197,7 @@ network is it”. Enabling the modes is covered in ADVANCED.
 
 ## Web dashboard
 
-The client can show its state in a browser: pool servers and their traffic, sticky rules with their owners, active flows and counters. The read-only panel is a dense monospace instrument readout: flat sections, sharp corners, a hard grid, a live clock, sparklines, a hover tooltip on the traffic chart, flow filters and a light/dark theme switch. A dedicated block reports the `svpn` process itself: RSS, CPU as a percentage of one core, cumulative CPU time and uptime. Linux supplies current RSS from `/proc`; when it is unavailable, peak RSS is shown and explicitly labelled. It listens on loopback only and loads no external assets:
+The dashboard opens with three views of traffic: which VPN server or local exit carried it, which destination network (ASN) owns it, and which IP used it. Switch between volume since start and current throughput, rank by received or sent bytes, and select a name to inspect its current flows. Completed connections still count until the client restarts; no history is written to disk. The VPN graph, rules, servers and diagnostics follow. The read-only panel listens on loopback and loads no external assets:
 
 ```bash
 sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080

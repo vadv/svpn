@@ -151,6 +151,7 @@ pub struct Snapshot {
     pub generated_at_ms: u64,
     pub started_at: u64,
     pub fallback: TrafficView,
+    pub usage: Option<crate::hub::UsageSample>,
     pub databases: Vec<DatabaseView>,
     /// balance or sticky-asn.
     pub policy: &'static str,
@@ -165,6 +166,13 @@ pub struct Snapshot {
     pub jobs: JobStats,
     /// Resource usage of the svpn process itself. Each field may be null.
     pub process: ProcessView,
+}
+
+/// Advance the hub's measurement window once per published snapshot, never per HTTP request.
+pub fn sample(hub: &mut Hub) -> Snapshot {
+    let mut state = snapshot(hub);
+    state.usage = hub.routes.sample_usage(Instant::now());
+    state
 }
 
 /// Snapshot of the client state for the dashboard.
@@ -281,10 +289,13 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
                 .as_ref()
                 .and_then(|table| table.lookup(key.destination))
                 .map(crate::geo::unpack_country),
-            asn: hub
-                .geo
-                .as_ref()
-                .and_then(|table| table.lookup(key.destination)),
+            asn: if hub.routes.usage.is_some() {
+                flow.asn
+            } else {
+                hub.geo
+                    .as_ref()
+                    .and_then(|table| table.lookup(key.destination))
+            },
             via: match flow.target {
                 Target::Direct(_) => "local".to_owned(),
                 Target::Remote(owner) => node_id(hub, owner.epoch.link),
@@ -334,6 +345,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         generated_at_ms: generated.as_millis().min(u128::from(u64::MAX)) as u64,
         started_at: hub.job_stats.started_at,
         fallback: traffic(None),
+        usage: None,
         databases: vec![
             DatabaseView {
                 kind: "geo",

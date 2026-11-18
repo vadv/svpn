@@ -14,6 +14,30 @@ assert.ok(fs.existsSync(chrome), `Chrome not found: ${chrome}; set CHROME to an 
 const epoch = Date.now();
 let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0;
 
+// Same packets on all three axes. 198.51.100.80 is already closed; unknown and
+// pooled contributions keep their bytes even though neither has a provider name.
+function usageFixture(interval) {
+  const t = () => ({ rx_bytes: 0, tx_bytes: 0 });
+  const buckets = () => ({ named: {}, other: t() });
+  const usage = { exits: {}, local: t(), networks: buckets(), destinations: buckets(), unknown_asn: t() };
+  if (scenario === "empty") return usage;
+  for (const [exit, asn, ip, down, up] of [
+    [0, 13335, "203.0.113.2", 720, 39], [1, 15169, "203.0.113.3", 320, 65],
+    ["local", 13335, "198.51.100.80", 210, 330], [0, 13335, "203.0.113.4", 92, 3],
+    [1, null, "203.0.113.1", 28, 4], [0, "other", "other", 8, 2],
+  ]) {
+    const received = n => Math.round(down * (exit === 1 ? 1600 : exit === "local" ? 0 : 200) * (n + 8 * Math.sin(n / 12)));
+    const sent = n => Math.round(up * (exit === "local" ? 0 : 400) * (n + 14 * Math.sin(n / 18)));
+    const rx = received(sequence) + (interval ? -received(sequence - 1) : down * 1048576);
+    const tx = sent(sequence) + (interval ? -sent(sequence - 1) : up * 1048576);
+    const add = b => { b.rx_bytes += rx; b.tx_bytes += tx; };
+    add(exit === "local" ? usage.local : usage.exits[exit] ??= t());
+    add(asn == null ? usage.unknown_asn : asn === "other" ? usage.networks.other : usage.networks.named[asn] ??= t());
+    add(ip === "other" ? usage.destinations.other : usage.destinations.named[ip] ??= t());
+  }
+  return usage;
+}
+
 function frame() {
   const degraded = scenario === "degraded";
   const count = scenario === "large" ? 10003 : scenario === "empty" ? 0 : degraded ? 41 : 123;
@@ -35,6 +59,12 @@ function frame() {
       inner_tx_bytes: (i ? 91 : 64) * 1048576 + (degraded && i ? 0 : sequence * (i ? 12500 : 25000)), opened_flows: 85,
       open_failed_flows: degraded && i ? 3 : 0, closed_flows: 12, dropped_packets: degraded && i ? 2 : 0 },
   }));
+  const usage = { session: usageFixture(false), interval: usageFixture(true), seconds: 1 };
+  if (!degraded) for (const server of servers) {
+    const t = usage.session.exits[server.index];
+    server.stats.inner_rx_bytes = t?.rx_bytes ?? 0;
+    server.stats.inner_tx_bytes = t?.tx_bytes ?? 0;
+  }
   const flows = Array.from({ length: count }, (_, i) => ({
     protocol: i % 2 ? "tcp" : "udp", source: `10.77.0.2:${40000 + i}`, destination: `203.0.113.${i % 250 + 1}:443`,
     country: i % 5 === 0 ? null : i % 2 ? "US" : "DE", asn: i % 5 === 0 ? null : i % 2 ? 13335 : 15169,
@@ -68,6 +98,7 @@ function frame() {
     cpu_seconds: 12 + sequence * 0.18, cpus: 8,
   };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
+    usage,
     process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0,
       active_flows: flows.filter(flow => flow.via === "local").length, closing_flows: 0 },
@@ -137,6 +168,21 @@ try {
   assert($('servers').textContent.includes('Selecting…') && $('servers').textContent.includes('limited: webrtc · ssh'), 'pending selection and config restriction are shown');
   assert(!$('servers').textContent.includes('Auto'), 'configured-only mimic text is gone');
   await until(() => $('asn-status').textContent.includes('2 names'), 'CSV parsed and cached in browser');
+  assert($('rank-networks').querySelector('button').textContent.includes('Cloudflare'), 'session provider ranks use ASN organization names');
+  assert($('rank-exits').querySelector('button').textContent === 'NL', 'session ranks use bytes, including local exit');
+  input('usage-direction', 'tx');
+  assert($('rank-exits').querySelector('button').textContent === 'Local exit', 'sent bytes reorder exits numerically');
+  input('usage-direction', 'total'); $('usage-now').click();
+  assert($('rank-exits').querySelector('button').textContent === 'DE' && $('usage-total').textContent.includes('Mbit/s'), 'latest interval has a different busiest exit and rate units');
+  $('rank-networks').querySelector('button').click();
+  assert([...$('flows').tBodies[0].rows].every(row => row.cells[4].textContent.includes('AS15169')) && $('flow-order').value === 'rate', 'inspect the busy provider by current flow rate');
+  $('clear-drill').click(); $('usage-session').click();
+  [...$('rank-destinations').querySelectorAll('button')].find(b => b.textContent === '198.51.100.80').click();
+  assert($('flows').textContent.includes('Completed traffic remains'), 'retired destination keeps its traffic without a fictitious flow');
+  $('clear-drill').click();
+  $('rank-destinations').nextElementSibling.click();
+  assert($('rank-destinations').textContent.includes('Other · pooled'), 'expanded ranks include the bounded tail');
+  $('rank-destinations').nextElementSibling.click();
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
@@ -232,6 +278,8 @@ try {
   await control('offline');
   await until(() => $('freshness').textContent === 'Stale data', 'API failure is visible immediately');
   assert($('proc-rss').textContent === '—' && $('proc-cpu').textContent === '—', 'stale process values are not shown as live');
+  $('usage-now').click(); assert($('usage-total').textContent === '—' && $('rank-exits').textContent.includes('stale'), 'stale interval is unknown, never zero');
+  $('usage-session').click(); assert($('usage-period').textContent.includes('last snapshot'), 'stale session totals are labelled');
   assert((await fetch('/api/state')).status === 503, 'HTTP error fixture');
   const beforeApiGap = $('chart-rx').getAttribute('d');
   await control('frozen');
@@ -291,6 +339,7 @@ const server = http.createServer((request, response) => {
   }
   if (url.pathname === "/") {
     scenario = url.searchParams.get("scenario") || "normal";
+    if (url.searchParams.has("render")) sequence = 0;
     const html = fs.readFileSync(path.join(root, "src/web/index.html"), "utf8");
     response.setHeader("Content-Type", "text/html");
     response.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
@@ -361,12 +410,24 @@ async function browser(query = "", screenshot, mobile = false) {
     await page("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile });
     await evaluate("new Promise(resolve => { if (document.readyState === 'complete') resolve(); else addEventListener('load', resolve, { once: true }); })");
     await page("Page.enable");
+    // Replay five minutes of timestamped fixture snapshots for screenshots. The real
+    // module still fetches each frame and derives its own chart, ranks and labels.
+    const replay = screenshot && !query.includes("cold");
+    if (replay) await page("Page.addScriptToEvaluateOnNewDocument", { source: `{
+      const schedule = window.setTimeout;
+      window.setTimeout = (fn, ms, ...args) => schedule(fn, ms === 1000 ? 20 : ms, ...args);
+    }` });
     const loaded = new Promise(resolve => { onLoad = resolve; });
     await page("Page.navigate", { url: origin + "/" + query });
     await loaded; onLoad = null;
     await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
       const done = ${query ? `document.getElementById('freshness')?.textContent === '${query.includes("cold") ? "API unavailable" : "Live snapshots"}' && ${query.includes("cold") ? "true" : "document.getElementById('rx')?.textContent !== '—'"}` : "document.documentElement.dataset.browserCheck"};
       if (done) { clearInterval(timer); resolve(true); }
+    }, 100); })`);
+    if (replay) await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
+      if (parseInt(document.querySelector('#servers tbody tr td:nth-child(4) small')?.textContent.slice(4), 10) >= 300) {
+        clearInterval(timer); resolve();
+      }
     }, 100); })`);
     const layout = await evaluate(`({ width: innerWidth, scroll: document.documentElement.scrollWidth,
       fontHeight: document.getElementById('chart-max').getBoundingClientRect().height,
@@ -396,15 +457,25 @@ async function browser(query = "", screenshot, mobile = false) {
     assert.ok(layout.navFit, `all navigation items visible, no hidden horizontal scrolling: ${JSON.stringify(layout)}`);
     assert.ok(layout.helpPopups === true, `help popups fit and close on Escape: ${JSON.stringify(layout)}`);
     // A card may stretch to a neighbour's two-line note; a hidden sparkline used to add ~38px of dead space.
-    if (mobile) assert.ok(layout.cardGaps.every(gap => gap <= 28), `KPI cards keep compact bottoms on mobile: ${JSON.stringify(layout)}`);
+    if (mobile) {
+      assert.ok(layout.cardGaps.every(gap => gap <= 28), `KPI cards keep compact bottoms on mobile: ${JSON.stringify(layout)}`);
+      assert.ok(await evaluate(`(() => { const select = document.getElementById('usage-axis');
+        select.value = 'networks'; select.dispatchEvent(new Event('change'));
+        return document.getElementById('rank-networks').offsetWidth > 0 && !document.getElementById('rank-exits').offsetWidth;
+      })()`), 'mobile switches to provider ranks without sideways scrolling');
+    }
     assert.ok(layout.fontHeight >= 10, "chart axis labels are legible without SVG scaling");
     if (query.includes("cold")) {
       assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
       assert.ok(await evaluate("!document.getElementById('chart-empty').hidden"), "cold chart shows a collecting placeholder");
     }
     if (screenshot) {
+      await evaluate("window.scrollTo({top:0, behavior:'instant'})");
+      if (query.includes('view=now')) await evaluate("document.getElementById('usage-now').click(); document.getElementById('theme-toggle').click()");
+      if (query.includes('view=provider')) await evaluate("document.querySelector('#rank-networks button').click()");
+      const y = query.includes('view=provider') ? await evaluate("document.getElementById('flows-panel').getBoundingClientRect().top + scrollY - 8") : 0;
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
-        clip: { x: 0, y: 0, width, height, scale: 1 } });
+        clip: { x: 0, y, width, height, scale: 1 } });
       fs.writeFileSync(screenshot, Buffer.from(image.data, "base64"));
       if (query.includes("degraded")) {
         const jobs = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
@@ -426,8 +497,8 @@ try {
   console.log(`PASS Chrome dashboard: ${report.checks.length} UI assertions + viewport/axis checks`);
   const directory = process.env.DASHBOARD_SCREENSHOTS;
   if (directory) fs.mkdirSync(directory, { recursive: true });
-  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false]]) {
-    const name = `${scenario}${mobile ? "-mobile" : ""}.png`;
+  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=provider", false]] : [])]) {
+    const name = `${scenario.replace("normal&view=", "")}${mobile ? "-mobile" : ""}.png`;
     const layout = await browser(`?render=1&scenario=${scenario}`, directory ? path.join(directory, name) : undefined, mobile);
     console.log(`PASS layout ${name} (${layout.width}px viewport / ${layout.scroll}px document)${directory ? " + screenshot" : ""}`);
   }

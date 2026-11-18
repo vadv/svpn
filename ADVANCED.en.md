@@ -409,6 +409,8 @@ dashboard {
 
 What it shows:
 
+- **Where traffic goes** ranks the same hub-accounted inner IP bytes by actual exit (including local), destination ASN and destination IPv4. Choose *Since start* for volume including closed flows, or *Right now* for the last hub sampling interval in Mbit/s. Rank by RX+TX, received or sent; percentages use the selected direction. Select a name to inspect its currently visible flows, not a historical connection log.
+- ASN is pinned when the flow opens; a missing lookup goes to *Unknown ASN*. The snapshot retains up to 256 named IPs and 256 named ASNs per period. Smaller buckets fold into *Other · pooled*: totals stay exact, named entries may omit earlier evicted bytes. No disk history; restarting the client resets this accounting.
 - An overview: ready servers, RX/TX in Mbit/s, active connections and local-exit
   readiness. `ready` means the link is ready, not an end-to-end internet check.
 - A five-minute VPN-pool RX/TX chart. History lives only in the open tab; changing
