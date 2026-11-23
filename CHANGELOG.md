@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.7.0
 
 База стран для `countries`-селекторов — `server-country` из
 [ip-location-db](https://github.com/sapics/ip-location-db) вместо DB-IP Country
