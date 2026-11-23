@@ -51,7 +51,7 @@ pub struct ClientArgs {
     /// DB-IP ASN Lite CSV database for sticky-asn.
     #[arg(long, value_name = "FILE")]
     pub geo_db: Option<PathBuf>,
-    /// DB-IP Country Lite CSV database for country selectors.
+    /// Country CSV database (`start,end,CC`) for country selectors.
     #[arg(long, value_name = "FILE")]
     pub country_db: Option<PathBuf>,
     /// Explicit sticky groups (config-file only).

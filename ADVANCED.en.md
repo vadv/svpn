@@ -137,17 +137,20 @@ files are root-only:
 sudo install -d -m 700 /etc/svpn
 YEAR_MONTH=$(date +%Y-%m)
 
-curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
-gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+curl -fL "https://github.com/sapics/ip-location-db/releases/download/latest/server-country-ipv4.csv" -o /tmp/country.csv
+sudo install -m 600 /tmp/country.csv /etc/svpn/country.csv
 
 curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
 gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
 sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
-Country Lite determines the destination country (needed by `countries`
-selectors); ASN Lite determines the network (needed by `asn` selectors and
-`sticky-asn`). SVPN loads the CSV files at startup; after a manual update
+The country database is `server-country` from
+[ip-location-db](https://github.com/sapics/ip-location-db) (RIR statistics,
+BGP and operator geofeeds, published daily). It determines the destination
+country (needed by `countries` selectors); ASN Lite (DB-IP, monthly)
+determines the network (needed by `asn` selectors and `sticky-asn`). SVPN
+loads the CSV files at startup; after a manual update
 restart the service (`sudo systemctl restart svpn`) — or let a background
 job own the updates (next section): it replaces the file and svpn re-reads
 the table itself.

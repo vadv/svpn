@@ -138,16 +138,19 @@ root:
 sudo install -d -m 700 /etc/svpn
 YEAR_MONTH=$(date +%Y-%m)
 
-curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
-gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+curl -fL "https://github.com/sapics/ip-location-db/releases/download/latest/server-country-ipv4.csv" -o /tmp/country.csv
+sudo install -m 600 /tmp/country.csv /etc/svpn/country.csv
 
 curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
 gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
 sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
-Country Lite определяет страну назначения (нужна `countries`-селекторам),
-ASN Lite — сеть (нужна `asn`-селекторам и `sticky-asn`). SVPN загружает CSV
+База стран — `server-country` из
+[ip-location-db](https://github.com/sapics/ip-location-db) (статистика
+регистратур, BGP и geofeed'ы операторов, обновляется ежедневно) — определяет
+страну назначения (нужна `countries`-селекторам); ASN Lite (DB-IP, ежемесячно)
+— сеть (нужна `asn`-селекторами и `sticky-asn`). SVPN загружает CSV
 при запуске; при обновлении вручную перезапустите сервис (`sudo systemctl
 restart svpn`) — или доверьте обновление фоновому job'у (следующий раздел):
 он меняет файл и svpn перечитывает таблицу сам.

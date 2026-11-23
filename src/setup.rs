@@ -43,12 +43,12 @@ pub fn example(name: &str) -> Option<String> {
 /// for users who need their own mirror or schedule. Everyone else just sets
 /// `auto_job_update = true` in the database block and never sees this.
 fn job_update_example(spec: &crate::job::JobSpec) -> String {
-    let (tag, name) = match spec.reload.first() {
-        Some(crate::job::Reload::Geo) => ("geo", "ASN"),
-        _ => ("country", "Country"),
+    let (tag, source) = match spec.reload.first() {
+        Some(crate::job::Reload::Geo) => ("geo", "DB-IP ASN Lite, ежемесячно"),
+        _ => ("country", "server-country из ip-location-db, ежедневно"),
     };
     format!(
-        "# Автообновление {tag}-базы (DB-IP {name} Lite, ежемесячно).\n\
+        "# Автообновление {tag}-базы ({source}).\n\
 # Стандартный путь — без копирования этого блока:\n\
 #   {tag} {{ db = \"/etc/svpn/{tag}.csv\"; auto_job_update = true }}\n\
 # Блок ниже — отправная точка кастомизации (свой mirror, свой график).\n\

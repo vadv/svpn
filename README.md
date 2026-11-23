@@ -186,15 +186,16 @@ vpn.hcl` (код выхода — коду job'а). Для своего зерк
 sudo install -d -m 700 /etc/svpn
 YEAR_MONTH=$(date -u +%Y-%m)
 
-curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
-gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+curl -fL "https://github.com/sapics/ip-location-db/releases/download/latest/server-country-ipv4.csv" -o /tmp/country.csv
+sudo install -m 600 /tmp/country.csv /etc/svpn/country.csv
 
 curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
 gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
 sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
-Country DB отвечает на вопрос «какая страна у адреса», ASN DB — «какая сеть».
+Country DB (server-country из [ip-location-db](https://github.com/sapics/ip-location-db),
+обновляется ежедневно) отвечает на вопрос «какая страна у адреса», ASN DB — «какая сеть».
 Подключение режимов — в ADVANCED.
 
 ## Веб-морда

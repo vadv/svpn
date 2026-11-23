@@ -184,15 +184,16 @@ Once by hand (when jobs are not wanted):
 sudo install -d -m 700 /etc/svpn
 YEAR_MONTH=$(date -u +%Y-%m)
 
-curl -fL "https://download.db-ip.com/free/dbip-country-lite-${YEAR_MONTH}.csv.gz" -o /tmp/country.csv.gz
-gzip -dc /tmp/country.csv.gz | sudo tee /etc/svpn/country.csv >/dev/null
+curl -fL "https://github.com/sapics/ip-location-db/releases/download/latest/server-country-ipv4.csv" -o /tmp/country.csv
+sudo install -m 600 /tmp/country.csv /etc/svpn/country.csv
 
 curl -fL "https://download.db-ip.com/free/dbip-asn-lite-${YEAR_MONTH}.csv.gz" -o /tmp/asn.csv.gz
 gzip -dc /tmp/asn.csv.gz | sudo tee /etc/svpn/asn.csv >/dev/null
 sudo chmod 600 /etc/svpn/country.csv /etc/svpn/asn.csv
 ```
 
-Country DB answers “which country is this address”, ASN DB answers “which
+Country DB (server-country from [ip-location-db](https://github.com/sapics/ip-location-db),
+published daily) answers “which country is this address”, ASN DB answers “which
 network is it”. Enabling the modes is covered in ADVANCED.
 
 ## Web dashboard
