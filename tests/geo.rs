@@ -48,7 +48,7 @@ fn full_rows(extra: &[String]) -> Vec<String> {
     rows
 }
 
-/// The same fill in Country Lite format `ip_start,ip_end,country`.
+/// The same fill in country CSV format `ip_start,ip_end,country`.
 fn full_country_rows(extra: &[String]) -> Vec<String> {
     let mut rows: Vec<String> = (0..100_000u32)
         .map(|i| {

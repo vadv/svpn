@@ -79,41 +79,73 @@ impl JobSpec {
 /// Single source: `svpn example job-*-update` renders this back into a full
 /// job block for customization, so the template cannot drift from the preset.
 pub fn preset_update(kind: Reload) -> JobSpec {
-    let (label, db_env, tag, dbip, row_re) = match kind {
+    let (label, db_env, tag, row_re, url, archive, fresh) = match kind {
         Reload::Geo => (
             "geo-update",
             "SVPN_GEO_DB",
             "geo",
-            "asn",
             r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+",
+            "https://download.db-ip.com/free/dbip-asn-lite-$(date -u +%Y-%m).csv.gz",
+            true,
+            // Monthly issues: stale once the file is not from the current month.
+            r#"file_month=$(date -u -d "@$mtime" +%Y-%m 2>/dev/null || date -u -r "$mtime" +%Y-%m)
+[ -n "$file_month" ] || exit 1
+[ "$file_month" = "$(date -u +%Y-%m)" ] && exit 1
+exit 0"#,
         ),
+        // ip-location-db `server-country`: RIR statistics, BGP and operator
+        // geofeeds, public domain. Same `start,end,CC` rows as the DB-IP file
+        // it replaces, published daily as a plain CSV.
         Reload::Country => (
             "country-update",
             "SVPN_COUNTRY_DB",
             "country",
-            "country",
             r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,[A-Z][A-Z]$",
+            "https://github.com/sapics/ip-location-db/releases/download/latest/server-country-ipv4.csv",
+            false,
+            // Published daily: a day-old file is due for the next issue. A
+            // future mtime (the clock ran ahead) is refreshed too instead of
+            // staying fresh until the clock catches up.
+            r#"now=$(date +%s)
+[ "$mtime" -gt "$now" ] && exit 0
+[ $(( now - mtime )) -lt 86400 ] && exit 1
+exit 0"#,
         ),
     };
-    // Exit 0 means the database is stale: missing, or its month is not this
-    // month. BSD stat and GNU stat shadow each other depending on PATH, and
-    // GNU `stat -f` even exits 0 with filesystem garbage — validate the
-    // answer, not the exit code.
+    // Exit 0 means the database is stale: missing, or past its source's
+    // issue (`fresh`). BSD stat and GNU stat shadow each other depending on
+    // PATH, and GNU `stat -f` even exits 0 with filesystem garbage — validate
+    // the answer, not the exit code. OpenWrt ships no stat: there GNU and
+    // BusyBox `date -r FILE` read the age instead. An unknown age skips: a
+    // broken check never blind-runs the download.
     let run_if = format!(
         r#"db=${db_env}
 [ -n "$db" ] || exit 1
 [ -f "$db" ] || exit 0
 mtime=$(stat -f %m "$db" 2>/dev/null)
-case "$mtime" in ''|*[!0-9]*) mtime=$(stat -c %Y "$db") ;; esac
-file_month=$(date -u -d "@$mtime" +%Y-%m 2>/dev/null || date -u -r "$mtime" +%Y-%m)
-[ -n "$file_month" ] || exit 1
-[ "$file_month" = "$(date -u +%Y-%m)" ] && exit 1
-exit 0
-"#
+case "$mtime" in ''|*[!0-9]*) mtime=$(stat -c %Y "$db" 2>/dev/null) ;; esac
+case "$mtime" in ''|*[!0-9]*) mtime=$(date -r "$db" +%s 2>/dev/null) ;; esac
+case "$mtime" in ''|*[!0-9]*) echo "{label}: cannot read the age of $db" >&2; exit 1 ;; esac
+{fresh}
+"#,
     );
     // Staged download with size caps, row validation and an atomic install:
     // a broken mirror must not replace the database with garbage, and no
-    // partial files are left behind on any failure path.
+    // partial files are left behind on any failure path. `download` is where
+    // the transfer lands: an archive to unpack, or the CSV itself.
+    let (download, unpack) = if archive {
+        (
+            "$tmp.gz",
+            r#"
+# The unpacked file outgrows its archive: raise the cap to ~477 MiB
+# (976563 x 512-byte blocks).
+ulimit -f 976563 2>/dev/null || true
+gzip -dc "$tmp.gz" >"$tmp"
+rm -f "$tmp.gz""#,
+        )
+    } else {
+        ("$tmp", "")
+    };
     let run = format!(
         r#"set -eu
 db=${db_env}
@@ -121,22 +153,23 @@ dir=$(dirname "$db")
 mkdir -p "$dir"
 tmp=$(mktemp "$dir/{tag}.XXXXXX")
 trap 'rm -f "$tmp" "$tmp.gz"' EXIT
-url="https://download.db-ip.com/free/dbip-{dbip}-lite-$(date -u +%Y-%m).csv.gz"
+# Quota the download by file size, 100 MiB in 512-byte blocks: the kernel
+# stops the transfer whatever the client, and OpenWrt's uclient-fetch and
+# BusyBox wget have no size limit of their own.
+ulimit -f 204800 2>/dev/null || true
+url="{url}"
 case "$SVPN_OS" in
-  openwrt) wget -q -Q 104857600 -O "$tmp.gz" "$url" ;;
-  *) curl -fsSL --max-filesize 104857600 "$url" -o "$tmp.gz" ;;
+  openwrt) wget -q -O "{download}" "$url" ;;
+  *) curl -fsSL --max-filesize 104857600 "$url" -o "{download}" ;;
 esac
-[ "$(wc -c <"$tmp.gz")" -le 104857600 ] || {{ echo "{label}: download exceeds 100 MiB" >&2; exit 1; }}
-# Cap the expanded file (~477 MiB: 976563 x 512-byte blocks) before decompressing.
-ulimit -f 976563 2>/dev/null || true
-gzip -dc "$tmp.gz" >"$tmp"
-rm -f "$tmp.gz"
+[ "$(wc -c <"{download}")" -le 104857600 ] || {{ echo "{label}: download exceeds 100 MiB" >&2; exit 1; }}
+{unpack}
 # Validate rows, not lines: a same-sized pile of garbage must not pass.
 rows=$(grep -cE '{row_re}' "$tmp" || true)
 [ "$rows" -ge 100000 ] || {{ echo "{label}: suspicious download ($rows valid rows)" >&2; exit 1; }}
 mv "$tmp" "$db"
 echo "{label}: $rows rows installed"
-"#
+"#,
     );
     JobSpec {
         label: label.to_owned(),
