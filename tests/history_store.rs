@@ -36,7 +36,7 @@ fn a_new_file_is_empty_versioned_and_in_wal_mode() {
             &path,
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ),
-        table(["day", "hour", "meta", "minute", "series"])
+        table(["day", "hour", "meta", "minute", "names", "series"])
     );
 
     let opened = recover::open(&path).unwrap();

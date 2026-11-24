@@ -158,7 +158,7 @@ async fn recording_hub(tag: &str) -> Hub {
     let _ = std::fs::remove_dir_all(&dir);
     hub.routes.usage = Some(UsageMeter::default());
     std::fs::create_dir_all(&dir).unwrap();
-    let recorder = Recorder::spawn(dir.join("stats.sqlite"));
+    let recorder = Recorder::spawn(dir.join("stats.sqlite"), None);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while recorder.status().state == "checking" && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;

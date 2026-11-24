@@ -143,7 +143,8 @@ fn a_corrupt_page_costs_only_its_own_rows() {
         panic!("a corrupt page must be salvaged, not {:#?}", opened.outcome);
     };
     assert!(reason.contains("integrity_check"), "{reason}");
-    assert!(reason.contains("page 12"), "{reason}");
+    // SQLite numbers pages from one; the damage is where the test put it.
+    assert!(reason.contains(&format!("page {}", page + 1)), "{reason}");
     assert!(rows > 0, "nothing was kept");
     // The rows of the damaged page are gone; the rest of the file came along.
     let [kept, hours, _] = opened.store.rows().unwrap();

@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking, historyQuery, historyStack, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel, historyScale, historyAreas, historyMarks, historyTime, historyName } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -7,7 +7,7 @@ let frozen = null, page = 0, flowSignature = "";
 const serverRows = new Map();
 let period = "session", drill = null, usageFrame, usageStale;
 // What history is asked for and the last answer to it.
-const past = { range: "24h", kind: "link", link: "", direction: "total", data: null, fetched: -Infinity, error: "", loading: false, request: null };
+const past = { range: "24h", custom: null, kind: "link", link: "", direction: "total", data: null, fetched: -Infinity, error: "", invalid: "", loading: false, request: null, asked: "", live: true };
 const filters = ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"];
 const expandedRanks = new Set();
 let asnNames = Object.create(null), asnCount = 0, asnState = "idle", asnError = "", asnAbort = null, asnIdleTimer = null;
@@ -188,7 +188,8 @@ function inspectFlows(axis, key, label) {
 
 function freshness() {
   const stale = isStale();
-  if (!document.hidden && historyVisible() && latest?.history?.enabled && performance.now() - past.fetched >= 60000) void loadHistory();
+  // Yesterday and a custom window that ended in the past do not change: only a window reaching now is redrawn.
+  if (past.live && !document.hidden && historyVisible() && latest?.history?.enabled && performance.now() - past.fetched >= 60000) void loadHistory();
   if (usageFrame !== latest || usageStale !== stale) renderUsage(stale);
   document.body.classList.toggle("stale", stale && Boolean(latest));
   $("stale-notice").hidden = !latest || !stale;
@@ -233,17 +234,60 @@ function historyVisible() {
   return rect.bottom > 0 && rect.top < innerHeight;
 }
 
+// What is asked for. Yesterday and Custom carry their own window; the other
+// ranges leave it to the server.
+function historyAsk() {
+  return { range: past.range, kind: past.kind, link: past.link, from: past.custom?.from, to: past.custom?.to };
+}
+
+function askHistory() {
+  past.invalid = "";
+  // What was on screen stays until the answer is there: no blank chart in between.
+  past.error = ""; past.fetched = -Infinity;
+  past.live = historyLive(historyAsk());
+  renderHistory();
+  void loadHistory();
+}
+
+function chooseHistoryRange(range) {
+  past.range = range;
+  // Custom opens on the window it last showed, or on the last day.
+  if (range === "custom" && !past.custom) {
+    const now = Math.floor(Date.now() / 60000) * 60;
+    past.custom = { from: now - 86400, to: now };
+  }
+  if (range === "custom") {
+    $("history-from").value = historyInputValue(past.custom.from);
+    $("history-to").value = historyInputValue(past.custom.to);
+  }
+  askHistory();
+}
+
+function applyHistoryWindow() {
+  const custom = {
+    from: historyInputSeconds($("history-from").value),
+    to: historyInputSeconds($("history-to").value),
+  };
+  past.invalid = historyWindowError(custom) ?? "";
+  if (past.invalid) {
+    renderHistory();
+    return;
+  }
+  past.custom = custom;
+  askHistory();
+}
+
 async function loadHistory() {
   if (!latest?.history?.enabled) return;
+  const asked = historyQuery(historyAsk());
   // A request already out is left to finish unless it answers another question.
-  if (past.loading && past.asked === historyQuery(past)) return;
+  if (past.loading && past.asked === asked) return;
   past.request?.abort();
-  past.asked = historyQuery(past);
+  past.asked = asked;
   const request = new AbortController();
   past.request = request; past.loading = true;
-  const query = { range: past.range, kind: past.kind, link: past.link };
   try {
-    const response = await fetch(historyQuery(query), { cache: "no-store", signal: AbortSignal.any([request.signal, AbortSignal.timeout(5000)]) });
+    const response = await fetch(asked, { cache: "no-store", signal: AbortSignal.any([request.signal, AbortSignal.timeout(5000)]) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (past.request !== request) return;
@@ -263,7 +307,9 @@ function renderHistory() {
     button.disabled = !status.enabled;
     button.setAttribute("aria-pressed", String(button.dataset.range === past.range));
   }
-  for (const id of ["history-kind", "history-server", "history-direction"]) $(id).disabled = !status.enabled;
+  for (const id of ["history-kind", "history-server", "history-direction", "history-from", "history-to", "history-apply"]) $(id).disabled = !status.enabled;
+  // The inputs keep what was typed into them: they are filled when Custom opens and after Apply.
+  $("history-custom").hidden = past.range !== "custom";
   if (latest) {
     $("history-kind").value = past.kind; $("history-direction").value = past.direction;
     options($("history-server"), [["", "All servers"], ...latest.servers.map(server => [server.id, name(server.id)]),
@@ -274,10 +320,11 @@ function renderHistory() {
   }
   // One sentence says why there is nothing to draw; an error of the database is the loud case.
   const trouble = latest && status.enabled && (status.state === "error" || past.error);
-  const note = !latest ? "" : !status.enabled ? "History is off. Add a stats block to the client config to keep it."
+  const state = !latest ? "" : !status.enabled ? "History is off. Add a stats block to the client config to keep it."
     : status.state === "checking" ? "Opening the history database…"
     : status.state === "error" ? `History is not being recorded: ${status.error}`
     : past.error ? `History unavailable: ${past.error}` : "";
+  const note = past.range === "custom" && past.invalid ? past.invalid : state;
   $("history-note").textContent = note;
   $("history-note").className = `history-note${trouble ? " bad" : ""}`;
   $("history-note").hidden = !note;
@@ -291,6 +338,7 @@ function drawHistory() {
   const bands = [];
   const legend = [];
   const rows = [];
+  $("history-resolution").textContent = stack?.count ? historyStepLabel(stack.step) : "";
   if (stack?.count && latest) {
     const { top, mid } = historyScale(stack.peak);
     const paths = historyAreas(stack, top);
@@ -301,6 +349,7 @@ function drawHistory() {
     $("history-mid").textContent = rate(mid);
     let seen = 0;
     stack.series.forEach((item, index) => {
+      const named = historyName(item, latest.servers, latest.rules, asnNames);
       // A series nobody recorded in this window is not drawn, only listed.
       if (item.points.length) {
         // createElement would make an HTML element, which SVG never draws.
@@ -309,11 +358,10 @@ function drawHistory() {
         band.setAttribute("d", paths[index]);
         bands.push(band);
         const entry = node("span", "", `legend-item series cat-${seen % 8 + 1}`);
-        entry.append(node("i", "", ""), node("span", historyName(item, latest.servers, latest.rules, asnNames).label));
+        entry.append(node("i", "", ""), node("span", named.label));
         legend.push(entry);
         seen++;
       }
-      const named = historyName(item, latest.servers, latest.rules, asnNames);
       const shown = past.direction === "rx" ? item.rx_bytes : past.direction === "tx" ? item.tx_bytes : item.rx_bytes + item.tx_bytes;
       rows.push([
         cell(named.via && past.kind !== "link" ? title(named.label, `via ${named.via}`) : named.label),
@@ -603,12 +651,13 @@ function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidd
 for (const [id, value] of [["usage-session", "session"], ["usage-now", "interval"]]) $(id).addEventListener("click", () => { period = value; renderUsage(isStale()); });
 $("usage-axis").addEventListener("change", () => { $("usage-ranks").dataset.axis = $("usage-axis").value; });
 $("usage-direction").addEventListener("change", () => renderUsage(isStale()));
-for (const button of $("history-ranges").querySelectorAll("[data-range]")) button.addEventListener("click", () => { past.range = button.dataset.range; past.fetched = -Infinity; renderHistory(); void loadHistory(); });
+for (const button of $("history-ranges").querySelectorAll("[data-range]")) button.addEventListener("click", () => chooseHistoryRange(button.dataset.range));
+$("history-apply").addEventListener("click", applyHistoryWindow);
+for (const id of ["history-from", "history-to"]) $(id).addEventListener("keydown", event => { if (event.key === "Enter") applyHistoryWindow(); });
 for (const id of ["history-kind", "history-server", "history-direction"]) $(id).addEventListener("change", () => {
   past.kind = $("history-kind").value; past.link = $("history-server").value; past.direction = $("history-direction").value;
   // Another breakdown has no use for the previous answer; another direction redraws it.
-  if (id !== "history-direction") { past.data = null; past.error = ""; past.fetched = -Infinity; void loadHistory(); }
-  renderHistory();
+  if (id !== "history-direction") askHistory(); else renderHistory();
 });
 for (const axis of rankAxes) $(`rank-${axis}`).nextElementSibling.addEventListener("click", () => {
   if (expandedRanks.has(axis)) expandedRanks.delete(axis); else expandedRanks.add(axis);

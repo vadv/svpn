@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const chrome = process.env.CHROME || (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/google-chrome");
 assert.ok(fs.existsSync(chrome), `Chrome not found: ${chrome}; set CHROME to an installed browser`);
 const epoch = Date.now();
-let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0, historyRequests = 0;
+let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0, historyRequests = 0, historyLast = "";
 
 // Same packets on all three axes. 198.51.100.80 is already closed; unknown and
 // pooled contributions keep their bytes even though neither has a provider name.
@@ -117,11 +117,22 @@ function frame() {
 // One answer of /api/history per kind. The first fifth of every range was not
 // recorded, as when the client was off; the rest carries steady traffic.
 function historyFixture(url) {
-  const range = url.searchParams.get("range"), kind = url.searchParams.get("kind"), link = url.searchParams.get("link");
-  const length = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[range];
-  const step = { "1h": 60, "24h": 240, "7d": 3600, "30d": 86400 }[range];
-  if (!length || !["link", "rule", "network"].includes(kind)) return null;
-  const to = Math.floor(Date.now() / 1000 / step) * step, from = to - length;
+  const kind = url.searchParams.get("kind"), link = url.searchParams.get("link"), range = url.searchParams.get("range");
+  if (!["link", "rule", "network"].includes(kind)) return null;
+  const now = Math.floor(Date.now() / 1000);
+  let from, to, step, name = range;
+  if (range) {
+    const length = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[range];
+    step = { "1h": 60, "24h": 240, "7d": 3600, "30d": 86400 }[range];
+    if (!length) return null;
+    to = Math.floor(now / step) * step; from = to - length;
+  } else {
+    // A picked window, as the server answers it: a start older than a day comes by the hour.
+    from = Number(url.searchParams.get("from")); to = Math.min(Number(url.searchParams.get("to")), now);
+    step = now - from > 86400 + 900 ? 3600 : 240; name = "custom";
+    if (!(to > from) || to - from > 30 * 86400) return null;
+    from -= from % step; to -= to % step;
+  }
   const all = {
     link: [{ kind: "link", link: "nl.example.test", rule: null, asn: null, rx: 1000000, tx: 200000 },
       { kind: "link", link: "de.example.test", rule: null, asn: null, rx: 500000, tx: 100000 },
@@ -129,14 +140,16 @@ function historyFixture(url) {
     rule: [{ kind: "rule", link: "nl.example.test", rule: "names: anthropic.com,claude.ai", asn: null, rx: 900000, tx: 100000 },
       { kind: "rule", link: "local", rule: "cc:RU,BY", asn: null, rx: 100000, tx: 0 },
       { kind: "rule", link: "de.example.test", rule: "fallback", asn: null, rx: 500000, tx: 100000 }],
-    network: [{ kind: "network", link: "nl.example.test", rule: null, asn: 13335, rx: 900000, tx: 100000 },
-      { kind: "network", link: "de.example.test", rule: null, asn: 15169, rx: 500000, tx: 100000 }],
+    // The server names networks from its own ASN CSV; 24429 is in no browser copy.
+    network: [{ kind: "network", link: "nl.example.test", rule: null, asn: 13335, asn_name: "Cloudflare, Inc.", rx: 900000, tx: 100000 },
+      { kind: "network", link: "de.example.test", rule: null, asn: 15169, asn_name: "Google LLC", rx: 500000, tx: 100000 },
+      { kind: "network", link: "nl.example.test", rule: null, asn: 24429, asn_name: "Alibaba (US) Technology Co., Ltd.", rx: 250000, tx: 300000 }],
   };
   const series = all[kind].filter(item => !link || item.link === link).map(({ rx, tx, ...item }) => {
-    const points = Array.from({ length: length / step }, (_, i) => [from + i * step, rx, tx]).slice(Math.floor(length / step / 5));
+    const points = Array.from({ length: (to - from) / step }, (_, i) => [from + i * step, rx, tx]).slice(Math.floor((to - from) / step / 5));
     return { ...item, rx_bytes: rx * points.length, tx_bytes: tx * points.length, active_avg: 2, points };
   });
-  return { range, kind, step, from, to, series };
+  return { range: name, kind, step, from, to, series };
 }
 
 // This extra module is injected only by the fixture server, never shipped by SVPN.
@@ -146,7 +159,8 @@ const checks = [];
 function assert(value, label) { if (!value) throw new Error(label); checks.push(label); }
 async function until(condition, label, limit = 7000) {
   const start = performance.now();
-  while (!condition()) { if (performance.now() - start > limit) throw new Error('Timed out: ' + label); await new Promise(resolve => setTimeout(resolve, 100)); }
+  // A condition may be async: one that asks the fixture server.
+  while (!(await condition())) { if (performance.now() - start > limit) throw new Error('Timed out: ' + label); await new Promise(resolve => setTimeout(resolve, 100)); }
 }
 async function control(scenario) { return fetch('/fixture?scenario=' + scenario).then(response => response.json()); }
 function input(id, value) { $(id).value = value; $(id).dispatchEvent(new Event(id === 'flow-search' ? 'input' : 'change')); }
@@ -222,7 +236,7 @@ try {
   // History is read once its section is in view, then once a minute at most.
   $('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
   await until(() => $('history-bands').children.length === 3, 'history bands');
-  const historyReads = (await control('normal')).history_requests;
+  let historyReads = (await control('normal')).history_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).history_requests === historyReads, 'history is not fetched by one-second snapshot polling');
   assert(['cat-1', 'cat-2', 'cat-3'].every((name, i) => $('history-bands').children[i].classList.contains(name)), 'history series take the categorical palette in rank order');
@@ -234,23 +248,53 @@ try {
   assert([...$('history-axis').children].every(span => /^[0-9]{2}:[0-9]{2}$/.test(span.textContent)), 'a day of history is labelled with clock times');
   assert(/^M[0-9.]+,[0-9.]+ L/.test($('history-bands').children[0].getAttribute('d')) && !$('history-empty').offsetParent, 'recorded minutes draw as stacked bands');
   assert([...$('history-bands').children].every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).fill !== 'none') && $('history-bands').children[0].getBoundingClientRect().height > 40, 'bands are SVG paths that rise from the baseline with a fill of their own: ' + JSON.stringify([...$('history-bands').children].map(band => [band.getBoundingClientRect().height, getComputedStyle(band).fill])));
+  assert($('history-resolution').textContent === 'Every 4 min', 'history says how wide its points are');
+  // A pressed first button keeps its own border where the next one overlaps it, in every segmented group.
+  const rangeButton = name => document.querySelector('#history-ranges [data-range="' + name + '"]');
+  rangeButton('1h').click();
+  await until(() => $('history-resolution').textContent === 'Every minute' && $('history-bands').children.length === 3, 'one hour of history');
+  assert(rangeButton('1h').getAttribute('aria-pressed') === 'true' && getComputedStyle(rangeButton('1h')).zIndex === '1' && getComputedStyle(rangeButton('24h')).zIndex === 'auto' && getComputedStyle($('usage-session')).zIndex === '1', 'a pressed button sits above its neighbours whoever it is');
+  rangeButton('24h').click();
+  await until(() => $('history-resolution').textContent === 'Every 4 min', 'back to a day of history');
+  historyReads = (await control('normal')).history_requests;
   input('history-direction', 'tx');
   assert(historyRow(0)[4] === '66.7%' && (await control('normal')).history_requests === historyReads, 'another direction redraws the same answer');
   input('history-kind', 'network');
-  await until(() => $('history-bands').children.length === 2, 'network history');
+  await until(() => $('history-legend').textContent.includes('AS13335'), 'network history');
+  assert($('history-bands').children.length === 3, 'the twenty busiest networks are drawn, here all three');
   assert($('history-legend').textContent.includes('AS13335 · Cloudflare, Inc.') && $('history').tBodies[0].rows[0].cells[0].textContent.includes('via NL'), 'networks are named by ASN and organization, the exit is the second line');
+  assert($('history-legend').textContent.includes('AS24429 · Alibaba (US) Technology Co., Ltd.'), 'a network is named by the server, with no browser copy of the ASN CSV');
   input('history-server', 'de.example.test');
   await until(() => $('history-bands').children.length === 1, 'history of one server');
   assert($('history-legend').textContent.includes('AS15169 · Google LLC'), 'the server filter narrows the series');
   document.querySelector('#history-ranges [data-range="7d"]').click();
   await until(() => $('history-axis').children[0].textContent.includes(' '), 'week of history');
   assert(document.querySelector('#history-ranges [data-range="7d"]').getAttribute('aria-pressed') === 'true' && [...$('history-axis').children].every(span => /^[A-Z][a-z][a-z] [0-9]+ [A-Z][a-z][a-z]$/.test(span.textContent)) && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'range buttons state the choice and the axis names the days: ' + JSON.stringify([...$('history-axis').children].map(span => span.textContent)));
+  // Yesterday is one click: the whole local day before this one, by the hour.
+  rangeButton('yesterday').click();
+  await until(() => $('history-resolution').textContent === 'Every hour' && $('history-axis').children[1].textContent !== $('history-axis').children[3].textContent, 'yesterday');
+  const yesterday = new URLSearchParams((await control('normal')).history_last);
+  const midnight = new Date(Number(yesterday.get('to')) * 1000);
+  assert(yesterday.has('from') && yesterday.has('to') && !yesterday.has('range') && midnight.getHours() === 0 && midnight.getMinutes() === 0 && Math.round((Number(yesterday.get('to')) - Number(yesterday.get('from'))) / 3600) === 24 && rangeButton('yesterday').getAttribute('aria-pressed') === 'true', 'Yesterday asks for the whole local day before this one');
+  // Custom opens on the last day and takes any window of up to 30 days.
+  rangeButton('custom').click();
+  await until(() => !$('history-custom').hidden && $('history-resolution').textContent === 'Every 4 min', 'custom window');
+  assert(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$/.test($('history-from').value) && $('history-to').value > $('history-from').value, 'the picker is filled with the last day');
+  $('history-to').value = $('history-from').value; $('history-apply').click();
+  assert($('history-note').textContent === 'The end comes after the start' && !$('history-note').classList.contains('bad'), 'a custom window with its ends reversed is refused in place');
+  const pad = value => String(value).padStart(2, '0'), day = date => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
+  const first = new Date(), last = new Date(); first.setDate(first.getDate() - 2); last.setDate(last.getDate() - 1);
+  $('history-from').value = day(first) + 'T03:30'; $('history-to').value = day(last) + 'T21:15'; $('history-apply').click();
+  const asked = '?from=' + Math.floor(new Date(day(first) + 'T03:30').getTime() / 1000) + '&to=' + Math.floor(new Date(day(last) + 'T21:15').getTime() / 1000) + '&';
+  const firstLabel = new Date(day(first) + 'T03:30').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+  await until(async () => (await control('normal')).history_last.startsWith(asked) && $('history-axis').children[0].textContent === firstLabel, 'the picked window');
+  assert($('history-note').hidden && rangeButton('custom').getAttribute('aria-pressed') === 'true' && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'the picked window is drawn by the hour');
   await control('history-error');
   await until(() => $('history-note').textContent.includes('not being recorded'), 'history error is visible');
   assert($('history-note').classList.contains('bad') && $('history-note').textContent.includes('disk I/O error') && $('history-bands').children.length === 1, 'a failing history database is the loud case, the last answer stays drawn');
   await control('history-off');
   await until(() => $('history-note').textContent.includes('History is off'), 'history off is explained');
-  assert($('history-kind').disabled && document.querySelector('#history-ranges [data-range="7d"]').disabled && !$('history-note').classList.contains('bad'), 'history controls are quiet while history is off');
+  assert($('history-kind').disabled && $('history-from').disabled && $('history-apply').disabled && rangeButton('custom').disabled && !$('history-note').classList.contains('bad'), 'history controls are quiet while history is off');
   await control('normal');
   await until(() => !$('history-kind').disabled, 'history recovers');
   input('history-server', ''); input('history-kind', 'link');
@@ -393,7 +437,7 @@ const server = http.createServer((request, response) => {
     scenario = url.searchParams.get("scenario");
     if (scenario === "restart") { generation++; scenario = "normal"; }
     response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000, asn_requests: namesRequests, history_requests: historyRequests }));
+    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000, asn_requests: namesRequests, history_requests: historyRequests, history_last: historyLast }));
     return;
   }
   if (url.pathname === "/api/asn.csv") {
@@ -405,7 +449,7 @@ const server = http.createServer((request, response) => {
     setTimeout(() => response.end(csv), 500); return;
   }
   if (url.pathname === "/api/history") {
-    historyRequests++;
+    historyRequests++; historyLast = url.search;
     if (scenario === "history-off") { response.writeHead(503); response.end("history is off"); return; }
     if (scenario === "history-error") { response.writeHead(503); response.end("1 minute is waiting: disk I/O error"); return; }
     const answer = historyFixture(url);

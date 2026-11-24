@@ -62,6 +62,46 @@ fn the_query_string_rejects_what_it_does_not_know() {
     assert!(Query::parse(&format!("link={long}")).is_err());
 }
 
+#[test]
+fn a_custom_window_is_two_unix_seconds_no_further_apart_than_a_month() {
+    let custom = Query::parse("from=1000&to=2000&kind=network").unwrap();
+    assert_eq!(
+        custom,
+        Query {
+            range: Range::Custom {
+                from: 1000,
+                to: 2000
+            },
+            kind: Kind::Network,
+            link: None,
+            top: 8,
+        }
+    );
+    for query in [
+        "from=1000",
+        "to=2000",
+        "from=2000&to=1000",
+        "from=5&to=5",
+        &format!("from=0&to={}", 30 * DAY + 1),
+        "range=24h&from=0&to=60",
+        "from=a&to=60",
+        "from=1&to=-1",
+        "from=1&to=1e9",
+        "from=1&from=2&to=60",
+    ] {
+        assert!(Query::parse(query).is_err(), "{query}");
+    }
+    assert_eq!(
+        Query::parse(&format!("from=0&to={}", 30 * DAY))
+            .unwrap()
+            .range,
+        Range::Custom {
+            from: 0,
+            to: 30 * DAY
+        }
+    );
+}
+
 // ── answers ──
 
 #[test]
@@ -222,6 +262,128 @@ fn long_ranges_come_from_the_coarse_tiers_in_thinned_buckets() {
 }
 
 #[test]
+fn a_custom_window_is_answered_by_the_tier_that_still_holds_it() {
+    // Two days and six hours of data: every tier has rows by now.
+    let (_, store) = history("custom", 2 * DAY / HOUR + 6);
+    let now = START + 2 * DAY + 6 * HOUR - 7 * MINUTE;
+    let window = |from, to| Query {
+        range: Range::Custom { from, to },
+        kind: Kind::Link,
+        link: Some(B.to_owned()),
+        top: 8,
+    };
+
+    // Inside the last day the minutes are all there.
+    let recent = store.query(&window(now - 2 * HOUR, now), now).unwrap();
+    assert_eq!((recent.range, recent.step), ("custom", MINUTE));
+    assert_eq!(
+        (recent.from, recent.to),
+        (now / MINUTE * MINUTE - 2 * HOUR, now / MINUTE * MINUTE)
+    );
+    assert_eq!(recent.series[0].points.len(), 120);
+    assert_eq!(recent.series[0].rx_bytes, 2000 * 120);
+    assert_eq!(recent.series[0].points[0], [recent.from, 2000, 1]);
+
+    // A day and more back only the folded hours are left: yesterday, whole.
+    let yesterday = store
+        .query(&window(START + DAY, START + 2 * DAY), now)
+        .unwrap();
+    assert_eq!(
+        (yesterday.step, yesterday.from, yesterday.to),
+        (HOUR, START + DAY, START + 2 * DAY)
+    );
+    assert_eq!(yesterday.series[0].points.len(), 24);
+    assert_eq!(yesterday.series[0].points[0], [START + DAY, 2000 * 60, 60]);
+    assert_eq!(yesterday.series[0].rx_bytes, 2000 * 60 * 24);
+
+    // Older than a week only the days are.
+    let (_, store) = history("custom-old", 8 * DAY / HOUR);
+    let now = START + 8 * DAY;
+    let days = store.query(&window(START, START + 3 * DAY), now).unwrap();
+    assert_eq!(
+        (days.step, days.from, days.to),
+        (DAY, START, START + 3 * DAY)
+    );
+    assert_eq!(days.series[0].points.len(), 3);
+    assert_eq!(
+        days.series[0].points[2],
+        [START + 2 * DAY, 2000 * 1440, 1440]
+    );
+    // A start less than a week old still has its hours; starts and ends
+    // sit on the step of their tier.
+    let tilted = store
+        .query(
+            &window(START + DAY + 20 * MINUTE, START + 2 * DAY - 20 * MINUTE),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        (tilted.step, tilted.from, tilted.to),
+        (HOUR, START + DAY, START + 2 * DAY - HOUR)
+    );
+    assert_eq!(tilted.series[0].points.len(), 23);
+    // A window shorter than one step holds nothing.
+    let sliver = store
+        .query(
+            &window(START + 3 * DAY + 20 * MINUTE, START + 3 * DAY + 40 * MINUTE),
+            now,
+        )
+        .unwrap();
+    assert!(sliver.series.is_empty());
+    // "The last day" is a few seconds past a day old when it is asked for:
+    // a quarter of an hour of slack keeps it by the minute.
+    let edge = |ago| window(now - ago, now);
+    let tier = |ago| store.query(&edge(ago), now).unwrap().step;
+    assert!(tier(DAY + 10 * MINUTE) < HOUR, "still by the minute");
+    assert_eq!(tier(DAY + 16 * MINUTE), HOUR);
+    assert_eq!(tier(7 * DAY + 10 * MINUTE), HOUR);
+    assert_eq!(tier(7 * DAY + 16 * MINUTE), DAY);
+    // A window still running stops at now.
+    let running = store
+        .query(&window(now - 2 * DAY - 30 * MINUTE, now + HOUR), now)
+        .unwrap();
+    assert_eq!(
+        (running.step, running.from, running.to),
+        (HOUR, now - 2 * DAY - HOUR, now)
+    );
+}
+
+#[test]
+fn a_named_network_carries_its_organization() {
+    let (_, mut store) = history("names", DAY / HOUR);
+    store
+        .name_networks(&[(15169, "Google LLC".to_owned()), (4134, String::new())])
+        .unwrap();
+
+    let answer = store
+        .query(
+            &Query {
+                range: Range::Day,
+                kind: Kind::Network,
+                link: None,
+                top: 8,
+            },
+            START + DAY,
+        )
+        .unwrap();
+
+    let named: Vec<(Option<u32>, Option<&str>)> = answer
+        .series
+        .iter()
+        .map(|series| (series.asn, series.asn_name.as_deref()))
+        .collect();
+    // An empty name is one the CSV does not give: it answers as null.
+    assert_eq!(
+        named,
+        [
+            (Some(4134), None),
+            (Some(31133), None),
+            (Some(15169), Some("Google LLC")),
+        ]
+    );
+}
+
+#[test]
 fn a_range_without_history_answers_with_no_series() {
     let path = database("empty");
     let store = recover::open(&path).unwrap().store;
@@ -247,7 +409,7 @@ fn a_range_without_history_answers_with_no_series() {
 #[tokio::test]
 async fn the_thread_opens_the_database_and_answers_through_the_hub() {
     let path = database("thread");
-    let recorder = Recorder::spawn(path.clone());
+    let recorder = Recorder::spawn(path.clone(), None);
     assert_eq!(recorder.status().state, "checking");
 
     let status = settled(&recorder).await;
@@ -278,7 +440,7 @@ async fn a_database_that_cannot_open_is_an_error_in_the_status_and_nothing_else(
     // A directory where the file should be: no build can open that.
     let path = database("not-a-file");
     std::fs::create_dir_all(&path).unwrap();
-    let recorder = Recorder::spawn(path);
+    let recorder = Recorder::spawn(path, None);
 
     let status = settled(&recorder).await;
     assert_eq!(status.state, "error");
@@ -302,7 +464,68 @@ async fn a_database_that_cannot_open_is_an_error_in_the_status_and_nothing_else(
     recorder.close();
 }
 
+#[tokio::test]
+async fn networks_are_named_from_the_asn_csv_without_the_browser() {
+    let dir = database("csv");
+    let csv = dir.with_file_name("asn.csv");
+    std::fs::write(
+        &csv,
+        "\"1.0.0.0\",\"1.0.0.255\",\"13335\",\"Cloudflare, Inc.\"\n\
+         \"2.0.0.0\",\"2.0.0.255\",15169,Google LLC\n\
+         \"3.0.0.0\",\"3.0.0.255\",\"13335\",\"A later row of the same network\"\n",
+    )
+    .unwrap();
+    let recorder = Recorder::spawn(dir, Some(csv));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    recorder.record(
+        now / MINUTE * MINUTE - 2 * MINUTE,
+        vec![network(15169), network(13335), network(99999)],
+    );
+
+    // The thread names what it wrote; a network the CSV lacks stays unnamed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let named = loop {
+        let answer = answered(&recorder, Kind::Network, 3).await;
+        let named: Vec<(u32, Option<String>)> = answer
+            .series
+            .iter()
+            .map(|series| (series.asn.unwrap_or(0), series.asn_name.clone()))
+            .collect();
+        let done = named.iter().any(|(asn, _)| *asn == 15169)
+            && named.iter().filter(|(_, name)| name.is_some()).count() == 2;
+        if done || std::time::Instant::now() > deadline {
+            break named;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    recorder.close();
+    let mut named = named;
+    named.sort();
+    assert_eq!(
+        named,
+        vec![
+            (13335, Some("Cloudflare, Inc.".to_owned())),
+            (15169, Some("Google LLC".to_owned())),
+            (99999, None),
+        ]
+    );
+}
+
 // ── helpers ──
+
+fn network(asn: u32) -> Row {
+    Row {
+        series: Series::Network {
+            link: A.to_owned(),
+            asn,
+        },
+        rx_bytes: 1000,
+        ..zero()
+    }
+}
 
 fn traffic(link: &str, rx_bytes: u64, tx_bytes: u64) -> Row {
     Row {

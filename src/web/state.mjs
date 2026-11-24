@@ -436,8 +436,60 @@ export function mimicCell(selection, configured = []) {
 
 // ── History kept on the client ──
 
-export const historyQuery = ({ range, kind, link = "" }) =>
-  `/api/history?range=${range}&kind=${kind}&top=8${link ? `&link=${encodeURIComponent(link)}` : ""}`;
+// Ranges the server works out itself end now. Yesterday and Custom send
+// their window instead: unix seconds at both ends, at most 30 days apart.
+export const HISTORY_PRESETS = ["1h", "24h", "7d", "30d"];
+export const HISTORY_MAX_WINDOW = 30 * 86400;
+
+// Yesterday of the browser's own calendar: from midnight to midnight, as
+// long as that day really was (a clock change makes it 23 or 25 hours).
+export function historyYesterday(now = Date.now()) {
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  return {
+    from: Math.floor(yesterday.getTime() / 1000),
+    to: Math.floor(today.getTime() / 1000),
+  };
+}
+
+export function historyQuery({ range, kind, link = "", from = 0, to = 0 }, now = Date.now()) {
+  const picked = range === "yesterday" ? historyYesterday(now) : { from, to };
+  const window = HISTORY_PRESETS.includes(range) ? `range=${range}` : `from=${picked.from}&to=${picked.to}`;
+  return `/api/history?${window}&kind=${kind}&top=8${link ? `&link=${encodeURIComponent(link)}` : ""}`;
+}
+
+// Whether a window is redrawn once a minute: only one that reaches "now".
+export const historyLive = ({ range, from = 0, to = 0 }, now = Date.now()) =>
+  HISTORY_PRESETS.includes(range) || (range === "custom" && to >= Math.floor(now / 1000) - 120);
+
+// What may be asked of a custom window. Null when it may.
+export function historyWindowError({ from, to }) {
+  if (from == null || to == null) return "Pick both ends of the window";
+  if (from >= to) return "The end comes after the start";
+  if (to - from > HISTORY_MAX_WINDOW) return "A window is at most 30 days";
+  return null;
+}
+
+// A datetime-local input takes local wall time in this exact shape, and
+// gives a string the Date constructor reads as local wall time too.
+export function historyInputValue(seconds) {
+  const date = new Date(seconds * 1000), pad = value => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+export function historyInputSeconds(value) {
+  const milliseconds = new Date(value).getTime();
+  return value && Number.isFinite(milliseconds) ? Math.floor(milliseconds / 1000) : null;
+}
+
+// How wide one point of the answer is, in words.
+export function historyStepLabel(step) {
+  if (step % 86400 === 0) return step === 86400 ? "Every day" : `Every ${step / 86400} days`;
+  if (step % 3600 === 0) return step === 3600 ? "Every hour" : `Every ${step / 3600} h`;
+  return step === 60 ? "Every minute" : `Every ${step / 60} min`;
+}
 
 // One answer of /api/history as the chart draws it: a value per series and
 // bucket, in bytes. A bucket without a single point is time nothing was
@@ -532,5 +584,6 @@ export function historyName(item, servers = [], rules = [], names = {}) {
     const rule = rules.find(rule => rule.canonical === item.rule);
     return { label: rule?.label ?? (item.rule === "fallback" ? "Fallback" : item.rule), via };
   }
-  return { label: asnLabel(item.asn, names), via };
+  // The server names the network from its own ASN CSV; the browser's copy is the fallback.
+  return { label: asnLabel(item.asn, item.asn_name ? { [item.asn]: item.asn_name } : names), via };
 }

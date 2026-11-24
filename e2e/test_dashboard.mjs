@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName, historyYesterday, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel } from "../src/web/state.mjs";
 
 test("usage ranks raw bytes, not formatted strings, and includes the pooled share", () => {
   const entries = [["a", "Small", { rx_bytes: 99, tx_bytes: 0 }], ["b", "Big", { rx_bytes: 1024, tx_bytes: 4 }], [null, "Other", { rx_bytes: 0, tx_bytes: 7 }]];
@@ -577,4 +577,43 @@ test("history series are named by server label, rule label and ASN, the exit kep
   assert.deepEqual(historyName({ kind: "rule", link: "nl.example.test:22", rule: "asn:1" }, servers, rules), { label: "asn:1", via: "NL" });
   assert.deepEqual(historyName({ kind: "network", link: "nl.example.test:22", asn: 13335 }, servers, rules), { label: "AS13335", via: "NL" });
   assert.deepEqual(historyName({ kind: "network", link: "nl.example.test:22", asn: 13335 }, servers, rules, { 13335: "Cloudflare" }), { label: "AS13335 · Cloudflare", via: "NL" });
+});
+
+test("history windows: yesterday is the browser's own calendar day, a custom one is validated", () => {
+  const now = new Date(2026, 10, 24, 19, 42, 13).getTime();
+  const yesterday = { from: new Date(2026, 10, 23).getTime() / 1000, to: new Date(2026, 10, 24).getTime() / 1000 };
+  assert.deepEqual(historyYesterday(now), yesterday);
+  assert.equal(historyQuery({ range: "yesterday", kind: "link" }, now), `/api/history?from=${yesterday.from}&to=${yesterday.to}&kind=link&top=8`);
+  assert.equal(historyQuery({ range: "custom", kind: "network", from: 10, to: 20, link: "a b" }), "/api/history?from=10&to=20&kind=network&top=8&link=a%20b");
+  assert.equal(historyQuery({ range: "7d", kind: "link" }), "/api/history?range=7d&kind=link&top=8");
+  // Only a window that reaches now is worth asking for again.
+  assert.equal(historyLive({ range: "24h" }, now), true);
+  assert.equal(historyLive({ range: "yesterday" }, now), false);
+  assert.equal(historyLive({ range: "custom", from: 1, to: Math.floor(now / 1000) }, now), true);
+  assert.equal(historyLive({ range: "custom", from: 1, to: 2 }, now), false);
+  assert.equal(historyWindowError({ from: null, to: 2 }), "Pick both ends of the window");
+  assert.equal(historyWindowError({ from: 5, to: 5 }), "The end comes after the start");
+  assert.equal(historyWindowError({ from: 0, to: 31 * 86400 }), "A window is at most 30 days");
+  assert.equal(historyWindowError({ from: 0, to: 30 * 86400 }), null);
+  // The picker's own shape goes in and comes out as the same moment.
+  const value = historyInputValue(Math.floor(now / 1000));
+  assert.equal(value, "2026-11-24T19:42");
+  // The picker works to the minute.
+  assert.equal(historyInputSeconds(value), Math.floor(now / 60000) * 60);
+  assert.equal(historyInputSeconds(""), null);
+  assert.equal(historyInputSeconds("not a time"), null);
+});
+
+test("a history answer says how wide its points are, and the server's network name wins", () => {
+  assert.equal(historyStepLabel(60), "Every minute");
+  assert.equal(historyStepLabel(240), "Every 4 min");
+  assert.equal(historyStepLabel(3600), "Every hour");
+  assert.equal(historyStepLabel(7200), "Every 2 h");
+  assert.equal(historyStepLabel(86400), "Every day");
+  assert.equal(historyStepLabel(3 * 86400), "Every 3 days");
+  const network = { kind: "network", link: "nl.example.test", asn: 24429 };
+  const browser = { 24429: "From the browser" };
+  assert.deepEqual(historyName({ ...network, asn_name: "From the server" }, [], [], browser), { label: "AS24429 · From the server", via: "nl.example.test" });
+  assert.deepEqual(historyName(network, [], [], browser), { label: "AS24429 · From the browser", via: "nl.example.test" });
+  assert.deepEqual(historyName(network, [], [], {}), { label: "AS24429", via: "nl.example.test" });
 });

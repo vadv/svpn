@@ -420,9 +420,10 @@ What it shows:
   the selected server preserves it. This is inner IP traffic, not all WAN traffic
   or local-exit throughput. Restarting the client clears the chart.
 - **History** — the same inner IP traffic over an hour, a day, a week and a
-  month, from the database on the client (see "Traffic history"): by server
-  including local exit, by sticky rule and by destination network (ASN). A gap
-  in the graph is time the client was not running.
+  month, over yesterday or over any window you pick, from the database on the
+  client (see "Traffic history"): by server including local exit, by sticky
+  rule and by destination network (ASN with the organization's name). A gap in
+  the graph is time the client was not running.
 - Compact server rows; expand details for addresses, weights, cumulative counters
   and the last failure reason.
 - Sticky rules in first-match order: selectors, allowed exits, current owners,
@@ -542,13 +543,29 @@ deleted and started over. The journal left by a crash (the `-wal` file) is
 replayed by SQLite itself. An unwritable directory or a full disk is not
 damage: the file stays, the status shows the reason, and the attempts go on.
 
-The **History** section reads the database through
-`GET /api/history?range=24h&kind=link`: `range` is `1h`, `24h`, `7d` or `30d`;
-`kind` is `link` (servers and the local exit), `rule` or `network`; `top` (how
-many series to return, up to 32, 8 by default) and `link` (one server or
-`local`) are optional. The section asks for data while it is on screen and
-refreshes once a minute; a day is drawn in four-minute buckets so that no
-series exceeds 400 points.
+The **History** section reads the database through `GET /api/history`. The
+period is `range=1h`, `24h`, `7d` or `30d` — a window up to now — or
+`from=<unix>&to=<unix>`, any window of up to 30 days. The resolution follows
+the age of the window's start, because nothing is kept longer than its tier:
+by the minute up to a day old (with a quarter of an hour of slack), by the hour
+up to a week, by the day beyond. The caption under the graph says how wide a
+point is. The other fields: `kind` is `link` (servers and the local exit),
+`rule` or `network`; `top` (how many series to return, up to 32, 8 by default)
+and `link` (one server or `local`) are optional. No series exceeds 400 points:
+a day is drawn in four-minute buckets.
+
+The section has windows of its own. *Yesterday* shows the whole day before
+this one by the browser's calendar, in one click. *Custom…* opens two
+date-and-time fields and an Apply button (Enter works too): it starts on the
+last day and is checked in place — the end after the start, at most 30 days. A
+window that does not reach now is not refreshed by itself; the others are read
+again once a minute while the section is on screen.
+
+Networks are named by their organization from the same ASN CSV the dashboard
+serves. History reads the CSV in one pass whenever a network has no name yet
+and keeps the names itself: History shows them before the browser has loaded
+its dictionary and after it has been freed. The browser's copy stays as a
+fallback. Without an ASN database networks show their number.
 
 ## Using only part of the features
 

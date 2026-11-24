@@ -40,7 +40,7 @@ fn a_full_disk_is_an_error_in_the_status_and_the_process_goes_on() {
 
     let dir = std::env::temp_dir().join(format!("svpn history full {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let recorder = Recorder::spawn(dir.join("stats.sqlite"));
+    let recorder = Recorder::spawn(dir.join("stats.sqlite"), None);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut minute = 1_792_886_400;
     let status = loop {

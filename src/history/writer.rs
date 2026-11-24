@@ -21,6 +21,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 
 use super::{
+    names,
     query::{History, Query},
     recover::{self, Outcome},
     sample::Row,
@@ -66,9 +67,10 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Start the history thread. It cannot fail: until the database is open
-    /// the status stays `checking` and minutes queue up in the thread.
-    pub fn spawn(path: PathBuf) -> Arc<Recorder> {
+    /// Start the history thread, with the ASN CSV to name networks from
+    /// when there is one. It cannot fail: until the database is open the
+    /// status stays `checking` and minutes queue up in the thread.
+    pub fn spawn(path: PathBuf, asn_csv: Option<PathBuf>) -> Arc<Recorder> {
         let (commands, inbox) = mpsc::sync_channel(CHANNEL);
         let status = Arc::new(RwLock::new(Status {
             state: "checking",
@@ -78,7 +80,7 @@ impl Recorder {
             .name("history".into())
             .spawn({
                 let status = Arc::clone(&status);
-                move || run(&path, &inbox, &status)
+                move || run(&path, asn_csv.as_deref(), &inbox, &status)
             })
             .inspect_err(|error| {
                 // No thread to own the database: say so instead of pretending.
@@ -229,7 +231,7 @@ impl Session {
         }
     }
 
-    fn flush(&mut self, now: u64, status: &RwLock<Status>) {
+    fn flush(&mut self, now: u64, asn_csv: Option<&Path>, status: &RwLock<Status>) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
@@ -237,7 +239,7 @@ impl Session {
             return;
         }
         let oldest = self.queue.front().map(|(minute, _)| *minute);
-        match store.append(self.queue.iter(), oldest, now) {
+        let written = match store.append(self.queue.iter(), oldest, now) {
             Ok(trimmed) => {
                 if let Some(trimmed) = trimmed {
                     warn!(
@@ -248,6 +250,7 @@ impl Session {
                 self.queue.clear();
                 self.logged = None;
                 set(status, "ok", "", store.file_bytes());
+                true
             }
             Err(error) => {
                 let waiting = self.queue.len();
@@ -255,8 +258,54 @@ impl Session {
                     1 => "1 minute is waiting".to_owned(),
                     minutes => format!("{minutes} minutes are waiting"),
                 });
-                self.failed(error, now, status)
+                self.failed(error, now, status);
+                false
             }
+        };
+        if written {
+            self.name_networks(asn_csv, now, status);
+        }
+    }
+
+    /// Name the networks the file holds and the CSV may still tell: one pass
+    /// over the ASN CSV for all of them. A missing or unreadable CSV costs
+    /// the names, never the history.
+    fn name_networks(&mut self, asn_csv: Option<&Path>, now: u64, status: &RwLock<Status>) {
+        let wanted = match self.store.as_mut() {
+            Some(store) => match store.unnamed_networks() {
+                Ok(wanted) => wanted,
+                Err(error) => return self.failed(error, now, status),
+            },
+            None => return,
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(csv) = asn_csv else {
+            return;
+        };
+        let names = match names::lookup(csv, &wanted) {
+            Ok(names) => names,
+            Err(error) => {
+                return self.warned(format!("history: network names unavailable: {error}"), now);
+            }
+        };
+        // A network the CSV does not name gets an empty name, so that the
+        // file is not read again for it.
+        let names: Vec<(u32, String)> = wanted
+            .into_iter()
+            .map(|asn| {
+                let name = names
+                    .iter()
+                    .find(|(known, _)| *known == asn)
+                    .map_or_else(String::new, |(_, name)| name.clone());
+                (asn, name)
+            })
+            .collect();
+        if let Some(store) = self.store.as_mut()
+            && let Err(error) = store.name_networks(&names)
+        {
+            self.failed(error, now, status);
         }
     }
 
@@ -264,19 +313,35 @@ impl Session {
     /// most once in ten minutes.
     fn failed(&mut self, error: anyhow::Error, now: u64, status: &RwLock<Status>) {
         let message = format!("{error:#}");
-        let repeated = self
-            .logged
-            .as_ref()
-            .is_some_and(|(last, at)| last == &message && now.saturating_sub(*at) < LOG_EVERY);
-        if !repeated {
+        if !self.repeated(&message, now) {
             error!("history: {message}");
         }
         set(status, "error", &message, 0);
-        self.logged = Some((message, now));
+    }
+
+    /// Log a shortcoming that is no failure to record, at most once in ten
+    /// minutes while it stays the same.
+    fn warned(&mut self, message: String, now: u64) {
+        if !self.repeated(&message, now) {
+            warn!("{message}");
+        }
+    }
+
+    /// Whether this very message was logged less than ten minutes ago. A
+    /// message that was not repeated becomes the one logged last.
+    fn repeated(&mut self, message: &str, now: u64) -> bool {
+        let repeated = self
+            .logged
+            .as_ref()
+            .is_some_and(|(last, at)| last == message && now.saturating_sub(*at) < LOG_EVERY);
+        if !repeated {
+            self.logged = Some((message.to_owned(), now));
+        }
+        repeated
     }
 }
 
-fn run(path: &Path, inbox: &Receiver<Command>, status: &RwLock<Status>) {
+fn run(path: &Path, asn_csv: Option<&Path>, inbox: &Receiver<Command>, status: &RwLock<Status>) {
     let mut session = Session::default();
     session.open(path, unix(), status);
     loop {
@@ -329,10 +394,10 @@ fn run(path: &Path, inbox: &Receiver<Command>, status: &RwLock<Status>) {
             Err(TryRecvError::Empty) => {}
         }
         session.open(path, now, status);
-        session.flush(now, status);
+        session.flush(now, asn_csv, status);
     }
     // What the hub handed over is written before the file is closed.
-    session.flush(unix(), status);
+    session.flush(unix(), asn_csv, status);
     if let Some(store) = session.store.take()
         && let Err(error) = store.close()
     {

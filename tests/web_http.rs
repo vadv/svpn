@@ -231,7 +231,7 @@ async fn history_rejects_a_query_it_does_not_understand() {
 async fn history_answers_from_the_thread_that_owns_the_database() {
     let dir = std::env::temp_dir().join(format!("svpn history http {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let recorder = Recorder::spawn(dir.join("stats.sqlite"));
+    let recorder = Recorder::spawn(dir.join("stats.sqlite"), None);
     let addr = start_with(Some(Arc::clone(&recorder))).await;
     let minute = SystemTime::now()
         .duration_since(UNIX_EPOCH)

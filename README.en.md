@@ -212,8 +212,9 @@ Beyond the five live minutes there is history. The block
 `stats { db = "/var/lib/svpn/stats.sqlite" }` (the flag `--stats-db` without a
 config) keeps the same traffic in SQLite on the client: a minute for a day, an
 hour for a week, a day for a month, about 2 MB a month. The History section
-shows it by server, sticky rule and destination network. A database error never
-touches the VPN.
+shows it by server, sticky rule and destination network with the organization's
+name — over an hour, a day, a week, a month, yesterday or any window you pick.
+A database error never touches the VPN.
 
 On a router, look through an SSH tunnel: `ssh -L 8080:127.0.0.1:8080 root@router`, then open `http://127.0.0.1:8080/`.
 

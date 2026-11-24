@@ -133,7 +133,8 @@ header { display:flex; align-items:center; justify-content:space-between; gap:12
 .usage-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .segmented { display:inline-flex; }
 .segmented button+button { margin-left:-1px; }
-.segmented button+button:hover:not(:disabled),.segmented button+button[aria-pressed="true"] { position:relative; z-index:1; }
+/* Neighbours share an edge: the pressed or hovered one keeps its own border on top. */
+.segmented button:hover:not(:disabled),.segmented button[aria-pressed="true"] { position:relative; z-index:1; }
 .usage-readout { display:flex; align-items:baseline; gap:6px 14px; flex-wrap:wrap; padding:14px 18px 6px; }
 .usage-readout strong { font-size:26px; font-weight:500; line-height:1.2; letter-spacing:-.01em; white-space:nowrap; }
 .usage-readout b { font-weight:500; }
@@ -249,6 +250,11 @@ td details p { min-width:180px; max-width:320px; margin-top:4px; font-size:12px;
 .legend-item.series i { background:var(--cat); }
 .legend-item.series small { color:var(--muted); }
 .history-note { padding:10px 14px 0; color:var(--muted); font-size:12.5px; overflow-wrap:anywhere; }
+#history-panel input[type="datetime-local"] { min-width:0; width:13em; }
+/* Six ranges do not fit a phone: the group may shrink and wraps its buttons. */
+#history-ranges { flex-wrap:wrap; min-width:0; max-width:100%; }
+#history-resolution { margin-left:auto; }
+.legend-item.series small { display:block; color:var(--muted); }
 .history-note.bad { color:var(--bad); }
 
 /* Process */
@@ -391,11 +397,18 @@ footer { margin-top:20px; padding-top:12px; border-top:1px solid var(--line-soft
 </section>
 <section class="panel" id="history-panel" aria-labelledby="history-title">
 <div class="heading">
-<div class="heading-title"><h2 id="history-title">History</h2><span class="help-wrap"><button type="button" class="help" aria-label="About history" aria-describedby="history-help">?</button><span class="help-pop" id="history-help" role="tooltip">Traffic kept on the client, one minute at a time: an hour and a day by the minute, a week by the hour, a month by the day. A gap means the client was not running.</span></span></div>
-<div class="usage-controls"><div class="segmented" id="history-ranges" role="group" aria-label="History range"><button type="button" data-range="1h" aria-pressed="false" disabled>1 hour</button><button type="button" data-range="24h" aria-pressed="true" disabled>24 hours</button><button type="button" data-range="7d" aria-pressed="false" disabled>7 days</button><button type="button" data-range="30d" aria-pressed="false" disabled>30 days</button></div>
+<div class="heading-title"><h2 id="history-title">History</h2><span class="help-wrap"><button type="button" class="help" aria-label="About history" aria-describedby="history-help">?</button><span class="help-pop" id="history-help" role="tooltip">Traffic kept on the client, one minute at a time. The last day is kept by the minute, the last week by the hour, the last 30 days by the day. Yesterday and Custom read the same store: a window older than a day comes by the hour, older than a week by the day. A gap means the client was not running.</span></span></div>
+<div class="segmented" id="history-ranges" role="group" aria-label="History range"><button type="button" data-range="1h" aria-pressed="false" disabled>1 hour</button><button type="button" data-range="24h" aria-pressed="true" disabled>24 hours</button><button type="button" data-range="7d" aria-pressed="false" disabled>7 days</button><button type="button" data-range="30d" aria-pressed="false" disabled>30 days</button><button type="button" data-range="yesterday" aria-pressed="false" disabled>Yesterday</button><button type="button" data-range="custom" aria-pressed="false" disabled>Custom…</button></div>
+</div>
+<div class="toolbar">
 <label>By <select id="history-kind" disabled><option value="link">Server</option><option value="rule">Rule</option><option value="network">Network</option></select></label>
 <label>Server <select id="history-server" disabled><option value="">All servers</option></select></label>
-<label>Show <select id="history-direction" disabled><option value="total">Receive + send</option><option value="rx">Received</option><option value="tx">Sent</option></select></label></div>
+<label>Show <select id="history-direction" disabled><option value="total">Receive + send</option><option value="rx">Received</option><option value="tx">Sent</option></select></label>
+</div>
+<div class="toolbar" id="history-custom" hidden>
+<label>From <input id="history-from" type="datetime-local" step="60" disabled></label>
+<label>To <input id="history-to" type="datetime-local" step="60" disabled></label>
+<button type="button" id="history-apply" disabled>Apply</button>
 </div>
 <div id="history-note" class="history-note" role="status" hidden></div>
 <div class="chart">
@@ -413,7 +426,7 @@ footer { margin-top:20px; padding-top:12px; border-top:1px solid var(--line-soft
 </div>
 </div>
 <div class="chart-axis" id="history-axis"><span>—</span><span> </span><span> </span><span> </span><span>—</span></div>
-<div class="legend" id="history-legend"></div>
+<div class="legend" id="history-legend"></div><div class="legend"><span id="history-resolution" class="faint"></span></div>
 </div>
 <div class="scroll"><table id="history"><thead><tr><th>Series</th><th class="num">Received</th><th class="num">Sent</th><th class="num">Total</th><th class="num">Share</th><th class="num">Avg flows</th></tr></thead><tbody></tbody></table></div>
 </section>

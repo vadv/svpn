@@ -4,7 +4,11 @@
 //! hours and days can be simulated in tests. Roll-ups follow watermarks: a
 //! fine row leaves only after the coarser tier holds its total.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use anyhow::Result;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
@@ -12,7 +16,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction,
 use super::sample::{Row, Series};
 
 /// Version of the schema this build reads; anything else is rebuilt from scratch.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub(super) const MINUTE: u64 = 60;
 pub(super) const HOUR: u64 = 60 * MINUTE;
 pub(super) const DAY: u64 = 24 * HOUR;
@@ -34,11 +38,12 @@ const SALVAGE_SKIPS: usize = 64;
 
 /// Data tables in the order a damaged file is read: name, key column, how far
 /// to jump past an unreadable region, column count.
-pub(super) const DATA_TABLES: [(&str, &str, i64, usize); 4] = [
+pub(super) const DATA_TABLES: [(&str, &str, i64, usize); 5] = [
     ("series", "id", SALVAGE_BATCH as i64, 5),
     ("minute", "ts", HOUR as i64, 11),
     ("hour", "ts", DAY as i64, 13),
     ("day", "ts", 30 * DAY as i64, 13),
+    ("names", "asn", SALVAGE_BATCH as i64, 2),
 ];
 
 const SCHEMA: &str = "
@@ -97,6 +102,7 @@ CREATE TABLE day (
     minutes INTEGER NOT NULL,
     PRIMARY KEY (ts, series)
 ) WITHOUT ROWID;
+CREATE TABLE names (asn INTEGER PRIMARY KEY, name TEXT NOT NULL) WITHOUT ROWID;
 ";
 
 /// Why an existing database cannot be opened as it is. Only `Damaged` may
@@ -310,6 +316,30 @@ impl Store {
     /// The watermarks as they are in the file.
     pub fn tiers(&self) -> Tiers {
         self.tiers
+    }
+
+    /// Networks recorded in this file that have no organization name yet.
+    pub fn unnamed_networks(&self) -> Result<BTreeSet<u32>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT asn FROM series WHERE kind = 3 AND asn NOT IN (SELECT asn FROM names)",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, u32>(0))?;
+        Ok(rows.collect::<rusqlite::Result<BTreeSet<u32>>>()?)
+    }
+
+    /// Name networks. An empty name says the CSV does not know the network,
+    /// so that it is not looked up again.
+    pub fn name_networks(&mut self, names: &[(u32, String)]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement =
+                transaction.prepare("INSERT OR REPLACE INTO names (asn, name) VALUES (?1, ?2)")?;
+            for (asn, name) in names {
+                statement.execute(params![i64::from(*asn), name])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Bytes of the main database file on disk, the WAL aside.

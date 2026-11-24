@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use super::{
     sample::{LOCAL, Series},
-    store::{DAY, HOUR, MINUTE, Store},
+    store::{DAY, HOUR, HOUR_TTL, MINUTE, MINUTE_TTL, Store},
 };
 
 /// Points returned per series at most: a longer window comes in coarser buckets.
@@ -15,6 +15,12 @@ const MAX_POINTS: u64 = 400;
 pub const MAX_TOP: usize = 32;
 const DEFAULT_TOP: usize = 8;
 const MAX_LINK_ID: usize = 128;
+/// The longest window a custom range may span: what the day tier keeps.
+const MAX_WINDOW: u64 = 30 * DAY;
+/// A window may start this far beyond the age of a tier and still read it:
+/// "the last day" is a few seconds more than a day old by the time it is
+/// asked for. Its first minutes are then simply missing.
+const TIER_SLACK: u64 = 15 * MINUTE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Range {
@@ -22,6 +28,11 @@ pub enum Range {
     Day,
     Week,
     Month,
+    /// `[from, to)` in unix seconds, as picked on the dashboard.
+    Custom {
+        from: u64,
+        to: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +64,7 @@ impl Query {
             top: DEFAULT_TOP,
         };
         let mut seen: Vec<&str> = Vec::new();
+        let (mut from, mut to) = (None, None);
         for field in query.split('&').filter(|field| !field.is_empty()) {
             let (key, value) = field
                 .split_once('=')
@@ -74,11 +86,30 @@ impl Query {
                     _ => bail!("history query: top must be 1..={MAX_TOP}"),
                 },
                 ("link", value) if is_link_id(value) => parsed.link = Some(value.to_owned()),
+                ("from", value) => from = Some(seconds(value)?),
+                ("to", value) => to = Some(seconds(value)?),
                 _ => bail!("history query: unknown field {field:?}"),
             }
         }
+        match (from, to) {
+            (None, None) => {}
+            (Some(from), Some(to))
+                if to > from && to - from <= MAX_WINDOW && !seen.contains(&"range") =>
+            {
+                parsed.range = Range::Custom { from, to }
+            }
+            _ => bail!(
+                "history query: from and to go together, span at most {MAX_WINDOW} seconds and replace range"
+            ),
+        }
         Ok(parsed)
     }
+}
+
+fn seconds(value: &str) -> Result<u64> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("history query: from and to are unix seconds"))
 }
 
 /// Node ids and rule keys are made of these; anything else is not a series.
@@ -93,7 +124,7 @@ fn is_link_id(value: &str) -> bool {
 /// The window a query was answered for and its series, the busiest first.
 #[derive(Clone, Debug, Serialize)]
 pub struct History {
-    /// `1h`, `24h`, `7d` or `30d`.
+    /// `1h`, `24h`, `7d`, `30d` or `custom`.
     pub range: &'static str,
     pub kind: &'static str,
     /// Seconds one point covers.
@@ -112,6 +143,9 @@ pub struct SeriesHistory {
     pub link: String,
     pub rule: Option<String>,
     pub asn: Option<u32>,
+    /// Organization of the network from the ASN CSV, for a network the CSV
+    /// names; null otherwise.
+    pub asn_name: Option<String>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     /// Active flows over the recorded minutes of the window.
@@ -124,15 +158,56 @@ pub struct SeriesHistory {
 impl Store {
     /// Answer one query from the tier that covers its range.
     pub fn query(&self, query: &Query, now: u64) -> Result<History> {
-        let (table, step, length) = match query.range {
-            Range::Hour => ("minute", MINUTE, HOUR),
-            Range::Day => ("minute", MINUTE, DAY),
-            Range::Week => ("hour", HOUR, 7 * DAY),
-            Range::Month => ("day", DAY, 30 * DAY),
+        let (table, step, from, to) = match query.range {
+            Range::Hour => (
+                "minute",
+                MINUTE,
+                (now / MINUTE * MINUTE).saturating_sub(HOUR),
+                now / MINUTE * MINUTE,
+            ),
+            Range::Day => (
+                "minute",
+                MINUTE,
+                (now / MINUTE * MINUTE).saturating_sub(DAY),
+                now / MINUTE * MINUTE,
+            ),
+            Range::Week => (
+                "hour",
+                HOUR,
+                (now / HOUR * HOUR).saturating_sub(7 * DAY),
+                now / HOUR * HOUR,
+            ),
+            Range::Month => (
+                "day",
+                DAY,
+                (now / DAY * DAY).saturating_sub(30 * DAY),
+                now / DAY * DAY,
+            ),
+            // Minutes are kept a day and hours a week: the age of the window's
+            // start picks the tier that still holds its rows.
+            Range::Custom { from, to } => {
+                let (table, step) = match now.saturating_sub(from) {
+                    age if age <= MINUTE_TTL + TIER_SLACK => ("minute", MINUTE),
+                    age if age <= HOUR_TTL + TIER_SLACK => ("hour", HOUR),
+                    _ => ("day", DAY),
+                };
+                let to = to.min(now);
+                (table, step, from - from % step, to - to % step)
+            }
         };
-        let to = now / step * step;
-        let from = to.saturating_sub(length);
-        let bucket = step * (length / step).div_ceil(MAX_POINTS);
+        let empty = History {
+            range: query.range.name(),
+            kind: query.kind.name(),
+            step,
+            from,
+            to,
+            series: Vec::new(),
+        };
+        // A window shorter than one step, or lying in the future, holds nothing.
+        if to <= from {
+            return Ok(empty);
+        }
+        let bucket = step * ((to - from) / step).div_ceil(MAX_POINTS);
         let kinds = match query.kind {
             Kind::Link => "0, 2",
             Kind::Rule => "1",
@@ -159,8 +234,9 @@ impl Store {
              FROM {table} m JOIN series s ON s.id = m.series \
              WHERE m.ts >= ?1 AND m.ts < ?2 AND s.kind IN ({kinds}){} \
              GROUP BY m.series{having} ORDER BY bytes DESC, m.series LIMIT ?{}) \
-             SELECT s.kind, s.link, s.rule, s.asn, (m.ts / ?3) * ?3, SUM(m.rx_bytes), SUM(m.tx_bytes), {active}, {weight} \
+             SELECT s.kind, s.link, s.rule, s.asn, (m.ts / ?3) * ?3, SUM(m.rx_bytes), SUM(m.tx_bytes), {active}, {weight}, n.name \
              FROM top JOIN series s ON s.id = top.id JOIN {table} m ON m.series = s.id \
+             LEFT JOIN names n ON s.kind = 3 AND n.asn = s.asn \
              WHERE m.ts >= ?1 AND m.ts < ?2 \
              GROUP BY s.id, 5 ORDER BY MAX(top.bytes) DESC, s.id",
             link.map_or("", |_| " AND s.link = ?4"),
@@ -186,6 +262,7 @@ impl Store {
                 point: [row.get(4)?, row.get(5)?, row.get(6)?],
                 active_avg: row.get(7)?,
                 weight: row.get(8)?,
+                asn_name: row.get(9)?,
             })
         })?;
         let mut series: Vec<SeriesHistory> = Vec::new();
@@ -213,6 +290,10 @@ impl Store {
                     rule: matches!(key, Series::Rule { .. }).then(|| key.rule().to_owned()),
                     asn: match key {
                         Series::Network { asn, .. } => Some(asn),
+                        _ => None,
+                    },
+                    asn_name: match key {
+                        Series::Network { .. } => row.asn_name.filter(|name| !name.is_empty()),
                         _ => None,
                     },
                     rx_bytes: point[1],
@@ -255,6 +336,7 @@ struct QueryRow {
     active_avg: f64,
     /// Minutes the gauge of the row stands for.
     weight: i64,
+    asn_name: Option<String>,
 }
 
 impl Range {
@@ -264,6 +346,7 @@ impl Range {
             Range::Day => "24h",
             Range::Week => "7d",
             Range::Month => "30d",
+            Range::Custom { .. } => "custom",
         }
     }
 }

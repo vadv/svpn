@@ -6,6 +6,7 @@
 //! error of the database is logged and shown in the dashboard, never
 //! propagated into the VPN.
 
+pub mod names;
 pub mod query;
 pub mod recover;
 pub mod sample;

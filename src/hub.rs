@@ -1443,6 +1443,8 @@ pub async fn run(
         .collect();
     let (events, incoming) = mpsc::channel(QUEUE);
     let (sticky_updates, sticky_task) = spawn_sticky_resolver(&stickies, &mut shutdown);
+    // The history names networks from the same ASN CSV the dashboard serves.
+    let asn_csv = jobs.geo_db.clone();
     let mut hub = Hub {
         geo,
         country,
@@ -1485,7 +1487,7 @@ pub async fn run(
         incoming,
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
-        history: stats_db.map(crate::history::Recorder::spawn),
+        history: stats_db.map(|path| crate::history::Recorder::spawn(path, asn_csv)),
         history_prev: None,
         history_ts: None,
     };
