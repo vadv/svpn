@@ -27,6 +27,7 @@ pub mod drivers;
 pub mod exit_state;
 pub mod framing;
 pub mod geo;
+pub mod history;
 pub mod hooks;
 pub mod hub;
 pub mod job;
@@ -370,6 +371,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     sticky_blocks: args.stickies.clone(),
                     jobs,
                     web_listen: args.web_listen,
+                    stats_db: args.stats_db,
                 },
             );
             tokio::pin!(client);

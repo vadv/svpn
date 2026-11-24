@@ -155,7 +155,7 @@ async fn start(path: Option<PathBuf>, loaded: bool) -> (SocketAddr, JoinHandle<(
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         let _sender = tx;
-        web::serve(listener, rx, path).await.unwrap();
+        web::serve(listener, rx, path, None).await.unwrap();
     });
     (addr, task)
 }

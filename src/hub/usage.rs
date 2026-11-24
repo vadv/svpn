@@ -1,7 +1,12 @@
 //! Dashboard-only inner-IP accounting. Fold flow deltas at snapshot/retirement,
 //! not on the packet path. Each axis counts the same bytes independently.
 
-use std::{collections::HashMap, hash::Hash, net::Ipv4Addr, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::Hash,
+    net::Ipv4Addr,
+    time::Instant,
+};
 
 use serde::Serialize;
 
@@ -67,6 +72,19 @@ pub struct Usage {
     pub destinations: Breakdown<Ipv4Addr>,
     pub networks: Breakdown<u32>,
     pub unknown_asn: Traffic,
+    /// What the history rows are cut from; never part of the dashboard API.
+    #[serde(skip)]
+    pub split: Split,
+}
+
+/// Bytes by sticky rule and by network, each with its link; a link of `None`
+/// is the local exit.
+#[derive(Clone, Default, Serialize)]
+pub struct Split {
+    /// Sticky rule index (None: fallback) by link.
+    pub rules: BTreeMap<(Option<usize>, Option<usize>), Traffic>,
+    /// Network by link.
+    pub networks: BTreeMap<(u32, Option<usize>), Traffic>,
 }
 
 impl Usage {
@@ -79,14 +97,25 @@ impl Usage {
             return;
         }
         flow.reported = flow.traffic;
-        match flow.target {
-            Target::Remote(owner) => self.exits.entry(owner.epoch.link).or_default(),
-            Target::Direct(_) => &mut self.local,
+        let link = match flow.target {
+            Target::Remote(owner) => Some(owner.epoch.link),
+            Target::Direct(_) => None,
+        };
+        match link {
+            Some(link) => self.exits.entry(link).or_default().add(t),
+            None => self.local.add(t),
         }
-        .add(t);
+        self.split
+            .rules
+            .entry((link, flow.rule))
+            .or_default()
+            .add(t);
         self.destinations.add(ip, t);
         match flow.asn {
-            Some(asn) => self.networks.add(asn, t),
+            Some(asn) => {
+                self.networks.add(asn, t);
+                self.split.networks.entry((asn, link)).or_default().add(t);
+            }
             None => self.unknown_asn.add(t),
         }
     }
@@ -104,6 +133,8 @@ pub struct UsageMeter {
     pub(super) pending: Usage,
     session: Usage,
     last: Option<Instant>,
+    /// Rule and network bytes since the last history minute took them.
+    window: Split,
 }
 
 impl UsageMeter {
@@ -118,6 +149,13 @@ impl UsageMeter {
         for (&link, &t) in &interval.exits {
             self.session.exits.entry(link).or_default().add(t);
         }
+        // Sampled once a minute, not once a second: the intervals pile up.
+        for (&key, &t) in &interval.split.rules {
+            self.window.rules.entry(key).or_default().add(t);
+        }
+        for (&key, &t) in &interval.split.networks {
+            self.window.networks.entry(key).or_default().add(t);
+        }
         let seconds = self
             .last
             .replace(now)
@@ -127,6 +165,13 @@ impl UsageMeter {
             interval,
             seconds,
         }
+    }
+}
+
+impl UsageMeter {
+    /// The rule and network bytes since the last call: one history minute.
+    pub fn take_window(&mut self) -> Split {
+        std::mem::take(&mut self.window)
     }
 }
 

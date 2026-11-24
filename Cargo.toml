@@ -19,6 +19,8 @@ http = "1.5.0"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "signal", "resource"] }
 quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio", "futures-io", "log"] }
 rlimit = "0.10"
+# Bundled SQLite: one pinned engine on every target, no system dependency.
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2", "rsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

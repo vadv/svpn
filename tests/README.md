@@ -39,7 +39,11 @@ checks 1440 px and 390 px layouts and optionally writes screenshots. CI runs it
 in the Linux native job. `tests/proc_stats.rs` covers `/proc` parsing, unit
 conversion, peak-RSS fallback and the `process` JSON shape; `node --test` covers
 CPU-percent derivation and uptime; the Chrome check asserts the rendered RAM/CPU
-readout, stale handling and the labelled peak-RSS fallback.
+readout, stale handling and the labelled peak-RSS fallback. `tests/history_*.rs`
+and `tests/hub_history.rs` cover traffic history: minute rows and roll-ups,
+damaged-file recovery, write failures under a file-size limit, the HTTP route
+and the hub's minute; `thirty_days_stay_within_the_budget` writes a month of
+minute rows and takes about seven seconds.
 
 ## Network checks — Docker Compose
 

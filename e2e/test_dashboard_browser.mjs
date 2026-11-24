@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const chrome = process.env.CHROME || (process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/google-chrome");
 assert.ok(fs.existsSync(chrome), `Chrome not found: ${chrome}; set CHROME to an installed browser`);
 const epoch = Date.now();
-let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0;
+let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0, historyRequests = 0;
 
 // Same packets on all three axes. 198.51.100.80 is already closed; unknown and
 // pooled contributions keep their bytes even though neither has a provider name.
@@ -85,9 +85,9 @@ function frame() {
     closing_flows: flows.filter(flow => flow.rule === rule && flow.closing).length,
   });
   const rules = scenario === "empty" ? [] : [
-    { index: 0, label: "claude", kind: "names", selector: "names: claude.ai, anthropic.com", via: "servers: nl", local: false, candidates: [servers[0].id],
+    { index: 0, label: "claude", canonical: "names: anthropic.com,claude.ai", kind: "names", selector: "names: claude.ai, anthropic.com", via: "servers: nl", local: false, candidates: [servers[0].id],
       owner: servers[0].id, every_secs: 300, resolved_ips: 6, traffic: traffic(0) },
-    { index: 1, label: "home", kind: "countries", selector: "cc: RU, BY", via: "local", local: true, candidates: [], owner: null, every_secs: 300, resolved_ips: 0, traffic: traffic(1) },
+    { index: 1, label: "home", canonical: "cc:RU,BY", kind: "countries", selector: "cc: RU, BY", via: "local", local: true, candidates: [], owner: null, every_secs: 300, resolved_ips: 0, traffic: traffic(1) },
   ];
   const status = { loaded_at: Math.floor(epoch / 1000) - (degraded ? 3900 : 299), attempted_at: Math.floor(epoch / 1000) - 299,
     error: degraded ? "Update failed: exit status: 1; previous table retained" : "" };
@@ -97,8 +97,10 @@ function frame() {
     rss_bytes: 48 * 1048576 + sequence * 65536, peak_rss_bytes: 64 * 1048576,
     cpu_seconds: 12 + sequence * 0.18, cpus: 8,
   };
+  const history = { enabled: !["empty", "history-off"].includes(scenario), state: scenario === "history-error" ? "error" : "ok",
+    error: scenario === "history-error" ? "1 minute is waiting: disk I/O error" : "", bytes: scenario === "empty" ? 0 : 1908736 };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
-    usage,
+    usage, history,
     process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0,
       active_flows: flows.filter(flow => flow.via === "local").length, closing_flows: 0 },
@@ -110,6 +112,31 @@ function frame() {
         started_at: Math.floor(epoch / 1000) - 300, finished_at: Math.floor(epoch / 1000) - 299,
         success_at: Math.floor(epoch / 1000) - (degraded ? 3900 : 299), next_at: Math.floor(epoch / 1000) + 3301, reason: degraded ? "exit status: 1" : "" }] },
   };
+}
+
+// One answer of /api/history per kind. The first fifth of every range was not
+// recorded, as when the client was off; the rest carries steady traffic.
+function historyFixture(url) {
+  const range = url.searchParams.get("range"), kind = url.searchParams.get("kind"), link = url.searchParams.get("link");
+  const length = { "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[range];
+  const step = { "1h": 60, "24h": 240, "7d": 3600, "30d": 86400 }[range];
+  if (!length || !["link", "rule", "network"].includes(kind)) return null;
+  const to = Math.floor(Date.now() / 1000 / step) * step, from = to - length;
+  const all = {
+    link: [{ kind: "link", link: "nl.example.test", rule: null, asn: null, rx: 1000000, tx: 200000 },
+      { kind: "link", link: "de.example.test", rule: null, asn: null, rx: 500000, tx: 100000 },
+      { kind: "local", link: "", rule: null, asn: null, rx: 100000, tx: 0 }],
+    rule: [{ kind: "rule", link: "nl.example.test", rule: "names: anthropic.com,claude.ai", asn: null, rx: 900000, tx: 100000 },
+      { kind: "rule", link: "local", rule: "cc:RU,BY", asn: null, rx: 100000, tx: 0 },
+      { kind: "rule", link: "de.example.test", rule: "fallback", asn: null, rx: 500000, tx: 100000 }],
+    network: [{ kind: "network", link: "nl.example.test", rule: null, asn: 13335, rx: 900000, tx: 100000 },
+      { kind: "network", link: "de.example.test", rule: null, asn: 15169, rx: 500000, tx: 100000 }],
+  };
+  const series = all[kind].filter(item => !link || item.link === link).map(({ rx, tx, ...item }) => {
+    const points = Array.from({ length: length / step }, (_, i) => [from + i * step, rx, tx]).slice(Math.floor(length / step / 5));
+    return { ...item, rx_bytes: rx * points.length, tx_bytes: tx * points.length, active_avg: 2, points };
+  });
+  return { range, kind, step, from, to, series };
 }
 
 // This extra module is injected only by the fixture server, never shipped by SVPN.
@@ -165,7 +192,7 @@ try {
   const bodyStyle = getComputedStyle(document.body), titleStyle = getComputedStyle(document.querySelector('.heading h2'));
   assert(/system-ui/.test(bodyStyle.fontFamily) && parseFloat(bodyStyle.fontSize) >= 13 && titleStyle.textTransform === 'none' && parseFloat(titleStyle.fontSize) >= 14, 'interface text is sentence case in the UI face at a readable size');
   assert(!document.querySelector('.caret') && getComputedStyle(document.querySelector('.rail-health'), '::before').animationName === 'none', 'nothing blinks on a healthy dashboard');
-  assert([...document.querySelectorAll('.chart-axis span')].map(span => span.textContent).join('|') === '−5 min|−3:45|−2:30|−1:15|' + $('chart-end').textContent, 'chart carries time ticks');
+  assert([...document.querySelectorAll('#traffic .chart-axis span')].map(span => span.textContent).join('|') === '−5 min|−3:45|−2:30|−1:15|' + $('chart-end').textContent, 'chart carries time ticks');
   assert(Math.abs(Number.parseFloat($('chart-mid').textContent) * 2 - Number.parseFloat($('chart-max').textContent)) < 0.02, 'value axis labels its middle gridline');
   assert($('flow-reset').disabled, 'clear filters stays quiet without filters');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
@@ -192,6 +219,41 @@ try {
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
+  // History is read once its section is in view, then once a minute at most.
+  $('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
+  await until(() => $('history-bands').children.length === 3, 'history bands');
+  const historyReads = (await control('normal')).history_requests;
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  assert((await control('normal')).history_requests === historyReads, 'history is not fetched by one-second snapshot polling');
+  assert(['cat-1', 'cat-2', 'cat-3'].every((name, i) => $('history-bands').children[i].classList.contains(name)), 'history series take the categorical palette in rank order');
+  assert(['NL', 'DE', 'Local exit'].every((label, i) => $('history-legend').children[i].textContent === label), 'history legend names servers by label and the local exit');
+  const historyRow = index => [...$('history').tBodies[0].rows[index].cells].map(cell => cell.textContent);
+  assert(historyRow(0)[0] === 'NL' && historyRow(0)[1] === '274.7 MiB' && historyRow(0)[3] === '329.6 MiB' && historyRow(0)[4] === '63.2%' && historyRow(0)[5] === '2.0', 'history totals list bytes, share of the range and average flows');
+  assert(historyRow(2)[0] === 'Local exit' && $('history').tBodies[0].rows.length === 3, 'history table lists every series of the breakdown');
+  assert(Math.abs(Number.parseFloat($('history-mid').textContent) * 2 - Number.parseFloat($('history-max').textContent)) < 0.02 && $('history-max').textContent.endsWith('Mbit/s'), 'history value axis labels its middle gridline');
+  assert([...$('history-axis').children].every(span => /^[0-9]{2}:[0-9]{2}$/.test(span.textContent)), 'a day of history is labelled with clock times');
+  assert(/^M[0-9.]+,[0-9.]+ L/.test($('history-bands').children[0].getAttribute('d')) && !$('history-empty').offsetParent, 'recorded minutes draw as stacked bands');
+  assert([...$('history-bands').children].every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).fill !== 'none') && $('history-bands').children[0].getBoundingClientRect().height > 40, 'bands are SVG paths that rise from the baseline with a fill of their own: ' + JSON.stringify([...$('history-bands').children].map(band => [band.getBoundingClientRect().height, getComputedStyle(band).fill])));
+  input('history-direction', 'tx');
+  assert(historyRow(0)[4] === '66.7%' && (await control('normal')).history_requests === historyReads, 'another direction redraws the same answer');
+  input('history-kind', 'network');
+  await until(() => $('history-bands').children.length === 2, 'network history');
+  assert($('history-legend').textContent.includes('AS13335 · Cloudflare, Inc.') && $('history').tBodies[0].rows[0].cells[0].textContent.includes('via NL'), 'networks are named by ASN and organization, the exit is the second line');
+  input('history-server', 'de.example.test');
+  await until(() => $('history-bands').children.length === 1, 'history of one server');
+  assert($('history-legend').textContent.includes('AS15169 · Google LLC'), 'the server filter narrows the series');
+  document.querySelector('#history-ranges [data-range="7d"]').click();
+  await until(() => $('history-axis').children[0].textContent.includes(' '), 'week of history');
+  assert(document.querySelector('#history-ranges [data-range="7d"]').getAttribute('aria-pressed') === 'true' && [...$('history-axis').children].every(span => /^[A-Z][a-z][a-z] [0-9]+ [A-Z][a-z][a-z]$/.test(span.textContent)) && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'range buttons state the choice and the axis names the days: ' + JSON.stringify([...$('history-axis').children].map(span => span.textContent)));
+  await control('history-error');
+  await until(() => $('history-note').textContent.includes('not being recorded'), 'history error is visible');
+  assert($('history-note').classList.contains('bad') && $('history-note').textContent.includes('disk I/O error') && $('history-bands').children.length === 1, 'a failing history database is the loud case, the last answer stays drawn');
+  await control('history-off');
+  await until(() => $('history-note').textContent.includes('History is off'), 'history off is explained');
+  assert($('history-kind').disabled && document.querySelector('#history-ranges [data-range="7d"]').disabled && !$('history-note').classList.contains('bad'), 'history controls are quiet while history is off');
+  await control('normal');
+  await until(() => !$('history-kind').disabled, 'history recovers');
+  input('history-server', ''); input('history-kind', 'link');
   input('flow-country', 'US'); input('flow-asn', '13335');
   const countryCells = [...$('flows').tBodies[0].rows].map(row => row.cells[3].textContent);
   // Headless Chrome without an emoji font draws no flag: the code is mandatory, the flag is not.
@@ -331,7 +393,7 @@ const server = http.createServer((request, response) => {
     scenario = url.searchParams.get("scenario");
     if (scenario === "restart") { generation++; scenario = "normal"; }
     response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000, asn_requests: namesRequests }));
+    response.end(JSON.stringify({ started_at: epoch - 7200000 + generation * 1000, asn_requests: namesRequests, history_requests: historyRequests }));
     return;
   }
   if (url.pathname === "/api/asn.csv") {
@@ -341,6 +403,15 @@ const server = http.createServer((request, response) => {
     const csv = `1.0.0.0,1.0.0.255,13335,"${organization.replaceAll('"', '""')}"\n2.0.0.0,2.0.0.255,15169,Google LLC\n`;
     response.setHeader("Content-Type", "text/csv; charset=utf-8");
     setTimeout(() => response.end(csv), 500); return;
+  }
+  if (url.pathname === "/api/history") {
+    historyRequests++;
+    if (scenario === "history-off") { response.writeHead(503); response.end("history is off"); return; }
+    if (scenario === "history-error") { response.writeHead(503); response.end("1 minute is waiting: disk I/O error"); return; }
+    const answer = historyFixture(url);
+    response.setHeader("Content-Type", "application/json");
+    if (answer) response.end(JSON.stringify(answer)); else { response.writeHead(400); response.end("bad query"); }
+    return;
   }
   if (url.pathname === "/api/state") {
     response.setHeader("Content-Type", "application/json");
@@ -485,7 +556,15 @@ async function browser(query = "", screenshot, mobile = false) {
       await evaluate("window.scrollTo({top:0, behavior:'instant'})");
       if (query.includes('view=now')) await evaluate("document.getElementById('usage-now').click(); document.getElementById('theme-toggle').click()");
       if (query.includes('view=provider')) await evaluate("document.querySelector('#rank-networks button').click()");
-      const y = query.includes('view=provider') ? await evaluate("document.getElementById('flows-panel').getBoundingClientRect().top + scrollY - 8") : 0;
+      // History is read once its section is in view, as on a real scroll.
+      if (query.includes('view=history')) await evaluate(`(async () => {
+        document.getElementById('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
+        await new Promise(resolve => { const timer = setInterval(() => {
+          if (document.getElementById('history-bands').children.length) { clearInterval(timer); resolve(); }
+        }, 100); });
+      })()`);
+      const y = query.includes('view=provider') ? await evaluate("document.getElementById('flows-panel').getBoundingClientRect().top + scrollY - 8")
+        : query.includes('view=history') ? await evaluate("document.getElementById('history-panel').getBoundingClientRect().top + scrollY - 8") : 0;
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y, width, height, scale: 1 } });
       fs.writeFileSync(screenshot, Buffer.from(image.data, "base64"));
@@ -509,7 +588,7 @@ try {
   console.log(`PASS Chrome dashboard: ${report.checks.length} UI assertions + viewport/axis checks`);
   const directory = process.env.DASHBOARD_SCREENSHOTS;
   if (directory) fs.mkdirSync(directory, { recursive: true });
-  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=provider", false]] : [])]) {
+  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=history", false], ["normal&view=history", true], ["normal&view=provider", false]] : [])]) {
     const name = `${scenario.replace("normal&view=", "")}${mobile ? "-mobile" : ""}.png`;
     const layout = await browser(`?render=1&scenario=${scenario}`, directory ? path.join(directory, name) : undefined, mobile);
     console.log(`PASS layout ${name} (${layout.width}px viewport / ${layout.scroll}px document)${directory ? " + screenshot" : ""}`);

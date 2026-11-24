@@ -678,3 +678,32 @@ fn pasted_example_collides_with_the_preset_label() {
         .to_string();
     assert!(err.contains("duplicate job label geo-update"), "{err}");
 }
+
+// ── history database ──
+
+#[test]
+fn history_database_is_one_optional_path_relative_to_the_config() {
+    let base = Path::new("/etc/svpn");
+    let args = parse(
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+         stats {\n  db = \"var/lib/svpn stats.sqlite\"\n}\n",
+        base,
+        false,
+    )
+    .unwrap();
+    assert_eq!(args.stats_db, Some(base.join("var/lib/svpn stats.sqlite")));
+    assert_eq!(parse(SINGLE, base, false).unwrap().stats_db, None);
+
+    for block in [
+        "stats {\n  db = \"\"\n}\n",
+        "stats {\n  db = \"/a\"\n  db = \"/b\"\n}\n",
+        "stats {\n  db = \"/a\"\n  keep = 7\n}\n",
+        "stats {\n  db = \"/a\"\n}\nstats {\n  db = \"/b\"\n}\n",
+        "stats {\"daily\"} {\n  db = \"/a\"\n}\n",
+    ] {
+        assert!(
+            parse(&format!("{SINGLE}{block}"), base, false).is_err(),
+            "{block}"
+        );
+    }
+}

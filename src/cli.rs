@@ -54,6 +54,9 @@ pub struct ClientArgs {
     /// Country CSV database (`start,end,CC`) for country selectors.
     #[arg(long, value_name = "FILE")]
     pub country_db: Option<PathBuf>,
+    /// Traffic history database (SQLite); off by default.
+    #[arg(long, value_name = "FILE")]
+    pub stats_db: Option<PathBuf>,
     /// Explicit sticky groups (config-file only).
     #[arg(skip)]
     pub stickies: Vec<crate::sticky::StickyBlock>,

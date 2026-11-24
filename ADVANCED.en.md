@@ -413,12 +413,16 @@ dashboard {
 What it shows:
 
 - **Where traffic goes** ranks the same hub-accounted inner IP bytes by actual exit (including local), destination ASN and destination IPv4. Choose *Since start* for volume including closed flows, or *Right now* for the last hub sampling interval in Mbit/s. Rank by RX+TX, received or sent; percentages use the selected direction. Select a name to inspect its currently visible flows, not a historical connection log.
-- ASN is pinned when the flow opens; a missing lookup goes to *Unknown ASN*. The snapshot retains up to 256 named IPs and 256 named ASNs per period. Smaller buckets fold into *Other · pooled*: totals stay exact, named entries may omit earlier evicted bytes. No disk history; restarting the client resets this accounting.
+- ASN is pinned when the flow opens; a missing lookup goes to *Unknown ASN*. The snapshot retains up to 256 named IPs and 256 named ASNs per period. Smaller buckets fold into *Other · pooled*: totals stay exact, named entries may omit earlier evicted bytes. This accounting is memory-only and restarts with the client; the History section below is what can reach the disk.
 - An overview: ready servers, RX/TX in Mbit/s, active connections and local-exit
   readiness. `ready` means the link is ready, not an end-to-end internet check.
 - A five-minute VPN-pool RX/TX chart. History lives only in the open tab; changing
   the selected server preserves it. This is inner IP traffic, not all WAN traffic
   or local-exit throughput. Restarting the client clears the chart.
+- **History** — the same inner IP traffic over an hour, a day, a week and a
+  month, from the database on the client (see "Traffic history"): by server
+  including local exit, by sticky rule and by destination network (ASN). A gap
+  in the graph is time the client was not running.
 - Compact server rows; expand details for addresses, weights, cumulative counters
   and the last failure reason.
 - Sticky rules in first-match order: selectors, allowed exits, current owners,
@@ -491,6 +495,60 @@ DASHBOARD_SCREENSHOTS=/tmp/svpn-dashboard-preview node e2e/test_dashboard_browse
 The browser check requires installed Chrome; override its path with `CHROME`.
 CI runs it on Linux. The static fixture server and its control endpoints exist
 only in the self-check, never in SVPN.
+
+## Traffic history
+
+The dashboard chart remembers five minutes. To look further, the client
+records the same counters into SQLite on the client once a minute:
+
+```hcl
+stats {
+  db = "/var/lib/svpn/stats.sqlite"
+}
+```
+
+Without a config, use the flag `--stats-db FILE`. The directory is created if
+it does not exist; without the block or the flag nothing is written. The
+database lives on the client only: no server and no export.
+
+What is kept, per minute in UTC:
+
+| Series | Key | Metrics |
+| --- | --- | --- |
+| server | `host:port` | RX/TX bytes and packets, opened, closed, failed opens, drops, active flows |
+| local exit | — | the same |
+| rule | server × sticky rule; `fallback` for traffic without a rule | RX/TX bytes, active flows |
+| network | ASN × server, the 20 busiest of the minute | RX/TX bytes, active flows |
+
+The server and the local exit get a row every minute the client runs; a rule
+or a network only for a minute with traffic. So a stretch without rows is a
+client that was off, not zero traffic. As everywhere on the dashboard, this
+is inner IP traffic, not all WAN traffic.
+
+Three tiers: minutes are kept for a day, the hours folded from them for a
+week, the days folded from the hours for 30 days. For three servers and a
+few dozen networks that is about 2 MB a month with a 4 MB journal peak. If
+the main file reaches 16 MB, the client logs a warning and cuts what it
+keeps — first minutes older than two hours, then hours and days.
+
+A database error never touches the VPN. The hub hands the minute to its own
+thread through a non-blocking queue and does not wait for the disk. A failed
+write is logged at most once in ten minutes; minutes pile up for two hours
+and are written once the database is available again, and the error shows in
+the History section and the `history` field of the snapshot. At start the
+file is checked with `integrity_check`: a damaged file is read row by row and
+whatever still reads is moved into a new file; if nothing reads, the file is
+deleted and started over. The journal left by a crash (the `-wal` file) is
+replayed by SQLite itself. An unwritable directory or a full disk is not
+damage: the file stays, the status shows the reason, and the attempts go on.
+
+The **History** section reads the database through
+`GET /api/history?range=24h&kind=link`: `range` is `1h`, `24h`, `7d` or `30d`;
+`kind` is `link` (servers and the local exit), `rule` or `network`; `top` (how
+many series to return, up to 32, 8 by default) and `link` (one server or
+`local`) are optional. The section asks for data while it is on screen and
+refreshes once a minute; a day is drawn in four-minute buckets so that no
+series exceeds 400 points.
 
 ## Using only part of the features
 

@@ -82,5 +82,8 @@ pub fn dashboard_hub() -> Hub {
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
         pair: watch::channel(None).0,
+        history: None,
+        history_prev: None,
+        history_ts: None,
     }
 }

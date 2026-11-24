@@ -30,6 +30,7 @@ use crate::{
     session, stats,
 };
 
+pub mod history;
 pub mod jobs;
 mod routes;
 pub mod usage;
@@ -119,6 +120,8 @@ pub struct Extras {
     pub jobs: JobContext,
     /// Read-only dashboard address; None keeps the dashboard off.
     pub web_listen: Option<SocketAddr>,
+    /// Traffic history database; None keeps history off.
+    pub stats_db: Option<std::path::PathBuf>,
 }
 
 /// First-match decision for one destination.
@@ -179,6 +182,11 @@ pub struct Hub {
     /// Shared tunnel pair (client, server) pinned by the first Ready link
     /// (#181): later links and reconnects must negotiate the same pair.
     pub pair: watch::Sender<Option<(Ipv4Addr, Ipv4Addr)>>,
+    /// Traffic history thread; None keeps history off.
+    pub history: Option<Arc<crate::history::Recorder>>,
+    /// The last snapshot and minute handed to it.
+    pub history_prev: Option<crate::history::Counters>,
+    pub history_ts: Option<u64>,
 }
 
 impl Hub {
@@ -995,6 +1003,7 @@ impl Hub {
         let mut dashboard_timer = dashboard
             .as_ref()
             .and_then(|_| report_timer(SNAPSHOT_INTERVAL));
+        let mut history_timer = self.history.as_ref().map(|_| history::deadline());
         loop {
             let retry_at = self.pool.next_retry();
             tokio::select! {
@@ -1131,6 +1140,15 @@ impl Hub {
                     if let Some(tx) = &dashboard {
                         let _ = tx.send(crate::web::sample(self));
                     }
+                }
+                _ = async {
+                    match &mut history_timer {
+                        Some(timer) => timer.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.record_history();
+                    history_timer = self.history.as_ref().map(|_| history::deadline());
                 }
                 _ = async {
                     match retry_at {
@@ -1379,6 +1397,7 @@ pub async fn run(
         sticky_blocks,
         jobs,
         web_listen,
+        stats_db,
     } = extras;
     let GeoExits {
         geo,
@@ -1466,7 +1485,14 @@ pub async fn run(
         incoming,
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
+        history: stats_db.map(crate::history::Recorder::spawn),
+        history_prev: None,
+        history_ts: None,
     };
+    if hub.history.is_some() || web_listen.is_some() {
+        // Rule and network bytes come from the same meter the dashboard reads.
+        hub.routes.usage.get_or_insert_with(UsageMeter::default);
+    }
     for link in 0..hub.links.len() {
         hub.start(Epoch {
             link,
@@ -1478,11 +1504,12 @@ pub async fn run(
     let dashboard = match web_listen {
         Some(addr) => {
             let listener = crate::web::bind(addr).await?;
-            hub.routes.usage = Some(UsageMeter::default());
+            hub.routes.usage.get_or_insert_with(UsageMeter::default);
             let (tx, rx) = watch::channel(crate::web::sample(&mut hub));
             let geo_path = hub.geo_path.clone();
+            let history = hub.history.clone();
             let task = tokio::spawn(async move {
-                if let Err(error) = crate::web::serve(listener, rx, geo_path).await {
+                if let Err(error) = crate::web::serve(listener, rx, geo_path, history).await {
                     crate::error!("dashboard: {error:#}");
                 }
             });
@@ -1503,6 +1530,9 @@ pub async fn run(
         .await;
     if let Some((_, task)) = dashboard {
         task.abort();
+    }
+    if let Some(history) = &hub.history {
+        history.close();
     }
     let canceled = hooks.cancel_up().await;
     hub.tasks.shutdown().await;

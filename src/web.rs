@@ -10,6 +10,7 @@ pub mod lan;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,6 +24,7 @@ use tokio::{
 
 use crate::{
     control::{RoundReport, Stats},
+    history::Recorder,
     hub::{Hub, JobStats, StickyStats, Target},
     proc_stats::ProcessView,
 };
@@ -65,6 +67,8 @@ pub struct SelectionView {
 pub struct RuleView {
     pub index: usize,
     pub label: String,
+    /// Canonical selector key: the rule's history series are keyed by it.
+    pub canonical: String,
     pub kind: &'static str,
     pub local: bool,
     /// Allowed remote node ids, distinct from the group's current owner.
@@ -96,6 +100,17 @@ pub struct DatabaseView {
     pub pending: Option<String>,
     pub rows: usize,
     pub status: crate::hub::jobs::DatabaseStatus,
+}
+
+/// Traffic history: whether it is recorded and how its database is doing.
+#[derive(Clone, Serialize)]
+pub struct HistoryView {
+    pub enabled: bool,
+    /// `checking`, `ok` or `error`; empty when history is off.
+    pub state: &'static str,
+    pub error: String,
+    /// Bytes of the database file on disk.
+    pub bytes: u64,
 }
 
 /// One pinned destination group and the server that serves it.
@@ -166,6 +181,7 @@ pub struct Snapshot {
     pub jobs: JobStats,
     /// Resource usage of the svpn process itself. Each field may be null.
     pub process: ProcessView,
+    pub history: HistoryView,
 }
 
 /// Advance the hub's measurement window once per published snapshot, never per HTTP request.
@@ -233,6 +249,7 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         .map(|(index, runtime)| RuleView {
             index,
             label: runtime.block.label.clone(),
+            canonical: runtime.block.canonical_key(),
             kind: match &runtime.block.selector {
                 crate::sticky::Selector::Names(_) => "names",
                 crate::sticky::Selector::Countries(_) => "countries",
@@ -382,13 +399,30 @@ pub fn snapshot(hub: &Hub) -> Snapshot {
         flows,
         jobs: hub.job_stats.clone(),
         process: crate::proc_stats::sample(),
+        history: match &hub.history {
+            Some(recorder) => {
+                let status = recorder.status();
+                HistoryView {
+                    enabled: true,
+                    state: status.state,
+                    error: status.error,
+                    bytes: status.bytes,
+                }
+            }
+            None => HistoryView {
+                enabled: false,
+                state: "",
+                error: String::new(),
+                bytes: 0,
+            },
+        },
     }
 }
 
 /// Counters of one link, cumulative across generations: the totals the hub
 /// collected plus the live generation's unreported delta. A dead link has no
 /// delta left to add.
-fn link_counters(link: &crate::hub::Link) -> Stats {
+pub(crate) fn link_counters(link: &crate::hub::Link) -> Stats {
     match &link.latest {
         Some(latest) => link.stats.projected(&latest.borrow()),
         None => link.stats.totals().clone(),
@@ -397,7 +431,7 @@ fn link_counters(link: &crate::hub::Link) -> Stats {
 
 /// Node id of a link: the configured `server` string, with the index as
 /// fallback for a hub without nodes.
-fn node_id(hub: &Hub, link: usize) -> String {
+pub(crate) fn node_id(hub: &Hub, link: usize) -> String {
     hub.nodes
         .get(link)
         .map_or_else(|| link.to_string(), |(id, _)| id.clone())
@@ -459,6 +493,7 @@ pub async fn serve(
     listener: TcpListener,
     snapshots: watch::Receiver<Snapshot>,
     geo_path: Option<PathBuf>,
+    history: Option<Arc<Recorder>>,
 ) -> Result<()> {
     let mut requests = tokio::task::JoinSet::new();
     // One shared cache for every request task: the spawned futures are
@@ -476,9 +511,10 @@ pub async fn serve(
                 if !peer.ip().is_loopback() || requests.len() >= MAX_CONNECTIONS { continue; }
                 let snapshots = snapshots.clone();
                 let path = geo_path.clone();
-                let lan = std::sync::Arc::clone(&lan);
+                let history = history.clone();
+                let lan = Arc::clone(&lan);
                 requests.spawn(async move {
-                    handle(stream, &snapshots, path.as_deref(), &lan).await
+                    handle(stream, &snapshots, path.as_deref(), &lan, history.as_deref()).await
                 });
             }
         }
@@ -491,6 +527,7 @@ async fn handle(
     snapshots: &watch::Receiver<Snapshot>,
     geo_path: Option<&Path>,
     lan: &lan::Cache,
+    history: Option<&Recorder>,
 ) -> Result<()> {
     let Some(head) = tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut stream))
         .await
@@ -504,6 +541,7 @@ async fn handle(
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     let path = target.split('?').next().unwrap_or_default();
+    let query = target.split_once('?').map_or("", |(_, query)| query);
     if method != "GET" {
         return respond(
             &mut stream,
@@ -531,6 +569,7 @@ async fn handle(
             let json = serde_json::to_vec(&snapshot)?;
             respond(&mut stream, 200, "application/json", &json).await
         }
+        "/api/history" => history_route(&mut stream, history, query).await,
         "/api/asn.csv" => {
             let loaded = snapshots.borrow().asn_table;
             match geo_path {
@@ -575,6 +614,40 @@ async fn handle(
         }
         _ => respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await,
     }
+}
+
+/// One window of traffic history. The database is read by the thread that
+/// owns it; while history is off, failing or slow the answer is `503`.
+async fn history_route(
+    stream: &mut TcpStream,
+    history: Option<&Recorder>,
+    query: &str,
+) -> Result<()> {
+    // A malformed request is the caller's mistake whether or not history is on.
+    let query = match crate::history::Query::parse(query) {
+        Err(error) => return plain(stream, 400, &format!("{error:#}")).await,
+        Ok(query) => query,
+    };
+    let Some(recorder) = history else {
+        return plain(stream, 503, "history is off").await;
+    };
+    let answer = match recorder.query(query) {
+        Err(error) => (503, format!("{error:#}")),
+        Ok(answer) => match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            Ok(Ok(Ok(history))) => {
+                let json = serde_json::to_vec(&history)?;
+                return respond(stream, 200, "application/json", &json).await;
+            }
+            Ok(Ok(Err(error))) => (503, format!("{error:#}")),
+            // The thread dropped the reply, or ran out of the request's time.
+            Ok(Err(_)) | Err(_) => (503, "history store did not answer".to_owned()),
+        },
+    };
+    plain(stream, answer.0, &answer.1).await
+}
+
+async fn plain(stream: &mut TcpStream, status: u16, text: &str) -> Result<()> {
+    respond(stream, status, "text/plain; charset=utf-8", text.as_bytes()).await
 }
 
 /// Read the request head; None when the peer closed before a complete head.
@@ -649,6 +722,7 @@ fn response_head(status: u16, content_type: &str, length: u64) -> String {
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
+        400 => "Bad Request",
         405 => "Method Not Allowed",
         503 => "Service Unavailable",
         _ => "Error",

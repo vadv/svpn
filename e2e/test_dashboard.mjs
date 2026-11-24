@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName } from "../src/web/state.mjs";
 
 test("usage ranks raw bytes, not formatted strings, and includes the pooled share", () => {
   const entries = [["a", "Small", { rx_bytes: 99, tx_bytes: 0 }], ["b", "Big", { rx_bytes: 1024, tx_bytes: 4 }], [null, "Other", { rx_bytes: 0, tx_bytes: 7 }]];
@@ -509,4 +509,72 @@ test("mimic cell selects before the first verdict and hides empty notes", () => 
   assert.deepEqual(mimicCell(allFailed), { transport: "Selecting…", race: "quic timeout", limited: "" });
   // A live transport without a published round yet still shows the transport.
   assert.deepEqual(mimicCell({ active: "mosh" }), { transport: "mosh", race: "", limited: "" });
+});
+
+// ── History kept on the client ──
+
+function history() {
+  return { range: "24h", kind: "link", step: 240, from: 0, to: 240 * 4, series: [
+    { kind: "link", link: "nl", rule: null, asn: null, rx_bytes: 300, tx_bytes: 30, active_avg: 2, points: [[0, 100, 10], [240, 200, 20]] },
+    { kind: "local", link: "", rule: null, asn: null, rx_bytes: 300, tx_bytes: 300, active_avg: 1, points: [[240, 300, 300]] },
+  ] };
+}
+
+test("history stacks the shown bytes per bucket and keeps unrecorded time apart from zero", () => {
+  const total = historyStack(history());
+  assert.deepEqual(total.series.map(item => item.values), [[110, 220, 0, 0], [0, 600, 0, 0]]);
+  assert.deepEqual(total.recorded, [true, true, false, false]);
+  assert.equal(total.count, 4);
+  assert.equal(total.peak, 820 * 8 / 240 / 1e6);
+  assert.equal(total.total, 930);
+  const sent = historyStack(history(), "tx");
+  assert.deepEqual(sent.series.map(item => item.values), [[10, 20, 0, 0], [0, 300, 0, 0]]);
+  assert.equal(sent.total, 330);
+  assert.equal(sent.peak, 320 * 8 / 240 / 1e6);
+  // Points outside the window are not drawn; nothing at all is an empty stack, not a crash.
+  const edge = historyStack({ step: 60, from: 0, to: 120, series: [{ ...history().series[0], points: [[-60, 5, 5], [120, 5, 5]] }] });
+  assert.deepEqual(edge.recorded, [false, false]);
+  assert.equal(historyStack({ step: 60, from: 0, to: 0, series: [] }).count, 0);
+});
+
+test("the history value axis tops out at a round number just above the traffic", () => {
+  assert.deepEqual(historyScale(0.0633), { top: 0.1, mid: 0.05 });
+  assert.deepEqual(historyScale(0.9), { top: 1, mid: 0.5 });
+  assert.deepEqual(historyScale(1.1), { top: 2, mid: 1 });
+  assert.deepEqual(historyScale(7), { top: 10, mid: 5 });
+  assert.deepEqual(historyScale(0), { top: 0.01, mid: 0.005 });
+});
+
+test("history bands stack on each other and break around unrecorded time", () => {
+  const stack = { from: 0, to: 400, step: 100, count: 4, rate: value => value,
+    series: [{ values: [1, 1, 1, 1] }, { values: [0, 1, 0, 1] }], recorded: [true, true, false, true] };
+  const [first, second] = historyAreas(stack, 4);
+  assert.equal(first, "M125.00,152.00 L125.00,120.00 L375.00,120.00 L375.00,152.00 L125.00,152.00 Z M875.00,152.00 L875.00,120.00 L875.00,152.00 Z");
+  assert.equal(second, "M125.00,120.00 L125.00,120.00 L375.00,88.00 L375.00,120.00 L125.00,120.00 Z M875.00,120.00 L875.00,88.00 L875.00,120.00 Z");
+  assert.deepEqual(historyAreas({ ...stack, count: 0 }, 4), ["", ""]);
+});
+
+test("history time labels grow coarser with the range and its query names the series", () => {
+  assert.deepEqual(historyMarks(0, 400), [0, 100, 200, 300, 400]);
+  assert.match(historyTime(0, 3600), /^[0-9]{2}:[0-9]{2}$/);
+  assert.match(historyTime(0, 86400), /^[0-9]{2}:[0-9]{2}$/);
+  // The same weekday comes twice across a week, so the label carries the date.
+  assert.match(historyTime(0, 7 * 86400), /^[A-Z][a-z]{2} [0-9]{1,2} [A-Z][a-z]{2}$/);
+  assert.match(historyTime(0, 30 * 86400), /^[0-9]{1,2} [A-Z][a-z]{2}$/);
+  assert.equal(historyQuery({ range: "7d", kind: "network" }), "/api/history?range=7d&kind=network&top=8");
+  assert.equal(historyQuery({ range: "1h", kind: "link", link: "a b:22" }), "/api/history?range=1h&kind=link&top=8&link=a%20b%3A22");
+});
+
+test("history series are named by server label, rule label and ASN, the exit kept apart", () => {
+  const servers = [{ id: "nl.example.test:22", label: "NL", server: "nl.example.test" }, { id: "de.example.test:22", server: "de.example.test" }];
+  const rules = [{ label: "claude", canonical: "names: anthropic.com,claude.ai" }];
+  assert.deepEqual(historyName({ kind: "link", link: "nl.example.test:22" }, servers), { label: "NL", via: "" });
+  assert.deepEqual(historyName({ kind: "link", link: "de.example.test:22" }, servers), { label: "de.example.test", via: "" });
+  assert.deepEqual(historyName({ kind: "link", link: "gone.example:22" }, servers), { label: "gone.example:22", via: "" });
+  assert.deepEqual(historyName({ kind: "local", link: "" }, servers), { label: "Local exit", via: "" });
+  assert.deepEqual(historyName({ kind: "rule", link: "nl.example.test:22", rule: "names: anthropic.com,claude.ai" }, servers, rules), { label: "claude", via: "NL" });
+  assert.deepEqual(historyName({ kind: "rule", link: "local", rule: "fallback" }, servers, rules), { label: "Fallback", via: "Local" });
+  assert.deepEqual(historyName({ kind: "rule", link: "nl.example.test:22", rule: "asn:1" }, servers, rules), { label: "asn:1", via: "NL" });
+  assert.deepEqual(historyName({ kind: "network", link: "nl.example.test:22", asn: 13335 }, servers, rules), { label: "AS13335", via: "NL" });
+  assert.deepEqual(historyName({ kind: "network", link: "nl.example.test:22", asn: 13335 }, servers, rules, { 13335: "Cloudflare" }), { label: "AS13335 · Cloudflare", via: "NL" });
 });

@@ -2,9 +2,15 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use svpn::web;
+use svpn::{
+    history::{Recorder, Row, Series},
+    web,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -13,6 +19,10 @@ use tokio::{
 
 /// Start the dashboard on an ephemeral port and return its address.
 async fn start() -> std::net::SocketAddr {
+    start_with(None).await
+}
+
+async fn start_with(history: Option<Arc<Recorder>>) -> std::net::SocketAddr {
     let hub = common::hub::dashboard_hub();
     let (tx, rx) = watch::channel(web::snapshot(&hub));
     let listener = web::bind("127.0.0.1:0".parse().unwrap())
@@ -21,7 +31,7 @@ async fn start() -> std::net::SocketAddr {
     let addr = listener.local_addr().expect("dashboard addr");
     tokio::spawn(async move {
         let _sender = tx;
-        let _ = web::serve(listener, rx, None).await;
+        let _ = web::serve(listener, rx, None, history).await;
     });
     addr
 }
@@ -95,7 +105,14 @@ async fn root_serves_html() {
     assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
     assert!(answer.contains("content-type: text/html"), "{answer}");
     assert!(answer.contains("<h1>svpn</h1>"), "{answer}");
-    for section in ["Servers", "Rules", "Pinned groups", "Flows", "Diagnostics"] {
+    for section in [
+        "Servers",
+        "Rules",
+        "Pinned groups",
+        "Flows",
+        "History",
+        "Diagnostics",
+    ] {
         assert!(answer.contains(section), "missing section {section}");
     }
     assert!(
@@ -173,6 +190,115 @@ async fn browser_headers_are_accepted() {
 async fn dashboard_refuses_a_public_address() {
     let error = web::bind("0.0.0.0:8080".parse().unwrap()).await;
     assert!(error.is_err(), "public bind must be refused");
+}
+
+// ── History ──
+
+#[tokio::test]
+async fn history_is_refused_while_it_is_off() {
+    let addr = start().await;
+
+    let answer = get(addr, "/api/history?range=24h&kind=link").await;
+
+    assert!(
+        answer.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{answer}"
+    );
+    assert!(answer.ends_with("history is off"), "{answer}");
+}
+
+#[tokio::test]
+async fn history_rejects_a_query_it_does_not_understand() {
+    let addr = start().await;
+    for query in [
+        "range=1y",
+        "kind=country",
+        "top=0",
+        "top=33",
+        "link=a%20b",
+        "range=1h&range=24h",
+        "x=1",
+    ] {
+        let answer = get(addr, &format!("/api/history?{query}")).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 400 Bad Request"),
+            "{query}: {answer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_answers_from_the_thread_that_owns_the_database() {
+    let dir = std::env::temp_dir().join(format!("svpn history http {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let recorder = Recorder::spawn(dir.join("stats.sqlite"));
+    let addr = start_with(Some(Arc::clone(&recorder))).await;
+    let minute = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 60
+        * 60;
+    for (ago, bytes) in [(2, 4096), (1, 2048)] {
+        recorder.record(
+            minute - ago * 60,
+            vec![Row {
+                series: Series::Link {
+                    link: "192.0.2.1".to_owned(),
+                },
+                rx_bytes: bytes,
+                ..zero()
+            }],
+        );
+    }
+
+    // The thread writes on its own time; the answer follows within the request timeout.
+    let deadline = Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let json = loop {
+        let answer = get(addr, "/api/history?range=1h&kind=link").await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        let json: serde_json::Value =
+            serde_json::from_str(answer.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        if json["series"][0]["rx_bytes"] == 6144 || started.elapsed() > deadline {
+            break json;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(json["range"], "1h");
+    assert_eq!(json["kind"], "link");
+    assert_eq!(json["step"], 60);
+    assert_eq!(json["series"][0]["link"], "192.0.2.1");
+    assert_eq!(json["series"][0]["rx_bytes"], 6144);
+    assert_eq!(
+        json["series"][0]["points"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        json["series"][0]["points"][1],
+        serde_json::json!([minute - 60, 2048, 0])
+    );
+
+    recorder.close();
+    let answer = get(addr, "/api/history?range=1h&kind=link").await;
+    assert!(
+        answer.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+async fn the_snapshot_says_that_history_is_off() {
+    let addr = start().await;
+
+    let answer = get(addr, "/api/state").await;
+    let json: serde_json::Value =
+        serde_json::from_str(answer.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+
+    assert_eq!(
+        json["history"],
+        serde_json::json!({ "enabled": false, "state": "", "error": "", "bytes": 0 })
+    );
 }
 
 // ── Host and head parsing ──
@@ -261,4 +387,19 @@ async fn every_answer_is_no_store() {
     let addr = start().await;
     let answer = get(addr, "/api/state").await;
     assert!(answer.contains("cache-control: no-store"), "{answer}");
+}
+
+fn zero() -> Row {
+    Row {
+        series: Series::Local,
+        rx_bytes: 0,
+        tx_bytes: 0,
+        rx_packets: 0,
+        tx_packets: 0,
+        opened: 0,
+        closed: 0,
+        failed: 0,
+        drops: 0,
+        active: 0,
+    }
 }
