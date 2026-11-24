@@ -147,6 +147,7 @@ function historyFixture(url) {
   };
   const series = all[kind].filter(item => !link || item.link === link).map(({ rx, tx, ...item }) => {
     const points = Array.from({ length: (to - from) / step }, (_, i) => [from + i * step, rx, tx]).slice(Math.floor((to - from) / step / 5));
+    if (scenario === "history-once") points.splice(0, points.length - 1);
     return { ...item, rx_bytes: rx * points.length, tx_bytes: tx * points.length, active_avg: 2, points };
   });
   return { range: name, kind, step, from, to, series };
@@ -256,6 +257,14 @@ try {
   assert(rangeButton('1h').getAttribute('aria-pressed') === 'true' && getComputedStyle(rangeButton('1h')).zIndex === '1' && getComputedStyle(rangeButton('24h')).zIndex === 'auto' && getComputedStyle($('usage-session')).zIndex === '1', 'a pressed button sits above its neighbours whoever it is');
   rangeButton('24h').click();
   await until(() => $('history-resolution').textContent === 'Every 4 min', 'back to a day of history');
+  historyReads = (await control('normal')).history_requests;
+  // A database that just started holds one bucket: it is a column, not nothing.
+  const bandWidth = () => $('history-bands').children[0].getBoundingClientRect().width;
+  await control('history-once'); rangeButton('24h').click();
+  await until(() => bandWidth() > 0 && bandWidth() < 5, 'a single recorded bucket');
+  assert(bandWidth() > 2 && !$('history-empty').offsetParent, 'one recorded bucket is drawn as a column as wide as its step');
+  await control('normal'); rangeButton('24h').click();
+  await until(() => bandWidth() > 500, 'the whole day again');
   historyReads = (await control('normal')).history_requests;
   input('history-direction', 'tx');
   assert(historyRow(0)[4] === '66.7%' && (await control('normal')).history_requests === historyReads, 'another direction redraws the same answer');

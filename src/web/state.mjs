@@ -525,12 +525,15 @@ export function historyScale(peak) {
   return { top, mid: top / 2 };
 }
 
-// Stacked bands on the chart's grid (1000 wide, 24..152 high). A run of
-// recorded buckets is one polygon per series; an unrecorded bucket breaks it.
+// Stacked bands on the chart's grid (1000 wide, 24..152 high). A bucket is
+// as wide as its step, so a single recorded one is a visible column; a run
+// of recorded buckets is one stepped polygon per series, and an unrecorded
+// bucket breaks it.
 export function historyAreas(stack, top) {
   const { series, recorded, count, rate } = stack;
   if (!count) return series.map(() => "");
-  const x = index => (1000 * (index + 0.5) / count).toFixed(2);
+  // Left edge of a bucket; the last one ends at 1000.
+  const x = index => (1000 * index / count).toFixed(2);
   const y = value => (152 - 128 * value / top).toFixed(2);
   const edges = series.map(() => ({ lower: new Array(count).fill(0), upper: new Array(count).fill(0) }));
   const cumulative = new Array(count).fill(0);
@@ -543,17 +546,24 @@ export function historyAreas(stack, top) {
   });
   return edges.map(edge => {
     const parts = [];
-    let run = [];
+    let start = null, end = 0;
     const flush = () => {
-      if (run.length) {
-        const up = run.map(index => `L${x(index)},${y(edge.upper[index])}`).join(" ");
-        const down = [...run].reverse().map(index => `L${x(index)},${y(edge.lower[index])}`).join(" ");
-        parts.push(`M${x(run[0])},${y(edge.lower[run[0]])} ${up} ${down} Z`);
+      if (start == null) return;
+      const up = [], down = [];
+      for (let index = start; index <= end; index++) {
+        up.push(`L${x(index)},${y(edge.upper[index])}`, `L${x(index + 1)},${y(edge.upper[index])}`);
+        down.unshift(`L${x(index)},${y(edge.lower[index])}`, `L${x(index + 1)},${y(edge.lower[index])}`);
       }
-      run = [];
+      parts.push(`M${x(start)},${y(edge.lower[start])} ${up.join(" ")} ${down.join(" ")} Z`);
+      start = null;
     };
     for (let index = 0; index < count; index++) {
-      if (recorded[index]) run.push(index); else flush();
+      if (recorded[index]) {
+        if (start == null) start = index;
+        end = index;
+      } else {
+        flush();
+      }
     }
     flush();
     return parts.join(" ");

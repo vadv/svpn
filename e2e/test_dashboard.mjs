@@ -549,9 +549,17 @@ test("history bands stack on each other and break around unrecorded time", () =>
   const stack = { from: 0, to: 400, step: 100, count: 4, rate: value => value,
     series: [{ values: [1, 1, 1, 1] }, { values: [0, 1, 0, 1] }], recorded: [true, true, false, true] };
   const [first, second] = historyAreas(stack, 4);
-  assert.equal(first, "M125.00,152.00 L125.00,120.00 L375.00,120.00 L375.00,152.00 L125.00,152.00 Z M875.00,152.00 L875.00,120.00 L875.00,152.00 Z");
-  assert.equal(second, "M125.00,120.00 L125.00,120.00 L375.00,88.00 L375.00,120.00 L125.00,120.00 Z M875.00,120.00 L875.00,88.00 L875.00,120.00 Z");
+  // Each bucket spans its own width: a run is one stepped polygon from its first left edge to its last right edge.
+  assert.equal(first, "M0.00,152.00 L0.00,120.00 L250.00,120.00 L250.00,120.00 L500.00,120.00 L250.00,152.00 L500.00,152.00 L0.00,152.00 L250.00,152.00 Z M750.00,152.00 L750.00,120.00 L1000.00,120.00 L750.00,152.00 L1000.00,152.00 Z");
+  assert.equal(second, "M0.00,120.00 L0.00,120.00 L250.00,120.00 L250.00,88.00 L500.00,88.00 L250.00,120.00 L500.00,120.00 L0.00,120.00 L250.00,120.00 Z M750.00,120.00 L750.00,88.00 L1000.00,88.00 L750.00,120.00 L1000.00,120.00 Z");
   assert.deepEqual(historyAreas({ ...stack, count: 0 }, 4), ["", ""]);
+  // One recorded bucket, as right after a start, is a column as wide as its step: never zero width.
+  const day = 360;
+  const [alone] = historyAreas({ step: 240, count: day, rate: value => value, series: [{ values: [1] }],
+    recorded: Array.from({ length: day }, (_, index) => index === day - 1) }, 1);
+  const edges = alone.match(/[0-9.]+(?=,)/g).map(Number);
+  assert.equal(Math.min(...edges).toFixed(2), (1000 * (day - 1) / day).toFixed(2));
+  assert.equal(Math.max(...edges), 1000);
 });
 
 test("history time labels grow coarser with the range and its query names the series", () => {
