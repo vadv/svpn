@@ -317,9 +317,18 @@ const ORDERS = {
   idle: (a, b) => (b.idle_secs ?? -1) - (a.idle_secs ?? -1),
 };
 
-export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", names = {}, page = 0, order = "" } = {}) {
+// Each axis is an alternative view of the same bytes, not an additional expense.
+export function usageRanking(entries, direction) {
+  const amount = t => direction === "rx" ? t.rx_bytes : direction === "tx" ? t.tx_bytes : t.rx_bytes + t.tx_bytes;
+  const rows = entries.map(([key, label, traffic]) => ({ key, label, ...traffic, value: amount(traffic) }))
+    .filter(row => row.value > 0).sort((a, b) => b.value - a.value || String(a.key).localeCompare(String(b.key), "en"));
+  return { rows, total: rows.reduce((sum, row) => sum + row.value, 0) };
+}
+
+export function flowPage(flows, { query = "", protocol = "", via = "", country = "", asn = "", drill = null, names = {}, page = 0, order = "" } = {}) {
   const needle = query.trim().toLowerCase();
   const filtered = flows.filter(flow => (!protocol || flow.protocol === protocol) && (!via || flow.via === via) &&
+    (!drill || (drill.axis === "exits" ? flow.via : drill.axis === "networks" ? String(flow.asn ?? "unknown") : flow.destination.split(":", 1)[0]) === drill.key) &&
     (!country || (flow.country ?? "unknown") === country) && (!asn || String(flow.asn ?? "unknown") === asn) &&
     (!needle || `${flow.source} ${flow.destination} ${flow.client ?? ""} ${flow.client_name ?? ""} ${flow.country ?? "Unknown"} ${asnLabel(flow.asn, names)} ${flowService(flow) ?? ""}`.toLowerCase().includes(needle)));
   // The snapshot already arrives in address order; a stable sort keeps it as the tie-breaker.

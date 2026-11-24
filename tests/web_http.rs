@@ -95,7 +95,7 @@ async fn root_serves_html() {
     assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
     assert!(answer.contains("content-type: text/html"), "{answer}");
     assert!(answer.contains("<h1>svpn</h1>"), "{answer}");
-    for section in ["Servers", "Rules", "Pinned groups", "Flows", "Counters"] {
+    for section in ["Servers", "Rules", "Pinned groups", "Flows", "Diagnostics"] {
         assert!(answer.contains(section), "missing section {section}");
     }
     assert!(

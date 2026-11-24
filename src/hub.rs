@@ -32,6 +32,8 @@ use crate::{
 
 pub mod jobs;
 mod routes;
+pub mod usage;
+pub use usage::{UsageMeter, UsageSample};
 
 pub use jobs::{JobContext, JobEvent, JobStats};
 
@@ -290,12 +292,22 @@ impl Hub {
             &delivery,
             &self.links,
         )? {
-            if let Some(flow) = self.routes.by_key.get_mut(&key) {
-                flow.rule = rule;
-            }
+            self.attribute_open(key, rule);
             self.routes.record(key, bytes.len(), 0);
         }
         Ok(None)
+    }
+
+    fn attribute_open(&mut self, key: FlowKey, rule: Option<usize>) {
+        if let Some(flow) = self.routes.by_key.get_mut(&key) {
+            flow.rule = rule;
+            if self.routes.usage.is_some() {
+                flow.asn = self
+                    .geo
+                    .as_ref()
+                    .and_then(|geo| geo.lookup(key.destination));
+            }
+        }
     }
 
     /// Owner of one sticky group: rendezvous inside `via`, no snap-back,
@@ -336,6 +348,7 @@ impl Hub {
                 self.local_stats.opened += 1;
                 self.routes
                     .insert(key, Target::Direct(id), Some(rule), None);
+                self.attribute_open(key, Some(rule));
                 self.routes.record(key, bytes.len(), 0);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -503,15 +516,9 @@ impl Hub {
         };
         drop(local.outgoing);
         self.local_cleanup = Some(local.server);
-        let mut retired = Vec::new();
-        self.routes.by_key.retain(|key, flow| {
-            if matches!(flow.target, Target::Direct(_)) {
-                retired.push(*key);
-                false
-            } else {
-                true
-            }
-        });
+        let retired = self
+            .routes
+            .remove_matching(|target| matches!(target, Target::Direct(_)));
         for key in retired {
             self.local_stats.closed += 1;
             if key.protocol == 6 {
@@ -1122,7 +1129,7 @@ impl Hub {
                     }
                 } => {
                     if let Some(tx) = &dashboard {
-                        let _ = tx.send(crate::web::snapshot(self));
+                        let _ = tx.send(crate::web::sample(self));
                     }
                 }
                 _ = async {
@@ -1471,7 +1478,8 @@ pub async fn run(
     let dashboard = match web_listen {
         Some(addr) => {
             let listener = crate::web::bind(addr).await?;
-            let (tx, rx) = watch::channel(crate::web::snapshot(&hub));
+            hub.routes.usage = Some(UsageMeter::default());
+            let (tx, rx) = watch::channel(crate::web::sample(&mut hub));
             let geo_path = hub.geo_path.clone();
             let task = tokio::spawn(async move {
                 if let Err(error) = crate::web::serve(listener, rx, geo_path).await {

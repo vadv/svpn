@@ -1,10 +1,13 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
 let latest = null, point = null, history = [], lastChange = 0, apiError = false;
 let frozen = null, page = 0, flowSignature = "";
 const serverRows = new Map();
+let period = "session", drill = null, usageFrame, usageStale;
+const filters = ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"];
+const expandedRanks = new Set();
 let asnNames = Object.create(null), asnCount = 0, asnState = "idle", asnError = "", asnAbort = null, asnIdleTimer = null;
 
 // Regional-indicator pairs have no flag glyph everywhere: Windows renders the two letters
@@ -28,7 +31,9 @@ function badge(state, label = state) {
   const good = ["ready", "ok"].includes(state);
   const bad = ["failed", "timeout", "reload_failed", "missing"].includes(state);
   const warn = ["checking", "connecting", "backoff", "running", "previous"].includes(state);
-  return node("span", label, `pill ${good ? "good" : bad ? "bad" : warn ? "warn" : ""}`);
+  // "reload_failed" reads as words; the raw enum value never reaches the page.
+  const text = label === "ok" ? "OK" : label.replaceAll("_", " ").replace(/^./, letter => letter.toUpperCase());
+  return node("span", text, `pill ${good ? "good" : bad ? "bad" : warn ? "warn" : ""}`);
 }
 
 function cell(value, numeric = false) {
@@ -102,15 +107,93 @@ function renderProcess() {
   $("spark-cpu").setAttribute("d", spark(history, "cpu"));
 }
 
+const rankAxes = ["exits", "networks", "destinations"];
+
+function rankList(axis, ranking, format, empty) {
+  const list = $(`rank-${axis}`), more = list.nextElementSibling;
+  const { rows, total } = ranking;
+  more.hidden = rows.length <= 4;
+  more.textContent = expandedRanks.has(axis) ? "Show top 4" : `Show all ${rows.length}`;
+  more.setAttribute("aria-expanded", String(expandedRanks.has(axis)));
+  const visible = expandedRanks.has(axis) ? rows : rows.slice(0, 4);
+  const existing = new Map([...list.children].map(li => [li.dataset.key, li]));
+  for (const [i, row] of visible.entries()) {
+    const key = row.key ?? "", share = row.value / total * 100;
+    let li = existing.get(key);
+    if (!li) {
+      li = node("li"); li.dataset.key = key;
+      const line = node("div", "", "rank-line"), meter = node("div", "", "rank-meter");
+      const label = node(key ? "button" : "span");
+      if (key) label.addEventListener("click", () => inspectFlows(axis, key, label.textContent));
+      line.append(label, node("small")); meter.append(node("i")); li.append(line, meter);
+    }
+    const [line, meter] = li.children;
+    line.firstChild.textContent = row.label;
+    line.firstChild.title = key ? `Inspect current flows: ${row.label}` : "Bytes pooled when the named-bucket limit was reached";
+    line.lastChild.textContent = `${format(row.value)} · ${share < 1 ? "<1" : Math.round(share)}%`;
+    meter.firstChild.style.width = `${share}%`;
+    if (list.children[i] !== li) list.insertBefore(li, list.children[i] ?? null);
+    existing.delete(key);
+  }
+  for (const li of existing.values()) li.remove();
+  if (!visible.length) list.replaceChildren(node("li", empty, "muted"));
+}
+
+function renderUsage(stale) {
+  const sample = latest?.usage, now = period === "interval";
+  const direction = $("usage-direction").value;
+  const data = sample?.[period];
+  const available = data && (!now || (!stale && point && sample.seconds > 0));
+  const format = n => now ? `${rate(n * 8 / sample.seconds / 1e6)} Mbit/s` : bytes(n);
+  const groups = { exits: [], networks: [], destinations: [] };
+  if (available) {
+    for (const server of latest.servers) {
+      const traffic = data.exits[server.index];
+      if (traffic) groups.exits.push([server.id, name(server.id), traffic]);
+    }
+    groups.exits.push(["local", "Local exit", data.local]);
+    for (const axis of ["networks", "destinations"]) {
+      groups[axis] = Object.entries(data[axis].named).map(([key, t]) => [key, axis === "networks" ? asnLabel(key, asnNames) : key, t]);
+      groups[axis].push([null, "Other · pooled", data[axis].other]);
+    }
+    groups.networks.push(["unknown", "Unknown ASN", data.unknown_asn]);
+  }
+  const rx = groups.exits.reduce((s, [, , t]) => s + t.rx_bytes, 0);
+  const tx = groups.exits.reduce((s, [, , t]) => s + t.tx_bytes, 0);
+  const empty = !latest ? "Waiting for snapshot" : !sample ? "Accounting unavailable" : !available ? stale ? "Snapshot is stale" : "Measuring first interval…" : "No traffic in this view";
+  const window = now ? available ? `Last ${sample.seconds.toFixed(1)} s` : "Latest measurement interval" : stale && latest ? "Since start · last snapshot" : "Since client start";
+  $("usage-period").textContent = `${direction === "rx" ? "Received" : direction === "tx" ? "Sent" : "Total traffic"} · ${window}`;
+  $("usage-split").textContent = available ? `↓ ${format(rx)} received · ↑ ${format(tx)} sent` : empty;
+  for (const axis of rankAxes) {
+    const ranking = usageRanking(groups[axis], direction);
+    if (axis === "exits") $("usage-total").textContent = available ? format(ranking.total) : "—";
+    rankList(axis, ranking, format, empty);
+  }
+  for (const id of ["usage-session", "usage-now", "usage-direction"]) $(id).disabled = !sample;
+  $("usage-session").setAttribute("aria-pressed", String(!now));
+  $("usage-now").setAttribute("aria-pressed", String(now));
+  usageFrame = latest; usageStale = stale;
+}
+
+function inspectFlows(axis, key, label) {
+  drill = { axis, key }; frozen = null; page = 0;
+  for (const id of filters) $(id).value = "";
+  $("flow-order").value = period === "session" ? "total" : "rate";
+  $("drill-label").textContent = `Current flows · ${label} (completed flows are not listed)`;
+  $("drill-note").hidden = false;
+  renderFlows(); $("clear-drill").focus();
+}
+
 function freshness() {
   const stale = isStale();
+  if (usageFrame !== latest || usageStale !== stale) renderUsage(stale);
   document.body.classList.toggle("stale", stale && Boolean(latest));
   $("stale-notice").hidden = !latest || !stale;
-  $("freshness").className = `pill ${stale ? "warn" : "good"}`;
-  $("freshness").textContent = !latest ? (apiError ? "API unavailable" : "Connecting…") : stale ? "Stale data" : "Live snapshots";
+  $("freshness").className = `pill ${!latest ? (apiError ? "bad" : "") : stale ? "warn" : "good"}`;
+  $("freshness").textContent = !latest ? (apiError ? "API unavailable" : "Connecting…") : stale ? "Stale data" : "Live";
   if (latest) {
     const age = Math.max(0, Math.floor((performance.now() - lastChange) / 1000));
-    $("meta").textContent = `${latest.policy} · ${new Date(latest.generated_at_ms).toLocaleTimeString()} · ${age}s`;
+    $("meta").textContent = `Updated ${age}s ago · ${new Date(latest.generated_at_ms).toLocaleTimeString()} · ${latest.policy}`;
   } else if (apiError) $("meta").textContent = "Retrying /api/state";
   // Same smoothed value the chart draws; `point` gates it so a duplicate or failed poll shows —.
   const total = point ? graph(history).latest : null;
@@ -127,8 +210,8 @@ function freshness() {
   if (stale) {
     $("chart-note").textContent = latest ? "Last snapshot" : "Waiting…";
     $("recent-errors").textContent = latest ? "—" : "No snapshot";
-    $("legend-rx").textContent = "RX — Mbit/s";
-    $("legend-tx").textContent = "TX — Mbit/s";
+    $("legend-rx").textContent = "Receive — Mbit/s";
+    $("legend-tx").textContent = "Send — Mbit/s";
     $("proc-rss").textContent = "—";
     $("proc-cpu").textContent = "—";
     $("proc-cpu-kind").textContent = "No sample";
@@ -210,7 +293,7 @@ function renderFlows() {
   options($("flow-country"), [["", "All countries"], ...countries.map(country => [country, country === "unknown" ? "Unknown" : country])]);
   options($("flow-asn"), [["", "All ASNs"], ...asns.map(asn => [asn, asn === "unknown" ? "Unknown" : asnLabel(asn, names)])]);
   const result = flowPage(state.flows, { query: $("flow-search").value, protocol: $("flow-protocol").value, via: $("flow-exit").value,
-    country: $("flow-country").value, asn: $("flow-asn").value, names, page, order: $("flow-order").value });
+    country: $("flow-country").value, asn: $("flow-asn").value, drill, names, page, order: $("flow-order").value });
   page = result.page;
   const sources = result.rows.map(flowSource);
   const labels = result.rows.map((flow, index) => [flow.protocol.toUpperCase(), `${sources[index].main} ${sources[index].detail}`, flow.destination,
@@ -218,7 +301,7 @@ function renderFlows() {
     flow.rule == null ? "Fallback" : state.rules.find(rule => rule.index === flow.rule)?.label ?? "Unknown rule",
     rate(flow.rate == null ? null : flow.rate * 8 / 1e6), bytes((flow.rx_bytes ?? 0) + (flow.tx_bytes ?? 0)),
     flowService(flow), flowAge(flow).main, flowAge(flow).detail]);
-  const signature = JSON.stringify({ labels, closing: result.rows.map(flow => Boolean(flow.closing)), empty: result.total === 0 });
+  const signature = JSON.stringify({ labels, drill, closing: result.rows.map(flow => Boolean(flow.closing)), empty: result.total === 0 });
   if (flowSignature !== signature) {
     const rows = result.rows.map((flow, index) => {
       const protocol = cell(node("span", labels[index][0], `tag tag--${flow.protocol}`));
@@ -233,7 +316,7 @@ function renderFlows() {
       cell(title(labels[index][10], labels[index][11]), true),
       ];
     });
-    table("flows", rows, 9, result.total ? "No flows match these filters" : "No active flows");
+    table("flows", rows, 9, drill ? "No current flows match. Completed traffic remains in the session totals." : result.total ? "No flows match these filters" : "No active flows");
     // Closing rows dim in place; the tag alone would vanish in the density.
     result.rows.forEach((flow, index) => {
       if (flow.closing) $("flows").tBodies[0].rows[index].classList.add("closing");
@@ -249,6 +332,7 @@ function renderFlows() {
   $("pause").textContent = frozen ? "Resume" : "Pause";
   $("pause").setAttribute("aria-pressed", String(Boolean(frozen)));
   $("flow-status").textContent = frozen ? `Paused ${new Date(frozen.generated_at_ms).toLocaleTimeString()}` : "Live";
+  $("flow-reset").disabled = !latest || !(drill || filters.some(id => $(id).value));
 }
 
 function renderAsnNames() {
@@ -336,10 +420,11 @@ function renderChart() {
   $("chart-rx").setAttribute("d", result.rx);
   $("chart-tx").setAttribute("d", result.tx);
   $("chart-max").textContent = `${result.max.toFixed(2)} Mbit/s`;
+  $("chart-mid").textContent = (result.max / 2).toFixed(2);
   $("chart-end").textContent = new Date(latest.generated_at_ms).toLocaleTimeString();
   const current = point ? result.latest : null;
-  $("legend-rx").textContent = `RX ${rate(current?.rx)} Mbit/s`;
-  $("legend-tx").textContent = `TX ${rate(current?.tx)} Mbit/s`;
+  $("legend-rx").textContent = `Receive ${rate(current?.rx)} Mbit/s`;
+  $("legend-tx").textContent = `Send ${rate(current?.tx)} Mbit/s`;
   const collected = Math.max(0, Math.floor((history.at(-1).time - history[0].time) / 1000));
   $("chart-empty").hidden = collected >= 30 && current?.rx != null;
   $("chart-note").textContent = current?.rx == null ? "collecting samples…" : collected < 30 ? `${collected}s collected` : "VPN links";
@@ -349,6 +434,8 @@ function render() {
   for (const id of ["chart-server", "flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn", "flow-order"])  $(id).disabled = false;
   const ready = latest.servers.filter(server => server.state === "ready").length;
   $("ready").textContent = `${ready} / ${latest.servers.length}`;
+  // A healthy summary stays neutral; these two are what a reader scans for trouble.
+  $("ready").className = latest.servers.length && ready < latest.servers.length ? "warn" : "";
   const open = latest.flows.filter(flow => !flow.closing).length;
   const closing = latest.flows.length - open;
   // The headline stays a bare number so the card fits a phone; closing ones go to the note.
@@ -356,6 +443,7 @@ function render() {
   const localFlows = latest.flows.filter(flow => flow.via === "local").length;
   $("active-note").textContent = `${latest.flows.length - localFlows} VPN · ${localFlows} local${closing ? ` · ${closing} closing` : ""}`;
   $("local").textContent = localState(latest.local);
+  $("local").className = latest.local.enabled && !latest.local.ready ? "compact bad" : "compact";
   $("local-note").textContent = latest.local.enabled ? `${localFlows} flows · ${latest.local.ready ? "ready" : "unavailable"}` : "Disabled";
   const warnings = latest.servers.filter(server => server.state !== "ready").map(server => `${name(server.id)}: ${server.state}${server.reason ? ` — ${server.reason}` : ""}`);
   if (latest.local.enabled && !latest.local.ready) warnings.push("Local exit unavailable; local rules do not fall back to VPN");
@@ -401,8 +489,16 @@ async function refresh() {
 
 function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidden = true; }
 
+for (const [id, value] of [["usage-session", "session"], ["usage-now", "interval"]]) $(id).addEventListener("click", () => { period = value; renderUsage(isStale()); });
+$("usage-axis").addEventListener("change", () => { $("usage-ranks").dataset.axis = $("usage-axis").value; });
+$("usage-direction").addEventListener("change", () => renderUsage(isStale()));
+for (const axis of rankAxes) $(`rank-${axis}`).nextElementSibling.addEventListener("click", () => {
+  if (expandedRanks.has(axis)) expandedRanks.delete(axis); else expandedRanks.add(axis);
+  renderUsage(isStale());
+});
+$("clear-drill").addEventListener("click", () => { drill = null; page = 0; $("drill-note").hidden = true; renderFlows(); $("flow-search").focus(); });
 $("chart-server").addEventListener("change", () => { renderChart(); freshness(); });
-for (const id of ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn", "flow-order"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
+for (const id of [...filters, "flow-order"]) $(id).addEventListener(id === "flow-search" ? "input" : "change", () => { page = 0; renderFlows(); });
 $("asn-load").addEventListener("click", () => void loadAsnNames());
 document.addEventListener("visibilitychange", asnVisibility);
 asnVisibility();
@@ -415,13 +511,27 @@ $("pause").addEventListener("click", () => {
 $("previous").addEventListener("click", () => { page--; renderFlows(); });
 $("next").addEventListener("click", () => { page++; renderFlows(); });
 
+// Until the user picks, the theme follows the system; like everything else it lives in this tab only.
 function setTheme(light) {
-  document.body.dataset.theme = light ? "light" : "dark";
+  const theme = light ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  document.body.dataset.theme = theme;
   $("theme-toggle").setAttribute("aria-pressed", String(light));
-  $("theme-toggle").textContent = light ? "DARK" : "LIGHT";
+  $("theme-toggle").textContent = `Theme: ${theme}`;
 }
-setTheme(document.body.dataset.theme === "light");
-$("theme-toggle").addEventListener("click", () => setTheme(document.body.dataset.theme !== "light"));
+const systemTheme = matchMedia("(prefers-color-scheme: light)");
+let followsSystem = true;
+setTheme(systemTheme.matches);
+// The page keeps following the system until the user makes a choice of their own.
+systemTheme.addEventListener("change", () => { if (followsSystem) setTheme(systemTheme.matches); });
+$("theme-toggle").addEventListener("click", () => { followsSystem = false; setTheme(document.body.dataset.theme !== "light"); });
+
+// One way back to the unfiltered table, for the keyboard and the pointer alike.
+$("flow-reset").addEventListener("click", () => {
+  for (const id of filters) $(id).value = "";
+  drill = null; page = 0; $("drill-note").hidden = true;
+  renderFlows(); $("flow-search").focus();
+});
 
 $("chart-plot").addEventListener("pointermove", event => {
   if (!history.length) { hideCursor(); return; }
@@ -431,7 +541,7 @@ $("chart-plot").addEventListener("pointermove", event => {
   const end = history.at(-1).time;
   const sample = nearestSample(history, end - WINDOW_MS + ratio * WINDOW_MS, $("chart-server").value);
   if (!sample || (sample.rx == null && sample.tx == null)) { hideCursor(); return; }
-  $("chart-tooltip").textContent = `${new Date(sample.time).toLocaleTimeString()} · RX ${rate(sample.rx)} / TX ${rate(sample.tx)}`;
+  $("chart-tooltip").textContent = `${new Date(sample.time).toLocaleTimeString()} · Receive ${rate(sample.rx)} / Send ${rate(sample.tx)} Mbit/s`;
   $("chart-tooltip").style.left = `${(ratio * 100).toFixed(1)}%`;
   const x = (ratio * 1000).toFixed(2);
   $("chart-cursor").setAttribute("x1", x);

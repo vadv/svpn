@@ -11,7 +11,7 @@ use crate::{
     packet::{self, FlowKey},
 };
 
-use super::{Link, drop_note};
+use super::{Link, UsageMeter, UsageSample, drop_note};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Owner {
@@ -38,6 +38,9 @@ pub struct RoutedFlow {
     pub closing: bool,
     /// This flow's bytes since the hub first saw it.
     pub traffic: Traffic,
+    /// Destination network at admission; never relabel previously accounted bytes on DB reload.
+    pub asn: Option<u32>,
+    pub(super) reported: Traffic,
     /// When the hub first saw the flow, and when it last carried a packet.
     pub opened: Instant,
     pub active: Instant,
@@ -56,6 +59,7 @@ pub struct Routes {
     /// Bounded by configured rules plus fallback; survives flow retirement.
     pub traffic: HashMap<Option<usize>, Traffic>,
     pub next: u64,
+    pub usage: Option<UsageMeter>,
 }
 
 impl Routes {
@@ -80,7 +84,7 @@ impl Routes {
         group: Option<u64>,
     ) {
         let now = Instant::now();
-        self.by_key.insert(
+        let replaced = self.by_key.insert(
             key,
             RoutedFlow {
                 target,
@@ -88,10 +92,23 @@ impl Routes {
                 group,
                 closing: false,
                 traffic: Traffic::default(),
+                reported: Traffic::default(),
+                asn: None,
                 opened: now,
                 active: now,
             },
         );
+        if let (Some(meter), Some(mut old)) = (&mut self.usage, replaced) {
+            meter.pending.collect(key.destination, &mut old);
+        }
+    }
+
+    pub fn sample_usage(&mut self, now: Instant) -> Option<UsageSample> {
+        let meter = self.usage.as_mut()?;
+        for (key, flow) in &mut self.by_key {
+            meter.pending.collect(key.destination, flow);
+        }
+        Some(meter.sample(now))
     }
 
     /// Both FINs reported by the current owner; a stale owner cannot mark
@@ -244,9 +261,15 @@ impl Routes {
         })
     }
 
+    fn retire(&mut self, key: FlowKey) {
+        if let (Some(mut flow), Some(meter)) = (self.by_key.remove(&key), &mut self.usage) {
+            meter.pending.collect(key.destination, &mut flow);
+        }
+    }
+
     pub fn forget(&mut self, key: FlowKey, owner: Owner) {
         if self.target(&key) == Some(&Target::Remote(owner)) {
-            self.by_key.remove(&key);
+            self.retire(key);
         }
     }
 
@@ -254,7 +277,7 @@ impl Routes {
     /// The caller may tombstone the tuple only when removal succeeds.
     pub fn forget_direct(&mut self, key: FlowKey, id: u64) -> bool {
         if self.target(&key) == Some(&Target::Direct(id)) {
-            self.by_key.remove(&key);
+            self.retire(key);
             true
         } else {
             false
@@ -265,9 +288,18 @@ impl Routes {
     /// so the caller can tombstone the TCP ones. local-exit owners survive
     /// failure of an unrelated link.
     pub fn remove_epoch(&mut self, epoch: Epoch) -> Vec<FlowKey> {
+        self.remove_matching(
+            |target| matches!(target, Target::Remote(owner) if owner.epoch == epoch),
+        )
+    }
+
+    pub(super) fn remove_matching(&mut self, matches: impl Fn(Target) -> bool) -> Vec<FlowKey> {
         let mut retired = Vec::new();
         self.by_key.retain(|key, flow| {
-            if matches!(flow.target, Target::Remote(owner) if owner.epoch == epoch) {
+            if matches(flow.target) {
+                if let Some(meter) = &mut self.usage {
+                    meter.pending.collect(key.destination, flow);
+                }
                 retired.push(*key);
                 false
             } else {

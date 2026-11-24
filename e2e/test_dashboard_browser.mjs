@@ -14,6 +14,30 @@ assert.ok(fs.existsSync(chrome), `Chrome not found: ${chrome}; set CHROME to an 
 const epoch = Date.now();
 let scenario = "normal", generation = 1, sequence = 0, lastFrame, namesRequests = 0;
 
+// Same packets on all three axes. 198.51.100.80 is already closed; unknown and
+// pooled contributions keep their bytes even though neither has a provider name.
+function usageFixture(interval) {
+  const t = () => ({ rx_bytes: 0, tx_bytes: 0 });
+  const buckets = () => ({ named: {}, other: t() });
+  const usage = { exits: {}, local: t(), networks: buckets(), destinations: buckets(), unknown_asn: t() };
+  if (scenario === "empty") return usage;
+  for (const [exit, asn, ip, down, up] of [
+    [0, 13335, "203.0.113.2", 720, 39], [1, 15169, "203.0.113.3", 320, 65],
+    ["local", 13335, "198.51.100.80", 210, 330], [0, 13335, "203.0.113.4", 92, 3],
+    [1, null, "203.0.113.1", 28, 4], [0, "other", "other", 8, 2],
+  ]) {
+    const received = n => Math.round(down * (exit === 1 ? 1600 : exit === "local" ? 0 : 200) * (n + 8 * Math.sin(n / 12)));
+    const sent = n => Math.round(up * (exit === "local" ? 0 : 400) * (n + 14 * Math.sin(n / 18)));
+    const rx = received(sequence) + (interval ? -received(sequence - 1) : down * 1048576);
+    const tx = sent(sequence) + (interval ? -sent(sequence - 1) : up * 1048576);
+    const add = b => { b.rx_bytes += rx; b.tx_bytes += tx; };
+    add(exit === "local" ? usage.local : usage.exits[exit] ??= t());
+    add(asn == null ? usage.unknown_asn : asn === "other" ? usage.networks.other : usage.networks.named[asn] ??= t());
+    add(ip === "other" ? usage.destinations.other : usage.destinations.named[ip] ??= t());
+  }
+  return usage;
+}
+
 function frame() {
   const degraded = scenario === "degraded";
   const count = scenario === "large" ? 10003 : scenario === "empty" ? 0 : degraded ? 41 : 123;
@@ -35,6 +59,12 @@ function frame() {
       inner_tx_bytes: (i ? 91 : 64) * 1048576 + (degraded && i ? 0 : sequence * (i ? 12500 : 25000)), opened_flows: 85,
       open_failed_flows: degraded && i ? 3 : 0, closed_flows: 12, dropped_packets: degraded && i ? 2 : 0 },
   }));
+  const usage = { session: usageFixture(false), interval: usageFixture(true), seconds: 1 };
+  if (!degraded) for (const server of servers) {
+    const t = usage.session.exits[server.index];
+    server.stats.inner_rx_bytes = t?.rx_bytes ?? 0;
+    server.stats.inner_tx_bytes = t?.tx_bytes ?? 0;
+  }
   const flows = Array.from({ length: count }, (_, i) => ({
     protocol: i % 2 ? "tcp" : "udp", source: `10.77.0.2:${40000 + i}`, destination: `203.0.113.${i % 250 + 1}:443`,
     country: i % 5 === 0 ? null : i % 2 ? "US" : "DE", asn: i % 5 === 0 ? null : i % 2 ? 13335 : 15169,
@@ -68,6 +98,7 @@ function frame() {
     cpu_seconds: 12 + sequence * 0.18, cpus: 8,
   };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
+    usage,
     process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0,
       active_flows: flows.filter(flow => flow.via === "local").length, closing_flows: 0 },
@@ -97,7 +128,7 @@ try {
   assert($('active-note').textContent.endsWith(' · 8 closing'), 'closing flows are counted in the note, not the headline');
   assert($('rules').tBodies[0].rows[0].cells[3].textContent === '37 active · 4 closing' && $('rules').textContent.includes('41 active'), 'rules split active and closing counts, a rule without closing omits the note');
   assert($('rules').tBodies[0].rows[$('rules').tBodies[0].rows.length - 1].cells[1].textContent === 'Per flow / group', 'fallback exit states per flow / group pinning');
-  assert($('local').textContent === 'Ready', 'local readiness');
+  assert($('local').textContent === 'Ready' && $('local').className === 'compact' && $('ready').className === '', 'local readiness; a healthy summary stays neutral');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
   assert($('chart-rx').getAttribute('d').includes('l0,0') && getComputedStyle($('chart-rx')).strokeLinecap === 'round', 'isolated first chart sample is visible');
   await until(() => $('proc-rss').textContent.includes('MiB') && $('proc-cpu').textContent.includes('%'), 'process RSS and CPU readout');
@@ -128,15 +159,36 @@ try {
   assert(statusTag && getComputedStyle(statusTag).borderTopWidth === '0px', 'status labels are plain text, not button-like boxes');
   assert(!document.querySelector('#rules-panel').textContent.includes('IP bytes since client start'), 'long prose is removed from the rules panel');
   $('theme-toggle').click();
-  assert(document.body.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true', 'light theme switch');
+  assert(document.body.dataset.theme === 'light' && document.documentElement.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true' && $('theme-toggle').textContent === 'Theme: light', 'light theme switch');
   $('theme-toggle').click();
-  assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false', 'dark theme switch');
+  assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false' && $('theme-toggle').textContent === 'Theme: dark', 'dark theme switch');
+  const bodyStyle = getComputedStyle(document.body), titleStyle = getComputedStyle(document.querySelector('.heading h2'));
+  assert(/system-ui/.test(bodyStyle.fontFamily) && parseFloat(bodyStyle.fontSize) >= 13 && titleStyle.textTransform === 'none' && parseFloat(titleStyle.fontSize) >= 14, 'interface text is sentence case in the UI face at a readable size');
+  assert(!document.querySelector('.caret') && getComputedStyle(document.querySelector('.rail-health'), '::before').animationName === 'none', 'nothing blinks on a healthy dashboard');
+  assert([...document.querySelectorAll('.chart-axis span')].map(span => span.textContent).join('|') === '−5 min|−3:45|−2:30|−1:15|' + $('chart-end').textContent, 'chart carries time ticks');
+  assert(Math.abs(Number.parseFloat($('chart-mid').textContent) * 2 - Number.parseFloat($('chart-max').textContent)) < 0.02, 'value axis labels its middle gridline');
+  assert($('flow-reset').disabled, 'clear filters stays quiet without filters');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
   assert($('servers').textContent.includes('tcp 41 ms (+penalty) · quic 63 ms · webrtc timeout · obfs handshake'), 'race is shown, winner first');
   assert($('servers').textContent.includes('Selecting…') && $('servers').textContent.includes('limited: webrtc · ssh'), 'pending selection and config restriction are shown');
   assert(!$('servers').textContent.includes('Auto'), 'configured-only mimic text is gone');
   await until(() => $('asn-status').textContent.includes('2 names'), 'CSV parsed and cached in browser');
+  assert($('rank-networks').querySelector('button').textContent.includes('Cloudflare'), 'session provider ranks use ASN organization names');
+  assert($('rank-exits').querySelector('button').textContent === 'NL', 'session ranks use bytes, including local exit');
+  input('usage-direction', 'tx');
+  assert($('rank-exits').querySelector('button').textContent === 'Local exit', 'sent bytes reorder exits numerically');
+  input('usage-direction', 'total'); $('usage-now').click();
+  assert($('rank-exits').querySelector('button').textContent === 'DE' && $('usage-total').textContent.includes('Mbit/s'), 'latest interval has a different busiest exit and rate units');
+  $('rank-networks').querySelector('button').click();
+  assert([...$('flows').tBodies[0].rows].every(row => row.cells[4].textContent.includes('AS15169')) && $('flow-order').value === 'rate', 'inspect the busy provider by current flow rate');
+  $('clear-drill').click(); $('usage-session').click();
+  [...$('rank-destinations').querySelectorAll('button')].find(b => b.textContent === '198.51.100.80').click();
+  assert($('flows').textContent.includes('Completed traffic remains'), 'retired destination keeps its traffic without a fictitious flow');
+  $('clear-drill').click();
+  $('rank-destinations').nextElementSibling.click();
+  assert($('rank-destinations').textContent.includes('Other · pooled'), 'expanded ranks include the bounded tail');
+  $('rank-destinations').nextElementSibling.click();
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
@@ -187,7 +239,7 @@ try {
   await until(() => $('asn-status').textContent.includes('2 names'), 'explicit load after eviction');
   await control('names-error'); $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('HTTP 503'), 'CSV fetch error is explicit');
-  assert($('freshness').textContent === 'Live snapshots', 'CSV errors do not break live state polling');
+  assert($('freshness').textContent === 'Live', 'CSV errors do not break live state polling');
   await control('normal'); $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('2 names'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
@@ -197,6 +249,9 @@ try {
   assert(document.querySelector('#servers details') === details && details.open, 'details identity and open state preserved');
   input('flow-search', '49999'); input('flow-protocol', 'tcp'); input('flow-exit', 'local');
   assert($('flows').tBodies[0].rows.length === 1 && $('flows').textContent.includes('49999'), 'combined flow filters');
+  assert(!$('flow-reset').disabled, 'clear filters is offered once a filter is active');
+  $('flow-reset').click();
+  assert(['flow-search','flow-protocol','flow-exit'].every(id => $(id).value === '') && $('flow-reset').disabled, 'clear filters resets the search and the selectors');
   input('flow-search', ''); input('flow-protocol', ''); input('flow-exit', 'de.example.test');
   input('flow-country', 'US'); input('flow-asn', '13335');
   $('next').click(); assert($('flow-page').textContent.startsWith('2 /'), 'next flow page');
@@ -227,15 +282,19 @@ try {
   await control('degraded');
   await until(() => $('jobs').tBodies[0].textContent.includes('Previous attempt: '), 'a retrying job keeps its previous failure visible');
   assert($('jobs').tBodies[0].rows[0].cells[4].textContent === 'Running', 'running job shows Running instead of a next-check time');
+  assert($('local').className === 'compact bad' && $('ready').className === 'warn' && $('freshness').className === 'pill good', 'trouble is the only coloured thing in the summary');
+  assert(!document.querySelector('#servers .pill.bad') && document.querySelector('#servers .pill.warn')?.textContent === 'Backoff', 'state tags read as words');
   await control('normal');
   await until(() => !$('jobs').textContent.includes('Previous attempt:'), 'clean job drops the previous-attempt prefix');
   await control('offline');
   await until(() => $('freshness').textContent === 'Stale data', 'API failure is visible immediately');
   assert($('proc-rss').textContent === '—' && $('proc-cpu').textContent === '—', 'stale process values are not shown as live');
+  $('usage-now').click(); assert($('usage-total').textContent === '—' && $('rank-exits').textContent.includes('stale'), 'stale interval is unknown, never zero');
+  $('usage-session').click(); assert($('usage-period').textContent.includes('last snapshot'), 'stale session totals are labelled');
   assert((await fetch('/api/state')).status === 503, 'HTTP error fixture');
   const beforeApiGap = $('chart-rx').getAttribute('d');
   await control('frozen');
-  await until(() => $('freshness').textContent === 'Live snapshots', 'same-timestamp response clears the API error', 2500);
+  await until(() => $('freshness').textContent === 'Live', 'same-timestamp response clears the API error', 2500);
   assert($('chart-rx').getAttribute('d') === beforeApiGap, 'duplicate recovery does not add a chart sample');
   assert($('rx').textContent === '—' && $('legend-rx').textContent.includes('—'), 'duplicate recovery does not reuse a pre-error rate');
   assert(!$('chart-note').textContent.includes('not live'), 'duplicate recovery restores chart freshness');
@@ -248,7 +307,7 @@ try {
   await until(() => $('freshness').textContent === 'Stale data', 'unchanged snapshot becomes stale');
   assert(!$('stale-notice').hidden && $('rx').textContent === '—', 'stale screen has warning and unknown rate');
   await control('empty');
-  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
+  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live', 'recovery and empty flow table');
   assert($('rx').textContent === '—', 'stale recovery starts with an unknown rate');
   assert($('flows').textContent.includes('No active flows'), 'empty flow state');
   assert($('servers').textContent.includes('No servers configured'), 'empty server table is explicit');
@@ -291,6 +350,7 @@ const server = http.createServer((request, response) => {
   }
   if (url.pathname === "/") {
     scenario = url.searchParams.get("scenario") || "normal";
+    if (url.searchParams.has("render")) sequence = 0;
     const html = fs.readFileSync(path.join(root, "src/web/index.html"), "utf8");
     response.setHeader("Content-Type", "text/html");
     response.setHeader("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
@@ -359,14 +419,27 @@ async function browser(query = "", screenshot, mobile = false) {
     };
     const width = mobile ? 390 : 1440, height = mobile ? 1100 : 1250;
     await page("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile });
+    await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
     await evaluate("new Promise(resolve => { if (document.readyState === 'complete') resolve(); else addEventListener('load', resolve, { once: true }); })");
     await page("Page.enable");
+    // Replay five minutes of timestamped fixture snapshots for screenshots. The real
+    // module still fetches each frame and derives its own chart, ranks and labels.
+    const replay = screenshot && !query.includes("cold");
+    if (replay) await page("Page.addScriptToEvaluateOnNewDocument", { source: `{
+      const schedule = window.setTimeout;
+      window.setTimeout = (fn, ms, ...args) => schedule(fn, ms === 1000 ? 20 : ms, ...args);
+    }` });
     const loaded = new Promise(resolve => { onLoad = resolve; });
     await page("Page.navigate", { url: origin + "/" + query });
     await loaded; onLoad = null;
     await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
-      const done = ${query ? `document.getElementById('freshness')?.textContent === '${query.includes("cold") ? "API unavailable" : "Live snapshots"}' && ${query.includes("cold") ? "true" : "document.getElementById('rx')?.textContent !== '—'"}` : "document.documentElement.dataset.browserCheck"};
+      const done = ${query ? `document.getElementById('freshness')?.textContent === '${query.includes("cold") ? "API unavailable" : "Live"}' && ${query.includes("cold") ? "true" : "document.getElementById('rx')?.textContent !== '—'"}` : "document.documentElement.dataset.browserCheck"};
       if (done) { clearInterval(timer); resolve(true); }
+    }, 100); })`);
+    if (replay) await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
+      if (parseInt(document.querySelector('#servers tbody tr td:nth-child(4) small')?.textContent.slice(4), 10) >= 300) {
+        clearInterval(timer); resolve();
+      }
     }, 100); })`);
     const layout = await evaluate(`({ width: innerWidth, scroll: document.documentElement.scrollWidth,
       fontHeight: document.getElementById('chart-max').getBoundingClientRect().height,
@@ -396,15 +469,25 @@ async function browser(query = "", screenshot, mobile = false) {
     assert.ok(layout.navFit, `all navigation items visible, no hidden horizontal scrolling: ${JSON.stringify(layout)}`);
     assert.ok(layout.helpPopups === true, `help popups fit and close on Escape: ${JSON.stringify(layout)}`);
     // A card may stretch to a neighbour's two-line note; a hidden sparkline used to add ~38px of dead space.
-    if (mobile) assert.ok(layout.cardGaps.every(gap => gap <= 28), `KPI cards keep compact bottoms on mobile: ${JSON.stringify(layout)}`);
+    if (mobile) {
+      assert.ok(layout.cardGaps.every(gap => gap <= 28), `KPI cards keep compact bottoms on mobile: ${JSON.stringify(layout)}`);
+      assert.ok(await evaluate(`(() => { const select = document.getElementById('usage-axis');
+        select.value = 'networks'; select.dispatchEvent(new Event('change'));
+        return document.getElementById('rank-networks').offsetWidth > 0 && !document.getElementById('rank-exits').offsetWidth;
+      })()`), 'mobile switches to provider ranks without sideways scrolling');
+    }
     assert.ok(layout.fontHeight >= 10, "chart axis labels are legible without SVG scaling");
     if (query.includes("cold")) {
-      assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
+      assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load','flow-reset'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
       assert.ok(await evaluate("!document.getElementById('chart-empty').hidden"), "cold chart shows a collecting placeholder");
     }
     if (screenshot) {
+      await evaluate("window.scrollTo({top:0, behavior:'instant'})");
+      if (query.includes('view=now')) await evaluate("document.getElementById('usage-now').click(); document.getElementById('theme-toggle').click()");
+      if (query.includes('view=provider')) await evaluate("document.querySelector('#rank-networks button').click()");
+      const y = query.includes('view=provider') ? await evaluate("document.getElementById('flows-panel').getBoundingClientRect().top + scrollY - 8") : 0;
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
-        clip: { x: 0, y: 0, width, height, scale: 1 } });
+        clip: { x: 0, y, width, height, scale: 1 } });
       fs.writeFileSync(screenshot, Buffer.from(image.data, "base64"));
       if (query.includes("degraded")) {
         const jobs = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
@@ -426,8 +509,8 @@ try {
   console.log(`PASS Chrome dashboard: ${report.checks.length} UI assertions + viewport/axis checks`);
   const directory = process.env.DASHBOARD_SCREENSHOTS;
   if (directory) fs.mkdirSync(directory, { recursive: true });
-  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false]]) {
-    const name = `${scenario}${mobile ? "-mobile" : ""}.png`;
+  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=provider", false]] : [])]) {
+    const name = `${scenario.replace("normal&view=", "")}${mobile ? "-mobile" : ""}.png`;
     const layout = await browser(`?render=1&scenario=${scenario}`, directory ? path.join(directory, name) : undefined, mobile);
     console.log(`PASS layout ${name} (${layout.width}px viewport / ${layout.scroll}px document)${directory ? " + screenshot" : ""}`);
   }
