@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName, historyYesterday, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel } from "../src/web/state.mjs";
+import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyCrests, historyMarks, historyTime, historyName, historyYesterday, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel } from "../src/web/state.mjs";
 
 test("usage ranks raw bytes, not formatted strings, and includes the pooled share", () => {
   const entries = [["a", "Small", { rx_bytes: 99, tx_bytes: 0 }], ["b", "Big", { rx_bytes: 1024, tx_bytes: 4 }], [null, "Other", { rx_bytes: 0, tx_bytes: 7 }]];
@@ -545,21 +545,46 @@ test("the history value axis tops out at a round number just above the traffic",
   assert.deepEqual(historyScale(0), { top: 0.01, mid: 0.005 });
 });
 
-test("history bands stack on each other and break around unrecorded time", () => {
-  const stack = { from: 0, to: 400, step: 100, count: 4, rate: value => value,
-    series: [{ values: [1, 1, 1, 1] }, { values: [0, 1, 0, 1] }], recorded: [true, true, false, true] };
-  const [first, second] = historyAreas(stack, 4);
-  // Each bucket spans its own width: a run is one stepped polygon from its first left edge to its last right edge.
-  assert.equal(first, "M0.00,152.00 L0.00,120.00 L250.00,120.00 L250.00,120.00 L500.00,120.00 L250.00,152.00 L500.00,152.00 L0.00,152.00 L250.00,152.00 Z M750.00,152.00 L750.00,120.00 L1000.00,120.00 L750.00,152.00 L1000.00,152.00 Z");
-  assert.equal(second, "M0.00,120.00 L0.00,120.00 L250.00,120.00 L250.00,88.00 L500.00,88.00 L250.00,120.00 L500.00,120.00 L0.00,120.00 L250.00,120.00 Z M750.00,120.00 L750.00,88.00 L1000.00,88.00 L750.00,120.00 L1000.00,120.00 Z");
-  assert.deepEqual(historyAreas({ ...stack, count: 0 }, 4), ["", ""]);
-  // One recorded bucket, as right after a start, is a column as wide as its step: never zero width.
-  const day = 360;
-  const [alone] = historyAreas({ step: 240, count: day, rate: value => value, series: [{ values: [1] }],
-    recorded: Array.from({ length: day }, (_, index) => index === day - 1) }, 1);
+test("history bands are a sandwich of smooth layers with flat ends and honest gaps", () => {
+  const day = 240, width = 1000 / day, all = Array(day).fill(true);
+  const stack = (values, recorded) => ({ step: 240, count: day, rate: value => value, series: values.map(value => ({ values: value })), recorded });
+  const heights = path => [...new Set(path.match(/,[0-9.]+(?=[ CL]|$)/g))].sort();
+  // One constant layer over the whole window: a rectangle from the first minute's left edge to the last one's right edge.
+  const [flat] = historyAreas(stack([Array(day).fill(1)], all), 4);
+  assert.ok(flat.startsWith("M0.00,120.00 C") && flat.includes(" 1000.00,120.00 L1000.00,152.00 C") && flat.endsWith(" 0.00,152.00 Z") && !flat.includes(" M"), flat.slice(0, 90));
+  assert.deepEqual(heights(flat), [",120.00", ",152.00"]);
+  // Two constant layers: the upper band sits on the lower one, nowhere else.
+  const [low, high] = historyAreas(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
+  assert.deepEqual(heights(low), [",120.00", ",152.00"]);
+  assert.deepEqual(heights(high), [",120.00", ",88.00"]);
+  // An unrecorded minute splits the band in two; each part starts and ends on a minute's edge.
+  const recorded = all.slice(); recorded[100] = false;
+  const [split] = historyAreas(stack([Array(day).fill(1)], recorded), 4);
+  assert.equal((split.match(/M/g) || []).length, 2);
+  assert.ok(split.includes(` M${(width * 101).toFixed(2)},120.00 C`) && split.includes(`L${(width * 100).toFixed(2)},152.00`), split.slice(-140));
+  // Between two minutes the curve stays within their values: a peak is never sharpened, a dip never deepened.
+  const spike = Array(day).fill(0);
+  for (const [index, value] of [[50, 10], [150, 0], [151, 10], [152, 0], [200, 10], [201, 20]]) spike[index] = value;
+  const [curve] = historyAreas(stack([spike], all), 40);
+  const ys = curve.match(/,[0-9.]+(?=[ CL]|$)/g).map(value => Number(value.slice(1)));
+  assert.equal(Math.min(...ys), 88);
+  assert.equal(Math.max(...ys), 152);
+  assert.ok(curve.includes(" L1000.00,152.00 ") && curve.endsWith(" 0.00,152.00 Z"), "the band closes on the edges of the window");
+  // A single recorded bucket, as right after a start, is a column as wide as its step.
+  const once = Array(day).fill(false); once[day - 1] = true;
+  const last = Array(day).fill(0); last[day - 1] = 1;
+  const [alone] = historyAreas(stack([last], once), 4);
   const edges = alone.match(/[0-9.]+(?=,)/g).map(Number);
-  assert.equal(Math.min(...edges).toFixed(2), (1000 * (day - 1) / day).toFixed(2));
+  assert.equal(Math.min(...edges).toFixed(2), (width * (day - 1)).toFixed(2));
   assert.equal(Math.max(...edges), 1000);
+  assert.deepEqual(heights(alone), [",120.00", ",152.00"]);
+  assert.deepEqual(historyAreas({ ...stack([[]], all), count: 0 }, 4), [""]);
+  // The hairline of a layer is the top edge of its band and nothing else.
+  const [top0, top1] = historyCrests(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
+  assert.deepEqual(heights(top0), [",120.00"]);
+  assert.deepEqual(heights(top1), [",88.00"]);
+  assert.ok(top0.startsWith("M0.00,120.00 C") && !top0.includes(" L"));
+  assert.deepEqual(historyCrests({ ...stack([[]], all), count: 0 }, 4), [""]);
 });
 
 test("history time labels grow coarser with the range and its query names the series", () => {

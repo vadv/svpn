@@ -236,7 +236,7 @@ try {
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
   // History is read once its section is in view, then once a minute at most.
   $('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
-  await until(() => $('history-bands').children.length === 3, 'history bands');
+  await until(() => document.querySelectorAll('#history-bands .band').length === 3, 'history bands');
   let historyReads = (await control('normal')).history_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).history_requests === historyReads, 'history is not fetched by one-second snapshot polling');
@@ -247,13 +247,15 @@ try {
   assert(historyRow(2)[0] === 'Local exit' && $('history').tBodies[0].rows.length === 3, 'history table lists every series of the breakdown');
   assert(Math.abs(Number.parseFloat($('history-mid').textContent) * 2 - Number.parseFloat($('history-max').textContent)) < 0.02 && $('history-max').textContent.endsWith('Mbit/s'), 'history value axis labels its middle gridline');
   assert([...$('history-axis').children].every(span => /^[0-9]{2}:[0-9]{2}$/.test(span.textContent)), 'a day of history is labelled with clock times');
-  assert(/^M[0-9.]+,[0-9.]+ L/.test($('history-bands').children[0].getAttribute('d')) && !$('history-empty').offsetParent, 'recorded minutes draw as stacked bands');
-  assert([...$('history-bands').children].every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).fill !== 'none') && $('history-bands').children[0].getBoundingClientRect().height > 40, 'bands are SVG paths that rise from the baseline with a fill of their own: ' + JSON.stringify([...$('history-bands').children].map(band => [band.getBoundingClientRect().height, getComputedStyle(band).fill])));
+  assert(/^M[0-9.]+,[0-9.]+ C/.test($('history-bands').children[0].getAttribute('d')) && $('history-bands').children[0].getAttribute('d').endsWith('Z') && !$('history-empty').offsetParent, 'recorded minutes draw as smooth stacked bands');
+  const drawn = [...document.querySelectorAll('#history-bands .band')], crests = [...document.querySelectorAll('#history-bands .crest')];
+  assert(drawn.length === 3 && drawn.every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).fill !== 'none' && getComputedStyle(band).stroke === 'none') && drawn[0].getBoundingClientRect().height > 40, 'bands are filled SVG paths that rise from the baseline');
+  assert(crests.length === 3 && crests.every(crest => getComputedStyle(crest).stroke !== 'none' && getComputedStyle(crest).fill === 'none' && crest.getAttribute('d').startsWith('M')), 'each layer has a hairline along its top, so a thin layer stays visible on a thick one');
   assert($('history-resolution').textContent === 'Every 4 min', 'history says how wide its points are');
   // A pressed first button keeps its own border where the next one overlaps it, in every segmented group.
   const rangeButton = name => document.querySelector('#history-ranges [data-range="' + name + '"]');
   rangeButton('1h').click();
-  await until(() => $('history-resolution').textContent === 'Every minute' && $('history-bands').children.length === 3, 'one hour of history');
+  await until(() => $('history-resolution').textContent === 'Every minute' && document.querySelectorAll('#history-bands .band').length === 3, 'one hour of history');
   assert(rangeButton('1h').getAttribute('aria-pressed') === 'true' && getComputedStyle(rangeButton('1h')).zIndex === '1' && getComputedStyle(rangeButton('24h')).zIndex === 'auto' && getComputedStyle($('usage-session')).zIndex === '1', 'a pressed button sits above its neighbours whoever it is');
   rangeButton('24h').click();
   await until(() => $('history-resolution').textContent === 'Every 4 min', 'back to a day of history');
@@ -270,11 +272,11 @@ try {
   assert(historyRow(0)[4] === '66.7%' && (await control('normal')).history_requests === historyReads, 'another direction redraws the same answer');
   input('history-kind', 'network');
   await until(() => $('history-legend').textContent.includes('AS13335'), 'network history');
-  assert($('history-bands').children.length === 3, 'the twenty busiest networks are drawn, here all three');
+  assert(document.querySelectorAll('#history-bands .band').length === 3, 'the twenty busiest networks are drawn, here all three');
   assert($('history-legend').textContent.includes('AS13335 · Cloudflare, Inc.') && $('history').tBodies[0].rows[0].cells[0].textContent.includes('via NL'), 'networks are named by ASN and organization, the exit is the second line');
   assert($('history-legend').textContent.includes('AS24429 · Alibaba (US) Technology Co., Ltd.'), 'a network is named by the server, with no browser copy of the ASN CSV');
   input('history-server', 'de.example.test');
-  await until(() => $('history-bands').children.length === 1, 'history of one server');
+  await until(() => document.querySelectorAll('#history-bands .band').length === 1, 'history of one server');
   assert($('history-legend').textContent.includes('AS15169 · Google LLC'), 'the server filter narrows the series');
   document.querySelector('#history-ranges [data-range="7d"]').click();
   await until(() => $('history-axis').children[0].textContent.includes(' '), 'week of history');
@@ -300,7 +302,7 @@ try {
   assert($('history-note').hidden && rangeButton('custom').getAttribute('aria-pressed') === 'true' && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'the picked window is drawn by the hour');
   await control('history-error');
   await until(() => $('history-note').textContent.includes('not being recorded'), 'history error is visible');
-  assert($('history-note').classList.contains('bad') && $('history-note').textContent.includes('disk I/O error') && $('history-bands').children.length === 1, 'a failing history database is the loud case, the last answer stays drawn');
+  assert($('history-note').classList.contains('bad') && $('history-note').textContent.includes('disk I/O error') && document.querySelectorAll('#history-bands .band').length === 1, 'a failing history database is the loud case, the last answer stays drawn');
   await control('history-off');
   await until(() => $('history-note').textContent.includes('History is off'), 'history off is explained');
   assert($('history-kind').disabled && $('history-from').disabled && $('history-apply').disabled && rangeButton('custom').disabled && !$('history-note').classList.contains('bad'), 'history controls are quiet while history is off');

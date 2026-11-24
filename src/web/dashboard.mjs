@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking, historyQuery, historyStack, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel, historyScale, historyAreas, historyMarks, historyTime, historyName } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking, historyQuery, historyStack, historyCrests, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel, historyScale, historyAreas, historyMarks, historyTime, historyName } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -336,12 +336,13 @@ function drawHistory() {
   const stack = past.data ? historyStack(past.data, past.direction) : null;
   const axis = $("history-axis").children;
   const bands = [];
+  const lines = [];
   const legend = [];
   const rows = [];
   $("history-resolution").textContent = stack?.count ? historyStepLabel(stack.step) : "";
   if (stack?.count && latest) {
     const { top, mid } = historyScale(stack.peak);
-    const paths = historyAreas(stack, top);
+    const paths = historyAreas(stack, top), crests = historyCrests(stack, top);
     const span = stack.to - stack.from;
     const marks = historyMarks(stack.from, stack.to);
     for (let i = 0; i < axis.length; i++) axis[i].textContent = historyTime(marks[i], span);
@@ -357,6 +358,11 @@ function drawHistory() {
         band.setAttribute("class", `band cat-${seen % 8 + 1}`);
         band.setAttribute("d", paths[index]);
         bands.push(band);
+        // A hairline along the top of the band: a thin layer stays visible on a thick one.
+        const crest = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        crest.setAttribute("class", `crest cat-${seen % 8 + 1}`);
+        crest.setAttribute("d", crests[index]);
+        lines.push(crest);
         const entry = node("span", "", `legend-item series cat-${seen % 8 + 1}`);
         entry.append(node("i", "", ""), node("span", named.label));
         legend.push(entry);
@@ -377,7 +383,7 @@ function drawHistory() {
     $("history-max").textContent = "Mbit/s"; $("history-mid").textContent = "";
     $("history-empty").hidden = !latest?.history?.enabled || Boolean(past.error);
   }
-  $("history-bands").replaceChildren(...bands);
+  $("history-bands").replaceChildren(...bands, ...lines);
   $("history-legend").replaceChildren(...legend);
   table("history", rows, 6, latest?.history?.enabled ? "Nothing recorded in this range" : "No snapshot yet");
 }

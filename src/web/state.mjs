@@ -525,49 +525,106 @@ export function historyScale(peak) {
   return { top, mid: top / 2 };
 }
 
-// Stacked bands on the chart's grid (1000 wide, 24..152 high). A bucket is
-// as wide as its step, so a single recorded one is a visible column; a run
-// of recorded buckets is one stepped polygon per series, and an unrecorded
-// bucket breaks it.
+// Stacked bands on the chart's grid (1000 wide, 24..152 high), drawn as a
+// sandwich. A layer's thickness is a curve through its minutes and the
+// boundary above it is the sum of the thicknesses below, so no layer turns
+// negative between two of its own minutes. The curve is monotone: between
+// two minutes it stays within their values, so jitter reads as flow and a
+// dip stays where it happened. A band starts and ends vertically on the
+// edges of its first and last minute; an unrecorded minute breaks it.
 export function historyAreas(stack, top) {
+  return layers(stack, top).map(layer => layer.band);
+}
+
+// The line along the top of each band: what keeps a thin layer visible
+// where it lies on a thick one.
+export function historyCrests(stack, top) {
+  return layers(stack, top).map(layer => layer.crest);
+}
+
+function layers(stack, top) {
   const { series, recorded, count, rate } = stack;
-  if (!count) return series.map(() => "");
-  // Left edge of a bucket; the last one ends at 1000.
-  const x = index => (1000 * index / count).toFixed(2);
+  if (!count) return series.map(() => ({ band: "", crest: "" }));
+  const width = 1000 / count;
   const y = value => (152 - 128 * value / top).toFixed(2);
-  const edges = series.map(() => ({ lower: new Array(count).fill(0), upper: new Array(count).fill(0) }));
-  const cumulative = new Array(count).fill(0);
-  series.forEach((item, s) => {
-    for (let index = 0; index < count; index++) {
-      edges[s].lower[index] = cumulative[index];
-      if (recorded[index]) cumulative[index] += rate(item.values[index]);
-      edges[s].upper[index] = cumulative[index];
-    }
+  const runs = [];
+  for (let index = 0; index < count; index++) {
+    if (!recorded[index]) continue;
+    const last = runs.at(-1);
+    if (last && last.end === index - 1) last.end = index;
+    else runs.push({ start: index, end: index });
+  }
+  const bands = series.map(() => []);
+  const crests = series.map(() => []);
+  for (const { start, end } of runs) {
+    // A sample at each minute's middle, held flat to the edges of the run.
+    const xs = [width * start];
+    for (let index = start; index <= end; index++) xs.push(width * (index + 0.5));
+    xs.push(width * (end + 1));
+    let below = xs.slice(1).map(() => [0, 0, 0, 0]);
+    series.forEach((item, layer) => {
+      const values = [rate(item.values[start])];
+      for (let index = start; index <= end; index++) values.push(rate(item.values[index]));
+      values.push(rate(item.values[end]));
+      const curve = cubic(xs, values, monotone(xs, values));
+      const above = curve.map((segment, i) => segment.map((value, j) => value + below[i][j]));
+      const crest = `M${xs[0].toFixed(2)},${y(above[0][0])} ${band(xs, above, y)}`;
+      crests[layer].push(crest);
+      bands[layer].push(`${crest} L${xs.at(-1).toFixed(2)},${y(below.at(-1)[3])} ${band(xs, below, y, true)} Z`);
+      below = above;
+    });
+  }
+  return bands.map((parts, layer) => ({ band: parts.join(" "), crest: crests[layer].join(" ") }));
+}
+
+// One cubic segment per pair of neighbouring samples, in value space.
+function cubic(xs, values, tangents) {
+  return xs.slice(1).map((x, i) => {
+    const third = (x - xs[i]) / 3;
+    return [values[i], values[i] + tangents[i] * third, values[i + 1] - tangents[i + 1] * third, values[i + 1]];
   });
-  return edges.map(edge => {
-    const parts = [];
-    let start = null, end = 0;
-    const flush = () => {
-      if (start == null) return;
-      const up = [], down = [];
-      for (let index = start; index <= end; index++) {
-        up.push(`L${x(index)},${y(edge.upper[index])}`, `L${x(index + 1)},${y(edge.upper[index])}`);
-        down.unshift(`L${x(index)},${y(edge.lower[index])}`, `L${x(index + 1)},${y(edge.lower[index])}`);
-      }
-      parts.push(`M${x(start)},${y(edge.lower[start])} ${up.join(" ")} ${down.join(" ")} Z`);
-      start = null;
-    };
-    for (let index = 0; index < count; index++) {
-      if (recorded[index]) {
-        if (start == null) start = index;
-        end = index;
-      } else {
-        flush();
-      }
+}
+
+// Slopes of a curve through the samples that never overshoots them
+// (Fritsch and Carlson): a sample between a rise and a fall is a summit.
+function monotone(xs, values) {
+  const last = values.length - 1;
+  const slopes = xs.slice(1).map((x, i) => (values[i + 1] - values[i]) / (x - xs[i]));
+  const tangents = values.map(() => 0);
+  tangents[0] = slopes[0];
+  tangents[last] = slopes.at(-1);
+  for (let i = 1; i < last; i++) {
+    if (slopes[i - 1] * slopes[i] > 0) tangents[i] = (slopes[i - 1] + slopes[i]) / 2;
+  }
+  for (let i = 0; i < last; i++) {
+    if (slopes[i] === 0) {
+      tangents[i] = 0;
+      tangents[i + 1] = 0;
+      continue;
     }
-    flush();
-    return parts.join(" ");
+    const a = tangents[i] / slopes[i], b = tangents[i + 1] / slopes[i];
+    const norm = a * a + b * b;
+    if (norm > 9) {
+      const scale = 3 / Math.sqrt(norm);
+      tangents[i] = scale * a * slopes[i];
+      tangents[i + 1] = scale * b * slopes[i];
+    }
+  }
+  return tangents;
+}
+
+// The SVG curve of `segments` from left to right, or, when `backwards`,
+// from the right end back to the start: the same segments in reverse order.
+function band(xs, segments, y, backwards = false) {
+  const parts = segments.map((segment, i) => {
+    const left = xs[i], right = xs[i + 1], third = (right - left) / 3;
+    const near = (left + third).toFixed(2), far = (right - third).toFixed(2);
+    return backwards
+      ? `C${far},${y(segment[2])} ${near},${y(segment[1])} ${left.toFixed(2)},${y(segment[0])}`
+      : `C${near},${y(segment[1])} ${far},${y(segment[2])} ${right.toFixed(2)},${y(segment[3])}`;
   });
+  if (backwards) parts.reverse();
+  return parts.join(" ");
 }
 
 // Five marks of the time axis: both ends and the quarters between.
