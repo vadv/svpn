@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 use svpn::{
-    hub::{Owner, Routes, Target, UsageMeter},
+    hub::{Owner, Routes, Target, Traffic, UsageMeter},
     link_io::Epoch,
     packet,
 };
@@ -126,4 +126,49 @@ fn long_tail_conserves_both_directions_and_admits_a_late_busy_destination() {
         s.networks.other.rx_bytes + s.networks.named.values().map(|v| v.rx_bytes).sum::<u64>(),
         2050
     );
+}
+
+// ── history split ──
+
+#[test]
+fn rules_and_networks_are_split_by_link_until_the_history_minute_takes_them() {
+    let mut routes = Routes {
+        usage: Some(UsageMeter::default()),
+        ..Routes::default()
+    };
+    let key = packet::parse(&common::udp_packet(false), true)
+        .unwrap()
+        .flow;
+    let owner = Owner {
+        epoch: Epoch {
+            link: 1,
+            generation: 5,
+        },
+        id: 1,
+    };
+    routes.insert(key, Target::Remote(owner), Some(3), None);
+    routes.by_key.get_mut(&key).unwrap().asn = Some(64500);
+    routes.record(key, 20, 10);
+    routes.remove_epoch(owner.epoch);
+    routes.insert(key, Target::Direct(2), Some(3), None);
+    routes.record(key, 40, 0);
+    let now = Instant::now();
+
+    // Two dashboard seconds, then the history minute takes both.
+    let json = serde_json::to_value(routes.sample_usage(now).unwrap()).unwrap();
+    routes.sample_usage(now + Duration::from_secs(1)).unwrap();
+    let window = routes.usage.as_mut().unwrap().take_window();
+
+    let bytes = |tx_bytes, rx_bytes| (tx_bytes, rx_bytes);
+    let of = |traffic: &Traffic| (traffic.tx_bytes, traffic.rx_bytes);
+    assert_eq!(of(&window.rules[&(Some(1), Some(3))]), bytes(20, 10));
+    assert_eq!(of(&window.rules[&(None, Some(3))]), bytes(40, 0));
+    assert_eq!(of(&window.networks[&(64500, Some(1))]), bytes(20, 10));
+    assert_eq!(window.rules.len(), 2);
+    assert_eq!(window.networks.len(), 1);
+    // Taken: the next minute starts from zero.
+    let next = routes.usage.as_mut().unwrap().take_window();
+    assert!(next.rules.is_empty() && next.networks.is_empty());
+    // The dashboard API is what it was.
+    assert!(json["interval"].get("split").is_none());
 }

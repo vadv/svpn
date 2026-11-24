@@ -1,4 +1,4 @@
-import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking } from "/state.mjs";
+import { WINDOW_MS, STALE_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, readAsnNames, selector, localState, cpuAverage, trafficAverage, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyMarks, historyTime, historyName } from "/state.mjs";
 
 const $ = id => document.getElementById(id);
 const endpoint = document.querySelector("main").dataset.endpoint;
@@ -6,6 +6,8 @@ let latest = null, point = null, history = [], lastChange = 0, apiError = false;
 let frozen = null, page = 0, flowSignature = "";
 const serverRows = new Map();
 let period = "session", drill = null, usageFrame, usageStale;
+// What history is asked for and the last answer to it.
+const past = { range: "24h", kind: "link", link: "", direction: "total", data: null, fetched: -Infinity, error: "", loading: false, request: null };
 const filters = ["flow-search", "flow-protocol", "flow-exit", "flow-country", "flow-asn"];
 const expandedRanks = new Set();
 let asnNames = Object.create(null), asnCount = 0, asnState = "idle", asnError = "", asnAbort = null, asnIdleTimer = null;
@@ -186,6 +188,7 @@ function inspectFlows(axis, key, label) {
 
 function freshness() {
   const stale = isStale();
+  if (!document.hidden && historyVisible() && latest?.history?.enabled && performance.now() - past.fetched >= 60000) void loadHistory();
   if (usageFrame !== latest || usageStale !== stale) renderUsage(stale);
   document.body.classList.toggle("stale", stale && Boolean(latest));
   $("stale-notice").hidden = !latest || !stale;
@@ -221,6 +224,114 @@ function freshness() {
     $("spark-rss").setAttribute("d", "");
     $("spark-cpu").setAttribute("d", "");
   }
+}
+
+// History is read from the client's database when its section is in view,
+// and no more often than the minutes it is made of.
+function historyVisible() {
+  const rect = $("history-panel").getBoundingClientRect();
+  return rect.bottom > 0 && rect.top < innerHeight;
+}
+
+async function loadHistory() {
+  if (!latest?.history?.enabled) return;
+  // A request already out is left to finish unless it answers another question.
+  if (past.loading && past.asked === historyQuery(past)) return;
+  past.request?.abort();
+  past.asked = historyQuery(past);
+  const request = new AbortController();
+  past.request = request; past.loading = true;
+  const query = { range: past.range, kind: past.kind, link: past.link };
+  try {
+    const response = await fetch(historyQuery(query), { cache: "no-store", signal: AbortSignal.any([request.signal, AbortSignal.timeout(5000)]) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (past.request !== request) return;
+    if (!Array.isArray(data.series) || !Number.isFinite(data.step)) throw new Error("Invalid history");
+    past.data = data; past.error = ""; past.fetched = performance.now();
+  } catch (error) {
+    if (past.request !== request || request.signal.aborted) return;
+    past.error = error.message;
+  } finally {
+    if (past.request === request) { past.loading = false; renderHistory(); }
+  }
+}
+
+function renderHistory() {
+  const status = latest?.history ?? { enabled: false, state: "", error: "" };
+  for (const button of $("history-ranges").querySelectorAll("[data-range]")) {
+    button.disabled = !status.enabled;
+    button.setAttribute("aria-pressed", String(button.dataset.range === past.range));
+  }
+  for (const id of ["history-kind", "history-server", "history-direction"]) $(id).disabled = !status.enabled;
+  if (latest) {
+    $("history-kind").value = past.kind; $("history-direction").value = past.direction;
+    options($("history-server"), [["", "All servers"], ...latest.servers.map(server => [server.id, name(server.id)]),
+      ...(latest.local.enabled ? [["local", "Local"]] : [])]);
+    $("history-server").value = past.link;
+    // A server that is gone is no longer a filter.
+    if ($("history-server").value !== past.link) past.link = "";
+  }
+  // One sentence says why there is nothing to draw; an error of the database is the loud case.
+  const trouble = latest && status.enabled && (status.state === "error" || past.error);
+  const note = !latest ? "" : !status.enabled ? "History is off. Add a stats block to the client config to keep it."
+    : status.state === "checking" ? "Opening the history database…"
+    : status.state === "error" ? `History is not being recorded: ${status.error}`
+    : past.error ? `History unavailable: ${past.error}` : "";
+  $("history-note").textContent = note;
+  $("history-note").className = `history-note${trouble ? " bad" : ""}`;
+  $("history-note").hidden = !note;
+  if (!past.data) { $("history-empty").textContent = latest?.history?.enabled ? "No history yet" : "Waiting for the client…"; }
+  drawHistory();
+}
+
+function drawHistory() {
+  const stack = past.data ? historyStack(past.data, past.direction) : null;
+  const axis = $("history-axis").children;
+  const bands = [];
+  const legend = [];
+  const rows = [];
+  if (stack?.count && latest) {
+    const { top, mid } = historyScale(stack.peak);
+    const paths = historyAreas(stack, top);
+    const span = stack.to - stack.from;
+    const marks = historyMarks(stack.from, stack.to);
+    for (let i = 0; i < axis.length; i++) axis[i].textContent = historyTime(marks[i], span);
+    $("history-max").textContent = `${rate(top)} Mbit/s`;
+    $("history-mid").textContent = rate(mid);
+    let seen = 0;
+    stack.series.forEach((item, index) => {
+      // A series nobody recorded in this window is not drawn, only listed.
+      if (item.points.length) {
+        // createElement would make an HTML element, which SVG never draws.
+        const band = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        band.setAttribute("class", `band cat-${seen % 8 + 1}`);
+        band.setAttribute("d", paths[index]);
+        bands.push(band);
+        const entry = node("span", "", `legend-item series cat-${seen % 8 + 1}`);
+        entry.append(node("i", "", ""), node("span", historyName(item, latest.servers, latest.rules, asnNames).label));
+        legend.push(entry);
+        seen++;
+      }
+      const named = historyName(item, latest.servers, latest.rules, asnNames);
+      const shown = past.direction === "rx" ? item.rx_bytes : past.direction === "tx" ? item.tx_bytes : item.rx_bytes + item.tx_bytes;
+      rows.push([
+        cell(named.via && past.kind !== "link" ? title(named.label, `via ${named.via}`) : named.label),
+        cell(bytes(item.rx_bytes), true), cell(bytes(item.tx_bytes), true), cell(bytes(item.rx_bytes + item.tx_bytes), true),
+        cell(stack.total ? `${(shown / stack.total * 100).toFixed(1)}%` : "—", true),
+        cell(item.active_avg.toFixed(1), true),
+      ]);
+    });
+    $("history-empty").hidden = stack.series.some(item => item.points.length);
+    $("history-empty").textContent = "Nothing recorded in this range";
+  } else {
+    for (const mark of axis) mark.textContent = "—";
+    $("history-max").textContent = "Mbit/s"; $("history-mid").textContent = "";
+    $("history-empty").hidden = !latest?.history?.enabled || Boolean(past.error);
+  }
+  $("history-bands").replaceChildren(...bands);
+  $("history-legend").replaceChildren(...legend);
+  table("history", rows, 6, latest?.history?.enabled ? "Nothing recorded in this range" : "No snapshot yet");
 }
 
 function renderServers() {
@@ -452,7 +563,7 @@ function render() {
   $("warnings").hidden = !warnings.length;
   document.body.dataset.health = warnings.length ? "warn" : "ok";
   $("rail-health").textContent = warnings.length ? `${warnings.length} warning${warnings.length === 1 ? "" : "s"} to review` : ready === latest.servers.length ? "All links ready" : "Pool recovering";
-  renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderAsnNames(); renderJobs(); renderCounters(); renderChart(); freshness();
+  renderClock(); renderProcess(); renderServers(); renderRules(); renderFlows(); renderAsnNames(); renderJobs(); renderCounters(); renderChart(); renderHistory(); freshness();
   $("footer").textContent = `Client started ${time(latest.started_at / 1000)}`;
   if (latest.asn_table && asnState === "idle" && !document.hidden) void loadAsnNames();
 }
@@ -465,7 +576,7 @@ async function refresh() {
     if (!Number.isFinite(state.generated_at_ms) || !Array.isArray(state.servers) || !Array.isArray(state.flows)) throw new Error("Invalid snapshot");
     if (!latest || state.started_at !== latest.started_at || state.generated_at_ms > latest.generated_at_ms) {
       const resumed = isStale();
-      if (latest && state.started_at !== latest.started_at) { clearAsnNames("idle"); history = []; point = null; latest = null; }
+      if (latest && state.started_at !== latest.started_at) { clearAsnNames("idle"); history = []; point = null; latest = null; past.fetched = -Infinity; }
       point = measure(resumed || !point ? null : latest, state);
       apiError = false;
       history = keepHistory(history, point);
@@ -492,6 +603,13 @@ function hideCursor() { $("chart-tooltip").hidden = true; $("chart-cursor").hidd
 for (const [id, value] of [["usage-session", "session"], ["usage-now", "interval"]]) $(id).addEventListener("click", () => { period = value; renderUsage(isStale()); });
 $("usage-axis").addEventListener("change", () => { $("usage-ranks").dataset.axis = $("usage-axis").value; });
 $("usage-direction").addEventListener("change", () => renderUsage(isStale()));
+for (const button of $("history-ranges").querySelectorAll("[data-range]")) button.addEventListener("click", () => { past.range = button.dataset.range; past.fetched = -Infinity; renderHistory(); void loadHistory(); });
+for (const id of ["history-kind", "history-server", "history-direction"]) $(id).addEventListener("change", () => {
+  past.kind = $("history-kind").value; past.link = $("history-server").value; past.direction = $("history-direction").value;
+  // Another breakdown has no use for the previous answer; another direction redraws it.
+  if (id !== "history-direction") { past.data = null; past.error = ""; past.fetched = -Infinity; void loadHistory(); }
+  renderHistory();
+});
 for (const axis of rankAxes) $(`rank-${axis}`).nextElementSibling.addEventListener("click", () => {
   if (expandedRanks.has(axis)) expandedRanks.delete(axis); else expandedRanks.add(axis);
   renderUsage(isStale());
@@ -601,7 +719,7 @@ if ("IntersectionObserver" in window) {
   }
 }
 
-for (const [id, columns] of [["servers", 8], ["rules", 7], ["flows", 9], ["databases", 6], ["jobs", 6], ["groups", 2]]) table(id, [], columns, "No snapshot yet");
+for (const [id, columns] of [["servers", 8], ["rules", 7], ["flows", 9], ["history", 6], ["databases", 6], ["jobs", 6], ["groups", 2]]) table(id, [], columns, "No snapshot yet");
 renderClock();
 setInterval(() => { renderClock(); freshness(); }, 1000);
 refresh();

@@ -17,6 +17,8 @@
   --good:#3fb950; --warn:#d29922; --bad:#f85149; --focus:#58a6ff;
   --good-bg:rgba(63,185,80,.13); --warn-bg:rgba(210,153,34,.11); --bad-bg:rgba(248,81,73,.09);
   --rx:#58a6ff; --tx:#f0883e; --rx-fill:rgba(88,166,255,.10); --tx-fill:rgba(240,136,62,.10);
+  --cat-1:#58a6ff; --cat-2:#f0883e; --cat-3:#bc8cff; --cat-4:#39c5cf;
+  --cat-5:#f778ba; --cat-6:#56d4bd; --cat-7:#8b949e; --cat-8:#a5d6ff;
 }
 :root[data-theme="light"] {
   color-scheme:light;
@@ -26,6 +28,8 @@
   --good:#1a7f37; --warn:#8a5a00; --bad:#c62828; --focus:#0b62c4;
   --good-bg:rgba(26,127,55,.10); --warn-bg:rgba(138,90,0,.10); --bad-bg:rgba(198,40,40,.08);
   --rx:#0b62c4; --tx:#b4530a; --rx-fill:rgba(11,98,196,.09); --tx-fill:rgba(180,83,10,.10);
+  --cat-1:#0b62c4; --cat-2:#b4530a; --cat-3:#6f42c1; --cat-4:#096979;
+  --cat-5:#bf3989; --cat-6:#0f766e; --cat-7:#57606a; --cat-8:#034f84;
 }
 /* Before the module runs the page already follows the system preference. */
 @media (prefers-color-scheme:light) {
@@ -37,6 +41,8 @@
     --good:#1a7f37; --warn:#8a5a00; --bad:#c62828; --focus:#0b62c4;
     --good-bg:rgba(26,127,55,.10); --warn-bg:rgba(138,90,0,.10); --bad-bg:rgba(198,40,40,.08);
     --rx:#0b62c4; --tx:#b4530a; --rx-fill:rgba(11,98,196,.09); --tx-fill:rgba(180,83,10,.10);
+    --cat-1:#0b62c4; --cat-2:#b4530a; --cat-3:#6f42c1; --cat-4:#096979;
+    --cat-5:#bf3989; --cat-6:#0f766e; --cat-7:#57606a; --cat-8:#034f84;
   }
 }
 * { box-sizing:border-box; }
@@ -235,6 +241,15 @@ td details p { min-width:180px; max-width:320px; margin-top:4px; font-size:12px;
 .legend .rx { color:var(--rx); }
 .legend .tx { color:var(--tx); }
 .legend #chart-note { color:var(--faint); }
+/* History: one hue per series, each kept clear of the status colours */
+.cat-1 { --cat:var(--cat-1); } .cat-2 { --cat:var(--cat-2); } .cat-3 { --cat:var(--cat-3); } .cat-4 { --cat:var(--cat-4); }
+.cat-5 { --cat:var(--cat-5); } .cat-6 { --cat:var(--cat-6); } .cat-7 { --cat:var(--cat-7); } .cat-8 { --cat:var(--cat-8); }
+.chart path.band { stroke:none; fill:var(--cat); fill-opacity:.78; }
+.legend-item.series { color:var(--text); }
+.legend-item.series i { background:var(--cat); }
+.legend-item.series small { color:var(--muted); }
+.history-note { padding:10px 14px 0; color:var(--muted); font-size:12.5px; overflow-wrap:anywhere; }
+.history-note.bad { color:var(--bad); }
 
 /* Process */
 .system { margin-top:16px; border:1px solid var(--line); background:var(--surface); }
@@ -307,6 +322,7 @@ footer { margin-top:20px; padding-top:12px; border-top:1px solid var(--line-soft
 <nav class="rail-nav">
 <a href="#overview" data-section="overview" class="is-active">Overview</a>
 <a href="#traffic" data-section="traffic">Traffic</a>
+<a href="#history-panel" data-section="history-panel">History</a>
 <a href="#servers-panel" data-section="servers-panel">Servers</a>
 <a href="#rules-panel" data-section="rules-panel">Rules &amp; exits</a>
 <a href="#flows-panel" data-section="flows-panel">Flows</a>
@@ -372,6 +388,34 @@ footer { margin-top:20px; padding-top:12px; border-top:1px solid var(--line-soft
 <div class="chart-axis"><span>−5 min</span><span>−3:45</span><span>−2:30</span><span>−1:15</span><span id="chart-end">—</span></div>
 <div class="legend"><span class="legend-item rx"><i aria-hidden="true"></i><span id="legend-rx">Receive —</span></span><span class="legend-item tx"><i aria-hidden="true"></i><span id="legend-tx">Send —</span></span><span id="chart-note">Waiting for connection…</span></div>
 </div>
+</section>
+<section class="panel" id="history-panel" aria-labelledby="history-title">
+<div class="heading">
+<div class="heading-title"><h2 id="history-title">History</h2><span class="help-wrap"><button type="button" class="help" aria-label="About history" aria-describedby="history-help">?</button><span class="help-pop" id="history-help" role="tooltip">Traffic kept on the client, one minute at a time: an hour and a day by the minute, a week by the hour, a month by the day. A gap means the client was not running.</span></span></div>
+<div class="usage-controls"><div class="segmented" id="history-ranges" role="group" aria-label="History range"><button type="button" data-range="1h" aria-pressed="false" disabled>1 hour</button><button type="button" data-range="24h" aria-pressed="true" disabled>24 hours</button><button type="button" data-range="7d" aria-pressed="false" disabled>7 days</button><button type="button" data-range="30d" aria-pressed="false" disabled>30 days</button></div>
+<label>By <select id="history-kind" disabled><option value="link">Server</option><option value="rule">Rule</option><option value="network">Network</option></select></label>
+<label>Server <select id="history-server" disabled><option value="">All servers</option></select></label>
+<label>Show <select id="history-direction" disabled><option value="total">Receive + send</option><option value="rx">Received</option><option value="tx">Sent</option></select></label></div>
+</div>
+<div id="history-note" class="history-note" role="status" hidden></div>
+<div class="chart">
+<div class="chart-frame">
+<div class="chart-y"><span id="history-max">Mbit/s</span><span id="history-mid"> </span><span>0</span></div>
+<div class="chart-main">
+<div class="chart-plot">
+<svg viewBox="0 20 1000 140" preserveAspectRatio="none" role="img" aria-label="Traffic per series in Mbit/s"><title>Traffic history</title>
+<line class="grid" x1="0" y1="24" x2="1000" y2="24"/><line class="grid" x1="0" y1="88" x2="1000" y2="88"/><line class="grid" x1="0" y1="152" x2="1000" y2="152"/>
+<line class="grid v" x1="250" y1="24" x2="250" y2="152"/><line class="grid v" x1="500" y1="24" x2="500" y2="152"/><line class="grid v" x1="750" y1="24" x2="750" y2="152"/>
+<g id="history-bands"></g>
+</svg>
+<div class="chart-empty" id="history-empty">Waiting for the client…</div>
+</div>
+</div>
+</div>
+<div class="chart-axis" id="history-axis"><span>—</span><span> </span><span> </span><span> </span><span>—</span></div>
+<div class="legend" id="history-legend"></div>
+</div>
+<div class="scroll"><table id="history"><thead><tr><th>Series</th><th class="num">Received</th><th class="num">Sent</th><th class="num">Total</th><th class="num">Share</th><th class="num">Avg flows</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section class="panel" id="servers-panel" aria-labelledby="servers-title">
 <div class="heading"><div class="heading-title"><h2 id="servers-title">Servers</h2><span class="help-wrap"><button type="button" class="help" aria-label="About server totals" aria-describedby="servers-help">?</button><span class="help-pop" id="servers-help" role="tooltip">Totals count inner IP bytes since the client started. Diagnostics are cumulative, not current incidents.</span></span></div><span class="aside" id="recent-errors">—</span></div>

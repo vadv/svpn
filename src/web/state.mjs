@@ -433,3 +433,104 @@ export function mimicCell(selection, configured = []) {
     limited: configured.length ? `limited: ${configured.join(" · ")}` : "",
   };
 }
+
+// ── History kept on the client ──
+
+export const historyQuery = ({ range, kind, link = "" }) =>
+  `/api/history?range=${range}&kind=${kind}&top=8${link ? `&link=${encodeURIComponent(link)}` : ""}`;
+
+// One answer of /api/history as the chart draws it: a value per series and
+// bucket, in bytes. A bucket without a single point is time nothing was
+// recorded; a series without a point in a recorded bucket carried nothing.
+export function historyStack(answer, direction = "total") {
+  const { from, to, step } = answer;
+  const count = Math.max(0, Math.floor((to - from) / step));
+  const bytes = point => direction === "rx" ? point[1] : direction === "tx" ? point[2] : point[1] + point[2];
+  const series = answer.series.map(item => ({ ...item, values: new Array(count).fill(0) }));
+  const recorded = new Array(count).fill(false);
+  for (const item of series) {
+    for (const point of item.points) {
+      const index = Math.floor((point[0] - from) / step);
+      if (index >= 0 && index < count) { item.values[index] = bytes(point); recorded[index] = true; }
+    }
+  }
+  let peak = 0;
+  for (let index = 0; index < count; index++) {
+    if (recorded[index]) peak = Math.max(peak, series.reduce((sum, item) => sum + item.values[index], 0));
+  }
+  // Bytes of one bucket as Mbit/s.
+  const rate = value => value * 8 / step / 1e6;
+  const shown = item => direction === "rx" ? item.rx_bytes : direction === "tx" ? item.tx_bytes : item.rx_bytes + item.tx_bytes;
+  return { from, to, step, count, recorded, series, rate, peak: rate(peak), total: series.reduce((sum, item) => sum + shown(item), 0) };
+}
+
+// The top of the value axis: a round number just above the busiest bucket,
+// so the labels read as 0.5 or 2 and not as the traffic itself.
+export function historyScale(peak) {
+  const rough = Math.max(peak * 1.1, 0.01);
+  const power = 10 ** Math.floor(Math.log10(rough));
+  const top = [1, 2, 5, 10].find(step => step * power >= rough) * power;
+  return { top, mid: top / 2 };
+}
+
+// Stacked bands on the chart's grid (1000 wide, 24..152 high). A run of
+// recorded buckets is one polygon per series; an unrecorded bucket breaks it.
+export function historyAreas(stack, top) {
+  const { series, recorded, count, rate } = stack;
+  if (!count) return series.map(() => "");
+  const x = index => (1000 * (index + 0.5) / count).toFixed(2);
+  const y = value => (152 - 128 * value / top).toFixed(2);
+  const edges = series.map(() => ({ lower: new Array(count).fill(0), upper: new Array(count).fill(0) }));
+  const cumulative = new Array(count).fill(0);
+  series.forEach((item, s) => {
+    for (let index = 0; index < count; index++) {
+      edges[s].lower[index] = cumulative[index];
+      if (recorded[index]) cumulative[index] += rate(item.values[index]);
+      edges[s].upper[index] = cumulative[index];
+    }
+  });
+  return edges.map(edge => {
+    const parts = [];
+    let run = [];
+    const flush = () => {
+      if (run.length) {
+        const up = run.map(index => `L${x(index)},${y(edge.upper[index])}`).join(" ");
+        const down = [...run].reverse().map(index => `L${x(index)},${y(edge.lower[index])}`).join(" ");
+        parts.push(`M${x(run[0])},${y(edge.lower[run[0]])} ${up} ${down} Z`);
+      }
+      run = [];
+    };
+    for (let index = 0; index < count; index++) {
+      if (recorded[index]) run.push(index); else flush();
+    }
+    flush();
+    return parts.join(" ");
+  });
+}
+
+// Five marks of the time axis: both ends and the quarters between.
+export const historyMarks = (from, to) => [0, 0.25, 0.5, 0.75, 1].map(part => from + (to - from) * part);
+
+// The coarser the range, the coarser the label: a clock for a day, the day
+// of the week with its date for a week (the same weekday comes twice there),
+// the date for a month.
+export function historyTime(seconds, span) {
+  const date = new Date(seconds * 1000);
+  if (span > 7 * 86400) return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  if (span > 86400) return date.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  return date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+}
+
+// What a series is called. A rule goes by its label and a network by its
+// ASN; the exit is kept apart as a second line where more than one exists.
+export function historyName(item, servers = [], rules = [], names = {}) {
+  const server = servers.find(server => server.id === item.link);
+  const via = item.link === "" || item.link === "local" ? "Local" : server?.label || server?.server || item.link;
+  if (item.kind === "local") return { label: "Local exit", via: "" };
+  if (item.kind === "link") return { label: via, via: "" };
+  if (item.kind === "rule") {
+    const rule = rules.find(rule => rule.canonical === item.rule);
+    return { label: rule?.label ?? (item.rule === "fallback" ? "Fallback" : item.rule), via };
+  }
+  return { label: asnLabel(item.asn, names), via };
+}

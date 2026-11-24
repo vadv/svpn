@@ -125,6 +125,9 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
         pair: watch::channel(None).0,
+        history: None,
+        history_prev: None,
+        history_ts: None,
     }
 }
 

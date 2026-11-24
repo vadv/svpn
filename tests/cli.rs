@@ -249,6 +249,7 @@ fn every_explicit_client_setting_conflicts_with_config_even_at_default() {
         ("--stats-interval", "30"),
         ("--sticky-asn-mode", "hashed"),
         ("--web-listen", "127.0.0.1:8080"),
+        ("--stats-db", "stats.sqlite"),
         ("--up-script", "up"),
         ("--down-script", "down"),
         ("--up-command", "true"),
@@ -341,4 +342,28 @@ fn local_empty_tun_name_is_kernel_selected_and_stats_zero_is_off() {
             .is_none()
     );
     assert_eq!(args.stats_interval, 0);
+}
+
+// ── history database ──
+
+#[test]
+fn history_database_comes_from_the_flag_or_the_config() {
+    let args = client(&["--server", "203.0.113.1", "--stats-db", "stats.sqlite"]);
+    assert_eq!(
+        args.stats_db,
+        Some(std::path::PathBuf::from("stats.sqlite"))
+    );
+    assert_eq!(client(&["--server", "203.0.113.1"]).stats_db, None);
+
+    let config = svpn::config::parse(
+        "server \"main\" {\n  address = \"vpn.example\"\n}\n\
+         stats {\n  db = \"/var/lib/svpn/stats.sqlite\"\n}\n",
+        std::path::Path::new("."),
+        false,
+    )
+    .expect("history config");
+    assert_eq!(
+        config.stats_db,
+        Some(std::path::PathBuf::from("/var/lib/svpn/stats.sqlite"))
+    );
 }

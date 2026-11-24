@@ -152,6 +152,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
     let mut jobs = top.jobs()?;
     let geo_db = top.take_path("geo", "db", base)?;
     let country_db = top.take_path("country", "db", base)?;
+    let stats_db = top.take_path("stats", "db", base)?;
     // auto_job_update turns the database block into its own updater: the
     // preset lands in the same scheduler as hand-written jobs.
     if top.take_bool("geo", "auto_job_update")?.unwrap_or(false) {
@@ -188,6 +189,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         },
         geo_db,
         country_db,
+        stats_db,
         web_listen: match top.take_string("dashboard", "listen")? {
             Some(text) => Some(
                 text.parse::<std::net::SocketAddr>()
@@ -476,6 +478,7 @@ impl<'a> Top<'a> {
                         | "hooks"
                         | "dashboard"
                         | "fallback_sticky"
+                        | "stats"
                 ),
                 "config: unknown block {name}"
             );

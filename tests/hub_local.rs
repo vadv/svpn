@@ -106,6 +106,9 @@ fn local_hub() -> Hub {
         routes: Routes::default(),
         tombstones: session::Tombstones::default(),
         pair: watch::channel(None).0,
+        history: None,
+        history_prev: None,
+        history_ts: None,
     }
 }
 
@@ -151,4 +154,15 @@ fn report_calls_the_path_local_exit() {
     let report = hub.stats_report(std::time::Duration::from_secs(1));
     assert!(report.contains("local-exit: opened 0 / failed 0 / closed 0"));
     assert!(!report.contains("direct:"));
+}
+
+#[test]
+fn a_rule_names_its_history_series_by_its_canonical_key() {
+    let hub = local_hub();
+
+    let snapshot = svpn::web::snapshot(&hub);
+
+    assert_eq!(snapshot.rules[0].label, "local");
+    // Stable under config reorder: what the dashboard matches history rows against.
+    assert_eq!(snapshot.rules[0].canonical, "cc:BY,RU");
 }
