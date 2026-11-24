@@ -14,8 +14,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
-/// Sanity floor for a complete DB-IP Lite database; ASN Lite holds ~400k
-/// IPv4 rows, Country Lite is in the same range.
+/// Sanity floor for a complete database; DB-IP ASN Lite holds ~400k IPv4
+/// rows, ip-location-db server-country ~290k.
 const MIN_ROWS: usize = 100_000;
 /// Packed `ZZ`, see [`CountryRow::Unassigned`].
 const UNASSIGNED: u32 = (b'Z' as u32) << 8 | b'Z' as u32;
@@ -33,7 +33,8 @@ impl Geo {
         Self::load_ranges(path, asn_row)
     }
 
-    /// Load strict Country Lite IPv4 ranges (`ip_start,ip_end,country`).
+    /// Load strict country CSV IPv4 ranges (`ip_start,ip_end,country`): the
+    /// same rows for DB-IP Country Lite and ip-location-db server-country.
     /// Reject malformed, inverted or overlapping rows with their row number.
     /// Skip IPv6 rows, which this IPv4-only table cannot use.
     pub fn load_country(path: &Path) -> Result<Self> {
@@ -188,14 +189,15 @@ fn asn_row(line: &str) -> Option<(u32, u32, u32)> {
     Some((parse_v4(first)?, parse_v4(last)?, asn.parse::<u32>().ok()?))
 }
 
-/// Country Lite row `ip_start,ip_end,country`; trailing fields are ignored.
+/// Country CSV row `ip_start,ip_end,country`; trailing fields are ignored.
 enum CountryRow {
     Range(u32, u32, u32),
     /// Both address fields contain `:` — a valid IPv6 row, skipped because
     /// the table is IPv4-only.
     Ipv6,
-    /// `ZZ` — DB-IP's reserved/private range marker, not a country: the
-    /// address stays unknown instead of showing a made-up flag.
+    /// `ZZ` — the reserved/private range marker of country CSVs that list
+    /// them (DB-IP), not a country: the address stays unknown instead of
+    /// showing a made-up flag.
     Unassigned,
     /// Corruption category for the row-numbered startup error.
     Invalid(&'static str),

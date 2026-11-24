@@ -83,7 +83,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        # shortcut: macOS native tests are off until the macOS client is reworked.
+        # Hosted macOS runners queue past the 15-minute acquisition limit and the
+        # job is cancelled without running; add macos-15 back with the rework.
+        os: [ubuntu-24.04]
         rust: ["1.91.0", "1.99.0"]
     env:
       RUST_VERSION: ${{ matrix.rust }}
