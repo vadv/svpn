@@ -430,11 +430,14 @@ What it shows:
   from two fresh snapshots of a cumulative counter: after a restart, API gap or
   stale state it shows an unknown value rather than an invented average. A value
   above 100% means multithreaded load, not an error.
-- Interface: a dense monospace instrument readout with flat surfaces, sharp
-  corners, a hard grid, one acid accent, a live clock and caret. Side navigation,
-  sparklines, a filled traffic chart with a hover tooltip and a light/dark theme
-  switch. The theme lives only in the open tab and is never persisted; `/`
-  focuses the flow search and `Esc` clears it. No gradients, glassmorphism,
+- Interface: a calm operations console with flat surfaces and sharp corners.
+  Colour carries meaning only — status and the receive/send directions; active
+  and pressed controls differ by surface shade. Text uses the system UI face,
+  monospace stays with addresses, ports and selectors. The "now" summary is the
+  first row; the chart has a value axis and time ticks. The theme follows the
+  system until you pick one, lives only in the open tab and is never persisted;
+  `/` focuses the flow search, `Esc` clears it and *Clear filters* resets the
+  search, the filters and the explorer drill-down. No gradients, glassmorphism,
   decorative icons, external fonts, images or CDNs are used.
 - Job state, last successful attempt, failure reason and next run; ASN/Country
   database loading time in this process, range counts and update outcomes. Failed

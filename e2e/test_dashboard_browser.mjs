@@ -128,7 +128,7 @@ try {
   assert($('active-note').textContent.endsWith(' · 8 closing'), 'closing flows are counted in the note, not the headline');
   assert($('rules').tBodies[0].rows[0].cells[3].textContent === '37 active · 4 closing' && $('rules').textContent.includes('41 active'), 'rules split active and closing counts, a rule without closing omits the note');
   assert($('rules').tBodies[0].rows[$('rules').tBodies[0].rows.length - 1].cells[1].textContent === 'Per flow / group', 'fallback exit states per flow / group pinning');
-  assert($('local').textContent === 'Ready', 'local readiness');
+  assert($('local').textContent === 'Ready' && $('local').className === 'compact' && $('ready').className === '', 'local readiness; a healthy summary stays neutral');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
   assert($('chart-rx').getAttribute('d').includes('l0,0') && getComputedStyle($('chart-rx')).strokeLinecap === 'round', 'isolated first chart sample is visible');
   await until(() => $('proc-rss').textContent.includes('MiB') && $('proc-cpu').textContent.includes('%'), 'process RSS and CPU readout');
@@ -159,9 +159,15 @@ try {
   assert(statusTag && getComputedStyle(statusTag).borderTopWidth === '0px', 'status labels are plain text, not button-like boxes');
   assert(!document.querySelector('#rules-panel').textContent.includes('IP bytes since client start'), 'long prose is removed from the rules panel');
   $('theme-toggle').click();
-  assert(document.body.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true', 'light theme switch');
+  assert(document.body.dataset.theme === 'light' && document.documentElement.dataset.theme === 'light' && $('theme-toggle').getAttribute('aria-pressed') === 'true' && $('theme-toggle').textContent === 'Theme: light', 'light theme switch');
   $('theme-toggle').click();
-  assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false', 'dark theme switch');
+  assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false' && $('theme-toggle').textContent === 'Theme: dark', 'dark theme switch');
+  const bodyStyle = getComputedStyle(document.body), titleStyle = getComputedStyle(document.querySelector('.heading h2'));
+  assert(/system-ui/.test(bodyStyle.fontFamily) && parseFloat(bodyStyle.fontSize) >= 13 && titleStyle.textTransform === 'none' && parseFloat(titleStyle.fontSize) >= 14, 'interface text is sentence case in the UI face at a readable size');
+  assert(!document.querySelector('.caret') && getComputedStyle(document.querySelector('.rail-health'), '::before').animationName === 'none', 'nothing blinks on a healthy dashboard');
+  assert([...document.querySelectorAll('.chart-axis span')].map(span => span.textContent).join('|') === '−5 min|−3:45|−2:30|−1:15|' + $('chart-end').textContent, 'chart carries time ticks');
+  assert(Math.abs(Number.parseFloat($('chart-mid').textContent) * 2 - Number.parseFloat($('chart-max').textContent)) < 0.02, 'value axis labels its middle gridline');
+  assert($('flow-reset').disabled, 'clear filters stays quiet without filters');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
   assert($('servers').textContent.includes('tcp 41 ms (+penalty) · quic 63 ms · webrtc timeout · obfs handshake'), 'race is shown, winner first');
@@ -233,7 +239,7 @@ try {
   await until(() => $('asn-status').textContent.includes('2 names'), 'explicit load after eviction');
   await control('names-error'); $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('HTTP 503'), 'CSV fetch error is explicit');
-  assert($('freshness').textContent === 'Live snapshots', 'CSV errors do not break live state polling');
+  assert($('freshness').textContent === 'Live', 'CSV errors do not break live state polling');
   await control('normal'); $('asn-load').click();
   await until(() => $('asn-status').textContent.includes('2 names'), 'CSV retry recovers');
   const details = document.querySelector('#servers details'); details.open = true;
@@ -243,6 +249,9 @@ try {
   assert(document.querySelector('#servers details') === details && details.open, 'details identity and open state preserved');
   input('flow-search', '49999'); input('flow-protocol', 'tcp'); input('flow-exit', 'local');
   assert($('flows').tBodies[0].rows.length === 1 && $('flows').textContent.includes('49999'), 'combined flow filters');
+  assert(!$('flow-reset').disabled, 'clear filters is offered once a filter is active');
+  $('flow-reset').click();
+  assert(['flow-search','flow-protocol','flow-exit'].every(id => $(id).value === '') && $('flow-reset').disabled, 'clear filters resets the search and the selectors');
   input('flow-search', ''); input('flow-protocol', ''); input('flow-exit', 'de.example.test');
   input('flow-country', 'US'); input('flow-asn', '13335');
   $('next').click(); assert($('flow-page').textContent.startsWith('2 /'), 'next flow page');
@@ -273,6 +282,8 @@ try {
   await control('degraded');
   await until(() => $('jobs').tBodies[0].textContent.includes('Previous attempt: '), 'a retrying job keeps its previous failure visible');
   assert($('jobs').tBodies[0].rows[0].cells[4].textContent === 'Running', 'running job shows Running instead of a next-check time');
+  assert($('local').className === 'compact bad' && $('ready').className === 'warn' && $('freshness').className === 'pill good', 'trouble is the only coloured thing in the summary');
+  assert(!document.querySelector('#servers .pill.bad') && document.querySelector('#servers .pill.warn')?.textContent === 'Backoff', 'state tags read as words');
   await control('normal');
   await until(() => !$('jobs').textContent.includes('Previous attempt:'), 'clean job drops the previous-attempt prefix');
   await control('offline');
@@ -283,7 +294,7 @@ try {
   assert((await fetch('/api/state')).status === 503, 'HTTP error fixture');
   const beforeApiGap = $('chart-rx').getAttribute('d');
   await control('frozen');
-  await until(() => $('freshness').textContent === 'Live snapshots', 'same-timestamp response clears the API error', 2500);
+  await until(() => $('freshness').textContent === 'Live', 'same-timestamp response clears the API error', 2500);
   assert($('chart-rx').getAttribute('d') === beforeApiGap, 'duplicate recovery does not add a chart sample');
   assert($('rx').textContent === '—' && $('legend-rx').textContent.includes('—'), 'duplicate recovery does not reuse a pre-error rate');
   assert(!$('chart-note').textContent.includes('not live'), 'duplicate recovery restores chart freshness');
@@ -296,7 +307,7 @@ try {
   await until(() => $('freshness').textContent === 'Stale data', 'unchanged snapshot becomes stale');
   assert(!$('stale-notice').hidden && $('rx').textContent === '—', 'stale screen has warning and unknown rate');
   await control('empty');
-  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live snapshots', 'recovery and empty flow table');
+  await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live', 'recovery and empty flow table');
   assert($('rx').textContent === '—', 'stale recovery starts with an unknown rate');
   assert($('flows').textContent.includes('No active flows'), 'empty flow state');
   assert($('servers').textContent.includes('No servers configured'), 'empty server table is explicit');
@@ -408,6 +419,7 @@ async function browser(query = "", screenshot, mobile = false) {
     };
     const width = mobile ? 390 : 1440, height = mobile ? 1100 : 1250;
     await page("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile });
+    await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
     await evaluate("new Promise(resolve => { if (document.readyState === 'complete') resolve(); else addEventListener('load', resolve, { once: true }); })");
     await page("Page.enable");
     // Replay five minutes of timestamped fixture snapshots for screenshots. The real
@@ -421,7 +433,7 @@ async function browser(query = "", screenshot, mobile = false) {
     await page("Page.navigate", { url: origin + "/" + query });
     await loaded; onLoad = null;
     await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
-      const done = ${query ? `document.getElementById('freshness')?.textContent === '${query.includes("cold") ? "API unavailable" : "Live snapshots"}' && ${query.includes("cold") ? "true" : "document.getElementById('rx')?.textContent !== '—'"}` : "document.documentElement.dataset.browserCheck"};
+      const done = ${query ? `document.getElementById('freshness')?.textContent === '${query.includes("cold") ? "API unavailable" : "Live"}' && ${query.includes("cold") ? "true" : "document.getElementById('rx')?.textContent !== '—'"}` : "document.documentElement.dataset.browserCheck"};
       if (done) { clearInterval(timer); resolve(true); }
     }, 100); })`);
     if (replay) await evaluate(`new Promise(resolve => { const timer = setInterval(() => {
@@ -466,7 +478,7 @@ async function browser(query = "", screenshot, mobile = false) {
     }
     assert.ok(layout.fontHeight >= 10, "chart axis labels are legible without SVG scaling");
     if (query.includes("cold")) {
-      assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
+      assert.ok(await evaluate("['pause','previous','next','chart-server','flow-search','flow-protocol','flow-exit','flow-country','flow-asn','asn-load','flow-reset'].every(id => document.getElementById(id).disabled)"), "cold controls disabled");
       assert.ok(await evaluate("!document.getElementById('chart-empty').hidden"), "cold chart shows a collecting placeholder");
     }
     if (screenshot) {
