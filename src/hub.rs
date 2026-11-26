@@ -69,8 +69,7 @@ pub struct Link {
     pub last_reason: String,
     /// Tunnel pair assigned by the server during the current attempt (#181).
     pub assigned: Arc<std::sync::OnceLock<(Ipv4Addr, Ipv4Addr)>>,
-    /// Sending half of the control channel once the server agreed on DNS
-    /// relay; empty for an attempt whose server did not.
+    /// Sending half of the control channel, set once the link is open.
     pub resolver: Arc<std::sync::OnceLock<ControlSender>>,
 }
 
@@ -705,7 +704,6 @@ impl Hub {
                         }
                     }
                     self.serving();
-                    self.dns_ready(epoch.link);
                 }
                 Event::Checking => {
                     if self.pool.checking(epoch) {
@@ -831,12 +829,12 @@ impl Hub {
         } else {
             String::new()
         };
-        let dns = self.dns_asks(epoch.link);
         let link = &mut self.links[epoch.link];
         link.epoch = Some(epoch);
         link.stats.reset();
         let assigned = Arc::new(std::sync::OnceLock::new());
         link.assigned = assigned.clone();
+        // Published once the link is open; the hub's DNS queries go through it.
         let resolver = Arc::new(std::sync::OnceLock::new());
         link.resolver = resolver.clone();
         // Insist on the pinned shared pair when one exists (#181).
@@ -858,12 +856,9 @@ impl Hub {
         self.tasks.spawn(async move {
             let attempt = async {
                 let (control, tail, config, server_ip, addrs) =
-                    crate::open_link(&params, &io.tag, desired, dns).await?;
+                    crate::open_link(&params, &io.tag, desired).await?;
                 let _ = assigned.set((addrs.client_ip, addrs.server_ip));
-                // Published before the session can report Ready.
-                if control.dns() {
-                    let _ = resolver.set(control.sender());
-                }
+                let _ = resolver.set(control.sender());
                 io.peer_ip = addrs.server_ip;
                 let result =
                     session::run_link(control, server_ip, addrs.client_ip, params.mtu, config, io)

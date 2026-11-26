@@ -70,7 +70,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tokio::time::timeout;
 
-use control::{Control, DNS_VERSION, Endpoint, Message, Strategy, VERSION};
+use control::{Control, Endpoint, Message, Strategy, VERSION};
 use mimic::{DEFAULT_STRATEGIES, tcp_only_mode};
 use server_spec::{LinkParams, resolve_perf, resolve_servers};
 use tun::{create_tun, stale_tun_holders};
@@ -454,13 +454,10 @@ pub(crate) struct LinkAddrs {
 
 /// Bootstrap SSH and the server TUN. The packet port can run probes before
 /// the supervisor creates the single client TUN. Shared by client and perf.
-/// `dns` asks the server for DNS relay as well; the returned `Control` says
-/// whether it agreed.
 pub(crate) async fn open_link(
     params: &LinkParams,
     tag: &str,
     desired: Option<(Ipv4Addr, Ipv4Addr)>,
-    dns: bool,
 ) -> Result<(
     Control,
     ssh::SshTail,
@@ -497,59 +494,35 @@ pub(crate) async fn open_link(
         session::prefixed(tag, "ssh"),
         params.server
     );
+    let session = ssh::connect(
+        &target,
+        SocketAddr::from((server_ip, params.ssh_port)),
+        &command,
+        tag,
+    )
+    .await?;
+    let (stdin, stdout, tail) = session.into_io();
+    let mut control = Control::new(stdout, stdin);
     // desired (server, client) pins the shared pair: pool members and
     // reconnects propose it in Hello and accept nothing else (#181).
     let (hello_client, hello_server) =
         desired.map_or((params.tun_addr, params.peer_addr), |(s, c)| (c, s));
-    // DNS relay is negotiated by the hello version: a server without it exits
-    // on sight of the newer number, which comes back as EOF before `ready`.
-    // The link then reconnects speaking the plain version, without relay.
-    let versions: &[u32] = if dns {
-        &[DNS_VERSION, VERSION]
-    } else {
-        &[VERSION]
-    };
-    let mut next = 0;
-    let (mut control, tail) = loop {
-        let version = versions[next];
-        next += 1;
-        let session = ssh::connect(
-            &target,
-            SocketAddr::from((server_ip, params.ssh_port)),
-            &command,
-            tag,
-        )
+    control
+        .send(Message::Hello {
+            version: VERSION,
+            client_ip: hello_client,
+            server_ip: hello_server,
+            mtu: params.mtu,
+            addr_auto: params.addr_auto,
+        })
         .await?;
-        let (stdin, stdout, tail) = session.into_io();
-        let mut control = Control::new(stdout, stdin);
-        control
-            .send(Message::Hello {
-                version,
-                client_ip: hello_client,
-                server_ip: hello_server,
-                mtu: params.mtu,
-                addr_auto: params.addr_auto,
-            })
-            .await?;
-        let ready = match bootstrap(&mut control).await {
-            Ok(Message::Ready { version: ready, .. }) if ready == version => ready,
-            Ok(_) => bail!("unexpected server greeting"),
-            Err(error) => {
-                drop(control);
-                if versions.get(next) == Some(&VERSION) && control::is_eof(&error) {
-                    tail.close().await;
-                    crate::info!(
-                        "{} server does not speak control v{DNS_VERSION} — reconnecting without DNS relay",
-                        session::prefixed(tag, "ssh")
-                    );
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        control.set_dns(ready == DNS_VERSION);
-        break (control, tail);
-    };
+    ensure!(
+        matches!(
+            bootstrap(&mut control).await?,
+            Message::Ready { version: VERSION }
+        ),
+        "unexpected server greeting"
+    );
     // TCP mode takes the port from Endpoints.tcp; UDP — from Endpoints.udp.
     let Message::Endpoints {
         udp,
@@ -680,18 +653,12 @@ async fn serve(
     else {
         bail!("expected hello");
     };
-    ensure!(
-        matches!(version, VERSION | DNS_VERSION),
-        "unsupported control version"
-    );
+    ensure!(version == VERSION, "unsupported control version");
     validate_addresses(client_ip, server_ip, mtu)?;
     let bind = ssh_server_address(
         &std::env::var("SSH_CONNECTION").context("server requires SSH_CONNECTION from sshd")?,
     )?;
-    // The accepted version goes back: DNS relay is spoken only with a client
-    // that asked for it.
-    control.set_dns(version == DNS_VERSION);
-    control.send(Message::Ready { version }).await?;
+    control.send(Message::Ready { version: VERSION }).await?;
     // Bind the TCP-mode listener before Endpoints so the actual (possibly
     // ephemeral) port is announced everywhere and reused by the session.
     let tcp = match tcp {

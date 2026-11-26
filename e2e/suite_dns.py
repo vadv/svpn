@@ -106,7 +106,6 @@ def test_name_is_resolved_where_its_traffic_leaves():
             assert again == addresses, "the cache answers inside the TTL"
             assert ttl_again <= TTL, "never more TTL than the answer carried"
             assert len(asked("cdn.example")) <= 2, "a cached answer asks nobody"
-        assert "server does not speak control" not in path.read_text(), "both servers relay"
     cleanup_verified(process, server_hosts=HOSTS)
     print("PASS dns exit: a name resolves at the exit its traffic takes, then from the cache")
 

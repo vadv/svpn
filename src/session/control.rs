@@ -187,10 +187,7 @@ impl Session {
     /// loop; the answer goes back as `dns_answer`, empty when the query is
     /// unreadable, the relay is busy or no resolver answered in time.
     async fn dns_query(&mut self, id: u64, data: String) -> Result<()> {
-        ensure!(
-            self.control.dns() && !self.client(),
-            "dns_query outside a DNS_VERSION server session"
-        );
+        ensure!(!self.client(), "dns_query outside a server session");
         let relay = match (crate::dns::decode(&data), crate::dns::relay::acquire()) {
             (Some(query), Some(permit)) => Some((query, permit)),
             _ => None,

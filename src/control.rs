@@ -12,9 +12,6 @@ use crate::packet::FlowKey;
 use crate::selector::Reason;
 
 pub const VERSION: u32 = 3;
-/// Hello version of a peer that also speaks `dns_query`/`dns_answer`. A peer
-/// without it exits on the newer number: the caller falls back to `VERSION`.
-pub const DNS_VERSION: u32 = 4;
 /// One line carries a DNS answer: base64 of the 64 KiB DNS limit is 87 380
 /// characters. `read_message` grows its buffer as the line arrives, so the
 /// limit costs nothing on ordinary control traffic.
@@ -267,7 +264,7 @@ pub enum Message {
         stats: Stats,
     },
     /// Client → server: resolve one DNS wire query with the server's system
-    /// resolvers. Spoken only after a `DNS_VERSION` hello.
+    /// resolvers.
     DnsQuery {
         id: u64,
         /// Base64 of the query as the stub sent it.
@@ -285,8 +282,6 @@ pub struct Control {
     outbound: mpsc::Sender<Message>,
     inbound: mpsc::Receiver<Result<Message>>,
     tasks: JoinSet<()>,
-    /// The hello agreed on `DNS_VERSION`: `dns_query`/`dns_answer` are spoken.
-    dns: bool,
 }
 
 /// Cloneable sending half of the control channel, for tasks that outlive one
@@ -324,7 +319,6 @@ impl Control {
             outbound,
             inbound,
             tasks,
-            dns: false,
         }
     }
 
@@ -342,15 +336,6 @@ impl Control {
     pub fn sender(&self) -> ControlSender {
         ControlSender(self.outbound.clone())
     }
-
-    /// The hello agreed on DNS relay (`DNS_VERSION`).
-    pub fn dns(&self) -> bool {
-        self.dns
-    }
-
-    pub fn set_dns(&mut self, negotiated: bool) {
-        self.dns = negotiated;
-    }
 }
 
 impl Drop for Control {
@@ -364,7 +349,7 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Mes
     loop {
         let buffer = reader.fill_buf().await.context("control read failed")?;
         if buffer.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, EOF).into());
+            bail!("control EOF");
         }
         let end = buffer.iter().position(|byte| *byte == b'\n');
         let length = end.map_or(buffer.len(), |index| index + 1);
@@ -378,18 +363,6 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Mes
             return serde_json::from_slice(&line).map_err(|_| anyhow!("invalid control JSON"));
         }
     }
-}
-
-const EOF: &str = "control EOF";
-
-/// The peer closed its side of the control channel: the server it started
-/// has exited, for instance because it rejected the hello version.
-pub fn is_eof(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            io.kind() == std::io::ErrorKind::UnexpectedEof && io.to_string() == EOF
-        })
-    })
 }
 
 async fn run_writer<W: AsyncWrite + Unpin>(

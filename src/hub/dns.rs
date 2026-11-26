@@ -10,7 +10,7 @@
 //! for a while longer and served only when asking the exit fails.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     time::Duration,
@@ -19,7 +19,7 @@ use std::{
 use tokio::{task::JoinSet, time::Instant};
 
 use crate::{
-    control::{DNS_VERSION, Message, VERSION},
+    control::Message,
     dns::{self, relay, wire},
     link_io::{Delivery, Epoch, Event, Packet},
     packet::{self, FlowKey},
@@ -176,8 +176,6 @@ pub struct DnsState {
     /// Device the local exit's queries leave through; unknown until the
     /// client TUN is up.
     wan: Option<String>,
-    /// Links whose server speaks only the plain control version.
-    legacy: HashSet<usize>,
     /// No exit can resolve right now: UDP/53 is passed through, as without
     /// the mode.
     idle: bool,
@@ -216,11 +214,6 @@ impl DnsState {
 }
 
 impl Hub {
-    /// Whether link `index` asks its server for DNS relay.
-    pub fn dns_asks(&self, index: usize) -> bool {
-        self.dns.on && !self.dns.legacy.contains(&index)
-    }
-
     /// The client TUN exists: the local exit's queries leave through `device`.
     pub fn dns_set_wan(&mut self, device: Option<String>) {
         self.dns.wan = device;
@@ -229,20 +222,6 @@ impl Hub {
     /// The resolvers the local exit asks, as sockets.
     pub fn dns_set_resolvers(&mut self, resolvers: Vec<SocketAddr>) {
         self.dns.local = resolvers;
-    }
-
-    /// A link reached Ready. A server too old for DNS relay is named once
-    /// and stops being asked.
-    pub fn dns_ready(&mut self, link: usize) {
-        if !self.dns.on || self.links[link].resolver.get().is_some() {
-            return;
-        }
-        if self.dns.legacy.insert(link) {
-            crate::warn!(
-                "dns[{}]: server speaks control v{VERSION}, not v{DNS_VERSION} — this exit cannot resolve until svpn on the server is updated",
-                self.links[link].params.server
-            );
-        }
     }
 
     /// UDP/53 from the client TUN; `true` once the hub takes the datagram,
@@ -408,9 +387,7 @@ impl Hub {
             if serving {
                 crate::info!("dns: on — UDP/53 from the client TUN resolves at the exit");
             } else {
-                crate::warn!(
-                    "dns: no exit can resolve — UDP/53 passes through until a server speaks control v{DNS_VERSION}"
-                );
+                crate::warn!("dns: no exit can resolve — UDP/53 passes through");
             }
         }
         serving

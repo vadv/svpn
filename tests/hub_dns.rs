@@ -286,19 +286,15 @@ async fn without_the_mode_udp_53_is_ordinary_traffic() {
 }
 
 #[tokio::test]
-async fn until_an_exit_can_resolve_udp_53_passes_through() {
+async fn an_exit_with_no_open_control_channel_leaves_udp_53_alone() {
     let mut bench = Bench::new(1, Vec::new());
-    // The server did not agree on relay: never asked again, traffic as usual.
+    // A link publishes its control sender once it is open: until then no
+    // exit can resolve, and DNS is ordinary traffic.
     bench.hub.links[0].resolver = Arc::default();
-    bench.hub.dns_ready(0);
-    assert!(!bench.hub.dns_asks(0));
     let datagram = datagram(1, dns::HOST, 40000, None);
     assert!(bench.hub.dispatch(&datagram, CLIENT).unwrap().is_none());
     assert_eq!(bench.flows[0].try_recv().unwrap().bytes, datagram);
-
-    let mut agreed = Bench::new(1, Vec::new());
-    agreed.hub.dns_ready(0);
-    assert!(agreed.hub.dns_asks(0));
+    assert!(bench.hub.dns_replies().is_empty());
 }
 
 #[tokio::test]

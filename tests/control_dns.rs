@@ -102,32 +102,6 @@ async fn the_sender_never_waits() {
     assert!(!sender.try_send(query(1)), "the writer is gone");
 }
 
-#[tokio::test]
-async fn only_a_closed_channel_is_eof() {
-    let oversized = vec![b'x'; MAX_LINE + 1];
-    for (bytes, eof) in [
-        (b"".to_vec(), true),
-        // Cut in the middle of a line: the same closed channel.
-        (b"{\"type\":".to_vec(), true),
-        (b"not JSON\n".to_vec(), false),
-        (
-            b"{\"type\":\"ready\",\"version\":3,\"extra\":true}\n".to_vec(),
-            false,
-        ),
-        (oversized, false),
-    ] {
-        let mut reader = BufReader::new(Cursor::new(bytes));
-        let error = match control::read_message(&mut reader).await {
-            Err(error) => error,
-            Ok(_) => panic!(
-                "the line starting {:?} should be rejected",
-                reader.buffer()[..8.min(reader.buffer().len())].to_vec()
-            ),
-        };
-        assert_eq!(control::is_eof(&error), eof, "{error}");
-    }
-}
-
 // ── session ──
 
 /// A link session with a control channel the test holds the other end of.
@@ -186,7 +160,6 @@ async fn a_client_session_hands_answers_to_the_hub() {
 #[tokio::test]
 async fn a_client_never_relays_a_query() {
     let (mut session, _peer, _events) = linked();
-    session.control.set_dns(true);
     let error = session
         .dispatch_control(Message::DnsQuery {
             id: 1,
@@ -194,30 +167,17 @@ async fn a_client_never_relays_a_query() {
         })
         .await
         .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "dns_query outside a DNS_VERSION server session"
-    );
+    assert_eq!(error.to_string(), "dns_query outside a server session");
 }
 
 #[tokio::test]
-async fn a_server_relays_only_after_the_dialect_hello() {
+async fn a_server_answers_what_it_cannot_relay_with_nothing() {
     let (mut session, mut peer, _events) = linked();
     // The same session seen from the server: no client plane.
     if let Plane::Tcp(plane) = &mut session.plane {
         plane.server_ip = None;
     }
     let ask = |id: u64, data: String| Message::DnsQuery { id, data };
-    let error = session
-        .dispatch_control(ask(4, dns::encode(&query())))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "dns_query outside a DNS_VERSION server session"
-    );
-
-    session.control.set_dns(true);
     // A query that is not base64 is answered at once, with nothing.
     session
         .dispatch_control(ask(5, "%%%".to_owned()))
