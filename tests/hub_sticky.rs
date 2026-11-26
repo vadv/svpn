@@ -107,6 +107,7 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
                 stats: stats::Snapshot::default(),
                 last_reason: String::new(),
                 assigned: Arc::default(),
+                resolver: Arc::default(),
             })
             .collect(),
         policy: svpn::cli::ExitPolicy::Balance,
@@ -143,6 +144,7 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
         history: None,
         history_prev: None,
         history_ts: None,
+        dns: Default::default(),
     }
 }
 

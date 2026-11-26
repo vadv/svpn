@@ -200,6 +200,10 @@ impl Session {
             incumbent: incumbent_probe,
             deadline: Instant::now() + CHALLENGE_CAP,
         });
+        // The round took the measurement slot: a health tick left due would
+        // wake the loop in a tight loop for the whole round.
+        // `finish_challenge` arms the real follow-up.
+        self.health_at = Some(Instant::now() + HEALTH_INTERVAL);
         for candidate in candidates {
             // A live, non-draining channel is reused: probing every
             // interval must not rebuild channels every interval (a WebRTC
@@ -473,10 +477,11 @@ impl Session {
         let Some(mut challenge) = self.challenge.take() else {
             return Ok(());
         };
-        // The challenge borrowed the probe slot; resume periodic health
-        // bursts unless the session is tearing down.
+        // The challenge borrowed the measurement slot: the next measurement
+        // — a challenger round at its gate, a health burst at its tick — is
+        // armed for whichever is due first, unless the session is tearing down.
         if self.readiness == Some(crate::session::Readiness::Ready) {
-            self.health_at = Some(Instant::now() + HEALTH_INTERVAL);
+            self.health_at = Some(self.next_measurement_at(Instant::now()));
         }
         let tag = self.tag().to_owned();
         let incumbent = challenge.incumbent;

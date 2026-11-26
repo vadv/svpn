@@ -819,11 +819,6 @@ impl Session {
         }
         permit.send((io.epoch, link_io::Event::Ready));
         self.readiness = Some(Readiness::Ready);
-        // health bursts start once the link is Ready; the first
-        // challenger round may run one remeasure interval later.
-        self.health_at = self
-            .client()
-            .then_some(now + crate::session::burst::HEALTH_INTERVAL);
         let challenge_seed = crate::session::challenge::jitter_seed()?;
         self.next_challenge_at = if self.client() {
             self.remeasure.map(|interval| {
@@ -832,6 +827,9 @@ impl Session {
         } else {
             None
         };
+        // Measurements start once the link is Ready: a challenger round one
+        // remeasure interval later, a health burst at its tick.
+        self.health_at = self.client().then(|| self.next_measurement_at(now));
         if let Plane::Channels(plane) = &mut self.plane
             && let Some(selector) = plane.selector.as_mut()
         {

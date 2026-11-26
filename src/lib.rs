@@ -23,6 +23,7 @@ mod cmdline;
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod dns;
 pub mod drivers;
 pub mod exit_state;
 pub mod framing;
@@ -372,6 +373,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     jobs,
                     web_listen: args.web_listen,
                     stats_db: args.stats_db,
+                    dns: args.dns,
                 },
             );
             tokio::pin!(client);

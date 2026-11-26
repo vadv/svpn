@@ -73,6 +73,14 @@ impl Session {
                             reason: Reason::PathTimeout,
                         })
                         .await?;
+                    // A background challenger leaves its challenge here: kept
+                    // in `attempts`, it would hold the verdict until the cap.
+                    self.challenge_channel_failed(
+                        Some(attempt),
+                        Some(channel),
+                        Reason::PathTimeout,
+                    )
+                    .await?;
                     self.execute_actions(actions).await?;
                 }
             },

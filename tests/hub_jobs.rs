@@ -71,6 +71,7 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
             stats: stats::Snapshot::default(),
             last_reason: String::new(),
             assigned: Arc::default(),
+            resolver: Arc::default(),
         }],
         pool: Pool::new([1]),
         geo: None,
@@ -101,6 +102,7 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
         history: None,
         history_prev: None,
         history_ts: None,
+        dns: Default::default(),
     }
 }
 

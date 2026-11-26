@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 aes-gcm = { version = "0.10", features = ["aes", "zeroize"] }
 anyhow = "1"
+base64 = "0.23"
 bytes = "1.12.1"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"

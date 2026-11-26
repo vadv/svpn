@@ -1,8 +1,15 @@
-"""File-backed DNS A-record server for the sticky suite.
+"""File-backed DNS A-record server for the sticky and DNS-exit suites.
 
-Records live in /dns/records (`name ip` per line, `#` comments); the file is
-reloaded when its mtime changes, so the suite rewrites answers without any
-signalling. NODATA answers as NOERROR with zero records: the resolver treats
+Records live in /dns/records, one per line, reloaded when the file's mtime
+changes, so the suites rewrite answers without any signalling:
+
+    name ip            for every asker
+    name ip@address    only when the query comes from `address`
+    name -             no answer at all: a resolver with nothing to say
+
+A name may have both: the asker's own line wins over the line for everyone.
+Every query is appended to /dns/queries as `<asker> <name> <qtype>`.
+NODATA answers as NOERROR with zero records: the resolver treats
 that as a successful refresh with an empty set, which is what lets stale pins
 purge.
 """
@@ -12,12 +19,15 @@ import socket
 import struct
 
 RECORDS = pathlib.Path("/dns/records")
+QUERIES = pathlib.Path("/dns/queries")
 TTL = 5
 T_A = 1
 CLASS_IN = 1
+SILENT = "-"
 
 
 def load():
+    """name → [(asker address or None, answer)], in file order."""
     table = {}
     try:
         text = RECORDS.read_text()
@@ -27,12 +37,24 @@ def load():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        name, _, ip = line.partition(" ")
+        name, _, value = line.partition(" ")
         name = name.strip().rstrip(".").lower()
-        ip = ip.strip()
-        if name and ip:
-            table[name] = ip
+        answer, _, asker = value.strip().partition("@")
+        if name and answer:
+            table.setdefault(name, []).append((asker or None, answer))
     return table
+
+
+def lookup(table, qname, asker):
+    """The answer `qname` gives `asker`: its own line, else the line for everyone."""
+    records = table.get(qname, ())
+    for who, answer in records:
+        if who == asker:
+            return answer
+    for who, answer in records:
+        if who is None:
+            return answer
+    return None
 
 
 def question(data):
@@ -104,9 +126,14 @@ def main():
             print(f"DNS unparsable from {peer}", flush=True)
             continue
         ident, qname, qtype = parsed
+        with QUERIES.open("a") as log:
+            log.write(f"{peer[0]} {qname} {qtype}\n")
         print(f"DNS query qname={qname} qtype={qtype} from {peer}", flush=True)
-        if qtype == T_A and qname in table:
-            sock.sendto(answer(ident, qname, table[qname]), peer)
+        found = lookup(table, qname, peer[0])
+        if found == SILENT:
+            continue
+        if qtype == T_A and found is not None:
+            sock.sendto(answer(ident, qname, found), peer)
         else:
             # Every other query (AAAA included — glibc resolves A and AAAA
             # in parallel) gets NOERROR with zero answers, never silence.

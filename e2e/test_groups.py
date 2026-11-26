@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 import integration
 import matrix
 import suite_bootstrap
+import suite_dns
 import suite_jobs
 import suite_pool
 import suite_recovery
@@ -68,6 +69,10 @@ ZOMBIE_BASELINE = """
 test_zombie_storm_keeps_flows_moving test_zombie_silent_storm_reclaims_flow_slots
 test_failed_handshake_fails_fast
 """.split()
+DNS_BASELINE = """
+test_name_is_resolved_where_its_traffic_leaves test_ttl_is_honoured_and_failures_serve_the_cache
+test_without_the_mode_udp_53_is_ordinary_traffic
+""".split()
 MATRIX_BASELINE = (
     ("mosh", ("--mimic", "mosh")),
     ("obfs", ("--mimic", "obfs")),
@@ -105,6 +110,7 @@ def integration_groups():
         "sticky": suite_sticky,
         "jobs": suite_jobs,
         "zombie": suite_zombie,
+        "dns": suite_dns,
     }
     assert set(suites) == set(integration.GROUPS)
     by_fn = {test: (group, name) for group, suite in suites.items() for name, test in suite.TESTS}
@@ -117,6 +123,7 @@ def integration_groups():
         + STICKY_DNS_BASELINE
         + JOBS_BASELINE
         + ZOMBIE_BASELINE
+        + DNS_BASELINE
     )
     assert [by_fn[test][1] for test in tests] == original, "original order"
     assert [by_fn[test][0] for test in tests] == [owner for owner, _ in integration.TESTS]
@@ -140,6 +147,7 @@ def integration_groups():
         "sticky": 5,
         "jobs": 3,
         "zombie": 3,
+        "dns": 3,
     }
     for group in ("all", *integration.GROUPS):
         expected = [test for owner, test in integration.TESTS if group in ("all", owner)]
@@ -184,7 +192,28 @@ def dnsserver_wire_selftest():
     assert (ident, qname, qtype) == (0x4242, "pin.example", 1)
     assert dnsserver.question(b"\x00" * 8) is None, "truncated questions are rejected"
     assert dnsserver.question(query("pin.example", 1)[:14]) is None
-    print("PASS dnsserver wire: A rdlength, NODATA qtype echo, question parsing")
+
+    # The DNS-exit suite: an answer per asker, silence on request.
+    table = {"cdn.example": [(None, "203.0.113.1"), ("10.0.0.2", "203.0.113.2")]}
+    assert dnsserver.lookup(table, "cdn.example", "10.0.0.2") == "203.0.113.2", "the asker's own line"
+    assert dnsserver.lookup(table, "cdn.example", "10.0.0.9") == "203.0.113.1", "else everyone's"
+    assert dnsserver.lookup(table, "other.example", "10.0.0.2") is None
+    with tempfile.NamedTemporaryFile("w", suffix=".records") as records:
+        records.write(
+            "# comment\npin.example 1.2.3.4\ncdn.example 203.0.113.2@10.0.0.2\n"
+            "CDN.Example. -\ndead.example -\n"
+        )
+        records.flush()
+        with patch.object(dnsserver, "RECORDS", pathlib.Path(records.name)):
+            table = dnsserver.load()
+    assert table == {
+        "pin.example": [(None, "1.2.3.4")],
+        "cdn.example": [("10.0.0.2", "203.0.113.2"), (None, "-")],
+        "dead.example": [(None, "-")],
+    }
+    assert dnsserver.lookup(table, "cdn.example", "10.0.0.2") == "203.0.113.2"
+    assert dnsserver.lookup(table, "cdn.example", "10.0.0.9") == "-"
+    print("PASS dnsserver wire: A rdlength, NODATA qtype echo, question parsing, per-asker records")
 
 
 # The setup suite runs on its own compose rig, outside the integration registry.

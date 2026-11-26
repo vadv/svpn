@@ -12,7 +12,10 @@ use crate::packet::FlowKey;
 use crate::selector::Reason;
 
 pub const VERSION: u32 = 3;
-pub const MAX_LINE: usize = 4096;
+/// One line carries a DNS answer: base64 of the 64 KiB DNS limit is 87 380
+/// characters. `read_message` grows its buffer as the line arrives, so the
+/// limit costs nothing on ordinary control traffic.
+pub const MAX_LINE: usize = 88 * 1024;
 pub const QUEUE: usize = 256;
 
 /// UDP channel strategy; the strings are the wire names (`plain` is a
@@ -260,12 +263,45 @@ pub enum Message {
     Heartbeat {
         stats: Stats,
     },
+    /// Client → server: resolve one DNS wire query with the server's system
+    /// resolvers.
+    DnsQuery {
+        id: u64,
+        /// Base64 of the query as the stub sent it.
+        data: String,
+    },
+    /// Server → client: the wire answer to `DnsQuery`; empty `data` when no
+    /// resolver answered in time.
+    DnsAnswer {
+        id: u64,
+        data: String,
+    },
 }
 
 pub struct Control {
     outbound: mpsc::Sender<Message>,
     inbound: mpsc::Receiver<Result<Message>>,
     tasks: JoinSet<()>,
+}
+
+/// Cloneable sending half of the control channel, for tasks that outlive one
+/// `dispatch_control` call or run outside the session loop.
+#[derive(Clone)]
+pub struct ControlSender(mpsc::Sender<Message>);
+
+impl ControlSender {
+    pub async fn send(&self, message: Message) -> Result<()> {
+        self.0
+            .send(message)
+            .await
+            .map_err(|_| anyhow!("control writer unavailable"))
+    }
+
+    /// Enqueue without waiting for queue space: false when the queue is full
+    /// or the writer is gone.
+    pub fn try_send(&self, message: Message) -> bool {
+        self.0.try_send(message).is_ok()
+    }
 }
 
 impl Control {
@@ -287,10 +323,7 @@ impl Control {
     }
 
     pub async fn send(&self, message: Message) -> Result<()> {
-        self.outbound
-            .send(message)
-            .await
-            .map_err(|_| anyhow!("control writer unavailable"))
+        ControlSender(self.outbound.clone()).send(message).await
     }
 
     pub async fn recv(&mut self) -> Result<Message> {
@@ -298,6 +331,10 @@ impl Control {
             .recv()
             .await
             .context("control reader stopped")?
+    }
+
+    pub fn sender(&self) -> ControlSender {
+        ControlSender(self.outbound.clone())
     }
 }
 

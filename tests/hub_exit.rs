@@ -91,6 +91,7 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
                 stats: stats::Snapshot::default(),
                 last_reason: String::new(),
                 assigned: Arc::default(),
+                resolver: Arc::default(),
             })
             .collect(),
         policy: svpn::cli::ExitPolicy::StickyAsn,
@@ -128,6 +129,7 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
         history: None,
         history_prev: None,
         history_ts: None,
+        dns: Default::default(),
     }
 }
 

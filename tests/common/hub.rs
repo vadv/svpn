@@ -49,6 +49,7 @@ pub fn dashboard_hub() -> Hub {
                 stats: svpn::stats::Snapshot::default(),
                 last_reason: String::new(),
                 assigned: Arc::default(),
+                resolver: Arc::default(),
             })
             .collect(),
         pool,
@@ -85,5 +86,6 @@ pub fn dashboard_hub() -> Hub {
         history: None,
         history_prev: None,
         history_ts: None,
+        dns: Default::default(),
     }
 }
