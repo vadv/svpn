@@ -150,6 +150,8 @@ jobs:
             group: zombie
           - suite: integration
             group: tcp-auto
+          - suite: integration
+            group: dns
           - suite: matrix
             group: udp
           - suite: matrix
