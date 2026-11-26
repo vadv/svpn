@@ -164,8 +164,8 @@ impl Session {
     }
 
     /// Whether a new burst may start now. `health_at` is armed by
-    /// `announce_ready` and re-armed by `finish_burst`; a dead channel
-    /// clears both the burst and the timer.
+    /// `announce_ready` and re-armed by `finish_burst` and
+    /// `finish_challenge`; a dead channel clears both the burst and the timer.
     fn health_due(&self, now: Instant) -> bool {
         self.client()
             && self.accepts_packets()
@@ -173,6 +173,18 @@ impl Session {
             && self.burst.is_none()
             && self.challenge.is_none()
             && self.health_at.is_some_and(|at| now >= at)
+    }
+
+    /// When the next path measurement is due after `now`: a challenger round
+    /// at its remeasure gate, a health burst at its tick — whichever is
+    /// first. The loop wakes on it and `poll_burst` asks for a challenge
+    /// before a burst, so a short remeasure interval is honoured on its own
+    /// instead of waiting out the 30 s tick. The gate may already stand
+    /// open: the next round then runs back to back.
+    pub fn next_measurement_at(&self, now: Instant) -> Instant {
+        let health = now + HEALTH_INTERVAL;
+        self.next_challenge_at
+            .map_or(health, |at| Instant::from_std(at).min(health))
     }
 
     /// Drive the burst: start when due, send the echoes that are due, close
