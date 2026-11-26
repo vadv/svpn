@@ -18,6 +18,7 @@ from _lib import (
     cleanup_verified,
     command,
     recv_exact,
+    server_iface,
     session,
     ssh,
     tcp_echo,
@@ -269,7 +270,7 @@ def test_perf():
     command(["tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "20ms"])
     server_delay = False
     try:
-        ssh("tc qdisc add dev eth0 root netem delay 20ms")
+        ssh(f"tc qdisc add dev {server_iface()} root netem delay 20ms")
         server_delay = True
         result, log = run_perf(
             ["-P", "4", "-t", "12", "-i", "3", "-l", "1M", "--json"], timeout=30, mimic="webrtc"
@@ -287,7 +288,7 @@ def test_perf():
     finally:
         try:
             if server_delay:
-                ssh("tc qdisc del dev eth0 root")
+                ssh(f"tc qdisc del dev {server_iface()} root")
         finally:
             command(["tc", "qdisc", "del", "dev", "eth0", "root"])
     both_clean()

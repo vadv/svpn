@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import pathlib
+import re
 import socket
 import struct
 import subprocess
@@ -91,6 +92,19 @@ def command(args, check=True, timeout=90, **kwargs):
 
 def ssh(script, **kwargs):
     return command(SSH + [script], **kwargs)
+
+
+def server_iface():
+    """Name of the server's interface toward this container. Docker attaches a
+    container's networks in no fixed order: on a service with several networks
+    `eth0` is the test network in only about half of the containers, so traffic
+    shaping or addressing meant for the client's path must name this one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect((SERVER, 9))
+        route = ssh(f"ip -o -4 route get {probe.getsockname()[0]}").stdout
+    match = re.search(r"\bdev (\S+)", route)
+    assert match, f"no route to this container on the server:\n{route}"
+    return match.group(1)
 
 
 def until(condition, seconds=8):
