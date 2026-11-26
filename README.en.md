@@ -226,7 +226,7 @@ Everything beyond the quick-start pair of servers is covered in
 - `sticky` blocks: pinning exits by DNS names, IPs, ASNs and countries;
 - `via = local` — sending selected addresses outside the VPN;
 - `fallback_sticky` — how the pool serves the remaining traffic;
-- `dns { mode = "exit" }` — resolving each name where the traffic to it will leave;
+- `dns { mode = "exit" }` — resolving DNS at the exit the traffic will use;
 - Country and ASN databases and their background auto-update
   (`auto_job_update`);
 - hooks and environment variables;

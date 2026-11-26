@@ -130,78 +130,91 @@ survive restarts: a restart during an outage does not snap groups back.
 
 ## DNS from the exit
 
-Without this block SVPN leaves client DNS alone: the client asks its own
-resolver, and SVPN picks the exit by the ASN of the address it got. Where
-the name resolves and where the traffic leaves are unrelated, so CDNs and
-geo-services answer for the resolver's country, not the exit's.
+By default SVPN does not handle DNS. The client asks its own resolver and gets
+an address, and SVPN only picks the exit for that address. This is why a CDN or
+a geo-restricted service may give the client addresses for the resolver's
+country instead of the exit's.
+
+To resolve DNS at the exit, add the block:
 
 ```hcl
 dns {
-  mode  = "exit"          # UDP/53 from the TUN is answered by the exit that will carry the traffic
-  local = ["77.88.8.8"]   # resolvers of the local exit; taken from the system when absent
+  mode  = "exit"
+  local = ["77.88.8.8"]   # optional
 }
 ```
 
-How it works:
+Update `svpn` on every server before you turn this on: an older server closes
+the connection when the client sends it a DNS query.
 
-- The hub answers every UDP query to port 53 that enters the client TUN,
-  in the name of the resolver the client asked.
-- A name listed in a `names` sticky block is asked through the block's exit
-  at once. Any other name is first asked through the default VPN exit (the
-  probe); the first address of the answer goes through the ordinary path
-  selection — sticky blocks, then `fallback_sticky` — and when it belongs to
-  another exit, the name is asked there again. The exit of a name is
-  remembered for as long as the answer lives.
-- A VPN exit is resolved by `svpn server` itself, with the VPS's system
-  resolvers; the answer travels back inside the SSH control channel, there
-  is no DNS traffic of its own.
-- `via = local` resolves through the WAN: `local`, else the `nameserver`
-  lines outside loopback of `/etc/resolv.conf`, on OpenWrt of
-  `/tmp/resolv.conf.d/resolv.conf.auto`. The sockets are bound to the WAN
-  interface.
-- A new name is probed through the VPN only, never through the provider.
+What happens to a query:
 
-The hub's cache:
+1. The client sends a DNS query (UDP, port 53) into the tunnel. SVPN
+   intercepts it and answers on behalf of the resolver the client asked for.
+2. For a name listed in a `names` sticky block, SVPN sends the query through
+   that block's exit. For any other name it uses the default exit. The first
+   query for a new name always goes through the VPN, never through the
+   provider.
+3. When the answer arrives, SVPN checks which exit will carry the traffic to
+   the first address in it. If that is a different exit, SVPN repeats the
+   query through that exit and gives the client the second answer.
+4. The answer is cached. Until its TTL runs out, SVPN answers repeated queries
+   for the same name itself.
 
-- An answer lives exactly its TTL: a positive one the smallest TTL of its
-  records, a negative one (NXDOMAIN, NODATA) `min(SOA TTL, SOA MINIMUM)` per
-  RFC 2308. Served from the cache, every record's TTL is shorter by the
-  entry's age.
-- A failed resolve — timeout, lost link, `SERVFAIL` from the resolver —
-  serves the expired answer from the cache with a TTL of at most 30 s.
-  The client gets `SERVFAIL` only when the cache has nothing.
-- After a failure the same query is not sent out again for five seconds.
-- Up to 4096 entries; when full, the ones closest to expiry go.
+Where names are resolved:
 
-For the clients' queries to reach the TUN they must leave from the TUN's
-address. For dnsmasq on OpenWrt (the TUN address is yours):
+| Exit | Resolved by |
+| --- | --- |
+| VPN server | `svpn server` through the VPS's system resolvers. The query and the answer travel inside the SSH connection |
+| `via = local` | SVPN on the client. The resolvers come from `local` or from the system (see below) |
+
+`local` sets the resolvers for `via = local`. Without `local`, SVPN takes the
+`nameserver` lines from `/etc/resolv.conf`, and on OpenWrt from
+`/tmp/resolv.conf.d/resolv.conf.auto`. Addresses in 127.0.0.0/8 are skipped so
+that there is no loop with dnsmasq. The queries leave through the WAN
+interface.
+
+Cache:
+
+- An answer is kept until its TTL runs out. For negative answers (name not
+  found) the lifetime comes from the SOA record, as in RFC 2308. When SVPN
+  serves an answer from the cache, it lowers the TTL by the time the answer has
+  been stored.
+- If the exit does not answer (timeout, lost link, SERVFAIL from the resolver),
+  SVPN gives the client the last saved answer, even if its TTL has run out.
+  The TTL in such an answer is at most 30 seconds. If nothing is saved, the
+  client gets SERVFAIL.
+- After a failure SVPN sends no new queries for the same name for 5 seconds.
+- The cache holds at most 4096 entries. When it is full, the entries with the
+  smallest remaining TTL are dropped first.
+
+For the clients' queries to reach the tunnel, dnsmasq on the router must send
+them through the tunnel address:
 
 ```
 list server '1.1.1.1@10.77.0.2'
 ```
 
-The resolver's address does not matter: the hub answers for any unicast
-address. Remove the other upstreams (WAN, smartdns), or dnsmasq keeps
-choosing between them on its own.
-
-Compatibility: the client asks the server for relay with `hello` version 4.
-An older server refuses — the link reconnects with version 3 and works as
-before, only without DNS; one warning per link in the log. Update `svpn`
-on the VPS and restart the client.
+`10.77.0.2` is the tunnel address; replace it with your own. The address
+`1.1.1.1` can be anything: SVPN answers instead of it. Remove the other
+`server` lines from the dnsmasq configuration, or dnsmasq will keep sending
+queries there too.
 
 Limits:
 
-- UDP/53 only. TCP/53, DoT (853) and DoH (443) pass as ordinary traffic; an
-  answer that does not fit the MTU is fetched over TCP from the real
-  resolver by the client.
-- The IP set of a `names` block is still filled by the system resolver.
-- AAAA queries go through the same exit as the name; IPv6 is not tunneled.
-- SVPN resolves its own servers' names with the system resolver: the
-  router must keep a DNS path outside the tunnel (or addresses in
-  `server`), or a cold start loops.
-- While no exit can relay, interception is off and queries pass as before.
-- Counters are in the periodic report:
-  `dns: queries N | cache N | stale N | moved N | failed N`.
+- Only UDP/53 is intercepted. DNS over TCP, DoT and DoH pass as ordinary
+  traffic.
+- If an answer does not fit the tunnel MTU, SVPN gives the client a truncated
+  answer (the TC flag). The client then asks for the full answer over TCP, as
+  it normally would.
+- SVPN still learns the addresses for `names` sticky blocks through the system
+  resolver.
+- IPv6 is not tunneled. AAAA queries are handled like any others.
+- SVPN resolves the addresses of its own servers through the system resolver,
+  so DNS on the router must work without the tunnel. Alternatively, use
+  addresses instead of names in `server`.
+- Until at least one link is ready, queries pass as they always did.
+- DNS counters are in the periodic report: `dns: queries | cache | stale | moved | failed`.
 
 ## Country and ASN databases
 
@@ -688,10 +701,9 @@ not need.
 ## Limits
 
 - Only IPv4 is tunnelled. IPv6 is not protected by this configuration.
-- Without a `dns` block DNS is neither intercepted nor spoofed: SVPN
-  resolves only the names from its sticky blocks; the system resolver stays
-  yours. With `dns { mode = "exit" }` the exit itself resolves what comes
-  from the TUN — see "DNS from the exit".
+- SVPN does not intercept DNS, except in the `dns { mode = "exit" }` mode;
+  see "DNS from the exit". The system resolver stays yours, and SVPN resolves
+  only the names from its sticky blocks itself.
 - A name behind a large CDN resolves into thousands of addresses shared with
   other services: the sticky group pins them too, until the records wash out.
   Use `ips` for precise cases.
