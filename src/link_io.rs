@@ -48,6 +48,12 @@ pub enum Event {
         id: u64,
         key: FlowKey,
     },
+    /// Answer to the hub's `dns_query` `id`; None when the server's resolvers
+    /// gave no answer in time.
+    DnsAnswer {
+        id: u64,
+        answer: Option<Vec<u8>>,
+    },
 }
 
 /// Shared delivery counters: enqueueing a packet is not a successful TUN write.

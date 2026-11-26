@@ -64,6 +64,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
                 last_reason: String::new(),
                 stats: stats::Snapshot::default(),
                 assigned: Arc::default(),
+                resolver: Arc::default(),
             })
             .collect(),
         pool: Pool::new([1, 1]),
@@ -95,6 +96,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         history: None,
         history_prev: None,
         history_ts: None,
+        dns: Default::default(),
     }
 }
 

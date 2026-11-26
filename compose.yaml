@@ -21,6 +21,7 @@ services:
     devices: [/dev/net/tun:/dev/net/tun]
     environment:
       SVPN_TEST_DEFAULT_GW: 172.30.77.1
+      SVPN_TEST_RESOLVER: 172.30.77.7
     volumes:
       - keys:/keys:ro
     networks:
@@ -49,6 +50,7 @@ services:
     devices: [/dev/net/tun:/dev/net/tun]
     environment:
       SVPN_TEST_DEFAULT_GW: 172.30.77.1
+      SVPN_TEST_RESOLVER: 172.30.77.7
     volumes:
       - keys:/keys:ro
     networks:

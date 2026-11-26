@@ -63,6 +63,9 @@ pub struct ClientArgs {
     /// Scheduled background jobs (config-file only).
     #[arg(skip)]
     pub jobs: Vec<crate::job::JobSpec>,
+    /// DNS that follows the exit (config-file only); None leaves UDP/53 alone.
+    #[arg(skip)]
+    pub dns: Option<crate::dns::Settings>,
     #[command(flatten)]
     pub hooks: hooks::Args,
     #[command(flatten)]

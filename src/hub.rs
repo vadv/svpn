@@ -20,7 +20,7 @@ use tokio::{
 use tun_rs::AsyncDevice;
 
 use crate::{
-    control::Stats,
+    control::{ControlSender, Stats},
     hooks::Hooks,
     link_io::{Delivery, Epoch, Event, LinkIo, Packet},
     local_proxy::{self, LocalServer},
@@ -30,12 +30,14 @@ use crate::{
     session, stats,
 };
 
+pub mod dns;
 pub mod history;
 pub mod jobs;
 mod routes;
 pub mod usage;
 pub use usage::{UsageMeter, UsageSample};
 
+pub use dns::{DnsState, DnsStats};
 pub use jobs::{JobContext, JobEvent, JobStats};
 
 pub use routes::{Owner, RoutedFlow, Routes, Target, Traffic};
@@ -67,6 +69,9 @@ pub struct Link {
     pub last_reason: String,
     /// Tunnel pair assigned by the server during the current attempt (#181).
     pub assigned: Arc<std::sync::OnceLock<(Ipv4Addr, Ipv4Addr)>>,
+    /// Sending half of the control channel once the server agreed on DNS
+    /// relay; empty for an attempt whose server did not.
+    pub resolver: Arc<std::sync::OnceLock<ControlSender>>,
 }
 
 /// Sticky exit counters, surfaced in the periodic stats report.
@@ -122,6 +127,8 @@ pub struct Extras {
     pub web_listen: Option<SocketAddr>,
     /// Traffic history database; None keeps history off.
     pub stats_db: Option<std::path::PathBuf>,
+    /// DNS that follows the exit; None keeps UDP/53 untouched.
+    pub dns: Option<crate::dns::Settings>,
 }
 
 /// First-match decision for one destination.
@@ -187,6 +194,7 @@ pub struct Hub {
     /// The last snapshot and minute handed to it.
     pub history_prev: Option<crate::history::Counters>,
     pub history_ts: Option<u64>,
+    pub dns: DnsState,
 }
 
 impl Hub {
@@ -218,6 +226,9 @@ impl Hub {
         let now = StdInstant::now();
         if self.tombstones.active(&parsed.flow, now) {
             return Ok(self.tombstones.respond(&parsed.flow, &parsed, now));
+        }
+        if self.dns_packet(&parsed.flow, bytes) {
+            return Ok(None);
         }
         match self.routes.target(&parsed.flow) {
             Some(Target::Direct(id)) => self.forward_local(*id, bytes),
@@ -251,9 +262,17 @@ impl Hub {
     /// Where one destination goes: the first matching sticky block decides;
     /// a miss falls back to the automatic strategy.
     fn route(&mut self, destination: Ipv4Addr) -> Route {
+        let route = self.route_of(destination);
+        if !matches!(route, Route::Auto) {
+            self.sticky.block_hit += 1;
+        }
+        route
+    }
+
+    /// The decision for one destination, without its counter.
+    fn route_of(&self, destination: Ipv4Addr) -> Route {
         for (index, block) in self.stickies.iter().enumerate() {
             if block.matches(destination, self.country.as_ref(), self.geo.as_ref()) {
-                self.sticky.block_hit += 1;
                 return match &self.sticky_via[index] {
                     crate::sticky::ResolvedVia::Local => Route::Local(index),
                     crate::sticky::ResolvedVia::Links(_) => Route::Sticky(index),
@@ -444,6 +463,8 @@ impl Hub {
                 Event::Closed { id, key } => {
                     self.close_local(id, key, false);
                 }
+                // Only a link or the hub's own local resolver reports these.
+                Event::DnsAnswer { .. } => {}
             }
             return Ok(());
         }
@@ -606,6 +627,13 @@ impl Hub {
                 self.sticky.purged_ips
             ));
         }
+        if self.dns.on {
+            let dns = &self.dns.stats;
+            report.push_str(&format!(
+                "\ndns: queries {} | cache {} | stale {} | moved {} | failed {}",
+                dns.queries, dns.cache_hits, dns.stale, dns.moved, dns.failed
+            ));
+        }
         for line in per_link {
             report.push('\n');
             report.push_str(&line);
@@ -667,12 +695,17 @@ impl Hub {
                             .context("missing configured client TUN")?
                             .name()?;
                         self.start_local(&name, params).await?;
-                        hooks.start(name, tun_addr, peer_addr)?;
+                        hooks.start(name.clone(), tun_addr, peer_addr)?;
                         if !hooks.starting() {
                             self.announce_started(params, started);
                         }
+                        // The local exit's DNS leaves the same way as its traffic.
+                        if self.dns.on {
+                            self.dns_set_wan(local_proxy::egress::wan_device(&name).ok());
+                        }
                     }
                     self.serving();
+                    self.dns_ready(epoch.link);
                 }
                 Event::Checking => {
                     if self.pool.checking(epoch) {
@@ -725,6 +758,7 @@ impl Hub {
                 }
                 Event::Closing { id, key } => self.routes.mark_closing(key, Owner { epoch, id }),
                 Event::Closed { id, key } => self.routes.forget(key, Owner { epoch, id }),
+                Event::DnsAnswer { id, answer } => self.dns_answer(epoch, id, answer),
             }
             return Ok(());
         }
@@ -797,11 +831,14 @@ impl Hub {
         } else {
             String::new()
         };
+        let dns = self.dns_asks(epoch.link);
         let link = &mut self.links[epoch.link];
         link.epoch = Some(epoch);
         link.stats.reset();
         let assigned = Arc::new(std::sync::OnceLock::new());
         link.assigned = assigned.clone();
+        let resolver = Arc::new(std::sync::OnceLock::new());
+        link.resolver = resolver.clone();
         // Insist on the pinned shared pair when one exists (#181).
         let desired = (*self.pair.borrow()).map(|(client, server)| (server, client));
         let (stats, latest) = watch::channel(Stats::default());
@@ -821,8 +858,12 @@ impl Hub {
         self.tasks.spawn(async move {
             let attempt = async {
                 let (control, tail, config, server_ip, addrs) =
-                    crate::open_link(&params, &io.tag, desired).await?;
+                    crate::open_link(&params, &io.tag, desired, dns).await?;
                 let _ = assigned.set((addrs.client_ip, addrs.server_ip));
+                // Published before the session can report Ready.
+                if control.dns() {
+                    let _ = resolver.set(control.sender());
+                }
                 io.peer_ip = addrs.server_ip;
                 let result =
                     session::run_link(control, server_ip, addrs.client_ip, params.mtu, config, io)
@@ -1006,6 +1047,7 @@ impl Hub {
         let mut history_timer = self.history.as_ref().map(|_| history::deadline());
         loop {
             let retry_at = self.pool.next_retry();
+            let dns_due = self.dns_deadline();
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
                 result = hooks.wait_up() => {
@@ -1028,10 +1070,12 @@ impl Hub {
                             tokio::time::timeout(TUN_WRITE_TIMEOUT, tun.send(&reset)).await;
                         finish_write(&self.links[0].delivery, reset.len(), result.ok())?;
                     }
+                    self.flush_dns(tun).await?;
                 }
                 event = self.incoming.recv() => {
                     let (epoch, event) = event.context("server event channel stopped")?;
                     self.handle_event(epoch, event, tun, &params, &mut started, hooks).await?;
+                    self.flush_dns(tun).await?;
                 }
                 update = async {
                     match &mut self.sticky_updates {
@@ -1107,6 +1151,8 @@ impl Hub {
                         }
                     }
                     self.links[epoch.link].outgoing = None;
+                    self.links[epoch.link].resolver = Arc::default();
+                    self.dns_link_failed(epoch);
                     let link = &mut self.links[epoch.link];
                     if let Some(latest) = link.latest.take() {
                         link.stats.observe(latest.borrow().clone());
@@ -1119,6 +1165,7 @@ impl Hub {
                         self.log_retry(epoch.link, now, &reason);
                         self.serving();
                     }
+                    self.flush_dns(tun).await?;
                 }
                 _ = async {
                     match &mut reports {
@@ -1158,6 +1205,30 @@ impl Hub {
                 } => {
                     for epoch in self.pool.retry_due(Instant::now())? { self.start(epoch); }
                 }
+                _ = async {
+                    match dns_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.dns_expire();
+                    self.flush_dns(tun).await?;
+                }
+            }
+        }
+    }
+
+    /// DNS replies queued by the last packet or event go to the TUN under
+    /// the batch deadline; without a client TUN they are lost like any other.
+    async fn flush_dns(&mut self, tun: &mut Option<AsyncDevice>) -> Result<()> {
+        let replies = self.dns_replies();
+        match tun.as_ref() {
+            Some(tun) if !replies.is_empty() => self.flush_tun_batch(tun, &replies).await,
+            _ => {
+                for (delivery, _) in &replies {
+                    delivery.dropped();
+                }
+                Ok(())
             }
         }
     }
@@ -1398,6 +1469,7 @@ pub async fn run(
         jobs,
         web_listen,
         stats_db,
+        dns,
     } = extras;
     let GeoExits {
         geo,
@@ -1445,7 +1517,9 @@ pub async fn run(
     let (sticky_updates, sticky_task) = spawn_sticky_resolver(&stickies, &mut shutdown);
     // The history names networks from the same ASN CSV the dashboard serves.
     let asn_csv = jobs.geo_db.clone();
+    let dns = dns.as_ref().map(DnsState::new).unwrap_or_default();
     let mut hub = Hub {
+        dns,
         geo,
         country,
         policy: exits_policy,
@@ -1478,6 +1552,7 @@ pub async fn run(
                 stats: stats::Snapshot::default(),
                 last_reason: String::new(),
                 assigned: Arc::default(),
+                resolver: Arc::default(),
             })
             .collect(),
         pool,

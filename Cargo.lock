@@ -3366,6 +3366,7 @@ version = "1.8.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
+ "base64",
  "bytes",
  "clap",
  "futures",

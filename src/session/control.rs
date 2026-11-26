@@ -154,6 +154,9 @@ impl Session {
                     self.tcp_close(id).await?;
                 }
             }
+            // ── DNS relay ──
+            Message::DnsQuery { id, data } => self.dns_query(id, data).await?,
+            Message::DnsAnswer { id, data } => self.dns_answer(id, data).await?,
             // ── TCP candidate in channel mode ──
             Message::Open {
                 id,
@@ -178,6 +181,53 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Server: relay one DNS query to the system resolvers off the session
+    /// loop; the answer goes back as `dns_answer`, empty when the query is
+    /// unreadable, the relay is busy or no resolver answered in time.
+    async fn dns_query(&mut self, id: u64, data: String) -> Result<()> {
+        ensure!(
+            self.control.dns() && !self.client(),
+            "dns_query outside a DNS_VERSION server session"
+        );
+        let relay = match (crate::dns::decode(&data), crate::dns::relay::acquire()) {
+            (Some(query), Some(permit)) => Some((query, permit)),
+            _ => None,
+        };
+        let Some((query, permit)) = relay else {
+            return self
+                .control
+                .send(Message::DnsAnswer {
+                    id,
+                    data: String::new(),
+                })
+                .await;
+        };
+        let sender = self.control.sender();
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let data = match crate::dns::relay::resolve_system(&query).await {
+                Some(answer) => crate::dns::encode(&answer),
+                None => String::new(),
+            };
+            let _ = sender.send(Message::DnsAnswer { id, data }).await;
+        });
+        Ok(())
+    }
+
+    /// Client: hand the relayed answer to the hub.
+    async fn dns_answer(&mut self, id: u64, data: String) -> Result<()> {
+        let PacketIo::Link(io) = &self.io else {
+            bail!("unexpected control message");
+        };
+        let answer = (!data.is_empty())
+            .then(|| crate::dns::decode(&data))
+            .flatten();
+        io.events
+            .send((io.epoch, link_io::Event::DnsAnswer { id, answer }))
+            .await
+            .context("packet event port closed")
     }
 
     /// Server: allocate strategy resources and reply `channel_ready`.

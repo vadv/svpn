@@ -167,6 +167,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         jobs.push(crate::job::preset_update(crate::job::Reload::Country));
     }
     crate::job::JobSpec::validate_all(&jobs)?;
+    let dns = top.dns()?;
 
     // Deprecated: sticky owners are RAM-only; the key is accepted so old
     // configs keep parsing and the value is ignored.
@@ -200,6 +201,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         },
         stickies,
         jobs,
+        dns,
         hooks,
         globals,
     };
@@ -479,6 +481,7 @@ impl<'a> Top<'a> {
                         | "dashboard"
                         | "fallback_sticky"
                         | "stats"
+                        | "dns"
                 ),
                 "config: unknown block {name}"
             );
@@ -576,6 +579,44 @@ impl<'a> Top<'a> {
             Some(split) => read(split, key),
             None => Ok(None),
         }
+    }
+
+    /// The `dns` block: off unless `mode = "exit"`, in which case `local`
+    /// may name the resolvers of the local exit.
+    fn dns(&mut self) -> Result<Option<crate::dns::Settings>> {
+        let mode = self.take_string("dns", "mode")?;
+        let local = self.take("dns", "local", take_string_list)?;
+        let Some(mode) = mode else {
+            ensure!(
+                local.is_none(),
+                "dns: local is only used with mode = \"exit\""
+            );
+            return Ok(None);
+        };
+        ensure!(mode == "exit", "dns: mode must be exit");
+        let local = match local {
+            // Absent: the WAN resolvers are discovered.
+            None => Vec::new(),
+            Some(local) => {
+                ensure!(
+                    !local.is_empty() && local.len() <= crate::dns::relay::MAX_NAMESERVERS,
+                    "dns: local must list 1..=3 resolvers"
+                );
+                local
+            }
+        };
+        let local: Vec<Ipv4Addr> = local
+            .iter()
+            .map(|address| {
+                // A loopback forwarder may send the hub its own queries back.
+                address
+                    .parse::<Ipv4Addr>()
+                    .ok()
+                    .filter(|address| !address.is_loopback())
+                    .ok_or_else(|| anyhow::anyhow!("dns: local must list IPv4 WAN resolvers"))
+            })
+            .collect::<Result<Vec<Ipv4Addr>>>()?;
+        Ok(Some(crate::dns::Settings { local }))
     }
 
     fn servers(&mut self, base: &Path) -> Result<Vec<(String, ServerSpec)>> {

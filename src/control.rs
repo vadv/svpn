@@ -12,7 +12,13 @@ use crate::packet::FlowKey;
 use crate::selector::Reason;
 
 pub const VERSION: u32 = 3;
-pub const MAX_LINE: usize = 4096;
+/// Hello version of a peer that also speaks `dns_query`/`dns_answer`. A peer
+/// without it exits on the newer number: the caller falls back to `VERSION`.
+pub const DNS_VERSION: u32 = 4;
+/// One line carries a DNS answer: base64 of the 64 KiB DNS limit is 87 380
+/// characters. `read_message` grows its buffer as the line arrives, so the
+/// limit costs nothing on ordinary control traffic.
+pub const MAX_LINE: usize = 88 * 1024;
 pub const QUEUE: usize = 256;
 
 /// UDP channel strategy; the strings are the wire names (`plain` is a
@@ -260,12 +266,47 @@ pub enum Message {
     Heartbeat {
         stats: Stats,
     },
+    /// Client → server: resolve one DNS wire query with the server's system
+    /// resolvers. Spoken only after a `DNS_VERSION` hello.
+    DnsQuery {
+        id: u64,
+        /// Base64 of the query as the stub sent it.
+        data: String,
+    },
+    /// Server → client: the wire answer to `DnsQuery`; empty `data` when no
+    /// resolver answered in time.
+    DnsAnswer {
+        id: u64,
+        data: String,
+    },
 }
 
 pub struct Control {
     outbound: mpsc::Sender<Message>,
     inbound: mpsc::Receiver<Result<Message>>,
     tasks: JoinSet<()>,
+    /// The hello agreed on `DNS_VERSION`: `dns_query`/`dns_answer` are spoken.
+    dns: bool,
+}
+
+/// Cloneable sending half of the control channel, for tasks that outlive one
+/// `dispatch_control` call or run outside the session loop.
+#[derive(Clone)]
+pub struct ControlSender(mpsc::Sender<Message>);
+
+impl ControlSender {
+    pub async fn send(&self, message: Message) -> Result<()> {
+        self.0
+            .send(message)
+            .await
+            .map_err(|_| anyhow!("control writer unavailable"))
+    }
+
+    /// Enqueue without waiting for queue space: false when the queue is full
+    /// or the writer is gone.
+    pub fn try_send(&self, message: Message) -> bool {
+        self.0.try_send(message).is_ok()
+    }
 }
 
 impl Control {
@@ -283,14 +324,12 @@ impl Control {
             outbound,
             inbound,
             tasks,
+            dns: false,
         }
     }
 
     pub async fn send(&self, message: Message) -> Result<()> {
-        self.outbound
-            .send(message)
-            .await
-            .map_err(|_| anyhow!("control writer unavailable"))
+        ControlSender(self.outbound.clone()).send(message).await
     }
 
     pub async fn recv(&mut self) -> Result<Message> {
@@ -298,6 +337,19 @@ impl Control {
             .recv()
             .await
             .context("control reader stopped")?
+    }
+
+    pub fn sender(&self) -> ControlSender {
+        ControlSender(self.outbound.clone())
+    }
+
+    /// The hello agreed on DNS relay (`DNS_VERSION`).
+    pub fn dns(&self) -> bool {
+        self.dns
+    }
+
+    pub fn set_dns(&mut self, negotiated: bool) {
+        self.dns = negotiated;
     }
 }
 
@@ -312,7 +364,7 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Mes
     loop {
         let buffer = reader.fill_buf().await.context("control read failed")?;
         if buffer.is_empty() {
-            bail!("control EOF");
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, EOF).into());
         }
         let end = buffer.iter().position(|byte| *byte == b'\n');
         let length = end.map_or(buffer.len(), |index| index + 1);
@@ -326,6 +378,18 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Mes
             return serde_json::from_slice(&line).map_err(|_| anyhow!("invalid control JSON"));
         }
     }
+}
+
+const EOF: &str = "control EOF";
+
+/// The peer closed its side of the control channel: the server it started
+/// has exited, for instance because it rejected the hello version.
+pub fn is_eof(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::UnexpectedEof && io.to_string() == EOF
+        })
+    })
 }
 
 async fn run_writer<W: AsyncWrite + Unpin>(

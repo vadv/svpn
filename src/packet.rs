@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 
@@ -168,7 +168,7 @@ fn parse_ip(bytes: &[u8], from_client: bool, quoted: bool) -> Option<Packet> {
     })
 }
 
-fn word(bytes: &[u8], offset: usize) -> Option<u16> {
+pub fn word(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
     ))
@@ -287,6 +287,54 @@ pub fn internet_checksum(bytes: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// Payload of the UDP datagram inside an IPv4 packet already accepted by
+/// `parse`.
+pub fn udp_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let header = usize::from(bytes.first()? & 15) * 4 + 8;
+    let total = usize::from(word(bytes, 2)?);
+    bytes.get(header..total)
+}
+
+/// UDP/IPv4 datagram the hub itself writes into the client TUN: TTL 64, no
+/// options, header and pseudoheader checksums. `None` past the UDP limit.
+pub fn udp_datagram(
+    source: SocketAddrV4,
+    destination: SocketAddrV4,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    // The UDP limit: 65 535 of IPv4 payload less the UDP header.
+    let length = u16::try_from(8 + payload.len())
+        .ok()
+        .filter(|_| payload.len() <= 65507)?;
+    let total = length + 20;
+    let mut bytes = vec![0u8; 28 + payload.len()];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&total.to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 17;
+    bytes[12..16].copy_from_slice(&source.ip().octets());
+    bytes[16..20].copy_from_slice(&destination.ip().octets());
+    bytes[20..22].copy_from_slice(&source.port().to_be_bytes());
+    bytes[22..24].copy_from_slice(&destination.port().to_be_bytes());
+    bytes[24..26].copy_from_slice(&length.to_be_bytes());
+    bytes[28..].copy_from_slice(payload);
+    let mut header = [0u8; 20];
+    header.copy_from_slice(&bytes[..20]);
+    bytes[10..12].copy_from_slice(&internet_checksum(&header).to_be_bytes());
+    // Pseudoheader followed by the UDP header (checksum still zero) and data.
+    let mut sum = Vec::with_capacity(20 + payload.len());
+    sum.extend_from_slice(&source.ip().octets());
+    sum.extend_from_slice(&destination.ip().octets());
+    sum.extend_from_slice(&[0, 17]);
+    sum.extend_from_slice(&length.to_be_bytes());
+    sum.extend_from_slice(&bytes[20..]);
+    let checksum = internet_checksum(&sum);
+    // A computed zero is sent as all ones: zero would mean "not verified".
+    let checksum = if checksum == 0 { u16::MAX } else { checksum };
+    bytes[26..28].copy_from_slice(&checksum.to_be_bytes());
+    Some(bytes)
 }
 
 /// ICMP echo request toward the server's TUN address — the liveness probe

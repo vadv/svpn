@@ -5,6 +5,7 @@ import argparse
 import os
 
 import suite_bootstrap
+import suite_dns
 import suite_jobs
 import suite_pool
 import suite_recovery
@@ -22,6 +23,7 @@ GROUPS = (
     "bootstrap",
     "lifecycle-pool",
     "udp",
+    "dns",
     "tcp-auto",
     "reselect",
     "recovery",
@@ -52,6 +54,7 @@ _SEQUENCE = (
     + ("sticky",) * 5
     + ("jobs",) * 3
     + ("zombie",) * 3
+    + ("dns",) * 3
 )
 _SUITES = {
     "bootstrap": suite_bootstrap,
@@ -64,6 +67,7 @@ _SUITES = {
     "sticky": suite_sticky,
     "jobs": suite_jobs,
     "zombie": suite_zombie,
+    "dns": suite_dns,
 }
 _PENDING = {group: iter(suite.TESTS) for group, suite in _SUITES.items()}
 TESTS = []
