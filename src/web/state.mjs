@@ -143,9 +143,9 @@ export function trafficAverage(history, serverId = "") {
   return ms ? { rx: rx / ms, tx: tx / ms, seconds: ms / 1000 } : null;
 }
 
-// One sample vocabulary for the chart, its filled areas, sparklines, the hover readout and the
-// headline numbers. Everything shows the smoothed rate: a single poll-length rate reads 0 or a spike
-// while the line says otherwise, and two numbers for one quantity is one too many.
+// One sample vocabulary for the chart, its sparklines and the headline numbers. Everything
+// shows the smoothed rate: a single poll-length rate reads 0 or a spike while the chart says
+// otherwise, and two numbers for one quantity is one too many.
 function series(history, serverId = "") {
   const raw = history.map(point => ({
     time: point.time,
@@ -159,71 +159,40 @@ function series(history, serverId = "") {
   // Samples older than the window only feed the average: drawn alone they are raw one-poll rates.
   const samples = raw.map((sample, index) => ({ ...sample, rx: rx[index], tx: tx[index], cpu: cpu[index] }))
     .filter(sample => sample.time > end - WINDOW_MS);
-  const max = Math.max(0.01, ...samples.flatMap(sample => [sample.rx ?? 0, sample.tx ?? 0])) * 1.1;
-  return { samples, max, end, latest: samples.at(-1) ?? null };
+  return { samples, end, latest: samples.at(-1) ?? null };
 }
 
-const chartX = (time, end) => 1000 * (time - end + WINDOW_MS) / WINDOW_MS;
-const chartY = (value, max) => 152 - 128 * value / max;
-
-export function graph(history, serverId = "") {
-  const { samples, max, end, latest } = series(history, serverId);
-  const path = field => {
-    let connected = false;
-    return samples.map(sample => {
-      const value = sample[field];
-      if (value == null) { connected = false; return ""; }
-      const position = `${chartX(sample.time, end).toFixed(2)},${chartY(value, max).toFixed(2)}`;
-      // Round caps make a zero-length first segment visible without inventing history.
-      const segment = connected ? `L${position}` : `M${position} l0,0`;
-      connected = true;
-      return segment;
-    }).join(" ");
-  };
-  return { rx: path("rx"), tx: path("tx"), max, latest };
-}
-
-// Closed polygons under the lines. A missing interval starts a new polygon
-// instead of painting a fake value across the gap.
-export function areas(history, serverId = "") {
-  const { samples, max, end } = series(history, serverId);
-  const area = field => {
-    const segments = [];
-    let run = [];
-    const flush = () => {
-      if (!run.length) return;
-      const first = run[0], last = run.at(-1);
-      const start = `M${chartX(first.time, end).toFixed(2)},152`;
-      const ridge = run.map(sample => `L${chartX(sample.time, end).toFixed(2)},${chartY(sample[field], max).toFixed(2)}`).join(" ");
-      segments.push(`${start} ${ridge} L${chartX(last.time, end).toFixed(2)},152 Z`);
-      run = [];
-    };
-    for (const sample of samples) {
-      if (sample[field] == null) { flush(); continue; }
-      run.push(sample);
-    }
-    flush();
-    return segments.join(" ");
-  };
-  return { rx: area("rx"), tx: area("tx") };
-}
+// The newest sample, smoothed like the chart: what the headline numbers quote.
+export const latestSample = (history, serverId = "") => series(history, serverId).latest;
 
 // A compact trend for the summary cells: last 40 samples, its own scale.
-export function spark(history, field, serverId = "") {
-  const { samples } = series(history, serverId);
-  const recent = samples.slice(-40);
+// The points of the trend, run by run: a missing sample is not joined over.
+function sparkPoints(history, field) {
+  const recent = series(history).samples.slice(-40);
   const max = Math.max(0.01, ...recent.map(sample => sample[field] ?? 0));
-  const count = recent.length;
-  let connected = false;
-  return recent.map((sample, index) => {
-    const value = sample[field];
-    if (value == null) { connected = false; return ""; }
-    const x = count === 1 ? 120 : 120 * index / (count - 1);
-    const position = `${x.toFixed(2)},${(28 - 24 * value / max).toFixed(2)}`;
-    const segment = connected ? `L${position}` : `M${position} l0,0`;
-    connected = true;
-    return segment;
-  }).join(" ");
+  const runs = [];
+  let run = [];
+  for (const [index, sample] of recent.entries()) {
+    if (sample[field] == null) { run = []; continue; }
+    const x = recent.length === 1 ? 120 : 120 * index / (recent.length - 1);
+    if (!run.length) runs.push(run);
+    run.push([x, 28 - 24 * sample[field] / max]);
+  }
+  return runs;
+}
+
+export function spark(history, field) {
+  return sparkPoints(history, field).map(run => run.map(([x, y], index) => {
+    const position = `${x.toFixed(2)},${y.toFixed(2)}`;
+    // Round caps make a zero-length first segment visible without inventing history.
+    return index ? `L${position}` : `M${position} l0,0`;
+  }).join(" ")).join(" ");
+}
+
+// The same trend filled down to its baseline: a card carries the chart's look.
+export function sparkArea(history, field) {
+  return sparkPoints(history, field).filter(run => run.length > 1).map(run =>
+    `M${run[0][0].toFixed(2)},30 ${run.map(([x, y]) => `L${x.toFixed(2)},${y.toFixed(2)}`).join(" ")} L${run.at(-1)[0].toFixed(2)},30 Z`).join(" ");
 }
 
 // A trend for values whose useful baseline is not zero, such as resident memory.
@@ -246,18 +215,32 @@ export function sparkScaled(history, field) {
   }).join(" ");
 }
 
-export function nearestSample(history, time, serverId = "") {
-  const { samples } = series(history, serverId);
-  let best = null, distance = Infinity;
-  for (const sample of samples) {
-    const delta = Math.abs(sample.time - time);
-    if (delta < distance) { distance = delta; best = sample; }
-  }
-  return best && { time: best.time, rx: best.rx ?? null, tx: best.tx ?? null };
-}
-
 export function asnLabel(asn, names = {}) {
   return asn == null ? "Unknown" : `AS${asn}${names[asn] ? ` · ${names[asn]}` : ""}`;
+}
+
+// The exit each ASN group is pinned to, keyed by the ASN as the usage names it.
+export function asnOwners(groups) {
+  const owners = new Map();
+  for (const item of groups ?? []) {
+    const asn = /^asn (\d+)$/.exec(item.group)?.[1];
+    if (asn != null) owners.set(asn, item.server);
+  }
+  return owners;
+}
+
+// The pinned groups as the table lists them: an ASN group named by its network, every
+// group with its exit and what it carried since start, busiest first and then by number.
+export function pinnedGroups(groups, { rules = [], networks = {}, names = {} } = {}) {
+  const trafficOf = new Map(rules.map(rule => [rule.label, rule.traffic]));
+  return (groups ?? []).map(item => {
+    const asn = /^asn (\d+)$/.exec(item.group)?.[1] ?? null;
+    const traffic = asn == null ? trafficOf.get(item.group) : networks[asn];
+    return {
+      key: item.group, asn, server: item.server, label: asn == null ? item.group : asnLabel(Number(asn), names),
+      rx_bytes: traffic?.rx_bytes ?? 0, tx_bytes: traffic?.tx_bytes ?? 0,
+    };
+  }).sort((a, b) => b.rx_bytes + b.tx_bytes - a.rx_bytes - a.tx_bytes || (a.asn ?? 0) - (b.asn ?? 0) || a.key.localeCompare(b.key));
 }
 
 // Flag for a country code as the regional-indicator pair. The snapshot only ever
@@ -320,7 +303,8 @@ const ORDERS = {
 // Each axis is an alternative view of the same bytes, not an additional expense.
 export function usageRanking(entries, direction) {
   const amount = t => direction === "rx" ? t.rx_bytes : direction === "tx" ? t.tx_bytes : t.rx_bytes + t.tx_bytes;
-  const rows = entries.map(([key, label, traffic]) => ({ key, label, ...traffic, value: amount(traffic) }))
+  // A row may name the exit it is pinned to: the list colours and labels it by that.
+  const rows = entries.map(([key, label, traffic, via = null]) => ({ key, label, ...traffic, value: amount(traffic), via }))
     .filter(row => row.value > 0).sort((a, b) => b.value - a.value || String(a.key).localeCompare(String(b.key), "en"));
   return { rows, total: rows.reduce((sum, row) => sum + row.value, 0) };
 }
@@ -434,11 +418,20 @@ export function mimicCell(selection, configured = []) {
   };
 }
 
+// The line a server speaks right now and how far it is: what a glance at the pool needs.
+export function transport(server) {
+  const active = server.selection?.active ?? "";
+  const { rtt_ms } = server.selection?.round?.entries?.find(entry => entry.candidate === active) ?? {};
+  return { active, latency: Number.isFinite(rtt_ms) ? rtt_ms : null };
+}
+
 // ── History kept on the client ──
 
 // Ranges the server works out itself end now. Yesterday and Custom send
 // their window instead: unix seconds at both ends, at most 30 days apart.
 export const HISTORY_PRESETS = ["1h", "24h", "7d", "30d"];
+// The shortest range is not history: five minutes measured in this tab.
+export const LIVE_RANGE = "5m";
 export const HISTORY_MAX_WINDOW = 30 * 86400;
 
 // Yesterday of the browser's own calendar: from midnight to midnight, as
@@ -493,7 +486,8 @@ export function historyStepLabel(step) {
 
 // One answer of /api/history as the chart draws it: a value per series and
 // bucket, in bytes. A bucket without a single point is time nothing was
-// recorded; a series without a point in a recorded bucket carried nothing.
+// recorded, a hole for every series; a series without a point in a recorded
+// bucket carried nothing.
 export function historyStack(answer, direction = "total") {
   const { from, to, step } = answer;
   const count = Math.max(0, Math.floor((to - from) / step));
@@ -510,10 +504,16 @@ export function historyStack(answer, direction = "total") {
   for (let index = 0; index < count; index++) {
     if (recorded[index]) peak = Math.max(peak, series.reduce((sum, item) => sum + item.values[index], 0));
   }
+  for (const item of series) item.values = item.values.map((value, index) => recorded[index] ? value : null);
   // Bytes of one bucket as Mbit/s.
   const rate = value => value * 8 / step / 1e6;
   const shown = item => direction === "rx" ? item.rx_bytes : direction === "tx" ? item.tx_bytes : item.rx_bytes + item.tx_bytes;
-  return { from, to, step, count, recorded, series, rate, peak: rate(peak), total: series.reduce((sum, item) => sum + shown(item), 0) };
+  // Every bucket sits in the middle of its slot and is held to the slot's edges.
+  const width = 1000 / Math.max(count, 1);
+  return {
+    from, to, step, count, series, rate, peak: rate(peak), total: series.reduce((sum, item) => sum + shown(item), 0),
+    xs: Array.from({ length: count }, (_, index) => width * (index + 0.5)), hold: width / 2,
+  };
 }
 
 // The top of the value axis: a round number just above the busiest bucket,
@@ -525,56 +525,148 @@ export function historyScale(peak) {
   return { top, mid: top / 2 };
 }
 
+// The value axis in few words: 100 and 50, 0.5 and 0.25.
+export const rateLabel = value => String(Number(value.toFixed(3)));
+
+// The live window grows from its first ten seconds to the full five minutes,
+// so the chart is never a mostly empty box while the tab is young.
+export const LIVE_MIN_MS = 10 * 1000;
+
+// The live window as the chart draws it: one smoothed sample per server and
+// poll, in Mbit/s, every server on the clock of the whole window. A poll a
+// server has no rate for is a hole. Servers are stacked largest first.
+export function liveStack(history, direction = "total", serverId = "") {
+  const end = history.at(-1)?.time ?? 0;
+  const span = Math.min(WINDOW_MS, Math.max(end - (history[0]?.time ?? end - LIVE_MIN_MS), LIVE_MIN_MS));
+  const ids = [...new Set(history.flatMap(point => Object.keys(point.servers ?? {})))];
+  const shown = sample => sample.rx == null || sample.tx == null ? null
+    : direction === "rx" ? sample.rx : direction === "tx" ? sample.tx : sample.rx + sample.tx;
+  const xs = series(history).samples.map(sample => 1000 * (sample.time - end + span) / span);
+  const size = values => values.reduce((sum, value) => sum + (value ?? 0), 0);
+  const stacked = (serverId ? [serverId] : ids)
+    .map(id => ({ key: id, values: series(history, id).samples.map(shown) }))
+    .filter(item => item.values.some(value => value != null))
+    .sort((a, b) => size(b.values) - size(a.values));
+  let peak = 0;
+  for (let index = 0; index < xs.length; index++) {
+    peak = Math.max(peak, stacked.reduce((sum, item) => sum + (item.values[index] ?? 0), 0));
+  }
+  return { xs, hold: 0, from: end - span, to: end, span, series: stacked, peak: Math.max(0.01, peak), rate: value => value, latest: series(history, serverId).latest };
+}
+
 // Stacked bands on the chart's grid (1000 wide, 24..152 high), drawn as a
-// sandwich. A layer's thickness is a curve through its minutes and the
-// boundary above it is the sum of the thicknesses below, so no layer turns
-// negative between two of its own minutes. The curve is monotone: between
-// two minutes it stays within their values, so jitter reads as flow and a
-// dip stays where it happened. A band starts and ends vertically on the
-// edges of its first and last minute; an unrecorded minute breaks it.
-export function historyAreas(stack, top) {
-  return layers(stack, top).map(layer => layer.band);
-}
-
-// The line along the top of each band: what keeps a thin layer visible
-// where it lies on a thick one.
-export function historyCrests(stack, top) {
-  return layers(stack, top).map(layer => layer.crest);
-}
-
-function layers(stack, top) {
-  const { series, recorded, count, rate } = stack;
-  if (!count) return series.map(() => ({ band: "", crest: "" }));
-  const width = 1000 / count;
+// sandwich. A layer's thickness is a curve through its samples and the
+// boundary above it is the sum of the layers under it, so no layer turns
+// negative between two of its own samples. The curve is monotone: between
+// two samples it stays within their values, so jitter reads as flow and a
+// dip stays where it happened. `hold` keeps the first and last sample of a
+// run flat to the edges of their slots, as a stored minute is held to the
+// edges of the minute; a live sample is a point on the clock. A run starts
+// and ends vertically; a hole breaks it; a lone live sample is a tick.
+export function stackPaths(stack, top) {
+  const { xs, hold, rate = value => value } = stack;
+  // Every stack in the unit being drawn.
+  const series = stack.series.map(item => item.values.map(value => value == null ? null : rate(value)));
   const y = value => (152 - 128 * value / top).toFixed(2);
-  const runs = [];
-  for (let index = 0; index < count; index++) {
-    if (!recorded[index]) continue;
-    const last = runs.at(-1);
-    if (last && last.end === index - 1) last.end = index;
-    else runs.push({ start: index, end: index });
-  }
-  const bands = series.map(() => []);
-  const crests = series.map(() => []);
-  for (const { start, end } of runs) {
-    // A sample at each minute's middle, held flat to the edges of the run.
-    const xs = [width * start];
-    for (let index = start; index <= end; index++) xs.push(width * (index + 0.5));
-    xs.push(width * (end + 1));
-    let below = xs.slice(1).map(() => [0, 0, 0, 0]);
-    series.forEach((item, layer) => {
-      const values = [rate(item.values[start])];
-      for (let index = start; index <= end; index++) values.push(rate(item.values[index]));
-      values.push(rate(item.values[end]));
-      const curve = cubic(xs, values, monotone(xs, values));
-      const above = curve.map((segment, i) => segment.map((value, j) => value + below[i][j]));
-      const crest = `M${xs[0].toFixed(2)},${y(above[0][0])} ${band(xs, above, y)}`;
-      crests[layer].push(crest);
-      bands[layer].push(`${crest} L${xs.at(-1).toFixed(2)},${y(below.at(-1)[3])} ${band(xs, below, y, true)} Z`);
-      below = above;
+  const zero = [0, 0, 0, 0];
+  const flat = value => [value, value, value, value];
+  const ramp = (from, to) => [from, from + (to - from) / 3, to - (to - from) / 3, to];
+  // Runs of neighbouring samples of a series: [first, one past the last].
+  const runs = values => {
+    const found = [];
+    let start = -1;
+    for (let index = 0; index <= values.length; index++) {
+      const present = index < values.length && values[index] != null;
+      if (present && start < 0) start = index;
+      if (!present && start >= 0) { found.push([start, index]); start = -1; }
+    }
+    return found;
+  };
+  // Each series' curve over the clock: one segment per interval it has a sample at both ends of.
+  // A held run meets its flat edges without a kink.
+  const curves = series.map(values => {
+    const parts = [];
+    for (const [first, last] of runs(values)) {
+      const at = xs.slice(first, last), run = values.slice(first, last);
+      cubic(at, run, monotone(at, run, Boolean(hold))).forEach((segment, offset) => { parts[first + offset] = segment; });
+    }
+    return parts;
+  });
+  // What the next layer lies on, interval by interval: the curves under it,
+  // each giving way to the baseline where it has no sample.
+  let under = xs.slice(1).map(() => zero);
+  return series.map((values, layer) => {
+    const bands = [], crests = [];
+    for (const [first, last] of runs(values)) {
+      const at = xs.slice(first, last);
+      const base = under.slice(first, Math.max(first, last - 1));
+      // The top of the layer is its own curve over what lies under it.
+      const lift = curves[layer].slice(first, Math.max(first, last - 1)).map((segment, i) => segment.map((value, k) => value + base[i][k]));
+      if (hold) {
+        const low = index => series.slice(0, layer).reduce((sum, lower) => sum + (lower[index] ?? 0), 0);
+        const [start, end] = [low(first), low(last - 1)];
+        at.unshift(at[0] - hold); at.push(at.at(-1) + hold);
+        lift.unshift(flat(start + values[first])); base.unshift(flat(start));
+        lift.push(flat(end + values[last - 1])); base.push(flat(end));
+      }
+      // A lone live sample has no width to fill: it is a tick as thick as its layer.
+      if (at.length < 2) {
+        const low = series.slice(0, layer).reduce((sum, lower) => sum + (lower[first] ?? 0), 0);
+        crests.push(`M${at[0].toFixed(2)},${y(low)} L${at[0].toFixed(2)},${y(low + values[first])}`);
+        continue;
+      }
+      const crest = `M${at[0].toFixed(2)},${y(lift[0][0])} ${band(at, lift, y)}`;
+      crests.push(crest);
+      bands.push(`${crest} L${at.at(-1).toFixed(2)},${y(base.at(-1)[3])} ${band(at, base, y, true)} Z`);
+    }
+    under = under.map((part, index) => {
+      const from = values[index], to = values[index + 1];
+      const added = from == null && to == null ? zero : from == null ? ramp(0, to) : to == null ? ramp(from, 0) : curves[layer][index];
+      return part.map((value, k) => value + added[k]);
     });
+    return { band: bands.join(" "), crest: crests.join(" ") };
+  });
+}
+
+// The sample a moment of the window falls in: the bucket that holds it, or
+// the live sample nearest to it. Null off the window or where nothing is near.
+export function stackIndex(stack, time) {
+  if (!stack.xs.length || time < stack.from || time > stack.to) return null;
+  if (stack.step) return Math.min(stack.xs.length - 1, Math.floor((time - stack.from) / stack.step));
+  const at = 1000 * (time - stack.from) / stack.span;
+  let best = null, distance = 5000 * 1000 / stack.span;
+  for (const [index, x] of stack.xs.entries()) {
+    const gap = Math.abs(x - at);
+    if (gap <= distance) { distance = gap; best = index; }
   }
-  return bands.map((parts, layer) => ({ band: parts.join(" "), crest: crests[layer].join(" ") }));
+  return best;
+}
+
+// How long ago a live mark is: to the second under a minute, whole minutes in
+// words, anything else as minutes and seconds.
+const ago = ms => {
+  const seconds = Math.round(ms / 1000);
+  return !seconds ? "now" : seconds % 60 === 0 ? `−${seconds / 60} min` : seconds < 60 ? `−${seconds} s`
+    : `−${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+};
+
+// Five labels of the time axis. The live window counts back from now over as
+// much as it holds; a stored one is a calendar.
+export function stackMarks(stack) {
+  if (!stack.step) return [1, 0.75, 0.5, 0.25, 0].map(part => ago(part * stack.span));
+  const span = stack.to - stack.from;
+  return historyMarks(stack.from, stack.to).map(seconds => historyTime(seconds, span));
+}
+
+// The moment under the pointer, in words: to the minute for a day, to the
+// hour for a week, to the second for the live window.
+export function stackTime(stack, time) {
+  const date = new Date(stack.step ? time * 1000 : time);
+  const span = stack.step ? stack.to - stack.from : 0;
+  const day = date.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  if (span > 7 * 86400) return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  if (span > 86400) return `${day}, ${date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}`;
+  return date.toLocaleTimeString("en-GB", stack.step ? { hour: "2-digit", minute: "2-digit" } : { hour12: false });
 }
 
 // One cubic segment per pair of neighbouring samples, in value space.
@@ -587,12 +679,13 @@ function cubic(xs, values, tangents) {
 
 // Slopes of a curve through the samples that never overshoots them
 // (Fritsch and Carlson): a sample between a rise and a fall is a summit.
-function monotone(xs, values) {
+function monotone(xs, values, held = false) {
   const last = values.length - 1;
   const slopes = xs.slice(1).map((x, i) => (values[i + 1] - values[i]) / (x - xs[i]));
   const tangents = values.map(() => 0);
-  tangents[0] = slopes[0];
-  tangents[last] = slopes.at(-1);
+  // A held run leaves and arrives its end samples flat; a live run keeps its slope.
+  tangents[0] = held ? 0 : slopes[0];
+  tangents[last] = held ? 0 : slopes.at(-1);
   for (let i = 1; i < last; i++) {
     if (slopes[i - 1] * slopes[i] > 0) tangents[i] = (slopes[i - 1] + slopes[i]) / 2;
   }

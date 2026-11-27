@@ -1,7 +1,7 @@
 // Dashboard calculations use only Node's built-in test runner; no npm dependencies.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WINDOW_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, graph, areas, spark, sparkScaled, nearestSample, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, flag, addAsnName, readAsnNames, selector, localState, mimicCell, usageRanking, historyQuery, historyStack, historyScale, historyAreas, historyCrests, historyMarks, historyTime, historyName, historyYesterday, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel } from "../src/web/state.mjs";
+import { WINDOW_MS, LIVE_MIN_MS, PAGE_SIZE, bytes, rate, flowCounts, measure, keepHistory, spark, sparkArea, sparkScaled, latestSample, liveStack, stackPaths, stackIndex, stackMarks, stackTime, rateLabel, cpuPercent, cpuAverage, smoothRates, SMOOTH_MS, trafficAverage, processRss, uptimeSeconds, duration, flowPage, flowSource, flowService, flowAge, withFlowRates, asnLabel, asnOwners, pinnedGroups, flag, addAsnName, readAsnNames, selector, localState, mimicCell, transport, usageRanking, historyQuery, historyStack, historyScale, historyMarks, historyTime, historyName, historyYesterday, historyLive, historyWindowError, historyInputValue, historyInputSeconds, historyStepLabel } from "../src/web/state.mjs";
 
 test("usage ranks raw bytes, not formatted strings, and includes the pooled share", () => {
   const entries = [["a", "Small", { rx_bytes: 99, tx_bytes: 0 }], ["b", "Big", { rx_bytes: 1024, tx_bytes: 4 }], [null, "Other", { rx_bytes: 0, tx_bytes: 7 }]];
@@ -9,6 +9,24 @@ test("usage ranks raw bytes, not formatted strings, and includes the pooled shar
   assert.deepEqual(usageRanking(entries, "tx").rows.map(r => r.key), [null, "b"]);
   assert.equal(usageRanking(entries, "total").total, 1134);
   assert.deepEqual(usageRanking([], "rx"), { rows: [], total: 0 });
+  // A row may name the exit it is pinned to; the ranking keeps it.
+  const pinned = usageRanking([["13335", "AS13335", { rx_bytes: 1, tx_bytes: 2 }, "nl"], ["15169", "AS15169", { rx_bytes: 5, tx_bytes: 0 }]], "total").rows;
+  assert.deepEqual(pinned.map(row => [row.key, row.via, row.value]), [["15169", null, 5], ["13335", "nl", 3]]);
+});
+
+test("pinned groups are named by their network and sorted by what they carried", () => {
+  const groups = [{ group: "asn 16509", server: "a" }, { group: "ru", server: "local" }, { group: "asn 15169", server: "b" }, { group: "asn 24429", server: "b" }, { group: "group 0xff", server: "a" }];
+  const rules = [{ label: "ru", traffic: { rx_bytes: 50, tx_bytes: 7 } }];
+  const networks = { 16509: { rx_bytes: 1000, tx_bytes: 100 }, 24429: { rx_bytes: 300, tx_bytes: 0 }, 15169: { rx_bytes: 10, tx_bytes: 20 } };
+  assert.deepEqual(asnOwners(groups), new Map([["16509", "a"], ["15169", "b"], ["24429", "b"]]), "the exit of each ASN group, keyed as the usage names it");
+  assert.deepEqual(asnOwners(undefined), new Map());
+  assert.deepEqual(pinnedGroups(groups, { rules, networks, names: { 16509: "Amazon.com, Inc.", 15169: "Google LLC" } }).map(group => [group.label, group.server, group.rx_bytes + group.tx_bytes]), [
+    ["AS16509 · Amazon.com, Inc.", "a", 1100], ["AS24429", "b", 300], ["ru", "local", 57], ["AS15169 · Google LLC", "b", 30], ["group 0xff", "a", 0],
+  ], "busiest first; a network is its number until the dictionary names it");
+  assert.equal(pinnedGroups(groups, { rules, networks })[0].label, "AS16509");
+  assert.deepEqual(pinnedGroups([{ group: "asn 100", server: "a" }, { group: "asn 9", server: "a" }]).map(group => group.asn), ["9", "100"], "without traffic the order is by number, not as strings");
+  assert.deepEqual(pinnedGroups([]), []);
+  assert.deepEqual(pinnedGroups(undefined), []);
 });
 
 test("destination drill-down matches an IP exactly, not a prefix or a source", () => {
@@ -139,61 +157,77 @@ test("history is bounded by the chart window plus one smoothing window and a sam
   assert.equal(history.length, 1, "future samples are discarded if the clock moves backwards");
 });
 
-test("graph leaves a gap instead of joining through an unknown interval", () => {
+test("live bands break at a poll without a rate, and a lone sample is a tick", () => {
   const history = [
-    { time: 1000, rx: 1, tx: 0, servers: {} }, { time: 2000, rx: 2, tx: 0, servers: {} },
-    { time: 8000, rx: null, tx: null, servers: {} }, { time: 9000, rx: 3, tx: 0, servers: {} },
+    { time: 1000, rx: 2, tx: 1, servers: { nl: { rx: 1, tx: 0 }, de: { rx: null, tx: null } } },
+    { time: 2000, rx: 4, tx: 1, servers: { nl: { rx: 2, tx: 0 }, de: { rx: 2, tx: 0 } } },
+    { time: 8000, rx: null, tx: null, servers: { nl: { rx: null, tx: null } } },
+    { time: 9000, rx: 6, tx: 1, servers: { nl: { rx: 3, tx: 0 }, de: { rx: 3, tx: 0 } } },
   ];
-  const paths = graph(history);
-  assert.equal(paths.rx.match(/M/g).length, 2);
-  assert.equal(paths.rx.match(/L/g).length, 1);
-  assert.ok(!paths.rx.includes("NaN"));
-  assert.equal(graph(history, "absent").rx.trim(), "");
+  const stack = liveStack(history);
+  assert.deepEqual(stack.series.map(item => item.key), ["nl", "de"], "one layer per server that has a rate in the window");
+  assert.deepEqual(stack.series.map(item => item.values), [[1, 1.5, null, 2], [null, 2, null, 2.5]], "smoothed like the headline, holes kept");
+  assert.deepEqual(stack.xs.map(x => x.toFixed(2)), ["200.00", "300.00", "900.00", "1000.00"], "samples sit on the clock of the window, the newest on its right edge");
+  assert.deepEqual([stack.span, stack.from, stack.to], [LIVE_MIN_MS, 9000 - LIVE_MIN_MS, 9000], "a young window is ten seconds wide, not an empty five minutes");
+  assert.equal(stack.peak, 4.5, "the peak is the whole stack at its busiest poll");
+  const [nl, de] = stackPaths(stack, 5);
+  assert.equal((nl.band.match(/M/g) || []).length, 1, "a hole starts a new band instead of painting across the gap");
+  assert.ok(nl.band.startsWith("M200.00,126.40 ") && nl.band.includes(" L300.00,152.00 ") && nl.band.endsWith(" 200.00,152.00 Z"), nl.band);
+  assert.ok(nl.crest.startsWith("M200.00,126.40 ") && nl.crest.includes(" 300.00,113.60 ") && nl.crest.endsWith(" M1000.00,152.00 L1000.00,100.80"), nl.crest);
+  assert.equal(de.band, "", "two lone samples have no width to fill");
+  assert.equal(de.crest, "M300.00,113.60 L300.00,62.40 M1000.00,100.80 L1000.00,36.80", "a lone sample is a tick as thick as its layer, over the layers under it");
+  assert.ok(!nl.band.includes("NaN") && !de.crest.includes("NaN"));
+  // The readout is the averaged value the chart ends on (2, 4, 6), and a lone unknown poll draws nothing.
+  assert.equal(latestSample(history).rx, 4);
+  assert.equal(latestSample([{ time: 1000, rx: null, tx: null, servers: {} }]).rx, null);
+  assert.equal(spark(history, "rx").match(/M/g).length, 2, "the compact trend breaks on the same gap");
 });
 
-test("graph can select a server and handles the empty first screen", () => {
+test("live layers stack, largest server first, and follow one server or one direction", () => {
+  const history = [1000, 2000, 3000].map(time => ({ time, rx: 6, tx: 2, servers: { de: { rx: 2, tx: 1 }, nl: { rx: 4, tx: 1 } } }));
+  const heights = path => [...new Set(path.match(/,[0-9.]+(?=[ CL]|$)/g))].sort();
+  const all = liveStack(history);
+  assert.deepEqual(all.series.map(item => [item.key, item.values]), [["nl", [5, 5, 5]], ["de", [3, 3, 3]]]);
+  assert.deepEqual(all.xs.map(x => x.toFixed(2)), ["800.00", "900.00", "1000.00"]);
+  assert.equal(all.peak, 8);
+  const [low, high] = stackPaths(all, 8);
+  assert.deepEqual(heights(low.band), [",152.00", ",72.00"], "the larger server lies on the baseline");
+  assert.deepEqual(heights(high.band), [",24.00", ",72.00"], "the next one lies on it, nowhere else");
+  assert.deepEqual(heights(high.crest), [",24.00"], "the hairline is the top of its band and nothing else");
+  assert.ok(high.crest.startsWith("M800.00,24.00 ") && !high.crest.includes(" L"), "the line runs without a break where every poll has a rate");
+  assert.deepEqual(liveStack(history, "total", "de").series.map(item => [item.key, item.values]), [["de", [3, 3, 3]]]);
+  assert.equal(liveStack(history, "total", "de").peak, 3);
+  assert.deepEqual(liveStack(history, "tx").series.map(item => item.values), [[1, 1, 1], [1, 1, 1]], "sent only");
+  assert.equal(liveStack(history, "rx").peak, 6, "received only");
+});
+
+test("the first screen: one sample is a tick, no sample is an empty stack", () => {
   const sample = measure(snapshot(1000), snapshot(2000, [server("nl", 1000, 2000)]));
-  assert.equal(graph([sample], "nl").latest.rx, 0.008);
-  assert.match(graph([sample], "nl").rx, /^M1000\.00,[\d.]+ l0,0$/, "one visible point, not invented historical traffic");
-  assert.equal(graph([]).rx, "");
+  const stack = liveStack([sample]);
+  assert.deepEqual(stack.series, [{ key: "nl", values: [0.024] }], "receive and send of the first measured poll");
+  assert.deepEqual([stack.xs.map(x => x.toFixed(2)), stack.peak], [["1000.00"], 0.024]);
+  const [first] = stackPaths(stack, 0.05);
+  assert.equal(first.band, "");
+  assert.equal(first.crest, "M1000.00,152.00 L1000.00,90.56", "the first sample is visible at the right edge, without invented history");
+  assert.equal(latestSample([sample], "nl").rx, 0.008);
+  const empty = liveStack([]);
+  assert.deepEqual([empty.xs, empty.span, empty.from, empty.to, empty.series, empty.peak, empty.latest], [[], LIVE_MIN_MS, -LIVE_MIN_MS, 0, [], 0.01, null], "no poll yet is an empty stack the width of the youngest window, not a crash");
+  assert.equal(empty.rate(3), 3, "a live stack is already in the unit being drawn");
+  assert.deepEqual(stackPaths(liveStack([]), 1), []);
+  assert.deepEqual(liveStack([sample], "total", "absent").series, [], "an unknown server has nothing to draw");
+  assert.deepEqual(liveStack([{ time: 1000, rx: 1, tx: 1, servers: {} }]).series, [], "totals without a server rate are not a layer");
 });
 
 test("headline numbers quote the smoothed rate, never a lone poll", () => {
   const history = [10, 10, 10, 10, 0].map((rx, index) => ({
     time: 1000 * (index + 1), rx, tx: rx / 2, cpu: rx * 10, servers: { nl: { rx, tx: 0 } },
   }));
-  assert.equal(graph(history).latest.rx, 8, "a zero-delta poll after steady traffic is not 0 Mbit/s");
-  assert.equal(graph(history).latest.tx, 4);
-  assert.equal(graph(history, "nl").latest.rx, 8, "server rows use the same average");
-  assert.equal(graph(history).latest.cpu, 80, "the CPU sparkline is averaged too");
-  assert.equal(graph([...history, { time: 6000, rx: null, tx: null, cpu: null, servers: {} }]).latest.rx, null,
+  assert.equal(latestSample(history).rx, 8, "a zero-delta poll after steady traffic is not 0 Mbit/s");
+  assert.equal(latestSample(history).tx, 4);
+  assert.equal(latestSample(history, "nl").rx, 8, "server rows use the same average");
+  assert.equal(latestSample(history).cpu, 80, "the CPU sparkline is averaged too");
+  assert.equal(latestSample([...history, { time: 6000, rx: null, tx: null, cpu: null, servers: {} }]).rx, null,
     "a gap is still unknown, not the average before it");
-});
-
-test("filled areas close at the baseline and break around unknown intervals", () => {
-  const history = [
-    { time: 1000, rx: 1, tx: 0, servers: {} }, { time: 2000, rx: 2, tx: 1, servers: {} },
-    { time: 8000, rx: null, tx: null, servers: {} }, { time: 9000, rx: 3, tx: 0, servers: {} },
-  ];
-  const fill = areas(history);
-  assert.equal(fill.rx.match(/M/g).length, 2, "a gap starts a second polygon instead of painting a fake value");
-  assert.equal(fill.rx.match(/Z/g).length, 2);
-  assert.equal(fill.tx.match(/Z/g).length, 2);
-  assert.ok(fill.rx.startsWith("M") && fill.rx.includes(",152 Z"), "polygons close on the chart baseline");
-  assert.ok(!fill.rx.includes("NaN") && !fill.tx.includes("NaN"));
-  assert.equal(areas([]).rx, "");
-  assert.equal(areas(history, "absent").rx.trim(), "", "an unknown server has nothing to fill");
-});
-
-test("areas and lines use the same scale and can be filtered by server", () => {
-  const history = [
-    { time: 1000, rx: 2, tx: 1, servers: { nl: { rx: 4, tx: 2 } } },
-    { time: 2000, rx: 6, tx: 3, servers: { nl: { rx: 8, tx: 4 } } },
-  ];
-  const line = graph(history, "nl").rx.split(" ").at(-1).slice(1);
-  assert.ok(areas(history, "nl").rx.includes(line), "the area ridge follows the line exactly");
-  assert.equal(graph(history, "nl").max, 6 * 1.1, "both views scale from the same smoothed peak");
-  assert.ok(areas(history, "nl").rx.includes("1000.00,35.64"));
 });
 
 test("sparklines are bounded to 40 samples, use their own scale and keep gaps", () => {
@@ -211,6 +245,18 @@ test("sparklines are bounded to 40 samples, use their own scale and keep gaps", 
   ];
   assert.equal(spark(gap, "rx").match(/M/g).length, 2, "unknown intervals stay broken");
   assert.equal(spark(gap, "tx").match(/M/g).length, 2);
+  // The same trend filled to the baseline of its box; a lone sample has no width to fill.
+  const filled = sparkArea(history, "rx");
+  assert.equal((filled.match(/M/g) || []).length, 1, "one polygon for one run");
+  assert.ok(filled.startsWith("M0.00,30 ") && filled.includes("L120.00,") && filled.endsWith(" L120.00,30 Z"), filled);
+  assert.equal(sparkArea(gap, "rx"), "", "a lone sample on either side of a gap has no width to fill");
+  const partial = [
+    { time: 1000, rx: 1, tx: 1, servers: {} }, { time: 2000, rx: null, tx: null, servers: {} },
+    { time: 3000, rx: 2, tx: 1, servers: {} }, { time: 4000, rx: 3, tx: 1, servers: {} },
+  ];
+  assert.equal(sparkArea(partial, "rx"), "M80.00,30 L80.00,10.00 L120.00,4.00 L120.00,30 Z", "the run that has width is filled, to its own ends");
+  assert.equal(sparkArea([partial[0]], "rx"), "");
+  assert.equal(sparkArea([], "rx"), "");
 });
 
 test("scaled sparklines keep flat memory trends finite and break at gaps", () => {
@@ -228,16 +274,20 @@ test("scaled sparklines keep flat memory trends finite and break at gaps", () =>
   assert.equal(sparkScaled([], "rss"), "");
 });
 
-test("hover readout picks the nearest real sample and never invents a value", () => {
-  const history = [
-    { time: 1000, rx: 1, tx: 2, servers: { nl: { rx: 5, tx: 6 } } },
-    { time: 3000, rx: null, tx: null, servers: { nl: { rx: 7, tx: 8 } } },
-  ];
-  assert.deepEqual(nearestSample(history, 900), { time: 1000, rx: 1, tx: 2 });
-  assert.deepEqual(nearestSample(history, 2600), { time: 3000, rx: null, tx: null });
-  assert.deepEqual(nearestSample(history, 2600, "nl"), { time: 3000, rx: 6, tx: 7 }, "the readout quotes the smoothed line, not the raw poll");
-  assert.deepEqual(nearestSample(history, 1000, "absent"), { time: 1000, rx: null, tx: null });
-  assert.equal(nearestSample([], 1000), null);
+test("the readout finds the sample under the pointer and never invents one", () => {
+  const live = liveStack([1000, 2000, 3000].map(time => ({ time, rx: 1, tx: 1, servers: { nl: { rx: 1, tx: 1 }, de: { rx: 2, tx: 2 } } })));
+  assert.equal(stackIndex(live, 1400), 0, "the live sample nearest to the pointer");
+  assert.equal(stackIndex(live, 2600), 2);
+  assert.equal(stackIndex(live, -100000), null, "the empty part of a young window has no sample to show");
+  assert.equal(stackIndex(live, 4000), null);
+  assert.equal(stackIndex(live, -400000), null, "off the window");
+  const day = historyStack(history());
+  assert.equal(stackIndex(day, 100), 0, "the bucket that holds the moment");
+  assert.equal(stackIndex(day, 700), 2, "an unrecorded bucket is still a place: its values are holes");
+  assert.equal(stackIndex(day, 960), 3, "the right edge reads as the last bucket");
+  assert.equal(stackIndex(day, -1), null);
+  assert.equal(stackIndex(day, 961), null);
+  assert.equal(stackIndex({ xs: [], from: 0, to: 0, step: 60 }, 0), null);
 });
 
 test("traffic lines average a short wall-time window instead of drawing one-poll spikes", () => {
@@ -265,15 +315,15 @@ test("the chart's oldest point is as smooth as its newest", () => {
   // One poll reads 0, the next a burst: the raw rate saw-tooths, the 15 s average sits near 50.
   let history = [];
   for (let time = 0; time <= WINDOW_MS + 60000; time += 1000) {
-    history = keepHistory(history, { time, rx: time / 1000 % 2 ? 100 : 0, tx: 0, servers: {} });
+    history = keepHistory(history, { time, rx: time / 1000 % 2 ? 100 : 0, tx: 0, servers: { nl: { rx: time / 1000 % 2 ? 100 : 0, tx: 0 } } });
   }
-  const end = history.at(-1).time;
+  const stack = liveStack(history);
+  const end = stack.to;
   for (const at of [end - WINDOW_MS + 1000, end - WINDOW_MS / 2, end]) {
-    const { rx } = nearestSample(history, at);
+    const rx = stack.series[0].values[stackIndex(stack, at)];
     assert.ok(rx > 40 && rx < 60, `smoothed at ${end - at} ms before the end: ${rx}`);
   }
-  const firstX = Number(graph(history).rx.match(/^M([\d.]+),/)[1]);
-  assert.ok(firstX >= 0, "samples kept only for the average are not drawn left of the axis");
+  assert.ok(stack.xs[0] >= 0, "samples kept only for the average are not drawn left of the axis");
 });
 
 test("traffic average covers the whole history, weighted by measured time", () => {
@@ -291,17 +341,6 @@ test("traffic average covers the whole history, weighted by measured time", () =
   assert.equal(trafficAverage([point(0, 5, 5, {})]), null, "one sample has no interval yet");
   assert.equal(trafficAverage([]), null);
   assert.equal(trafficAverage([point(1000, null, null, {}), point(1000, 9, 9, {})]), null, "a duplicate snapshot is no interval");
-});
-
-test("smoothing never bridges an API gap and the readout quotes the drawn line", () => {
-  const history = [
-    { time: 1000, rx: 2, tx: 1, servers: {} }, { time: 2000, rx: 4, tx: 1, servers: {} },
-    { time: 8000, rx: null, tx: null, servers: {} }, { time: 9000, rx: 6, tx: 1, servers: {} },
-  ];
-  assert.equal(graph(history).rx.match(/M/g).length, 2, "the gap still breaks the line");
-  assert.equal(graph([{ time: 1000, rx: null, tx: null, servers: {} }]).rx.trim(), "", "an unknown newest sample draws nothing");
-  assert.equal(graph(history).latest.rx, 4, "the readout is the averaged value the line ends on (2, 4, 6)");
-  assert.equal(spark(history, "rx").match(/M/g).length, 2, "the compact trend breaks on the same gap");
 });
 
 test("flow rates come from consecutive snapshots and order is stable", () => {
@@ -511,6 +550,16 @@ test("mimic cell selects before the first verdict and hides empty notes", () => 
   assert.deepEqual(mimicCell({ active: "mosh" }), { transport: "mosh", race: "", limited: "" });
 });
 
+test("the pool chip quotes the transport in use and its own distance", () => {
+  const server = { selection: { active: "tcp", round: { winner: "tcp", entries: [
+    { candidate: "quic", status: "verified", rtt_ms: 63 }, { candidate: "tcp", status: "verified", rtt_ms: 41, penalty: true }] } } };
+  assert.deepEqual(transport(server), { active: "tcp", latency: 41 }, "the distance of the line in use, not of the fastest one");
+  assert.deepEqual(transport({ selection: { active: "mosh", round: { entries: [{ candidate: "mosh", status: "probing", stage: "probe" }] } } }),
+    { active: "mosh", latency: null }, "a line still being probed has no distance");
+  assert.deepEqual(transport({ selection: { active: null } }), { active: "", latency: null });
+  assert.deepEqual(transport({}), { active: "", latency: null });
+});
+
 // ── History kept on the client ──
 
 function history() {
@@ -522,18 +571,20 @@ function history() {
 
 test("history stacks the shown bytes per bucket and keeps unrecorded time apart from zero", () => {
   const total = historyStack(history());
-  assert.deepEqual(total.series.map(item => item.values), [[110, 220, 0, 0], [0, 600, 0, 0]]);
-  assert.deepEqual(total.recorded, [true, true, false, false]);
+  assert.deepEqual(total.series.map(item => item.values), [[110, 220, null, null], [0, 600, null, null]]);
   assert.equal(total.count, 4);
+  // Every bucket sits in the middle of its slot and is held to the slot's edges.
+  assert.deepEqual(total.xs, [125, 375, 625, 875]);
+  assert.equal(total.hold, 125);
   assert.equal(total.peak, 820 * 8 / 240 / 1e6);
   assert.equal(total.total, 930);
   const sent = historyStack(history(), "tx");
-  assert.deepEqual(sent.series.map(item => item.values), [[10, 20, 0, 0], [0, 300, 0, 0]]);
+  assert.deepEqual(sent.series.map(item => item.values), [[10, 20, null, null], [0, 300, null, null]]);
   assert.equal(sent.total, 330);
   assert.equal(sent.peak, 320 * 8 / 240 / 1e6);
   // Points outside the window are not drawn; nothing at all is an empty stack, not a crash.
   const edge = historyStack({ step: 60, from: 0, to: 120, series: [{ ...history().series[0], points: [[-60, 5, 5], [120, 5, 5]] }] });
-  assert.deepEqual(edge.recorded, [false, false]);
+  assert.deepEqual(edge.series[0].values, [null, null]);
   assert.equal(historyStack({ step: 60, from: 0, to: 0, series: [] }).count, 0);
 });
 
@@ -547,25 +598,30 @@ test("the history value axis tops out at a round number just above the traffic",
 
 test("history bands are a sandwich of smooth layers with flat ends and honest gaps", () => {
   const day = 240, width = 1000 / day, all = Array(day).fill(true);
-  const stack = (values, recorded) => ({ step: 240, count: day, rate: value => value, series: values.map(value => ({ values: value })), recorded });
+  const stack = (values, recorded) => ({
+    xs: Array.from({ length: day }, (_, index) => width * (index + 0.5)), hold: width / 2, rate: value => value,
+    series: values.map(value => ({ values: value.map((sample, index) => recorded[index] ? sample : null) })),
+  });
+  const areas = (stack, top) => stackPaths(stack, top).map(layer => layer.band);
+  const lines = (stack, top) => stackPaths(stack, top).map(layer => layer.crest);
   const heights = path => [...new Set(path.match(/,[0-9.]+(?=[ CL]|$)/g))].sort();
   // One constant layer over the whole window: a rectangle from the first minute's left edge to the last one's right edge.
-  const [flat] = historyAreas(stack([Array(day).fill(1)], all), 4);
+  const [flat] = areas(stack([Array(day).fill(1)], all), 4);
   assert.ok(flat.startsWith("M0.00,120.00 C") && flat.includes(" 1000.00,120.00 L1000.00,152.00 C") && flat.endsWith(" 0.00,152.00 Z") && !flat.includes(" M"), flat.slice(0, 90));
   assert.deepEqual(heights(flat), [",120.00", ",152.00"]);
   // Two constant layers: the upper band sits on the lower one, nowhere else.
-  const [low, high] = historyAreas(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
+  const [low, high] = areas(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
   assert.deepEqual(heights(low), [",120.00", ",152.00"]);
   assert.deepEqual(heights(high), [",120.00", ",88.00"]);
   // An unrecorded minute splits the band in two; each part starts and ends on a minute's edge.
   const recorded = all.slice(); recorded[100] = false;
-  const [split] = historyAreas(stack([Array(day).fill(1)], recorded), 4);
+  const [split] = areas(stack([Array(day).fill(1)], recorded), 4);
   assert.equal((split.match(/M/g) || []).length, 2);
   assert.ok(split.includes(` M${(width * 101).toFixed(2)},120.00 C`) && split.includes(`L${(width * 100).toFixed(2)},152.00`), split.slice(-140));
   // Between two minutes the curve stays within their values: a peak is never sharpened, a dip never deepened.
   const spike = Array(day).fill(0);
   for (const [index, value] of [[50, 10], [150, 0], [151, 10], [152, 0], [200, 10], [201, 20]]) spike[index] = value;
-  const [curve] = historyAreas(stack([spike], all), 40);
+  const [curve] = areas(stack([spike], all), 40);
   const ys = curve.match(/,[0-9.]+(?=[ CL]|$)/g).map(value => Number(value.slice(1)));
   assert.equal(Math.min(...ys), 88);
   assert.equal(Math.max(...ys), 152);
@@ -573,18 +629,18 @@ test("history bands are a sandwich of smooth layers with flat ends and honest ga
   // A single recorded bucket, as right after a start, is a column as wide as its step.
   const once = Array(day).fill(false); once[day - 1] = true;
   const last = Array(day).fill(0); last[day - 1] = 1;
-  const [alone] = historyAreas(stack([last], once), 4);
+  const [alone] = areas(stack([last], once), 4);
   const edges = alone.match(/[0-9.]+(?=,)/g).map(Number);
   assert.equal(Math.min(...edges).toFixed(2), (width * (day - 1)).toFixed(2));
   assert.equal(Math.max(...edges), 1000);
   assert.deepEqual(heights(alone), [",120.00", ",152.00"]);
-  assert.deepEqual(historyAreas({ ...stack([[]], all), count: 0 }, 4), [""]);
+  assert.deepEqual(stackPaths({ ...stack([[]], all), xs: [] }, 4), [{ band: "", crest: "" }]);
   // The hairline of a layer is the top edge of its band and nothing else.
-  const [top0, top1] = historyCrests(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
+  const [top0, top1] = lines(stack([Array(day).fill(1), Array(day).fill(1)], all), 4);
   assert.deepEqual(heights(top0), [",120.00"]);
   assert.deepEqual(heights(top1), [",88.00"]);
   assert.ok(top0.startsWith("M0.00,120.00 C") && !top0.includes(" L"));
-  assert.deepEqual(historyCrests({ ...stack([[]], all), count: 0 }, 4), [""]);
+  assert.deepEqual(lines({ ...stack([[]], all), xs: [] }, 4), [""]);
 });
 
 test("history time labels grow coarser with the range and its query names the series", () => {
@@ -596,6 +652,27 @@ test("history time labels grow coarser with the range and its query names the se
   assert.match(historyTime(0, 30 * 86400), /^[0-9]{1,2} [A-Z][a-z]{2}$/);
   assert.equal(historyQuery({ range: "7d", kind: "network" }), "/api/history?range=7d&kind=network&top=8");
   assert.equal(historyQuery({ range: "1h", kind: "link", link: "a b:22" }), "/api/history?range=1h&kind=link&top=8&link=a%20b%3A22");
+});
+
+test("one axis for every range: the live window counts back, a stored one is a calendar", () => {
+  const day = historyStack(history());
+  const week = historyStack({ ...history(), from: 0, to: 7 * 86400, step: 3600 });
+  const live = liveStack([]);
+  // The live window counts back over as much as it holds: seconds, then minutes and seconds, then whole minutes.
+  assert.deepEqual(stackMarks(live), ["−10 s", "−8 s", "−5 s", "−3 s", "now"]);
+  const grown = liveStack(Array.from({ length: 181 }, (_, index) => ({ time: index * 1000, rx: 1, tx: 1, servers: {} })));
+  assert.deepEqual([grown.span, stackMarks(grown)], [180000, ["−3 min", "−2:15", "−1:30", "−45 s", "now"]]);
+  const full = liveStack(Array.from({ length: 400 }, (_, index) => ({ time: index * 1000, rx: 1, tx: 1, servers: {} })));
+  assert.deepEqual([full.span, stackMarks(full)], [WINDOW_MS, ["−5 min", "−3:45", "−2:30", "−1:15", "now"]], "the window stops growing at five minutes");
+  assert.deepEqual(stackMarks(day), [0, 240, 480, 720, 960].map(seconds => historyTime(seconds, 960)));
+  assert.deepEqual(stackMarks(week), [0, 7 * 86400 / 4, 7 * 86400 / 2, 3 * 7 * 86400 / 4, 7 * 86400].map(seconds => historyTime(seconds, 7 * 86400)));
+  // The moment under the pointer, to the minute for a day, to the hour for a week, to the second live.
+  const moment = new Date(2026, 10, 24, 19, 42, 13).getTime() / 1000;
+  assert.equal(stackTime({ ...day, from: moment - 86400, to: moment }, moment), "19:42");
+  assert.match(stackTime({ ...week, from: moment - 7 * 86400, to: moment }, moment), /^Tue 24 Nov, 19:42$/);
+  assert.match(stackTime({ ...week, step: 86400, from: moment - 8 * 86400, to: moment }, moment), /^24 Nov$/);
+  assert.equal(stackTime(live, moment * 1000), "19:42:13", "the live clock is in milliseconds, to the second");
+  assert.deepEqual([100, 50, 0.05, 2.5, 0.005, 0.25].map(rateLabel), ["100", "50", "0.05", "2.5", "0.005", "0.25"]);
 });
 
 test("history series are named by server label, rule label and ASN, the exit kept apart", () => {
