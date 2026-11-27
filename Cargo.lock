@@ -3364,16 +3364,19 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "svpn"
 version = "1.9.1"
 dependencies = [
+ "aes 0.9.3",
  "aes-gcm 0.10.3",
  "anyhow",
  "base64",
  "bytes",
  "clap",
+ "ctr 0.10.1",
  "futures",
  "getrandom 0.3.4",
  "h3",
  "h3-quinn",
  "hcl-rs",
+ "hmac 0.13.0",
  "http",
  "netstack-smoltcp",
  "nix 0.31.3",
