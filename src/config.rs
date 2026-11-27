@@ -168,6 +168,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
     }
     crate::job::JobSpec::validate_all(&jobs)?;
     let dns = top.dns()?;
+    let telegram_proxy = top.telegram_proxy(base)?;
 
     // Deprecated: sticky owners are RAM-only; the key is accepted so old
     // configs keep parsing and the value is ignored.
@@ -202,6 +203,7 @@ pub fn parse(text: &str, base: &Path, multi: bool) -> Result<ClientArgs> {
         stickies,
         jobs,
         dns,
+        telegram_proxy,
         hooks,
         globals,
     };
@@ -482,6 +484,7 @@ impl<'a> Top<'a> {
                         | "fallback_sticky"
                         | "stats"
                         | "dns"
+                        | "telegram_proxy"
                 ),
                 "config: unknown block {name}"
             );
@@ -617,6 +620,25 @@ impl<'a> Top<'a> {
             })
             .collect::<Result<Vec<Ipv4Addr>>>()?;
         Ok(Some(crate::dns::Settings { local }))
+    }
+
+    /// The `telegram_proxy` block: off unless both `listen` and
+    /// `secret_file` are set.
+    fn telegram_proxy(&mut self, base: &Path) -> Result<Option<crate::mtproxy::Settings>> {
+        let listen = self.take_string("telegram_proxy", "listen")?;
+        let secret_file = self.take_path("telegram_proxy", "secret_file", base)?;
+        let (listen, secret_file) = match (listen, secret_file) {
+            (None, None) => return Ok(None),
+            (Some(listen), Some(secret_file)) => (listen, secret_file),
+            _ => bail!("telegram_proxy: listen and secret_file are both required"),
+        };
+        Ok(Some(crate::mtproxy::Settings {
+            listen: listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("telegram_proxy: invalid listen address {listen}"))?,
+            secret: crate::mtproxy::Secret::from_file(&secret_file)?,
+        }))
     }
 
     fn servers(&mut self, base: &Path) -> Result<Vec<(String, ServerSpec)>> {

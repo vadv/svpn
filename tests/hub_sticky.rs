@@ -145,6 +145,7 @@ fn sticky_hub(blocks: Vec<StickyBlock>) -> Hub {
         history_prev: None,
         history_ts: None,
         dns: Default::default(),
+        telegram: None,
     }
 }
 

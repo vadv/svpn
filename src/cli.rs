@@ -66,6 +66,9 @@ pub struct ClientArgs {
     /// DNS that follows the exit (config-file only); None leaves UDP/53 alone.
     #[arg(skip)]
     pub dns: Option<crate::dns::Settings>,
+    /// MTProto proxy for Telegram clients (config-file only); None keeps it off.
+    #[arg(skip)]
+    pub telegram_proxy: Option<crate::mtproxy::Settings>,
     #[command(flatten)]
     pub hooks: hooks::Args,
     #[command(flatten)]

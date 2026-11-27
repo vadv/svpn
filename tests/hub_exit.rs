@@ -130,6 +130,7 @@ fn selector_hub(weights: &[u32], ready: bool, geo: Option<Geo>, country: Option<
         history_prev: None,
         history_ts: None,
         dns: Default::default(),
+        telegram: None,
     }
 }
 
