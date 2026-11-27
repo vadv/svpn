@@ -230,12 +230,17 @@ telegram_proxy {
 }
 ```
 
-Without the block the proxy is off. Open the `listen` port in the firewall.
-Stop `mtg` if it already runs on the machine: both would listen on one port.
+| Setting | What it sets |
+| --- | --- |
+| `listen` | The address and port where the client accepts Telegram connections |
+| `secret_file` | The file with the secret of a `tg://proxy` link |
 
-`secret_file` is read once at start. The file has one line: the secret of a
-`tg://proxy` link. The format is `ee`, 32 hex digits of the key and the
-domain in hex. `mtg generate-secret --hex` writes the same file.
+Without the block the proxy is off. The `listen` port must be open in the
+firewall. Stop `mtg` if it already runs on this port.
+
+The secret file is read once at start. The file has one line: `ee`, then 32
+hex digits of the key, then the domain in hex. `mtg generate-secret --hex`
+writes a file of the same format.
 
 How a connection passes:
 
@@ -245,10 +250,13 @@ How a connection passes:
 3. SVPN answers with a TLS 1.3 handshake. To the provider it looks like an
    HTTPS connection to the domain in the secret.
 4. The client names a datacenter. SVPN connects to the datacenter and
-   relays the stream. SVPN does not see the messages: they are encrypted
-   with the keys of the client and Telegram.
-5. The datacenter connection follows the routing table. On the hub it goes
-   through the tunnel like any other traffic of the machine.
+   relays the stream.
+
+SVPN does not read the messages. They are encrypted with the keys of the
+client and Telegram.
+
+The datacenter connection follows the routing table. On the hub it goes
+through the tunnel like any other traffic of the machine.
 
 Limits:
 
@@ -256,12 +264,14 @@ Limits:
   are not.
 - The datacenter addresses are built into the binary, as in Telegram
   Desktop.
-- Calls do not go through an MTProto proxy. Calls need another path.
 - Up to 256 clients are served at once. Other connections are closed at
   once.
 - The hello must arrive within 10 seconds.
-- A hello of another secret, a replayed hello and traffic without a
-  signature are closed. No connection to a datacenter is made for them.
+- Calls do not go through an MTProto proxy. Calls need another path.
+
+SVPN closes the connection without contacting a datacenter in three cases.
+The hello is signed with another secret. The hello was sent before. The
+traffic is not Telegram's.
 
 The periodic report has the counters: `telegram proxy: accepted N |
 rejected N | active N`. The secret is never written to the log.

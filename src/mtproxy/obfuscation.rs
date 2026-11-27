@@ -91,11 +91,10 @@ pub fn frame(
     Ok(frame)
 }
 
-/// The two ciphers a frame lays out with no regard to who holds them: the
-/// one from the frame's own key and IV, and the one from the same 48 bytes
-/// reversed. Whoever sent the frame encrypted with the first; whoever
-/// received it answers with the second. `secret` is mixed into the keys
-/// when there is one.
+/// The two ciphers a frame carries. The first uses the frame's own key and
+/// IV: the sender of the frame encrypted with it. The second uses the same
+/// 48 bytes reversed: the receiver answers with it. `secret` is mixed into
+/// both keys when there is one.
 fn laid_out(frame: &[u8; FRAME], secret: Option<&[u8; 16]>) -> (Cipher, Cipher) {
     let key = part::<KEY>(frame, OFFSET_KEY, false);
     let iv = part::<IV>(frame, OFFSET_KEY + KEY, false);
@@ -116,7 +115,7 @@ fn laid_out(frame: &[u8; FRAME], secret: Option<&[u8; 16]>) -> (Cipher, Cipher) 
 
 /// Put a frame on the wire: encrypted, except the key and the IV the
 /// receiver derives its ciphers from. The returned stream is the sender's,
-/// already past the frame.
+/// advanced past the frame.
 pub fn sent(frame: &[u8; FRAME]) -> ([u8; FRAME], Streams) {
     let (mut own, reversed) = laid_out(frame, None);
     let mut wire = *frame;
@@ -132,7 +131,7 @@ pub fn sent(frame: &[u8; FRAME]) -> ([u8; FRAME], Streams) {
 }
 
 /// Read a client's frame: the datacenter it asks for and the receiver's
-/// stream, already past the frame.
+/// stream, advanced past the frame.
 pub fn received(mut wire: [u8; FRAME], secret: &[u8; 16]) -> Result<(i16, Streams), Foreign> {
     let (mut own, reversed) = laid_out(&wire, Some(secret));
     own.apply_keystream(&mut wire);

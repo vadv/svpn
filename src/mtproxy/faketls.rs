@@ -20,7 +20,7 @@ pub const APPLICATION_DATA: u8 = 0x17;
 pub const HEADER: usize = 5;
 /// The largest payload a record may carry.
 pub const MAX_RECORD: usize = 1 << 14;
-/// A ClientHello split over more records is not a ClientHello.
+/// The most records a ClientHello may be split over.
 const MAX_RECORDS: usize = 10;
 const MAX_HELLO: usize = MAX_RECORDS * MAX_RECORD;
 /// `random` follows the record header, the handshake header and the version.
@@ -28,15 +28,16 @@ const RANDOM: usize = 11;
 const RANDOM_LEN: usize = 32;
 /// The last 4 bytes of `random` carry the creation time.
 const TIMESTAMP: usize = 4;
-/// A hello created further from now is a replay or a broken clock.
+/// How far from now a hello may have been created.
 pub const MAX_SKEW: u64 = 24 * 60 * 60;
-/// Size of the record that stands in for the encrypted server flight.
+/// Size range of the record that takes the place of the encrypted server
+/// flight.
 const NOISE_MIN: usize = 2500;
 const NOISE_SPAN: usize = 2200;
 /// Payload of one record written to the client at most.
 const WRITE_RECORD: usize = 8192;
 
-/// How many `noise` bytes a flight wants for two random bytes.
+/// The length of the noise record for two random bytes.
 pub fn noise_len(draw: [u8; 2]) -> usize {
     NOISE_MIN + u16::from_be_bytes(draw) as usize % NOISE_SPAN
 }
@@ -46,13 +47,13 @@ pub fn noise_len(draw: [u8; 2]) -> usize {
 pub struct ClientHello {
     /// The bytes that carry the HMAC and the timestamp.
     pub random: [u8; RANDOM_LEN],
-    /// What tells a replayed hello from a new one.
+    /// Tells a replayed hello from a new one.
     pub session_id: [u8; RANDOM_LEN],
     /// The first cipher suite that is not GREASE.
     pub cipher: u16,
 }
 
-/// Why a ClientHello is not let in.
+/// Why a ClientHello is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
     /// Not a ClientHello the proxy can read.
@@ -61,7 +62,7 @@ pub enum Reject {
     Foreign,
     /// Created too far from now.
     Stale,
-    /// Closed before the hello arrived whole.
+    /// The client closed before the whole hello arrived.
     Closed,
 }
 
@@ -78,7 +79,8 @@ impl std::fmt::Display for Reject {
 
 impl std::error::Error for Reject {}
 
-/// A read that ended early left the client; anything else is not TLS.
+/// A stream that ended early means the client left. Any other read error
+/// means the stream is not TLS.
 fn closed(error: std::io::Error) -> Reject {
     if error.kind() == std::io::ErrorKind::UnexpectedEof {
         Reject::Closed
@@ -356,7 +358,7 @@ impl<T: AsyncRead + Unpin> Reader<T> {
             let wanted_at = self.start;
             handshake.extend_from_slice(&self.buffered[wanted_at..wanted_at + wanted]);
             self.consume(wanted);
-            // Whatever the record carries past the hello is for `read`.
+            // Bytes after the hello in the same record stay for `read`.
             if handshake.len() == total {
                 return check(&signed(handshake), key, domain, now);
             }

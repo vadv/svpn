@@ -32,12 +32,13 @@ use tokio::{
     task::JoinSet,
 };
 
-/// The whole hello, Fake TLS and obfuscated, must fit in this time.
+/// Time for the whole hello: the Fake TLS one and the obfuscated one under
+/// it.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Clients served at once; a connection beyond that is closed unread.
 pub const MAX_CLIENTS: usize = 256;
-/// Hellos remembered against a replay.
+/// How many hellos are kept to tell a replay from a new hello.
 const REPLAYED: usize = 4096;
 const TAG: &str = "telegram_proxy";
 
@@ -80,14 +81,14 @@ impl Secret {
         })
     }
 
-    /// The secret as a file keeps it, in one line.
+    /// The secret from the file that keeps it: one line.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("{TAG}: read {}", path.display()))?;
         Self::parse(&text)
     }
 
-    /// The domain the clients' Fake TLS names.
+    /// The domain the clients send in their Fake TLS hello.
     pub fn domain(&self) -> &str {
         &self.domain
     }
@@ -121,7 +122,7 @@ fn nibble(digit: u8) -> anyhow::Result<u8> {
 pub struct Settings {
     /// Where the clients connect.
     pub listen: SocketAddr,
-    /// What the clients' links carry.
+    /// The secret the clients' links carry.
     pub secret: Secret,
 }
 
@@ -130,9 +131,9 @@ pub struct Settings {
 pub struct Stats {
     /// Hellos that went on to a datacenter.
     pub accepted: AtomicU64,
-    /// Connections closed before that.
+    /// Connections closed before a datacenter was reached.
     pub rejected: AtomicU64,
-    /// Connections held right now.
+    /// Connections open right now.
     pub active: AtomicU64,
 }
 
@@ -147,7 +148,7 @@ const DATACENTERS: [(i16, Ipv4Addr); 6] = [
 ];
 
 /// Addresses of a datacenter on port 443. The number is the client's with
-/// its sign dropped: the media counterpart lives at the same addresses.
+/// its sign dropped: the media datacenter has the same addresses.
 pub fn addresses(dc: i16) -> Vec<SocketAddr> {
     DATACENTERS
         .iter()
@@ -190,7 +191,7 @@ pub async fn serve(
     }
 }
 
-/// A held client: counted from `new` until the guard goes away.
+/// A client being served: `new` counts it, `drop` uncounts it.
 struct Held(Arc<Stats>);
 
 impl Held {
@@ -206,7 +207,7 @@ impl Drop for Held {
     }
 }
 
-/// Session ids of the hellos let in, oldest first.
+/// Session ids of accepted hellos, oldest first.
 #[derive(Default)]
 struct Replay {
     seen: HashMap<[u8; 32], u64>,
@@ -216,7 +217,8 @@ struct Replay {
 impl Replay {
     /// Records the hello; `true` when it was recorded before.
     fn check(&mut self, id: [u8; 32], now: u64) -> bool {
-        // A hello older than the skew window is refused by its timestamp.
+        // Old entries are dropped first: a hello that old is refused by its
+        // timestamp.
         while self.seen.len() >= REPLAYED
             || self
                 .order
@@ -331,7 +333,7 @@ async fn start<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     })
 }
 
-/// `out` filled from the records of `reader`.
+/// Fill `out` with payload from the records of `reader`.
 async fn fill<R: AsyncRead + Unpin>(reader: &mut Reader<R>, out: &mut [u8]) -> io::Result<()> {
     let mut filled = 0;
     while filled < out.len() {
