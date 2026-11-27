@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.9.2
 
 Встроенный прокси для Telegram.
 
