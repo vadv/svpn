@@ -216,6 +216,56 @@ Limits:
 - Until at least one link is ready, queries pass as they always did.
 - DNS counters are in the periodic report: `dns: queries | cache | stale | moved | failed`.
 
+## Telegram proxy
+
+The client can accept Telegram's MTProto connections itself. This replaces
+a separate `mtg` or MTProxy on the client's machine.
+
+Add the block:
+
+```hcl
+telegram_proxy {
+  listen      = "0.0.0.0:8081"
+  secret_file = "/etc/svpn/telegram.secret"
+}
+```
+
+Without the block the proxy is off. Open the `listen` port in the firewall.
+Stop `mtg` if it already runs on the machine: both would listen on one port.
+
+`secret_file` is read once at start. The file has one line: the secret of a
+`tg://proxy` link. The format is `ee`, 32 hex digits of the key and the
+domain in hex. `mtg generate-secret --hex` writes the same file.
+
+How a connection passes:
+
+1. The Telegram client connects to `listen`.
+2. The client signs the ClientHello with the secret. SVPN checks the
+   signature and the creation time.
+3. SVPN answers with a TLS 1.3 handshake. To the provider it looks like an
+   HTTPS connection to the domain in the secret.
+4. The client names a datacenter. SVPN connects to the datacenter and
+   relays the stream. SVPN does not see the messages: they are encrypted
+   with the keys of the client and Telegram.
+5. The datacenter connection follows the routing table. On the hub it goes
+   through the tunnel like any other traffic of the machine.
+
+Limits:
+
+- Only Fake TLS with an `ee` secret is accepted. The `dd` and classic modes
+  are not.
+- The datacenter addresses are built into the binary, as in Telegram
+  Desktop.
+- Calls do not go through an MTProto proxy. Calls need another path.
+- Up to 256 clients are served at once. Other connections are closed at
+  once.
+- The hello must arrive within 10 seconds.
+- A hello of another secret, a replayed hello and traffic without a
+  signature are closed. No connection to a datacenter is made for them.
+
+The periodic report has the counters: `telegram proxy: accepted N |
+rejected N | active N`. The secret is never written to the log.
+
 ## Country and ASN databases
 
 Both databases belong on the **client**, not on the VPSs. The directory and

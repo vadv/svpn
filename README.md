@@ -235,6 +235,7 @@ ASN с фильтрами. Организации ASN браузер сам ра
 - `via = local` — пускать избранные адреса мимо VPN;
 - `fallback_sticky` — как пул обслуживает остальной трафик;
 - `dns { mode = "exit" }` — разрешать DNS на выходе, через который пойдёт трафик;
+- `telegram_proxy` — принимать подключения Telegram по MTProto с Fake TLS;
 - базы Country и ASN и их фоновое автообновление (`auto_job_update`);
 - hooks и переменные окружения;
 - транспорт: mimic, TCP fallback, диапазон UDP-портов;
