@@ -501,17 +501,19 @@ dashboard {
 What it shows:
 
 - **Where traffic goes** ranks the same hub-accounted inner IP bytes by actual exit (including local), destination ASN and destination IPv4. Choose *Since start* for volume including closed flows, or *Right now* for the last hub sampling interval in Mbit/s. Rank by RX+TX, received or sent; percentages use the selected direction. Select a name to inspect its currently visible flows, not a historical connection log.
-- ASN is pinned when the flow opens; a missing lookup goes to *Unknown ASN*. The snapshot retains up to 256 named IPs and 256 named ASNs per period. Smaller buckets fold into *Other · pooled*: totals stay exact, named entries may omit earlier evicted bytes. This accounting is memory-only and restarts with the client; the History section below is what can reach the disk.
+- ASN is pinned when the flow opens; a missing lookup goes to *Unknown ASN*. The snapshot retains up to 256 named IPs and 256 named ASNs per period. Smaller buckets fold into *Other · pooled*: totals stay exact, named entries may omit earlier evicted bytes. This accounting is memory-only and restarts with the client; the history ranges of the Traffic chart below are what can reach the disk.
 - An overview: ready servers, RX/TX in Mbit/s, active connections and local-exit
   readiness. `ready` means the link is ready, not an end-to-end internet check.
-- A five-minute VPN-pool RX/TX chart. History lives only in the open tab; changing
-  the selected server preserves it. This is inner IP traffic, not all WAN traffic
-  or local-exit throughput. Restarting the client clears the chart.
-- **History** — the same inner IP traffic over an hour, a day, a week and a
-  month, over yesterday or over any window you pick, from the database on the
-  client (see "Traffic history"): by server including local exit, by sticky
-  rule and by destination network (ASN with the organization's name). A gap in
-  the graph is time the client was not running.
+- **Traffic** is one chart of VPN inner IP traffic. It is not all WAN traffic
+  and not local-exit throughput. The page measures the **5 min** range itself:
+  one sample a second, each server a layer. An hour, a day, a week, a month,
+  yesterday and any custom window are read from the database on the client
+  (see "Traffic history"). The chart breaks traffic down by server including
+  local exit, by sticky rule and by destination network. A network is labelled
+  with its ASN and the organization's name. A gap means the client was not
+  running. The live window exists only in the open tab and is cleared when
+  the client restarts. Hover the chart to see every series at that point. A
+  server keeps one colour over every range.
 - Compact server rows; expand details for addresses, weights, cumulative counters
   and the last failure reason.
 - Sticky rules in first-match order: selectors, allowed exits, current owners,
@@ -526,21 +528,32 @@ What it shows:
   from two fresh snapshots of a cumulative counter: after a restart, API gap or
   stale state it shows an unknown value rather than an invented average. A value
   above 100% means multithreaded load, not an error.
-- Interface: a calm operations console with flat surfaces and sharp corners.
-  Colour carries meaning only — status and the receive/send directions; active
-  and pressed controls differ by surface shade. Text uses the system UI face,
-  monospace stays with addresses, ports and selectors. The "now" summary is the
-  first row; the chart has a value axis and time ticks. The theme follows the
-  system until you pick one, lives only in the open tab and is never persisted;
-  `/` focuses the flow search, `Esc` clears it and *Clear filters* resets the
-  search, the filters and the explorer drill-down. No gradients, glassmorphism,
-  decorative icons, external fonts, images or CDNs are used.
+- Interface: a dark theme with a soft glow and translucent cards. One accent
+  colour marks the active menu item, the selected control and the keyboard
+  focus. The other colours show status, the receive and send directions, and
+  the traffic series. A server keeps one colour in the chart, the legend, the
+  bars and the tables. Text uses the system font. Monospace is kept for
+  addresses, ports and selectors. The first row is tiles with large numbers,
+  followed by the chart across the full width. The header shows the pool
+  servers: state, transport and latency. The theme follows the system until
+  you pick one. The choice is kept only in the open tab. `/` focuses the flow
+  search. `Esc` clears the search. *Clear filters* resets the search, the
+  filters and the explorer drill-down. There are no external fonts, images or
+  CDNs: the icons are SVG inside the page. Motion is switched off under
+  `prefers-reduced-motion`.
 - Job state, last successful attempt, failure reason and next run; ASN/Country
   database loading time in this process, range counts and update outcomes. Failed
   updates retain the previous table. A non-zero `run_if` exit skips the attempt;
   a gate spawn failure or timeout is a failed attempt, visible in the job state,
   database update error and corresponding counter.
-- Pinned groups and technical counters in collapsible diagnostics.
+- **Pinned groups** sit under Rules & exits, below the rules. The block shows
+  which exit each group is pinned to. An ASN group is named by its
+  organization from the ASN table, for example "AS16509 · Amazon.com, Inc.".
+  The exit is shown as the server name and colour. Groups are sorted by
+  traffic since start. The block is folded: its heading shows only the number
+  of groups. Click the heading to open the list. In *Destination networks* a
+  network shows the colour and name of its exit. Technical counters stay in
+  collapsible diagnostics.
 
 Rule bytes are cumulative for this client process: TX is a complete inner IP
 packet accepted by the hub queue; RX is a packet written to the client TUN. This
@@ -624,14 +637,15 @@ A database error never touches the VPN. The hub hands the minute to its own
 thread through a non-blocking queue and does not wait for the disk. A failed
 write is logged at most once in ten minutes; minutes pile up for two hours
 and are written once the database is available again, and the error shows in
-the History section and the `history` field of the snapshot. At start the
+the Traffic section and the `history` field of the snapshot. At start the
 file is checked with `integrity_check`: a damaged file is read row by row and
 whatever still reads is moved into a new file; if nothing reads, the file is
 deleted and started over. The journal left by a crash (the `-wal` file) is
 replayed by SQLite itself. An unwritable directory or a full disk is not
 damage: the file stays, the status shows the reason, and the attempts go on.
 
-The **History** section reads the database through `GET /api/history`. The
+The **Traffic** section reads ranges longer than five minutes from the
+database through `GET /api/history`. The
 period is `range=1h`, `24h`, `7d` or `30d` — a window up to now — or
 `from=<unix>&to=<unix>`, any window of up to 30 days. The resolution follows
 the age of the window's start, because nothing is kept longer than its tier:
@@ -642,18 +656,18 @@ point is. The other fields: `kind` is `link` (servers and the local exit),
 and `link` (one server or `local`) are optional. No series exceeds 400 points:
 a day is drawn in four-minute buckets.
 
-The section has windows of its own. *Yesterday* shows the whole day before
+The chart has windows of its own. *Yesterday* shows the whole day before
 this one by the browser's calendar, in one click. *Custom…* opens two
 date-and-time fields and an Apply button (Enter works too): it starts on the
 last day and is checked in place — the end after the start, at most 30 days. A
 window that does not reach now is not refreshed by itself; the others are read
-again once a minute while the section is on screen.
+again once a minute while the chart is on screen.
 
 Networks are named by their organization from the same ASN CSV the dashboard
-serves. History reads the CSV in one pass whenever a network has no name yet
-and keeps the names itself: History shows them before the browser has loaded
-its dictionary and after it has been freed. The browser's copy stays as a
-fallback. Without an ASN database networks show their number.
+serves. The history endpoint reads the CSV in one pass whenever a network has
+no name yet and keeps the names itself: the chart shows them before the browser
+has loaded its dictionary and after it has been freed. The browser's copy stays
+as a fallback. Without an ASN database networks show their number.
 
 ## Using only part of the features
 

@@ -101,7 +101,7 @@ function frame() {
     error: scenario === "history-error" ? "1 minute is waiting: disk I/O error" : "", bytes: scenario === "empty" ? 0 : 1908736 };
   return { generated_at: Math.floor(now / 1000), generated_at_ms: now, started_at: started, policy: "balance", asn_table: scenario !== "empty", country_table: true,
     usage, history,
-    process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }], fallback: traffic(null),
+    process, servers: scenario === "empty" ? [] : servers, flows, rules, groups: scenario === "empty" ? [] : [{ group: "claude", server: servers[0].id }, { group: "asn 13335", server: servers[1].id }, { group: "asn 15169", server: servers[0].id }], fallback: traffic(null),
     local: { enabled: scenario !== "empty", ready: scenario !== "empty" && !degraded, opened: 41, closed: 5, failed: degraded ? 2 : 0,
       active_flows: flows.filter(flow => flow.via === "local").length, closing_flows: 0 },
     sticky: { lookup_hit: 81, lookup_miss: 2, failover_moves: 0, block_hit: 410, resolve_ok: 8, resolve_fail: 0, resolved_ips: 6, purged_ips: 0 },
@@ -172,8 +172,15 @@ try {
   assert($('rules').tBodies[0].rows[$('rules').tBodies[0].rows.length - 1].cells[1].textContent === 'Per flow / group', 'fallback exit states per flow / group pinning');
   assert($('local').textContent === 'Ready' && $('local').className === 'compact' && $('ready').className === '', 'local readiness; a healthy summary stays neutral');
   assert($('servers').tBodies[0].rows.length === 2 && !$('servers').textContent.includes('No snapshot'), 'initial server placeholder is removed');
-  assert($('chart-rx').getAttribute('d').includes('l0,0') && getComputedStyle($('chart-rx')).strokeLinecap === 'round', 'isolated first chart sample is visible');
+  const rangeButton = name => document.querySelector('#chart-ranges [data-range="' + name + '"]');
+  // One chart for every range: a day of history on it by default, five minutes measured here on request.
+  assert(document.querySelectorAll('.chart').length === 1 && !document.getElementById('history-panel') && document.querySelectorAll('.rail-nav a[data-section="traffic"]').length === 1, 'one chart at a time');
+  assert(rangeButton('24h').getAttribute('aria-pressed') === 'true' && rangeButton('5m').getAttribute('aria-pressed') === 'false' && !$('chart-by').hidden, 'a day of history is the chart by default');
   await until(() => $('proc-rss').textContent.includes('MiB') && $('proc-cpu').textContent.includes('%'), 'process RSS and CPU readout');
+  // The pool at a glance, in the bar: a lamp for the state, the name, the line it speaks and how far it is.
+  const poolChip = label => [...$('pool').children].find(chip => chip.textContent.startsWith(label));
+  assert($('pool').children.length === 2 && poolChip('NL').tagName === 'A' && poolChip('NL').querySelector('.led.good') && poolChip('NL').querySelector('.mono').textContent === 'tcp · 41 ms' && poolChip('DE').querySelector('.mono').textContent === 'ready', 'the bar shows the pool: ' + $('pool').textContent);
+  assert($('ready-leds').children.length === 2 && [...$('ready-leds').children].every(led => led.classList.contains('led') && led.classList.contains('good') && led.title.includes(': ready')), 'one lamp per server under the number, each naming its server');
   assert($('proc-rss-kind').textContent.includes('Current RSS'), 'current RSS is not silently shown as peak');
   assert(Number.parseFloat($('proc-cpu').textContent) > 0, 'CPU percent is derived from cumulative seconds');
   assert(/[0-9]+s average/.test($('proc-cpu-kind').textContent), 'CPU percent states the window it averages over');
@@ -187,10 +194,15 @@ try {
   assert($('proc-time-note').textContent.includes('8 logical CPUs'), 'logical CPU count is shown');
   assert(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/.test($('uptime').textContent), 'uptime ticks locally');
   assert($('spark-rss').getAttribute('d').trim() && $('spark-cpu').getAttribute('d').trim(), 'process trends render');
-  assert(getComputedStyle(document.body).backgroundImage === 'none', 'no decorative gradient background');
-  assert(getComputedStyle($('ready').closest('.card')).borderRadius === '0px', 'sharp instrument-panel cells');
+  // A trend fills once it has two samples; with one it is a dot.
+  await until(() => $('spark-tx-area').getAttribute('d').trim(), 'summary trends fill');
+  assert($('spark-rx').getAttribute('d').trim() && /^url[(]"#spark-fade-rx"[)]$/.test(getComputedStyle($('spark-rx-area')).fill), 'the summary trends are drawn and filled like the chart');
+  // The aurora is a backdrop, not a surface: behind everything, catching nothing.
+  const aurora = getComputedStyle(document.body, '::before');
+  assert(aurora.position === 'fixed' && aurora.pointerEvents === 'none' && aurora.zIndex === '-1' && aurora.backgroundImage.includes('radial-gradient'), 'the aurora is a backdrop behind the page that catches nothing');
+  assert(getComputedStyle($('ready').closest('.card')).borderRadius === '16px' && getComputedStyle(rangeButton('24h')).borderRadius === '8px', 'cards and pills have soft corners');
   assert(document.querySelector('header').getBoundingClientRect().height <= 64, 'header stays a single row');
-  assert([...document.querySelectorAll('.heading')].every(h => h.getBoundingClientRect().height <= 48), 'panel headings stay on one line');
+  assert([...document.querySelectorAll('.heading')].every(h => h.getBoundingClientRect().height <= 64), 'panel headings stay on one line');
   const helps = [...document.querySelectorAll('button.help')];
   assert(helps.length >= 5 && helps.every(b => b.getAttribute('aria-describedby') && document.getElementById(b.getAttribute('aria-describedby'))), 'each help trigger has a described tooltip');
   assert(getComputedStyle(document.getElementById(helps[0].getAttribute('aria-describedby'))).display === 'none', 'help is hidden until hover or focus');
@@ -206,9 +218,8 @@ try {
   assert(document.body.dataset.theme === 'dark' && $('theme-toggle').getAttribute('aria-pressed') === 'false' && $('theme-toggle').textContent === 'Theme: dark', 'dark theme switch');
   const bodyStyle = getComputedStyle(document.body), titleStyle = getComputedStyle(document.querySelector('.heading h2'));
   assert(/system-ui/.test(bodyStyle.fontFamily) && parseFloat(bodyStyle.fontSize) >= 13 && titleStyle.textTransform === 'none' && parseFloat(titleStyle.fontSize) >= 14, 'interface text is sentence case in the UI face at a readable size');
-  assert(!document.querySelector('.caret') && getComputedStyle(document.querySelector('.rail-health'), '::before').animationName === 'none', 'nothing blinks on a healthy dashboard');
-  assert([...document.querySelectorAll('#traffic .chart-axis span')].map(span => span.textContent).join('|') === '−5 min|−3:45|−2:30|−1:15|' + $('chart-end').textContent, 'chart carries time ticks');
-  assert(Math.abs(Number.parseFloat($('chart-mid').textContent) * 2 - Number.parseFloat($('chart-max').textContent)) < 0.02, 'value axis labels its middle gridline');
+  // Nothing blinks; the only motion is the live chip's slow breath.
+  assert(!document.querySelector('.caret') && getComputedStyle(document.querySelector('.rail-health'), '::before').animationName === 'none' && getComputedStyle($('freshness'), '::before').animationName === 'breathe', 'nothing blinks on a healthy dashboard');
   assert($('flow-reset').disabled, 'clear filters stays quiet without filters');
   assert($('rules').textContent.includes('Local only'), 'explicit local rule');
   assert(!$('rules').textContent.includes('0 IPs'), 'country is not a DNS rule');
@@ -234,81 +245,133 @@ try {
   const requestsBefore = (await control('normal')).asn_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).asn_requests === requestsBefore, 'CSV is not fetched by one-second snapshot polling');
-  // History is read once its section is in view, then once a minute at most.
-  $('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
-  await until(() => document.querySelectorAll('#history-bands .band').length === 3, 'history bands');
+  // History is read once its panel is in view, then once a minute at most.
+  $('traffic').scrollIntoView({ behavior: 'instant', block: 'start' });
+  await until(() => document.querySelectorAll('#chart-bands .band').length === 3, 'history bands');
   let historyReads = (await control('normal')).history_requests;
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert((await control('normal')).history_requests === historyReads, 'history is not fetched by one-second snapshot polling');
-  assert(['cat-1', 'cat-2', 'cat-3'].every((name, i) => $('history-bands').children[i].classList.contains(name)), 'history series take the categorical palette in rank order');
-  assert(['NL', 'DE', 'Local exit'].every((label, i) => $('history-legend').children[i].textContent === label), 'history legend names servers by label and the local exit');
+  const bandsOf = () => [...document.querySelectorAll('#chart-bands .band')], crestsOf = () => [...document.querySelectorAll('#chart-bands .crest')];
+  assert(['cat-1', 'cat-2', 'cat-3'].every((name, i) => bandsOf()[i].classList.contains(name)), 'history series take the categorical palette in rank order');
+  assert(bandsOf().every(band => /^url[(]"#fade-[1-8]"[)]$/.test(getComputedStyle(band).fill)), 'each layer fades out of its own colour: ' + bandsOf().map(band => getComputedStyle(band).fill).join(' '));
+  assert(['NL', 'DE', 'Local exit'].every((label, i) => $('chart-legend').children[i].textContent.startsWith(label)), 'the legend names servers by label and the local exit');
+  assert($('chart-legend').children[0].textContent.endsWith('329.6 MiB'), 'the legend carries what each series moved in the range: ' + $('chart-legend').children[0].textContent);
   const historyRow = index => [...$('history').tBodies[0].rows[index].cells].map(cell => cell.textContent);
   assert(historyRow(0)[0] === 'NL' && historyRow(0)[1] === '274.7 MiB' && historyRow(0)[3] === '329.6 MiB' && historyRow(0)[4] === '63.2%' && historyRow(0)[5] === '2.0', 'history totals list bytes, share of the range and average flows');
   assert(historyRow(2)[0] === 'Local exit' && $('history').tBodies[0].rows.length === 3, 'history table lists every series of the breakdown');
-  assert(Math.abs(Number.parseFloat($('history-mid').textContent) * 2 - Number.parseFloat($('history-max').textContent)) < 0.02 && $('history-max').textContent.endsWith('Mbit/s'), 'history value axis labels its middle gridline');
-  assert([...$('history-axis').children].every(span => /^[0-9]{2}:[0-9]{2}$/.test(span.textContent)), 'a day of history is labelled with clock times');
-  assert(/^M[0-9.]+,[0-9.]+ C/.test($('history-bands').children[0].getAttribute('d')) && $('history-bands').children[0].getAttribute('d').endsWith('Z') && !$('history-empty').offsetParent, 'recorded minutes draw as smooth stacked bands');
-  const drawn = [...document.querySelectorAll('#history-bands .band')], crests = [...document.querySelectorAll('#history-bands .crest')];
-  assert(drawn.length === 3 && drawn.every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).fill !== 'none' && getComputedStyle(band).stroke === 'none') && drawn[0].getBoundingClientRect().height > 40, 'bands are filled SVG paths that rise from the baseline');
-  assert(crests.length === 3 && crests.every(crest => getComputedStyle(crest).stroke !== 'none' && getComputedStyle(crest).fill === 'none' && crest.getAttribute('d').startsWith('M')), 'each layer has a hairline along its top, so a thin layer stays visible on a thick one');
-  assert($('history-resolution').textContent === 'Every 4 min', 'history says how wide its points are');
-  // A pressed first button keeps its own border where the next one overlaps it, in every segmented group.
-  const rangeButton = name => document.querySelector('#history-ranges [data-range="' + name + '"]');
-  rangeButton('1h').click();
-  await until(() => $('history-resolution').textContent === 'Every minute' && document.querySelectorAll('#history-bands .band').length === 3, 'one hour of history');
-  assert(rangeButton('1h').getAttribute('aria-pressed') === 'true' && getComputedStyle(rangeButton('1h')).zIndex === '1' && getComputedStyle(rangeButton('24h')).zIndex === 'auto' && getComputedStyle($('usage-session')).zIndex === '1', 'a pressed button sits above its neighbours whoever it is');
+  assert($('history').tBodies[0].rows[0].cells[0].querySelector('i')?.classList.contains('cat-1'), 'a row of the table carries the colour of its layer');
+  // Pinned groups sit with the rules, shut until asked for: they are extra reading.
+  const groupRow = index => [...$('groups').tBodies[0].rows[index].cells].map(cell => cell.textContent);
+  const fold = document.getElementById('groups-panel'), lid = fold.querySelector('summary');
+  // A shut details is its lid alone; the table inside is laid out but not shown.
+  const shut = fold.getBoundingClientRect().height;
+  assert($('groups').closest('section').id === 'rules-panel' && fold.tagName === 'DETAILS' && !fold.open && shut < 60, 'pinned groups sit with the rules, shut by default: ' + [fold.tagName, fold.open, shut].join(' / '));
+  assert(lid.textContent.includes('Pinned groups') && lid.textContent.endsWith('3 groups since start'), 'the lid says how many there are, and shows nothing else: ' + lid.textContent);
+  lid.click();
+  assert(fold.open && fold.getBoundingClientRect().height > shut + 100, 'a click on the lid opens it');
+  assert($('groups').tBodies[0].rows.length === 3 && groupRow(0)[0] === 'AS13335 · Cloudflare, Inc.' && groupRow(0)[1] === 'DE' && / (MiB|GiB)$/.test(groupRow(0)[2]) && groupRow(0)[4] === '1.4 GiB' && $('groups').tBodies[0].rows[0].cells[1].firstChild.classList.contains('cat-2'), 'the busiest group first, named by its network, led out by name and colour: ' + JSON.stringify(groupRow(0)));
+  assert(groupRow(1)[0] === 'claude' && groupRow(1)[1] === 'NL' && groupRow(2)[0] === 'AS15169 · Google LLC' && groupRow(2)[4].endsWith('MiB') && $('groups-note').textContent === '3 groups since start', 'every group is listed with what it carried');
+  assert(!document.getElementById('groups-more'), 'the whole list is there once open: it scrolls, it does not open in stages');
+  lid.click();
+  assert(!fold.open, 'and a second click shuts it again');
+  assert(Math.abs(Number.parseFloat($('chart-mid').textContent) * 2 - Number.parseFloat($('chart-max').textContent)) < 0.002 && /^[0-9]+([.][0-9]+)? Mbit[/]s$/.test($('chart-max').textContent) && $('chart-mid').textContent === String(Number.parseFloat($('chart-max').textContent) / 2), 'the value axis labels its middle gridline in round numbers');
+  assert([...$('chart-axis').children].every(span => /^[0-9]{2}:[0-9]{2}$/.test(span.textContent)), 'a day of history is labelled with clock times');
+  assert(/^M[0-9.]+,[0-9.]+ C/.test(bandsOf()[0].getAttribute('d')) && bandsOf()[0].getAttribute('d').endsWith('Z') && !$('chart-empty').offsetParent, 'recorded minutes draw as smooth stacked bands');
+  assert(bandsOf().length === 3 && bandsOf().every(band => band instanceof SVGPathElement && band.getBoundingClientRect().height > 0 && getComputedStyle(band).stroke === 'none') && bandsOf()[0].getBoundingClientRect().height > 40, 'bands are filled SVG paths that rise from the baseline');
+  assert(crestsOf().length === 3 && crestsOf().every(crest => getComputedStyle(crest).stroke !== 'none' && getComputedStyle(crest).fill === 'none' && crest.getAttribute('d').startsWith('M')), 'each layer has a hairline along its top, so a thin layer stays visible on a thick one');
+  assert($('chart-resolution').textContent === 'Every 4 min', 'history says how wide its points are');
+  const shareBar = $('history').tBodies[0].rows[0].cells[4].querySelector('.share');
+  assert(shareBar && shareBar.classList.contains('cat-1') && shareBar.firstChild.style.width === '63.2%' && shareBar.textContent === '', 'a share of the range is a bar in its series colour beside its number: ' + (shareBar?.outerHTML ?? 'none'));
+  // A bar takes the colour of the exit it belongs to: an exit its own, a network the one it is pinned to.
+  const exitRow = $('rank-exits').querySelector('li[data-key="nl.example.test"]');
+  const networkRow = $('rank-networks').querySelector('li[data-key="13335"]'), pooledRow = $('rank-networks').querySelector('li[data-key=""]');
+  assert(exitRow.classList.contains('cat-1') && networkRow.classList.contains('cat-2') && pooledRow.className === '' && networkRow.querySelector('small').textContent.endsWith(' · DE'), 'a bar takes the colour of its exit, and a network names it: ' + networkRow.textContent);
+  assert(document.querySelector('#chart-bands .halo') && /^cat-[1-8]$/.test(document.querySelector('#chart-bands .halo').classList[1]) && getComputedStyle(document.querySelector('#chart-bands .halo')).filter !== 'none' && $('chart-pulse').hidden, 'the top of the stack glows, and the live point is off for a stored range');
+  assert(!$('chart-by').hidden && !$('chart-table').hidden && $('chart-total').children[0].textContent === '↓ 439.5 MiB' && $('chart-total').children[1].textContent === '↑ 82.4 MiB', 'a stored range adds up to received and sent: ' + $('chart-total').textContent);
+  // The five minutes measured in this tab are the same chart: the same layers by server.
+  // The legend is ordered by size, so a server is found by name, not by position.
+  const chipOf = label => [...$('chart-legend').children].find(chip => chip.textContent.startsWith(label));
+  const dayTint = chipOf('NL').className, dayTintDE = chipOf('DE').className;
+  rangeButton('5m').click();
+  await until(() => bandsOf().length === 2 && $('chart-resolution').textContent !== 'Waiting…', 'live bands');
+  assert(rangeButton('5m').getAttribute('aria-pressed') === 'true' && rangeButton('24h').getAttribute('aria-pressed') === 'false' && $('chart-by').hidden && $('chart-table').hidden, 'the live window is one breakdown, by server, with no table');
+  // The live window counts back from now over as much as it holds: a young tab speaks in seconds, never of time it never saw.
+  const liveAxis = [...document.querySelectorAll('#traffic .chart-axis span')].map(span => span.textContent);
+  assert(liveAxis[4] === 'now' && liveAxis.slice(0, 4).every(mark => /^−([0-9]+ min|[0-9]+ s|[0-9]+:[0-9]{2})$/.test(mark)) && Number.parseInt(liveAxis[0].slice(1)) >= 10 && Number.parseInt(liveAxis[0].slice(1)) >= Number.parseInt(liveAxis[3].slice(1)), 'the live axis counts back from now: ' + liveAxis.join('|'));
+  assert(chipOf('NL')?.className === dayTint && chipOf('DE')?.className === dayTintDE, 'a server keeps its colour from a day to five minutes: ' + dayTint + ',' + dayTintDE + ' → ' + [...$('chart-legend').children].map(chip => chip.className + ' ' + chip.textContent).join(' | '));
+  assert(!$('chart-pulse').hidden && /^cat-[1-8]$/.test($('chart-pulse').classList[1]) && Number.parseFloat($('chart-pulse').style.top) > 0 && Number.parseFloat($('chart-pulse').style.top) < $('chart-plot').clientHeight, 'the newest live sample is a point of light on the stack');
+  assert(/^(?:[0-9]+s collected|Every second)$/.test($('chart-resolution').textContent) && $('chart-total').textContent.endsWith('Mbit/s')
+    && Number.parseFloat($('chart-total').children[0].textContent.slice(1)) === Number.parseFloat($('rx').textContent), 'the live window quotes its newest sample, the number the summary shows');
+  const plot = $('chart-plot').getBoundingClientRect();
+  // The samples of this tab reach a few seconds back: the pointer goes there, not into the empty part of the window.
+  $('chart-plot').dispatchEvent(new PointerEvent('pointermove', { clientX: plot.left + plot.width * 0.995, clientY: plot.top + plot.height / 2, bubbles: true }));
+  assert(!$('chart-tooltip').hidden && !$('chart-cursor').hidden && Math.abs(Number.parseFloat($('chart-cursor').style.left) - 99.5) < 0.01 && $('chart-cursor').getBoundingClientRect().width > 0 && $('chart-tooltip').textContent.includes('NL') && $('chart-tooltip').textContent.includes('Total') && $('chart-tooltip').textContent.includes(' Mbit/s'), 'the pointer reads the stack under it: ' + $('chart-tooltip').textContent);
+  const tooltip = $('chart-tooltip').getBoundingClientRect();
+  assert(tooltip.left >= plot.left && tooltip.right <= plot.right, 'the readout stays inside the plot near its edge');
+  $('chart-plot').dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+  assert($('chart-tooltip').hidden && $('chart-cursor').hidden, 'the readout leaves with the pointer');
   rangeButton('24h').click();
-  await until(() => $('history-resolution').textContent === 'Every 4 min', 'back to a day of history');
+  await until(() => $('chart-resolution').textContent === 'Every 4 min' && bandsOf().length === 3, 'back to a day of history');
+  assert(!$('chart-by').hidden && !$('chart-table').hidden, 'a stored range offers the breakdowns and lists its series');
+  // The pointer reads a stored range too: the bucket under it, by series.
+  $('chart-plot').dispatchEvent(new PointerEvent('pointermove', { clientX: plot.left + plot.width * 0.6, clientY: plot.top + plot.height / 2, bubbles: true }));
+  assert(!$('chart-tooltip').hidden && /^[0-9]{2}:[0-9]{2}$/.test($('chart-tooltip').querySelector('p').textContent) && $('chart-tooltip').textContent.includes('Local exit'), 'a stored range reads to the minute under the pointer');
+  $('chart-plot').dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
   historyReads = (await control('normal')).history_requests;
   // A database that just started holds one bucket: it is a column, not nothing.
-  const bandWidth = () => $('history-bands').children[0].getBoundingClientRect().width;
+  const bandWidth = () => bandsOf()[0].getBoundingClientRect().width;
   await control('history-once'); rangeButton('24h').click();
   await until(() => bandWidth() > 0 && bandWidth() < 5, 'a single recorded bucket');
-  assert(bandWidth() > 2 && !$('history-empty').offsetParent, 'one recorded bucket is drawn as a column as wide as its step');
+  assert(bandWidth() > 1.2 && Math.abs(bandWidth() - $('chart-plot').getBoundingClientRect().width / 360) < 0.5 && !$('chart-empty').offsetParent, 'one recorded bucket is drawn as a column as wide as its step: ' + bandWidth());
   await control('normal'); rangeButton('24h').click();
   await until(() => bandWidth() > 500, 'the whole day again');
   historyReads = (await control('normal')).history_requests;
-  input('history-direction', 'tx');
+  input('chart-direction', 'tx');
   assert(historyRow(0)[4] === '66.7%' && (await control('normal')).history_requests === historyReads, 'another direction redraws the same answer');
-  input('history-kind', 'network');
-  await until(() => $('history-legend').textContent.includes('AS13335'), 'network history');
-  assert(document.querySelectorAll('#history-bands .band').length === 3, 'the twenty busiest networks are drawn, here all three');
-  assert($('history-legend').textContent.includes('AS13335 · Cloudflare, Inc.') && $('history').tBodies[0].rows[0].cells[0].textContent.includes('via NL'), 'networks are named by ASN and organization, the exit is the second line');
-  assert($('history-legend').textContent.includes('AS24429 · Alibaba (US) Technology Co., Ltd.'), 'a network is named by the server, with no browser copy of the ASN CSV');
-  input('history-server', 'de.example.test');
-  await until(() => document.querySelectorAll('#history-bands .band').length === 1, 'history of one server');
-  assert($('history-legend').textContent.includes('AS15169 · Google LLC'), 'the server filter narrows the series');
-  document.querySelector('#history-ranges [data-range="7d"]').click();
-  await until(() => $('history-axis').children[0].textContent.includes(' '), 'week of history');
-  assert(document.querySelector('#history-ranges [data-range="7d"]').getAttribute('aria-pressed') === 'true' && [...$('history-axis').children].every(span => /^[A-Z][a-z][a-z] [0-9]+ [A-Z][a-z][a-z]$/.test(span.textContent)) && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'range buttons state the choice and the axis names the days: ' + JSON.stringify([...$('history-axis').children].map(span => span.textContent)));
+  input('chart-kind', 'network');
+  await until(() => $('chart-legend').textContent.includes('AS13335'), 'network history');
+  assert(bandsOf().length === 3, 'the twenty busiest networks are drawn, here all three');
+  assert($('chart-legend').textContent.includes('AS13335 · Cloudflare, Inc.') && $('history').tBodies[0].rows[0].cells[0].textContent.includes('via NL'), 'networks are named by ASN and organization, the exit is the second line');
+  assert($('chart-legend').textContent.includes('AS24429 · Alibaba (US) Technology Co., Ltd.'), 'a network is named by the server, with no browser copy of the ASN CSV');
+  input('chart-server', 'de.example.test');
+  await until(() => bandsOf().length === 1, 'history of one server');
+  assert($('chart-legend').textContent.includes('AS15169 · Google LLC'), 'the server filter narrows the series');
+  rangeButton('7d').click();
+  await until(() => $('chart-axis').children[0].textContent.includes(' '), 'week of history');
+  assert(rangeButton('7d').getAttribute('aria-pressed') === 'true' && [...$('chart-axis').children].every(span => /^[A-Z][a-z][a-z] [0-9]+ [A-Z][a-z][a-z]$/.test(span.textContent)) && $('chart-axis').children[0].textContent !== $('chart-axis').children[4].textContent, 'range buttons state the choice and the axis names the days: ' + JSON.stringify([...$('chart-axis').children].map(span => span.textContent)));
   // Yesterday is one click: the whole local day before this one, by the hour.
   rangeButton('yesterday').click();
-  await until(() => $('history-resolution').textContent === 'Every hour' && $('history-axis').children[1].textContent !== $('history-axis').children[3].textContent, 'yesterday');
+  await until(() => $('chart-resolution').textContent === 'Every hour' && $('chart-axis').children[1].textContent !== $('chart-axis').children[3].textContent, 'yesterday');
   const yesterday = new URLSearchParams((await control('normal')).history_last);
   const midnight = new Date(Number(yesterday.get('to')) * 1000);
   assert(yesterday.has('from') && yesterday.has('to') && !yesterday.has('range') && midnight.getHours() === 0 && midnight.getMinutes() === 0 && Math.round((Number(yesterday.get('to')) - Number(yesterday.get('from'))) / 3600) === 24 && rangeButton('yesterday').getAttribute('aria-pressed') === 'true', 'Yesterday asks for the whole local day before this one');
+  // The chosen range is the lit pill of the tray: the accent, with ink that reads on it.
+  const lit = getComputedStyle(rangeButton('yesterday')), unlit = getComputedStyle(rangeButton('24h'));
+  assert(lit.backgroundImage.includes('gradient') && lit.color !== unlit.color && unlit.backgroundImage === 'none', 'the chosen range is the lit pill of the tray');
   // Custom opens on the last day and takes any window of up to 30 days.
   rangeButton('custom').click();
-  await until(() => !$('history-custom').hidden && $('history-resolution').textContent === 'Every 4 min', 'custom window');
-  assert(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$/.test($('history-from').value) && $('history-to').value > $('history-from').value, 'the picker is filled with the last day');
-  $('history-to').value = $('history-from').value; $('history-apply').click();
-  assert($('history-note').textContent === 'The end comes after the start' && !$('history-note').classList.contains('bad'), 'a custom window with its ends reversed is refused in place');
+  await until(() => !$('chart-custom').hidden && $('chart-resolution').textContent === 'Every 4 min', 'custom window');
+  assert(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$/.test($('chart-from').value) && $('chart-to').value > $('chart-from').value, 'the picker is filled with the last day');
+  $('chart-to').value = $('chart-from').value; $('chart-apply').click();
+  assert($('chart-note').textContent === 'The end comes after the start' && !$('chart-note').classList.contains('bad'), 'a custom window with its ends reversed is refused in place');
   const pad = value => String(value).padStart(2, '0'), day = date => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
   const first = new Date(), last = new Date(); first.setDate(first.getDate() - 2); last.setDate(last.getDate() - 1);
-  $('history-from').value = day(first) + 'T03:30'; $('history-to').value = day(last) + 'T21:15'; $('history-apply').click();
+  $('chart-from').value = day(first) + 'T03:30'; $('chart-to').value = day(last) + 'T21:15'; $('chart-apply').click();
   const asked = '?from=' + Math.floor(new Date(day(first) + 'T03:30').getTime() / 1000) + '&to=' + Math.floor(new Date(day(last) + 'T21:15').getTime() / 1000) + '&';
   const firstLabel = new Date(day(first) + 'T03:30').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
-  await until(async () => (await control('normal')).history_last.startsWith(asked) && $('history-axis').children[0].textContent === firstLabel, 'the picked window');
-  assert($('history-note').hidden && rangeButton('custom').getAttribute('aria-pressed') === 'true' && $('history-axis').children[0].textContent !== $('history-axis').children[4].textContent, 'the picked window is drawn by the hour');
+  await until(async () => (await control('normal')).history_last.startsWith(asked) && $('chart-axis').children[0].textContent === firstLabel, 'the picked window');
+  assert($('chart-note').hidden && rangeButton('custom').getAttribute('aria-pressed') === 'true' && $('chart-axis').children[0].textContent !== $('chart-axis').children[4].textContent, 'the picked window is drawn by the hour');
   await control('history-error');
-  await until(() => $('history-note').textContent.includes('not being recorded'), 'history error is visible');
-  assert($('history-note').classList.contains('bad') && $('history-note').textContent.includes('disk I/O error') && document.querySelectorAll('#history-bands .band').length === 1, 'a failing history database is the loud case, the last answer stays drawn');
+  await until(() => $('chart-note').textContent.includes('not being recorded'), 'history error is visible');
+  assert($('chart-note').classList.contains('bad') && $('chart-note').textContent.includes('disk I/O error') && bandsOf().length === 1, 'a failing history database is the loud case, the last answer stays drawn');
   await control('history-off');
-  await until(() => $('history-note').textContent.includes('History is off'), 'history off is explained');
-  assert($('history-kind').disabled && $('history-from').disabled && $('history-apply').disabled && rangeButton('custom').disabled && !$('history-note').classList.contains('bad'), 'history controls are quiet while history is off');
+  await until(() => $('chart-note').textContent.includes('History is off'), 'history off is explained');
+  assert($('chart-kind').disabled && $('chart-from').disabled && $('chart-apply').disabled && rangeButton('custom').disabled && !$('chart-note').classList.contains('bad'), 'history controls are quiet while history is off');
+  await until(() => rangeButton('5m').getAttribute('aria-pressed') === 'true' && !$('chart-server').disabled, 'without history the chart shows the live window');
+  assert(rangeButton('24h').disabled && !rangeButton('5m').disabled, 'only the live range is left');
   await control('normal');
-  await until(() => !$('history-kind').disabled, 'history recovers');
-  input('history-server', ''); input('history-kind', 'link');
+  await until(() => !$('chart-kind').disabled, 'history recovers');
+  input('chart-server', ''); input('chart-kind', 'link');
   input('flow-country', 'US'); input('flow-asn', '13335');
   const countryCells = [...$('flows').tBodies[0].rows].map(row => row.cells[3].textContent);
   // Headless Chrome without an emoji font draws no flag: the code is mandatory, the flag is not.
@@ -326,7 +389,9 @@ try {
   input('flow-order', 'rate');
   await until(() => sourceCell(0).note === 'via 10.77.0.2:40007' && flowRow(0)[7].querySelector('strong')?.textContent === '16.00', 'rate order puts the busiest flow first with its Mbit/s');
   assert(isSource(0, 'iphone-vadv · 192.168.0.27', 'via 10.77.0.2:40007'), 'a LAN device shows as the source with the tunnel address as the note');
+  assert(flowRow(0)[5].firstChild.classList.contains('cat-1') && Number.parseFloat(flowRow(0)[7].querySelector('.share.rate b')?.style.width) === 100, 'the busiest flow carries its exit colour and a full rate bar');
   assert(flowRow(1)[7].querySelector('strong').textContent === '0.00' && flowRow(0)[7].querySelector('small').textContent.endsWith('MiB'), 'idle flows read 0, the total sits under the rate');
+  assert(!flowRow(1)[7].querySelector('.share'), 'an idle flow draws no rate bar');
   input('flow-order', 'total');
   await until(() => sourceCell(0).note === 'via 10.77.0.2:40007', 'total order ranks by bytes so far');
   assert(isSource(1, 'router', '10.77.0.2:40000'), 'a flow without a LAN client is the router itself');
@@ -371,7 +436,7 @@ try {
   assert(['flow-search','flow-protocol','flow-exit'].every(id => $(id).value === '') && $('flow-reset').disabled, 'clear filters resets the search and the selectors');
   input('flow-search', ''); input('flow-protocol', ''); input('flow-exit', 'de.example.test');
   input('flow-country', 'US'); input('flow-asn', '13335');
-  $('next').click(); assert($('flow-page').textContent.startsWith('2 /'), 'next flow page');
+  $('next').click(); assert($('flow-page').textContent.startsWith('2 /'), 'next flow page: ' + $('flow-page').textContent + ' / ' + $('flow-count').textContent + ' / next disabled ' + $('next').disabled + ' / ' + $('active').textContent);
   $('pause').click();
   const frozen = $('flows').textContent, frozenExits = $('flow-exit').textContent;
   const frozenCountries = $('flow-country').textContent, frozenAsns = $('flow-asn').textContent;
@@ -391,15 +456,17 @@ try {
   await until(() => $('asn-status').textContent.includes('2 names') && $('flows').textContent.includes('<img'), 'untrusted CSV names loaded in browser');
   assert($('flows').textContent.includes('<img'), 'organization names render as text');
   assert(!document.querySelector('main img') && !window.pwned, 'snapshot text cannot inject HTML');
+  rangeButton('5m').click();
   const restart = await control('restart');
   await until(() => $('footer').textContent.includes(new Date(restart.started_at).toLocaleString()), 'client restart');
-  assert($('rx').textContent === '—' && !$('chart-rx').getAttribute('d').trim(), 'restart clears rates and graph');
+  assert($('rx').textContent === '—' && !$('chart-bands').children.length && !$('chart-empty').hidden, 'restart clears rates and the live chart');
   assert($('proc-cpu').textContent === '—', 'restart clears the derived CPU percentage');
   await until(() => $('rx').textContent !== '—', 'rates resume after restart');
   await control('degraded');
   await until(() => $('jobs').tBodies[0].textContent.includes('Previous attempt: '), 'a retrying job keeps its previous failure visible');
   assert($('jobs').tBodies[0].rows[0].cells[4].textContent === 'Running', 'running job shows Running instead of a next-check time');
   assert($('local').className === 'compact bad' && $('ready').className === 'warn' && $('freshness').className === 'pill good', 'trouble is the only coloured thing in the summary');
+  assert($('ready-leds').children[1].classList.contains('warn') && [...$('pool').children][1].querySelector('.led.warn') && [...$('pool').children][1].querySelector('.mono').textContent === 'backoff', 'a server in trouble turns its lamp and its chip with it');
   assert(!document.querySelector('#servers .pill.bad') && document.querySelector('#servers .pill.warn')?.textContent === 'Backoff', 'state tags read as words');
   await control('normal');
   await until(() => !$('jobs').textContent.includes('Previous attempt:'), 'clean job drops the previous-attempt prefix');
@@ -409,20 +476,20 @@ try {
   $('usage-now').click(); assert($('usage-total').textContent === '—' && $('rank-exits').textContent.includes('stale'), 'stale interval is unknown, never zero');
   $('usage-session').click(); assert($('usage-period').textContent.includes('last snapshot'), 'stale session totals are labelled');
   assert((await fetch('/api/state')).status === 503, 'HTTP error fixture');
-  const beforeApiGap = $('chart-rx').getAttribute('d');
+  const beforeApiGap = $('chart-bands').innerHTML;
   await control('frozen');
   await until(() => $('freshness').textContent === 'Live', 'same-timestamp response clears the API error', 2500);
-  assert($('chart-rx').getAttribute('d') === beforeApiGap, 'duplicate recovery does not add a chart sample');
-  assert($('rx').textContent === '—' && $('legend-rx').textContent.includes('—'), 'duplicate recovery does not reuse a pre-error rate');
-  assert(!$('chart-note').textContent.includes('not live'), 'duplicate recovery restores chart freshness');
-  const recoveredAt = $('chart-end').textContent;
+  assert($('chart-bands').innerHTML === beforeApiGap, 'duplicate recovery does not add a chart sample');
+  assert($('rx').textContent === '—' && $('chart-total').textContent.includes('↓ —'), 'duplicate recovery does not reuse a pre-error rate');
+  assert(!$('chart-resolution').textContent.includes('Last snapshot'), 'duplicate recovery restores chart freshness');
+  const recoveredAt = $('chart-bands').innerHTML;
   await control('normal');
-  await until(() => $('chart-end').textContent !== recoveredAt, 'first new snapshot after duplicate recovery');
+  await until(() => $('chart-bands').innerHTML !== recoveredAt, 'first new snapshot after duplicate recovery');
   assert($('rx').textContent === '—', 'short API gap is not averaged into a rate');
   await until(() => $('rx').textContent !== '—', 'two fresh snapshots restore rates');
   await control('frozen');
   await until(() => $('freshness').textContent === 'Stale data', 'unchanged snapshot becomes stale');
-  assert(!$('stale-notice').hidden && $('rx').textContent === '—', 'stale screen has warning and unknown rate');
+  assert(!$('stale-notice').hidden && $('rx').textContent === '—' && !$('spark-rx').getAttribute('d') && $('chart-resolution').textContent === 'Last snapshot' && $('chart-total').textContent.includes('↓ —'), 'stale screen has warning and unknown rate');
   await control('empty');
   await until(() => $('active').textContent === '0' && $('freshness').textContent === 'Live', 'recovery and empty flow table');
   assert($('rx').textContent === '—', 'stale recovery starts with an unknown rate');
@@ -612,14 +679,20 @@ async function browser(query = "", screenshot, mobile = false) {
       if (query.includes('view=now')) await evaluate("document.getElementById('usage-now').click(); document.getElementById('theme-toggle').click()");
       if (query.includes('view=provider')) await evaluate("document.querySelector('#rank-networks button').click()");
       // History is read once its section is in view, as on a real scroll.
-      if (query.includes('view=history')) await evaluate(`(async () => {
-        document.getElementById('history-panel').scrollIntoView({ behavior: 'instant', block: 'start' });
+      // The stored ranges are read once the chart is in view, as on a real scroll. `traffic-live`
+      // shows the five minutes measured here, from the replayed samples; `traffic-light` the light theme.
+      if (query.includes('view=traffic')) await evaluate(`(async () => {
+        document.getElementById('traffic').scrollIntoView({ behavior: 'instant', block: 'start' });
+        if ('live' === '${(query.match(/live|day|hour|week/) || [''])[0]}') { document.querySelector('#chart-ranges [data-range="5m"]').click(); await new Promise(resolve => setTimeout(resolve, 1200)); }
         await new Promise(resolve => { const timer = setInterval(() => {
-          if (document.getElementById('history-bands').children.length) { clearInterval(timer); resolve(); }
+          if (document.getElementById('chart-bands').children.length) { clearInterval(timer); resolve(); }
         }, 100); });
       })()`);
+      if (query.includes('light')) await evaluate("document.getElementById('theme-toggle').click()");
+      // The sticky bar and rail are their own layers: give them a frame to repaint in the new theme.
+      if (query.includes('light')) await evaluate("new Promise(resolve => setTimeout(resolve, 500))");
       const y = query.includes('view=provider') ? await evaluate("document.getElementById('flows-panel').getBoundingClientRect().top + scrollY - 8")
-        : query.includes('view=history') ? await evaluate("document.getElementById('history-panel').getBoundingClientRect().top + scrollY - 8") : 0;
+        : query.includes('view=traffic') ? await evaluate("document.getElementById('traffic').getBoundingClientRect().top + scrollY - 8") : 0;
       const image = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
         clip: { x: 0, y, width, height, scale: 1 } });
       fs.writeFileSync(screenshot, Buffer.from(image.data, "base64"));
@@ -627,6 +700,14 @@ async function browser(query = "", screenshot, mobile = false) {
         const jobs = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
           clip: { x: 0, y: layout.jobsTop - 8, width, height: Math.ceil(layout.jobsHeight + 16), scale: 1 } });
         fs.writeFileSync(screenshot.replace(".png", "-jobs.png"), Buffer.from(jobs.data, "base64"));
+      }
+      // The chart twice over: the readout under the pointer, in detail.
+      if (query.includes("view=traffic")) {
+        const plot = await evaluate("(() => { const rect = document.getElementById('chart-plot').getBoundingClientRect(); return { left: rect.left, top: rect.top + scrollY, width: rect.width, height: rect.height }; })()");
+        await evaluate(`document.getElementById('chart-plot').dispatchEvent(new PointerEvent('pointermove', { clientX: ${plot.left + plot.width * 0.6}, clientY: ${plot.top + plot.height / 2}, bubbles: true }))`);
+        const detail = await page("Page.captureScreenshot", { format: "png", captureBeyondViewport: true,
+          clip: { x: 0, y: plot.top - 70, width, height: Math.ceil(plot.height + 160), scale: 2 } });
+        fs.writeFileSync(screenshot.replace(".png", "-detail.png"), Buffer.from(detail.data, "base64"));
       }
     }
     return query ? layout : JSON.parse(await evaluate("document.documentElement.dataset.browserCheck"));
@@ -643,7 +724,7 @@ try {
   console.log(`PASS Chrome dashboard: ${report.checks.length} UI assertions + viewport/axis checks`);
   const directory = process.env.DASHBOARD_SCREENSHOTS;
   if (directory) fs.mkdirSync(directory, { recursive: true });
-  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=history", false], ["normal&view=history", true], ["normal&view=provider", false]] : [])]) {
+  for (const [scenario, mobile] of [["normal", false], ["degraded", false], ["normal", true], ["cold", false], ...(directory ? [["normal&view=now", false], ["normal&view=traffic", false], ["normal&view=traffic-live", false], ["normal&view=traffic-light", false], ["normal&view=traffic", true], ["normal&view=provider", false]] : [])]) {
     const name = `${scenario.replace("normal&view=", "")}${mobile ? "-mobile" : ""}.png`;
     const layout = await browser(`?render=1&scenario=${scenario}`, directory ? path.join(directory, name) : undefined, mobile);
     console.log(`PASS layout ${name} (${layout.width}px viewport / ${layout.scroll}px document)${directory ? " + screenshot" : ""}`);

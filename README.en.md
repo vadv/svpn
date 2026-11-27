@@ -198,7 +198,7 @@ network is it”. Enabling the modes is covered in ADVANCED.
 
 ## Web dashboard
 
-The dashboard opens with three views of traffic: which VPN server or local exit carried it, which destination network (ASN) owns it, and which IP used it. Switch between volume since start and current throughput, rank by received or sent bytes, and select a name to inspect its current flows. Completed connections still count until the client restarts; by default no history is written to disk. The VPN graph, History, rules, servers and diagnostics follow. The read-only panel listens on loopback and loads no external assets:
+The dashboard opens with three views of traffic: which VPN server or local exit carried it, which destination network (ASN) owns it, and which IP used it. Switch between volume since start and current throughput, rank by received or sent bytes, and select a name to inspect its current flows. Completed connections still count until the client restarts; by default no history is written to disk. The traffic chart, rules, servers and diagnostics follow. The read-only panel listens on loopback and loads no external assets:
 
 ```bash
 sudo -E svpn --server 203.0.113.10 --web-listen 127.0.0.1:8080
@@ -208,11 +208,11 @@ With a config, put `dashboard { listen = "127.0.0.1:8080" }` in `vpn.hcl`
 and run `svpn multi --config vpn.hcl`: `--config` cannot be combined with
 client flags. Details — in [ADVANCED.en.md](ADVANCED.en.md).
 
-Beyond the five live minutes there is history. The block
+The Traffic chart shows the last five minutes and the history alike. The block
 `stats { db = "/var/lib/svpn/stats.sqlite" }` (the flag `--stats-db` without a
 config) keeps the same traffic in SQLite on the client: a minute for a day, an
-hour for a week, a day for a month, about 2 MB a month. The History section
-shows it by server, sticky rule and destination network with the organization's
+hour for a week, a day for a month, about 2 MB a month. The same chart shows it
+by server, sticky rule and destination network with the organization's
 name — over an hour, a day, a week, a month, yesterday or any window you pick.
 A database error never touches the VPN.
 

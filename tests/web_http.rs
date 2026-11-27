@@ -110,7 +110,7 @@ async fn root_serves_html() {
         "Rules",
         "Pinned groups",
         "Flows",
-        "History",
+        "Traffic",
         "Diagnostics",
     ] {
         assert!(answer.contains(section), "missing section {section}");
