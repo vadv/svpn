@@ -3,6 +3,7 @@
 pub mod csv;
 pub mod dns;
 pub mod hub;
+pub mod mtproxy;
 pub mod selector;
 pub mod session;
 

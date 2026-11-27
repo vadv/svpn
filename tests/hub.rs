@@ -97,6 +97,7 @@ fn test_hub(servers: [Ipv4Addr; 2]) -> Hub {
         history_prev: None,
         history_ts: None,
         dns: Default::default(),
+        telegram: None,
     }
 }
 

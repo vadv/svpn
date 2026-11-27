@@ -128,6 +128,8 @@ pub struct Extras {
     pub stats_db: Option<std::path::PathBuf>,
     /// DNS that follows the exit; None keeps UDP/53 untouched.
     pub dns: Option<crate::dns::Settings>,
+    /// MTProto proxy for Telegram clients; None keeps it off.
+    pub telegram_proxy: Option<crate::mtproxy::Settings>,
 }
 
 /// First-match decision for one destination.
@@ -194,6 +196,8 @@ pub struct Hub {
     pub history_prev: Option<crate::history::Counters>,
     pub history_ts: Option<u64>,
     pub dns: DnsState,
+    /// Counters of the Telegram proxy; None when it is off.
+    pub telegram: Option<Arc<crate::mtproxy::Stats>>,
 }
 
 impl Hub {
@@ -631,6 +635,17 @@ impl Hub {
             report.push_str(&format!(
                 "\ndns: queries {} | cache {} | stale {} | moved {} | failed {}",
                 dns.queries, dns.cache_hits, dns.stale, dns.moved, dns.failed
+            ));
+        }
+        if let Some(stats) = &self.telegram {
+            let get = |counter: &std::sync::atomic::AtomicU64| {
+                counter.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            report.push_str(&format!(
+                "\ntelegram proxy: accepted {} | rejected {} | active {}",
+                get(&stats.accepted),
+                get(&stats.rejected),
+                get(&stats.active)
             ));
         }
         for line in per_link {
@@ -1465,6 +1480,7 @@ pub async fn run(
         web_listen,
         stats_db,
         dns,
+        telegram_proxy,
     } = extras;
     let GeoExits {
         geo,
@@ -1513,8 +1529,27 @@ pub async fn run(
     // The history names networks from the same ASN CSV the dashboard serves.
     let asn_csv = jobs.geo_db.clone();
     let dns = dns.as_ref().map(DnsState::new).unwrap_or_default();
+    let telegram_proxy = match telegram_proxy {
+        Some(settings) => {
+            let listen = settings.listen;
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("bind telegram proxy {listen}"))?;
+            let stats = Arc::new(crate::mtproxy::Stats::default());
+            let task = tokio::spawn(crate::mtproxy::serve(
+                listener,
+                Arc::new(settings.secret),
+                Arc::new(crate::mtproxy::addresses),
+                stats.clone(),
+            ));
+            crate::info!("telegram proxy: {listen}");
+            Some((stats, task))
+        }
+        None => None,
+    };
     let mut hub = Hub {
         dns,
+        telegram: telegram_proxy.as_ref().map(|(stats, _)| stats.clone()),
         geo,
         country,
         policy: exits_policy,
@@ -1601,6 +1636,9 @@ pub async fn run(
         )
         .await;
     if let Some((_, task)) = dashboard {
+        task.abort();
+    }
+    if let Some((_, task)) = telegram_proxy {
         task.abort();
     }
     if let Some(history) = &hub.history {

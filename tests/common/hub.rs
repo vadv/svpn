@@ -87,5 +87,6 @@ pub fn dashboard_hub() -> Hub {
         history_prev: None,
         history_ts: None,
         dns: Default::default(),
+        telegram: None,
     }
 }

@@ -146,6 +146,7 @@ impl Bench {
             history_prev: None,
             history_ts: None,
             dns: DnsState::new(&Default::default()),
+            telegram: None,
         };
         Self {
             hub,

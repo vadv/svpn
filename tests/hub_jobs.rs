@@ -103,6 +103,7 @@ fn jobs_hub(geo_path: Option<std::path::PathBuf>) -> Hub {
         history_prev: None,
         history_ts: None,
         dns: Default::default(),
+        telegram: None,
     }
 }
 

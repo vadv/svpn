@@ -227,6 +227,7 @@ Everything beyond the quick-start pair of servers is covered in
 - `via = local` — sending selected addresses outside the VPN;
 - `fallback_sticky` — how the pool serves the remaining traffic;
 - `dns { mode = "exit" }` — resolving DNS at the exit the traffic will use;
+- `telegram_proxy` — accepting Telegram's MTProto connections with Fake TLS;
 - Country and ASN databases and their background auto-update
   (`auto_job_update`);
 - hooks and environment variables;

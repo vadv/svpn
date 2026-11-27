@@ -37,6 +37,7 @@ pub mod link_io;
 pub mod local_proxy;
 pub mod logging;
 mod mimic;
+pub mod mtproxy;
 pub mod packet;
 pub mod pcap;
 pub mod perf;
@@ -374,6 +375,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     web_listen: args.web_listen,
                     stats_db: args.stats_db,
                     dns: args.dns,
+                    telegram_proxy: args.telegram_proxy,
                 },
             );
             tokio::pin!(client);

@@ -216,6 +216,66 @@ Limits:
 - Until at least one link is ready, queries pass as they always did.
 - DNS counters are in the periodic report: `dns: queries | cache | stale | moved | failed`.
 
+## Telegram proxy
+
+The client can accept Telegram's MTProto connections itself. This replaces
+a separate `mtg` or MTProxy on the client's machine.
+
+Add the block:
+
+```hcl
+telegram_proxy {
+  listen      = "0.0.0.0:8081"
+  secret_file = "/etc/svpn/telegram.secret"
+}
+```
+
+| Setting | What it sets |
+| --- | --- |
+| `listen` | The address and port where the client accepts Telegram connections |
+| `secret_file` | The file with the secret of a `tg://proxy` link |
+
+Without the block the proxy is off. The `listen` port must be open in the
+firewall. Stop `mtg` if it already runs on this port.
+
+The secret file is read once at start. The file has one line: `ee`, then 32
+hex digits of the key, then the domain in hex. `mtg generate-secret --hex`
+writes a file of the same format.
+
+How a connection passes:
+
+1. The Telegram client connects to `listen`.
+2. The client signs the ClientHello with the secret. SVPN checks the
+   signature and the creation time.
+3. SVPN answers with a TLS 1.3 handshake. To the provider it looks like an
+   HTTPS connection to the domain in the secret.
+4. The client names a datacenter. SVPN connects to the datacenter and
+   relays the stream.
+
+SVPN does not read the messages. They are encrypted with the keys of the
+client and Telegram.
+
+The datacenter connection follows the routing table. On the hub it goes
+through the tunnel like any other traffic of the machine.
+
+Limits:
+
+- Only Fake TLS with an `ee` secret is accepted. The `dd` and classic modes
+  are not.
+- The datacenter addresses are built into the binary, as in Telegram
+  Desktop.
+- Up to 256 clients are served at once. Other connections are closed at
+  once.
+- The hello must arrive within 10 seconds.
+- Calls do not go through an MTProto proxy. Calls need another path.
+
+SVPN closes the connection without contacting a datacenter in three cases.
+The hello is signed with another secret. The hello was sent before. The
+traffic is not Telegram's.
+
+The periodic report has the counters: `telegram proxy: accepted N |
+rejected N | active N`.
+
 ## Country and ASN databases
 
 Both databases belong on the **client**, not on the VPSs. The directory and
