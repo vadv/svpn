@@ -268,7 +268,7 @@ SVPN закрывает соединение без подключения к д
 трафик Telegram.
 
 Счётчики есть в периодическом отчёте: `telegram proxy: accepted N |
-rejected N | active N`. Секрет в лог не пишется.
+rejected N | active N`.
 
 ## Базы стран и ASN
 

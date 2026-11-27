@@ -274,7 +274,7 @@ The hello is signed with another secret. The hello was sent before. The
 traffic is not Telegram's.
 
 The periodic report has the counters: `telegram proxy: accepted N |
-rejected N | active N`. The secret is never written to the log.
+rejected N | active N`.
 
 ## Country and ASN databases
 
